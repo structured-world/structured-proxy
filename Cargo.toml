@@ -1,7 +1,7 @@
 [package]
 name = "structured-proxy"
 description = "Universal gRPC→REST transcoding proxy — config-driven, works with any gRPC service"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 authors = ["Structured World Foundation contributors"]
 license = "Apache-2.0"
