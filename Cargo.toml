@@ -1,0 +1,82 @@
+[package]
+name = "structured-proxy"
+description = "Universal gRPC→REST transcoding proxy — config-driven, works with any gRPC service"
+version = "0.1.0"
+edition = "2021"
+authors = ["Structured World Foundation contributors"]
+license = "Apache-2.0"
+repository = "https://github.com/structured-world/structured-proxy"
+homepage = "https://github.com/structured-world/structured-proxy"
+documentation = "https://docs.rs/structured-proxy"
+readme = "README.md"
+keywords = ["grpc", "rest", "proxy", "transcoding", "protobuf"]
+categories = ["network-programming", "web-programming::http-server"]
+rust-version = "1.75"
+
+[[bin]]
+name = "structured-proxy"
+path = "src/main.rs"
+
+[lib]
+name = "structured_proxy"
+path = "src/lib.rs"
+
+[dependencies]
+# HTTP framework
+axum = { version = "0.7", features = ["macros"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+# gRPC client (to upstream service)
+tonic = "0.14"
+tonic-health = "0.14"
+prost = "0.14"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_urlencoded = "0.7"
+serde_yaml = "0.9"
+
+# Streaming (server-streaming RPC handler)
+futures = "0.3"
+
+# Protobuf reflection (REST↔gRPC transcoding)
+prost-reflect = { version = "0.16", features = ["serde"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Metrics
+prometheus = "0.14"
+
+# Rate limiting (Shield middleware)
+dashmap = "6"
+
+# Auth (JWT validation, route policies)
+jsonwebtoken = "9"
+globset = "0.4"
+base64 = "0.22"
+sha2 = "0.10"
+url = "2"
+getrandom = "0.3"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tower = { version = "0.4", features = ["util"] }
+http-body-util = "0.1"
+ed25519-dalek = "2"
+rand = "0.9"
+chrono = "0.4"
+tokio-stream = "0.1"
