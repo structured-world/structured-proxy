@@ -89,13 +89,10 @@ impl ProxyServer {
                     let bytes = std::fs::read(file).map_err(|e| {
                         anyhow::anyhow!("Failed to read descriptor file {:?}: {}", file, e)
                     })?;
-                    pool.decode_file_descriptor_set(bytes.as_slice()).map_err(|e| {
-                        anyhow::anyhow!(
-                            "Failed to decode descriptor file {:?}: {}",
-                            file,
-                            e
-                        )
-                    })?;
+                    pool.decode_file_descriptor_set(bytes.as_slice())
+                        .map_err(|e| {
+                            anyhow::anyhow!("Failed to decode descriptor file {:?}: {}", file, e)
+                        })?;
                     tracing::info!("Loaded descriptor from {:?}", file);
                 }
                 DescriptorSource::Reflection { reflection } => {
@@ -120,12 +117,11 @@ impl ProxyServer {
         let pool = self.load_descriptors()?;
 
         let grpc_upstream = self.config.upstream.default.clone();
-        let grpc_channel =
-            tonic::transport::Channel::from_shared(grpc_upstream.clone())
-                .map_err(|e| anyhow::anyhow!("invalid gRPC upstream URL: {}", e))?
-                .connect_timeout(std::time::Duration::from_secs(5))
-                .timeout(std::time::Duration::from_secs(5))
-                .connect_lazy();
+        let grpc_channel = tonic::transport::Channel::from_shared(grpc_upstream.clone())
+            .map_err(|e| anyhow::anyhow!("invalid gRPC upstream URL: {}", e))?
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(5))
+            .connect_lazy();
 
         let service_name = self.config.service.name.clone();
         let metrics_namespace = service_name.replace('-', "_");
@@ -244,11 +240,7 @@ impl ProxyServer {
             .unwrap_or_else(|| self.config.service.name.clone());
         let openapi_path_for_docs = openapi_path.clone();
 
-        tracing::info!(
-            "OpenAPI spec at {}, docs at {}",
-            openapi_path,
-            docs_path,
-        );
+        tracing::info!("OpenAPI spec at {}, docs at {}", openapi_path, docs_path,);
 
         Router::new()
             .route(
@@ -308,11 +300,7 @@ impl ProxyServer {
         let addr: SocketAddr = self.config.listen.http.parse()?;
         let listener = tokio::net::TcpListener::bind(addr).await?;
 
-        tracing::info!(
-            "{} listening on {}",
-            self.config.service.name,
-            addr
-        );
+        tracing::info!("{} listening on {}", self.config.service.name, addr);
         axum::serve(listener, app).await?;
         Ok(())
     }

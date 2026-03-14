@@ -110,12 +110,13 @@ pub fn routes<S: TranscodeState>(pool: &DescriptorPool, aliases: &[AliasConfig])
                 };
 
                 let alias_entry = entry.clone();
-                let alias_handler = move |proxy_state: State<S>,
-                                          headers: HeaderMap,
-                                          path_params: Path<std::collections::HashMap<String, String>>,
-                                          body: axum::body::Bytes| {
-                    transcode_handler(proxy_state, headers, path_params, body, alias_entry)
-                };
+                let alias_handler =
+                    move |proxy_state: State<S>,
+                          headers: HeaderMap,
+                          path_params: Path<std::collections::HashMap<String, String>>,
+                          body: axum::body::Bytes| {
+                        transcode_handler(proxy_state, headers, path_params, body, alias_entry)
+                    };
                 let alias_method: MethodRouter<S> = match entry.http_method {
                     HttpMethod::Get => get(alias_handler),
                     HttpMethod::Post => post(alias_handler),
@@ -207,26 +208,19 @@ async fn streaming_handler<S: TranscodeState>(
 
             let byte_stream = stream.map(move |result| match result {
                 Ok(msg) => {
-                    match msg.serialize_with_options(
-                        serde_json::value::Serializer,
-                        &serialize_opts,
-                    ) {
+                    match msg.serialize_with_options(serde_json::value::Serializer, &serialize_opts)
+                    {
                         Ok(json_value) => {
-                            let mut bytes =
-                                serde_json::to_vec(&json_value).unwrap_or_default();
+                            let mut bytes = serde_json::to_vec(&json_value).unwrap_or_default();
                             bytes.push(b'\n');
-                            Ok::<axum::body::Bytes, std::io::Error>(
-                                axum::body::Bytes::from(bytes),
-                            )
+                            Ok::<axum::body::Bytes, std::io::Error>(axum::body::Bytes::from(bytes))
                         }
-                        Err(e) => Err(std::io::Error::other(format!(
-                            "serialization error: {e}"
-                        ))),
+                        Err(e) => Err(std::io::Error::other(format!("serialization error: {e}"))),
                     }
                 }
-                Err(status) => {
-                    Err(std::io::Error::other(format!("gRPC stream error: {status}")))
-                }
+                Err(status) => Err(std::io::Error::other(format!(
+                    "gRPC stream error: {status}"
+                ))),
             });
 
             let body = axum::body::Body::from_stream(byte_stream);

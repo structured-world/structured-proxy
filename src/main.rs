@@ -8,7 +8,10 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "structured-proxy", about = "Universal gRPC→REST transcoding proxy")]
+#[command(
+    name = "structured-proxy",
+    about = "Universal gRPC→REST transcoding proxy"
+)]
 struct Cli {
     /// Path to YAML config file.
     #[arg(short, long, default_value = "proxy.yaml")]
@@ -22,7 +25,8 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let config = structured_proxy::config::ProxyConfig::from_file(std::path::Path::new(&cli.config))?;
+    let config =
+        structured_proxy::config::ProxyConfig::from_file(std::path::Path::new(&cli.config))?;
 
     tracing::info!(
         service = %config.service.name,
