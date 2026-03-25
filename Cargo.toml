@@ -11,7 +11,7 @@ documentation = "https://docs.rs/structured-proxy"
 readme = "README.md"
 keywords = ["grpc", "rest", "proxy", "transcoding", "protobuf"]
 categories = ["network-programming", "web-programming::http-server"]
-rust-version = "1.75"
+rust-version = "1.92"
 
 [[bin]]
 name = "structured-proxy"
