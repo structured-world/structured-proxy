@@ -61,7 +61,7 @@ prometheus = "0.14"
 dashmap = "6"
 
 # Auth (JWT validation, route policies)
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 globset = "0.4"
 base64 = "0.22"
 sha2 = "0.10"
