@@ -76,6 +76,6 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tower = { version = "0.4", features = ["util"] }
 http-body-util = "0.1"
 ed25519-dalek = "2"
-rand = "0.9"
+rand = "0.10"
 chrono = "0.4"
 tokio-stream = "0.1"
