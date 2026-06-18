@@ -529,6 +529,22 @@ mod tests {
         assert_eq!(proto_path_to_axum("/v1/files/**"), "/v1/files/{*wildcard3}");
     }
 
+    #[test]
+    fn multi_segment_field_template_does_not_fracture() {
+        // google.api.http resource-name templates (AIP-127) embed slashes
+        // inside a SINGLE brace span: `{name=shelves/*/books/*}`. Splitting on
+        // `/` before brace parsing fractured this into invalid fragments and
+        // produced a mangled axum path that panicked at `Router::route()`.
+        // It must collapse to a single catch-all capture instead.
+        assert_eq!(
+            proto_path_to_axum("/v1/{name=shelves/*/books/*}"),
+            "/v1/{*name}"
+        );
+        // And the produced path must actually register on axum 0.8.
+        let path = proto_path_to_axum("/v1/{name=shelves/*/books/*}");
+        let _router: Router<()> = Router::new().route(&path, get(|| async { "ok" }));
+    }
+
     /// Regression for the axum 0.7→0.8 migration bug: `proto_path_to_axum`
     /// emitted `:id` syntax, which axum 0.8 rejects at `Router::route()` with
     /// a startup panic ("Path segments must not start with `:`"). Building the
