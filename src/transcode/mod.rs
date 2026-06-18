@@ -452,19 +452,51 @@ fn extract_http_rule(
     None
 }
 
-/// Convert proto-style path parameters `{param}` to axum-style `:param`.
+/// Convert a `google.api.http` path template to axum 0.8 path syntax.
+///
+/// The proto `{param}` form IS axum 0.8's native capture syntax, so plain
+/// single-segment params pass through verbatim. Only field-path templates and
+/// bare wildcards need rewriting (axum 0.7 used `:param`; 0.8 uses `{param}`
+/// and rejects any segment starting with `:`):
+/// - `{name=*}`  (single segment)      -> `{name}`
+/// - `{name=**}` (multi-segment) -> `{*name}` (axum catch-all)
+/// - bare `*` segment            -> `{wildcardN}`
+/// - bare `**` segment           -> `{*wildcardN}` (axum catch-all)
 pub fn proto_path_to_axum(path: &str) -> String {
-    let mut result = String::with_capacity(path.len());
+    let mut out = String::with_capacity(path.len());
 
-    for ch in path.chars() {
-        match ch {
-            '{' => result.push(':'),
-            '}' => {}
-            _ => result.push(ch),
+    for (idx, segment) in path.split('/').enumerate() {
+        if idx > 0 {
+            out.push('/');
         }
+        out.push_str(&convert_segment(segment, idx));
     }
 
-    result
+    out
+}
+
+/// Convert a single path segment from proto template to axum 0.8 form.
+fn convert_segment(segment: &str, idx: usize) -> String {
+    if let Some(inner) = segment.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+        // Brace capture, possibly with a `name=template` field path.
+        if let Some((name, template)) = inner.split_once('=') {
+            // `{name=**}` is a multi-segment catch-all; everything else
+            // (`{name=*}`, `{name=v1/*}`, ...) collapses to a single capture.
+            if template.trim_end_matches('/').ends_with("**") {
+                return format!("{{*{name}}}");
+            }
+            return format!("{{{name}}}");
+        }
+        // Plain `{name}` is already valid axum 0.8 syntax.
+        return format!("{{{inner}}}");
+    }
+
+    // Bare wildcards: name them by position so multiple wildcards never collide.
+    match segment {
+        "**" => format!("{{*wildcard{idx}}}"),
+        "*" => format!("{{wildcard{idx}}}"),
+        literal => literal.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -473,11 +505,44 @@ mod tests {
 
     #[test]
     fn test_proto_path_to_axum() {
-        assert_eq!(proto_path_to_axum("/v1/profiles/{id}"), "/v1/profiles/:id");
+        // axum 0.8: proto `{param}` IS the native capture syntax, pass through verbatim.
+        assert_eq!(proto_path_to_axum("/v1/profiles/{id}"), "/v1/profiles/{id}");
         assert_eq!(
             proto_path_to_axum("/v1/admin/profiles/{profile_id}/metadata/{key}"),
-            "/v1/admin/profiles/:profile_id/metadata/:key"
+            "/v1/admin/profiles/{profile_id}/metadata/{key}"
         );
         assert_eq!(proto_path_to_axum("/v1/auth/login"), "/v1/auth/login");
+    }
+
+    #[test]
+    fn test_proto_path_to_axum_wildcards() {
+        // `{name=*}` single-segment field path collapses to a plain capture.
+        assert_eq!(proto_path_to_axum("/v1/{name=*}"), "/v1/{name}");
+        // `{name=**}` multi-segment catch-all maps to axum's `{*name}`.
+        assert_eq!(
+            proto_path_to_axum("/v1/files/{path=**}"),
+            "/v1/files/{*path}"
+        );
+        // Bare wildcards get position-named captures so they never collide.
+        // Index is the segment position after splitting on `/` (leading "" = 0).
+        assert_eq!(proto_path_to_axum("/v1/*/items"), "/v1/{wildcard2}/items");
+        assert_eq!(proto_path_to_axum("/v1/files/**"), "/v1/files/{*wildcard3}");
+    }
+
+    /// Regression for the axum 0.7→0.8 migration bug: `proto_path_to_axum`
+    /// emitted `:id` syntax, which axum 0.8 rejects at `Router::route()` with
+    /// a startup panic ("Path segments must not start with `:`"). Building the
+    /// router over a brace-param path must NOT panic. Pre-fix this panicked.
+    #[test]
+    fn router_builds_with_brace_path_params_on_axum_0_8() {
+        let axum_path = proto_path_to_axum("/v1/profiles/{id}");
+        let _router: Router<()> = Router::new().route(&axum_path, get(|| async { "ok" }));
+
+        // Deeper nesting and a catch-all also route without panicking.
+        let nested = proto_path_to_axum("/v1/admin/profiles/{profile_id}/metadata/{key}");
+        let catch_all = proto_path_to_axum("/v1/files/{path=**}");
+        let _router: Router<()> = Router::new()
+            .route(&nested, get(|| async { "ok" }))
+            .route(&catch_all, get(|| async { "ok" }));
     }
 }
