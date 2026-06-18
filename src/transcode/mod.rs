@@ -465,7 +465,7 @@ fn extract_http_rule(
 pub fn proto_path_to_axum(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
 
-    for (idx, segment) in path.split('/').enumerate() {
+    for (idx, segment) in split_top_level(path).into_iter().enumerate() {
         if idx > 0 {
             out.push('/');
         }
@@ -475,17 +475,58 @@ pub fn proto_path_to_axum(path: &str) -> String {
     out
 }
 
-/// Convert a single path segment from proto template to axum 0.8 form.
+/// Split a path on `/` boundaries that are NOT inside a `{...}` brace span.
+///
+/// google.api.http field templates can embed slashes inside a single capture
+/// (e.g. the AIP-127 resource name `{name=shelves/*/books/*}`), so a naive
+/// `str::split('/')` would fracture the brace span into invalid fragments.
+/// Tracking brace depth keeps each capture intact.
+fn split_top_level(path: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+
+    for (i, ch) in path.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            // Decrement only on a matched brace; a stray `}` (malformed input)
+            // is treated as a literal rather than driving depth negative.
+            '}' if depth > 0 => depth -= 1,
+            '/' if depth == 0 => {
+                segments.push(&path[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    segments.push(&path[start..]);
+    segments
+}
+
+/// Convert a single top-level path segment from proto template to axum 0.8 form.
 fn convert_segment(segment: &str, idx: usize) -> String {
     if let Some(inner) = segment.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
         // Brace capture, possibly with a `name=template` field path.
         if let Some((name, template)) = inner.split_once('=') {
-            // `{name=**}` is a multi-segment catch-all; everything else
-            // (`{name=*}`, `{name=v1/*}`, ...) collapses to a single capture.
-            if template.trim_end_matches('/').ends_with("**") {
-                return format!("{{*{name}}}");
-            }
-            return format!("{{{name}}}");
+            return match template {
+                // Single-segment field path collapses to a plain capture.
+                "*" => format!("{{{name}}}"),
+                // Multi-segment catch-all maps to axum's `{*name}`.
+                "**" => format!("{{*{name}}}"),
+                // Templates with interspersed literals (`{name=shelves/*/books/*}`)
+                // have no faithful axum form: axum cannot bind literal segments
+                // into one capture. Collapse to a catch-all so routing stays
+                // deterministic and the field still binds to the matched tail,
+                // and warn so the limitation surfaces instead of mis-routing.
+                _ => {
+                    tracing::warn!(
+                        template = %inner,
+                        "google.api.http multi-segment field template is not fully \
+                         supported; routing it as a catch-all capture"
+                    );
+                    format!("{{*{name}}}")
+                }
+            };
         }
         // Plain `{name}` is already valid axum 0.8 syntax.
         return format!("{{{inner}}}");
