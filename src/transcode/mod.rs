@@ -465,11 +465,13 @@ fn extract_http_rule(
 pub fn proto_path_to_axum(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
 
-    for (idx, segment) in split_top_level(path).into_iter().enumerate() {
+    let segments = split_top_level(path);
+    let last = segments.len().saturating_sub(1);
+    for (idx, segment) in segments.iter().enumerate() {
         if idx > 0 {
             out.push('/');
         }
-        out.push_str(&convert_segment(segment, idx));
+        out.push_str(&convert_segment(segment, idx, idx == last));
     }
 
     out
@@ -504,15 +506,18 @@ fn split_top_level(path: &str) -> Vec<&str> {
 }
 
 /// Convert a single top-level path segment from proto template to axum 0.8 form.
-fn convert_segment(segment: &str, idx: usize) -> String {
+///
+/// `is_last` indicates the terminal segment: axum permits a catch-all capture
+/// (`{*name}`) only there, so catch-alls in any other position must degrade.
+fn convert_segment(segment: &str, idx: usize, is_last: bool) -> String {
     if let Some(inner) = segment.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
         // Brace capture, possibly with a `name=template` field path.
         if let Some((name, template)) = inner.split_once('=') {
             return match template {
                 // Single-segment field path collapses to a plain capture.
                 "*" => format!("{{{name}}}"),
-                // Multi-segment catch-all maps to axum's `{*name}`.
-                "**" => format!("{{*{name}}}"),
+                // Multi-segment catch-all maps to axum's `{*name}` (terminal only).
+                "**" => catch_all(name, is_last),
                 // Templates with interspersed literals (`{name=shelves/*/books/*}`)
                 // have no faithful axum form: axum cannot bind literal segments
                 // into one capture. Collapse to a catch-all so routing stays
@@ -524,7 +529,7 @@ fn convert_segment(segment: &str, idx: usize) -> String {
                         "google.api.http multi-segment field template is not fully \
                          supported; routing it as a catch-all capture"
                     );
-                    format!("{{*{name}}}")
+                    catch_all(name, is_last)
                 }
             };
         }
@@ -534,9 +539,29 @@ fn convert_segment(segment: &str, idx: usize) -> String {
 
     // Bare wildcards: name them by position so multiple wildcards never collide.
     match segment {
-        "**" => format!("{{*wildcard{idx}}}"),
+        "**" => catch_all(&format!("wildcard{idx}"), is_last),
         "*" => format!("{{wildcard{idx}}}"),
         literal => literal.to_string(),
+    }
+}
+
+/// Emit an axum catch-all `{*name}` when `is_last`, else degrade to a
+/// single-segment `{name}` capture.
+///
+/// axum accepts a catch-all only in the final path segment; a mid-path
+/// `{*name}` is rejected at `Router::route()`. A non-terminal catch-all comes
+/// from a malformed or unsupported google.api.http template, so we degrade
+/// (capturing one segment) and warn rather than panic the whole router.
+fn catch_all(name: &str, is_last: bool) -> String {
+    if is_last {
+        format!("{{*{name}}}")
+    } else {
+        tracing::warn!(
+            capture = %name,
+            "catch-all in a non-terminal path segment is unrepresentable in axum; \
+             degrading to a single-segment capture"
+        );
+        format!("{{{name}}}")
     }
 }
 
