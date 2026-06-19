@@ -289,10 +289,21 @@ async fn transcode_handler<S: TranscodeState>(
     };
 
     // Query string → field bindings (fields not bound by path or body).
-    let query_pairs: Vec<(String, String)> = raw_query
-        .as_deref()
-        .map(|q| serde_urlencoded::from_str(q).unwrap_or_default())
-        .unwrap_or_default();
+    // A malformed query is a client error: reject it rather than silently
+    // dropping every query-bound field.
+    let query_pairs = match request::parse_query(raw_query.as_deref()) {
+        Ok(pairs) => pairs,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "INVALID_ARGUMENT",
+                    "message": e,
+                })),
+            )
+                .into_response();
+        }
+    };
 
     let input_desc = entry.method.input();
     let request_json = match request::build_request_json(
@@ -375,7 +386,15 @@ async fn transcode_handler<S: TranscodeState>(
                 Ok(json_value) => {
                     // `response_body` returns just that subfield as the HTTP body.
                     let out = match &entry.response_body {
-                        Some(path) => request::extract_response_body(&json_value, path),
+                        Some(path) => request::extract_response_body(&json_value, path)
+                            .unwrap_or_else(|| {
+                                tracing::warn!(
+                                    response_body = %path,
+                                    "configured response_body path not found in response; \
+                                     returning null"
+                                );
+                                serde_json::Value::Null
+                            }),
                         None => json_value,
                     };
                     (StatusCode::OK, Json(out)).into_response()

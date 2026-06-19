@@ -87,18 +87,31 @@ pub fn build_request_json(
     Ok(root)
 }
 
+/// Parse a raw query string into ordered key/value pairs.
+///
+/// `None` and the empty string yield no pairs. A non-empty string must be valid
+/// `application/x-www-form-urlencoded`.
+///
+/// # Errors
+/// Returns an error string when the query cannot be parsed, so the caller can
+/// reject the request rather than silently dropping every query-bound field.
+pub fn parse_query(raw: Option<&str>) -> Result<Vec<(String, String)>, String> {
+    match raw {
+        None | Some("") => Ok(Vec::new()),
+        Some(q) => serde_urlencoded::from_str(q).map_err(|e| format!("invalid query string: {e}")),
+    }
+}
+
 /// Extract a (possibly dotted) subfield of the response JSON for `response_body`.
 ///
-/// Returns [`Value::Null`] when any path segment is missing.
-pub fn extract_response_body(value: &Value, path: &str) -> Value {
+/// Returns `None` when any path segment is missing, letting the caller
+/// distinguish a misconfigured path from a field that is legitimately null.
+pub fn extract_response_body(value: &Value, path: &str) -> Option<Value> {
     let mut cur = value;
     for seg in path.split('.') {
-        match cur.get(seg) {
-            Some(v) => cur = v,
-            None => return Value::Null,
-        }
+        cur = cur.get(seg)?;
     }
-    cur.clone()
+    Some(cur.clone())
 }
 
 /// Group query pairs by key, preserving value order, so repeated keys
@@ -169,8 +182,12 @@ fn coerce(kind: &Kind, raw: &str) -> Value {
             .parse::<bool>()
             .map(Value::Bool)
             .unwrap_or_else(|_| Value::String(raw.to_string())),
-        Kind::Int32 | Kind::Sint32 | Kind::Sfixed32 | Kind::Uint32 | Kind::Fixed32 => raw
-            .parse::<i64>()
+        Kind::Int32 | Kind::Sint32 | Kind::Sfixed32 => raw
+            .parse::<i32>()
+            .map(|n| Value::Number(n.into()))
+            .unwrap_or_else(|_| Value::String(raw.to_string())),
+        Kind::Uint32 | Kind::Fixed32 => raw
+            .parse::<u32>()
             .map(|n| Value::Number(n.into()))
             .unwrap_or_else(|_| Value::String(raw.to_string())),
         Kind::Double | Kind::Float => raw
@@ -418,12 +435,26 @@ mod tests {
         let v = serde_json::json!({ "result": { "token": "abc" } });
         assert_eq!(
             extract_response_body(&v, "result.token"),
-            serde_json::json!("abc")
+            Some(serde_json::json!("abc"))
         );
         assert_eq!(
             extract_response_body(&v, "result"),
-            serde_json::json!({ "token": "abc" })
+            Some(serde_json::json!({ "token": "abc" }))
         );
-        assert_eq!(extract_response_body(&v, "missing"), Value::Null);
+        // A missing path is None (caller can warn), distinct from a null field.
+        assert_eq!(extract_response_body(&v, "missing"), None);
+    }
+
+    #[test]
+    fn parse_query_handles_empty_and_pairs() {
+        assert_eq!(parse_query(None).unwrap(), Vec::<(String, String)>::new());
+        assert_eq!(
+            parse_query(Some("")).unwrap(),
+            Vec::<(String, String)>::new()
+        );
+        assert_eq!(
+            parse_query(Some("a=1&b=2")).unwrap(),
+            vec![("a".into(), "1".into()), ("b".into(), "2".into())]
+        );
     }
 }
