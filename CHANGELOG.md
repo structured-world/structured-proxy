@@ -1,3 +1,11 @@
+## [1.0.3](https://github.com/structured-world/structured-proxy/compare/v1.0.2...v1.0.3) (2026-06-19)
+
+### Bug Fixes
+
+* **transcode:** degrade non-terminal catch-all captures ([10e038b](https://github.com/structured-world/structured-proxy/commit/10e038be3d0b16e0a91c7a8634741838ac7f03c9)), closes [#17](https://github.com/structured-world/structured-proxy/issues/17)
+* **transcode:** emit axum 0.8 path syntax in proto_path_to_axum ([b7c0338](https://github.com/structured-world/structured-proxy/commit/b7c0338e35c4b0a35aeb3dc691bb58cc85dc29fb)), closes [#17](https://github.com/structured-world/structured-proxy/issues/17)
+* **transcode:** parse brace spans before splitting path on slashes ([ee657e8](https://github.com/structured-world/structured-proxy/commit/ee657e8d09c9047708b4619dc49be8f83393f4dc)), closes [#17](https://github.com/structured-world/structured-proxy/issues/17)
+
 ## [1.0.2](https://github.com/structured-world/structured-proxy/compare/v1.0.1...v1.0.2) (2026-06-18)
 
 ### Bug Fixes
