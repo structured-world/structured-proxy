@@ -126,6 +126,11 @@ pub async fn middleware(
     let method = request.method().as_str().to_ascii_uppercase();
     let policy = auth.policies.match_rule(&path, &method);
 
+    // Strip any client-supplied values for proxy-controlled claim headers, so a
+    // client can never forge them onto the upstream (only verified claims set
+    // them below).
+    strip_claim_headers(request.headers_mut(), &auth.claims_headers);
+
     // A token that is present but invalid is always a 401, regardless of policy.
     let claims = match bearer_token(request.headers()) {
         Some(token) => match auth.verify(&token).await {
@@ -140,10 +145,12 @@ pub async fn middleware(
             return unauthorized("authentication required");
         }
         if !policy.required_roles.is_empty() {
-            let roles = claims
-                .as_ref()
-                .map(|c| extract_roles(c, &auth.roles_claim))
-                .unwrap_or_default();
+            // An unauthenticated caller is told to authenticate (401), not that
+            // they lack a role (403).
+            let Some(claims) = claims.as_ref() else {
+                return unauthorized("authentication required");
+            };
+            let roles = extract_roles(claims, &auth.roles_claim);
             if !policy.required_roles.iter().all(|r| roles.contains(r)) {
                 return forbidden("insufficient role");
             }
@@ -185,6 +192,16 @@ fn extract_roles(claims: &Value, roles_claim: &str) -> HashSet<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Remove any incoming values for the proxy-controlled claim headers, so a
+/// client cannot forge them onto the upstream.
+fn strip_claim_headers(headers: &mut HeaderMap, mapping: &HashMap<String, String>) {
+    for header in mapping.values() {
+        if let Ok(name) = HeaderName::try_from(header.as_str()) {
+            while headers.remove(&name).is_some() {}
+        }
+    }
 }
 
 /// Inject configured claims as request headers forwarded to the upstream.

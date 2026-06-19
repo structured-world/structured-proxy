@@ -7,9 +7,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use jsonwebtoken::jwk::{AlgorithmParameters, JwkSet};
+use jsonwebtoken::jwk::{AlgorithmParameters, EllipticCurve, Jwk, JwkSet, KeyAlgorithm};
 use jsonwebtoken::{Algorithm, DecodingKey};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 /// A decoding key plus the signature algorithm it is valid for.
 #[derive(Clone)]
@@ -23,21 +23,28 @@ pub struct JwksCache {
     uri: String,
     client: reqwest::Client,
     keys: RwLock<HashMap<String, VerifyingKey>>,
-    last_refresh: RwLock<Option<Instant>>,
+    last_refresh: Mutex<Option<Instant>>,
 }
 
 /// Minimum spacing between refreshes triggered by an unknown `kid`, so a flood
 /// of bogus `kid`s cannot hammer the JWKS endpoint.
 const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Bound the worst-case latency of a slow/stalled JWKS endpoint.
+const JWKS_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl JwksCache {
     /// Create a cache for `uri` (keys are loaded lazily on first lookup).
     pub fn new(uri: String) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(JWKS_HTTP_TIMEOUT)
+            .build()
+            .unwrap_or_default();
         Self {
             uri,
-            client: reqwest::Client::new(),
+            client,
             keys: RwLock::new(HashMap::new()),
-            last_refresh: RwLock::new(None),
+            last_refresh: Mutex::new(None),
         }
     }
 
@@ -56,16 +63,18 @@ impl JwksCache {
     /// Fetch the JWKS and replace the cache. Throttled by [`MIN_REFRESH_INTERVAL`]
     /// unless the cache is still empty (first load).
     async fn refresh(&self) -> Result<(), String> {
+        // Claim the refresh slot atomically: hold the lock across the throttle
+        // check and the timestamp update so concurrent callers cannot all pass.
         {
-            let last = self.last_refresh.read().await;
+            let mut last = self.last_refresh.lock().await;
             if let Some(t) = *last {
                 let empty = self.keys.read().await.is_empty();
                 if !empty && t.elapsed() < MIN_REFRESH_INTERVAL {
                     return Err("refresh throttled".to_string());
                 }
             }
+            *last = Some(Instant::now());
         }
-        *self.last_refresh.write().await = Some(Instant::now());
 
         let set: JwkSet = self
             .client
@@ -91,7 +100,7 @@ fn parse_jwks(set: &JwkSet) -> HashMap<String, VerifyingKey> {
         let Some(kid) = jwk.common.key_id.clone() else {
             continue;
         };
-        let Some(algorithm) = algorithm_for(&jwk.algorithm) else {
+        let Some(algorithm) = algorithm_for(jwk) else {
             continue;
         };
         if let Ok(key) = DecodingKey::from_jwk(jwk) {
@@ -107,15 +116,43 @@ fn parse_jwks(set: &JwkSet) -> HashMap<String, VerifyingKey> {
     map
 }
 
-/// Pick the signature algorithm implied by a key's type. Symmetric keys
-/// (`OctetKey`) are rejected: HMAC secrets do not belong in a public JWKS.
-fn algorithm_for(params: &AlgorithmParameters) -> Option<Algorithm> {
-    match params {
+/// Pick the signature algorithm for a key.
+///
+/// The JWK's explicit `alg` is authoritative (so ES384 / RS512 / PS256 keys are
+/// not mis-pinned). Without it, fall back to the key type and EC curve.
+/// Symmetric keys (`OctetKey`) and unsupported variants are rejected.
+fn algorithm_for(jwk: &Jwk) -> Option<Algorithm> {
+    if let Some(alg) = jwk.common.key_algorithm.and_then(key_algorithm_to_alg) {
+        return Some(alg);
+    }
+    match &jwk.algorithm {
         AlgorithmParameters::RSA(_) => Some(Algorithm::RS256),
-        AlgorithmParameters::EllipticCurve(_) => Some(Algorithm::ES256),
+        AlgorithmParameters::EllipticCurve(ec) => match ec.curve {
+            EllipticCurve::P256 => Some(Algorithm::ES256),
+            EllipticCurve::P384 => Some(Algorithm::ES384),
+            // P-521 (ES512) is not supported by the verifier.
+            _ => None,
+        },
         AlgorithmParameters::OctetKeyPair(_) => Some(Algorithm::EdDSA),
         AlgorithmParameters::OctetKey(_) => None,
     }
+}
+
+/// Map a JWK signature `alg` to a verifier algorithm, rejecting symmetric and
+/// encryption algorithms (only asymmetric signatures are usable from a JWKS).
+fn key_algorithm_to_alg(ka: KeyAlgorithm) -> Option<Algorithm> {
+    Some(match ka {
+        KeyAlgorithm::ES256 => Algorithm::ES256,
+        KeyAlgorithm::ES384 => Algorithm::ES384,
+        KeyAlgorithm::RS256 => Algorithm::RS256,
+        KeyAlgorithm::RS384 => Algorithm::RS384,
+        KeyAlgorithm::RS512 => Algorithm::RS512,
+        KeyAlgorithm::PS256 => Algorithm::PS256,
+        KeyAlgorithm::PS384 => Algorithm::PS384,
+        KeyAlgorithm::PS512 => Algorithm::PS512,
+        KeyAlgorithm::EdDSA => Algorithm::EdDSA,
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -138,6 +175,27 @@ mod tests {
         let keys = parse_jwks(&set);
         assert!(keys.contains_key("rsa-1"));
         assert_eq!(keys["rsa-1"].algorithm, Algorithm::RS256);
+    }
+
+    #[test]
+    fn algorithm_prefers_explicit_jwk_alg() {
+        // An EC key that explicitly declares ES384 must not be pinned to ES256.
+        let jwk: Jwk = serde_json::from_value(serde_json::json!({
+            "kty": "EC", "crv": "P-384", "alg": "ES384", "kid": "k",
+            "x": "AAAA", "y": "AAAA"
+        }))
+        .unwrap();
+        assert_eq!(algorithm_for(&jwk), Some(Algorithm::ES384));
+    }
+
+    #[test]
+    fn algorithm_falls_back_to_curve_not_es256() {
+        // No alg field → infer from the curve, not a blanket ES256.
+        let jwk: Jwk = serde_json::from_value(serde_json::json!({
+            "kty": "EC", "crv": "P-384", "kid": "k", "x": "AAAA", "y": "AAAA"
+        }))
+        .unwrap();
+        assert_eq!(algorithm_for(&jwk), Some(Algorithm::ES384));
     }
 
     #[test]
