@@ -26,13 +26,13 @@ Works with **any** gRPC service via proto descriptor files. No code generation, 
 - **CORS** with a configurable origin allow-list
 - **Rate limiting (Shield)**: per-client endpoint classes + per-identifier limits, in-process by default or Redis-backed (feature `redis`) for multi-instance
 - **JWT auth**: validate `Bearer` tokens via an Ed25519 PEM key or JWKS auto-discovery, enforce per-route `require_auth` / `required_roles`, and forward claims as headers
+- **OIDC discovery**: serve `/.well-known/openid-configuration` and a JWKS endpoint (Ed25519) built from config, to front an identity provider
 - **Zero code changes** between services: same binary, different config
 
 ## Roadmap
 
 These have config scaffolding in place but are not yet enforced by the proxy. Tracked for implementation; do not rely on them yet.
 
-- **OIDC discovery**: `/.well-known/openid-configuration` + JWKS endpoint for IdP proxies
 - **Forward-auth / external AuthZ / BFF sessions**
 - **Context propagation**: W3C trace-context and deadline (`grpc-timeout`) across the REST↔gRPC boundary
 
@@ -121,16 +121,15 @@ auth:
         require_auth: true
         required_roles: ["admin"]
 
-# OIDC discovery [roadmap]: config is parsed but no endpoints are served yet
+# OIDC discovery: serves /.well-known/openid-configuration + a JWKS endpoint
 oidc_discovery:
   enabled: true
   issuer: "https://idp.example.com"
+  jwks_uri: "https://idp.example.com/.well-known/jwks.json" # path is served locally
   signing_key:
     algorithm: "EdDSA"
     public_key_pem_file: "/etc/proxy/oidc-signing.pub.pem"
 ```
-
-> The `oidc_discovery` section is tagged **[roadmap]**: accepted by the config loader today but not yet wired into the request path. See the [Roadmap](#roadmap) for status.
 
 Generate the descriptor file from your proto:
 
