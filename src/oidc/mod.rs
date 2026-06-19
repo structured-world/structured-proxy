@@ -275,6 +275,28 @@ mod tests {
         assert!(ed25519_jwk(&path, "RS256").is_err());
     }
 
+    // An EC P-256 public key (91-byte SPKI) that the loose length check would
+    // accept, publishing its last 32 bytes as a bogus Ed25519 key.
+    const EC_PUB_PEM: &str = "-----BEGIN PUBLIC KEY-----\n\
+        MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEgAJ0pjQcIv5a3YQTu2YHKyl9tYB8\n\
+        zxWf7gcS1JeuSRRT6RtezpLXHy5SGMxFCWnJukWOqaLR2lgxTFxQ48HsKA==\n\
+        -----END PUBLIC KEY-----\n";
+
+    #[test]
+    fn non_ed25519_spki_is_rejected_under_eddsa() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(1000);
+        let p = std::env::temp_dir().join(format!(
+            "sp_oidc_ec_{}_{}.pem",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&p, EC_PUB_PEM).unwrap();
+        // EdDSA configured but the PEM is an EC key: must be a hard error, not a
+        // silently-published wrong key.
+        assert!(ed25519_jwk(&p, "EdDSA").is_err());
+    }
+
     #[test]
     fn build_serves_jwks_when_signing_key_present() {
         let cfg = OidcDiscoveryConfig {
@@ -337,6 +359,40 @@ mod tests {
         let body = axum::body::to_bytes(jwks.into_body(), 4096).await.unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["keys"][0]["kty"], "OKP");
+    }
+
+    #[tokio::test]
+    async fn jwks_uri_is_served_even_without_signing_key() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        // No signing key, but the discovery doc still advertises a local
+        // jwks_uri, so that path must resolve (empty set), not 404.
+        let cfg = OidcDiscoveryConfig {
+            enabled: true,
+            issuer: "https://idp.example.com".into(),
+            authorization_endpoint: None,
+            token_endpoint: None,
+            userinfo_endpoint: None,
+            jwks_uri: None,
+            signing_key: None,
+        };
+        let oidc = Oidc::build(&cfg).unwrap().unwrap();
+        let advertised = oidc.discovery["jwks_uri"].as_str().unwrap().to_string();
+        let path = jwks_uri_path(&advertised);
+        let app: axum::Router = oidc.routes();
+        let resp = app
+            .oneshot(Request::get(&path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers()["content-type"], "application/jwk-set+json");
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({ "keys": [] })
+        );
     }
 
     #[test]
