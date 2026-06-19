@@ -452,19 +452,117 @@ fn extract_http_rule(
     None
 }
 
-/// Convert proto-style path parameters `{param}` to axum-style `:param`.
+/// Convert a `google.api.http` path template to axum 0.8 path syntax.
+///
+/// The proto `{param}` form IS axum 0.8's native capture syntax, so plain
+/// single-segment params pass through verbatim. Only field-path templates and
+/// bare wildcards need rewriting (axum 0.7 used `:param`; 0.8 uses `{param}`
+/// and rejects any segment starting with `:`):
+/// - `{name=*}`  (single segment)      -> `{name}`
+/// - `{name=**}` (multi-segment) -> `{*name}` (axum catch-all)
+/// - bare `*` segment            -> `{wildcardN}`
+/// - bare `**` segment           -> `{*wildcardN}` (axum catch-all)
 pub fn proto_path_to_axum(path: &str) -> String {
-    let mut result = String::with_capacity(path.len());
+    let mut out = String::with_capacity(path.len());
 
-    for ch in path.chars() {
-        match ch {
-            '{' => result.push(':'),
-            '}' => {}
-            _ => result.push(ch),
+    let segments = split_top_level(path);
+    let last = segments.len().saturating_sub(1);
+    for (idx, segment) in segments.iter().enumerate() {
+        if idx > 0 {
+            out.push('/');
         }
+        out.push_str(&convert_segment(segment, idx, idx == last));
     }
 
-    result
+    out
+}
+
+/// Split a path on `/` boundaries that are NOT inside a `{...}` brace span.
+///
+/// google.api.http field templates can embed slashes inside a single capture
+/// (e.g. the AIP-127 resource name `{name=shelves/*/books/*}`), so a naive
+/// `str::split('/')` would fracture the brace span into invalid fragments.
+/// Tracking brace depth keeps each capture intact.
+fn split_top_level(path: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+
+    for (i, ch) in path.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            // Decrement only on a matched brace; a stray `}` (malformed input)
+            // is treated as a literal rather than driving depth negative.
+            '}' if depth > 0 => depth -= 1,
+            '/' if depth == 0 => {
+                segments.push(&path[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    segments.push(&path[start..]);
+    segments
+}
+
+/// Convert a single top-level path segment from proto template to axum 0.8 form.
+///
+/// `is_last` indicates the terminal segment: axum permits a catch-all capture
+/// (`{*name}`) only there, so catch-alls in any other position must degrade.
+fn convert_segment(segment: &str, idx: usize, is_last: bool) -> String {
+    if let Some(inner) = segment.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+        // Brace capture, possibly with a `name=template` field path.
+        if let Some((name, template)) = inner.split_once('=') {
+            return match template {
+                // Single-segment field path collapses to a plain capture.
+                "*" => format!("{{{name}}}"),
+                // Multi-segment catch-all maps to axum's `{*name}` (terminal only).
+                "**" => catch_all(name, is_last),
+                // Templates with interspersed literals (`{name=shelves/*/books/*}`)
+                // have no faithful axum form: axum cannot bind literal segments
+                // into one capture. Collapse to a catch-all so routing stays
+                // deterministic and the field still binds to the matched tail,
+                // and warn so the limitation surfaces instead of mis-routing.
+                _ => {
+                    tracing::warn!(
+                        template = %inner,
+                        "google.api.http multi-segment field template is not fully \
+                         supported; routing it as a catch-all capture"
+                    );
+                    catch_all(name, is_last)
+                }
+            };
+        }
+        // Plain `{name}` is already valid axum 0.8 syntax.
+        return format!("{{{inner}}}");
+    }
+
+    // Bare wildcards: name them by position so multiple wildcards never collide.
+    match segment {
+        "**" => catch_all(&format!("wildcard{idx}"), is_last),
+        "*" => format!("{{wildcard{idx}}}"),
+        literal => literal.to_string(),
+    }
+}
+
+/// Emit an axum catch-all `{*name}` when `is_last`, else degrade to a
+/// single-segment `{name}` capture.
+///
+/// axum accepts a catch-all only in the final path segment; a mid-path
+/// `{*name}` is rejected at `Router::route()`. A non-terminal catch-all comes
+/// from a malformed or unsupported google.api.http template, so we degrade
+/// (capturing one segment) and warn rather than panic the whole router.
+fn catch_all(name: &str, is_last: bool) -> String {
+    if is_last {
+        format!("{{*{name}}}")
+    } else {
+        tracing::warn!(
+            capture = %name,
+            "catch-all in a non-terminal path segment is unrepresentable in axum; \
+             degrading to a single-segment capture"
+        );
+        format!("{{{name}}}")
+    }
 }
 
 #[cfg(test)]
@@ -473,11 +571,83 @@ mod tests {
 
     #[test]
     fn test_proto_path_to_axum() {
-        assert_eq!(proto_path_to_axum("/v1/profiles/{id}"), "/v1/profiles/:id");
+        // axum 0.8: proto `{param}` IS the native capture syntax, pass through verbatim.
+        assert_eq!(proto_path_to_axum("/v1/profiles/{id}"), "/v1/profiles/{id}");
         assert_eq!(
             proto_path_to_axum("/v1/admin/profiles/{profile_id}/metadata/{key}"),
-            "/v1/admin/profiles/:profile_id/metadata/:key"
+            "/v1/admin/profiles/{profile_id}/metadata/{key}"
         );
         assert_eq!(proto_path_to_axum("/v1/auth/login"), "/v1/auth/login");
+    }
+
+    #[test]
+    fn test_proto_path_to_axum_wildcards() {
+        // `{name=*}` single-segment field path collapses to a plain capture.
+        assert_eq!(proto_path_to_axum("/v1/{name=*}"), "/v1/{name}");
+        // `{name=**}` multi-segment catch-all maps to axum's `{*name}`.
+        assert_eq!(
+            proto_path_to_axum("/v1/files/{path=**}"),
+            "/v1/files/{*path}"
+        );
+        // Bare wildcards get position-named captures so they never collide.
+        // Index is the segment position after splitting on `/` (leading "" = 0).
+        assert_eq!(proto_path_to_axum("/v1/*/items"), "/v1/{wildcard2}/items");
+        assert_eq!(proto_path_to_axum("/v1/files/**"), "/v1/files/{*wildcard3}");
+    }
+
+    #[test]
+    fn non_terminal_catch_all_degrades_to_single_capture() {
+        // A catch-all `{*name}` is only valid in axum's LAST path segment.
+        // An unsupported/multi-segment field template in a NON-terminal position
+        // (`/v1/{name=projects/*}/topics`) must NOT emit a mid-path catch-all —
+        // axum rejects `/v1/{*name}/topics` at `Router::route()`. It degrades to
+        // a single-segment capture instead.
+        assert_eq!(
+            proto_path_to_axum("/v1/{name=projects/*}/topics"),
+            "/v1/{name}/topics"
+        );
+        let path = proto_path_to_axum("/v1/{name=projects/*}/topics");
+        let _router: Router<()> = Router::new().route(&path, get(|| async { "ok" }));
+
+        // The same guard applies to an explicit `**` template in non-terminal
+        // position and a terminal one still yields a real catch-all.
+        assert_eq!(proto_path_to_axum("/v1/{rest=**}/tail"), "/v1/{rest}/tail");
+        assert_eq!(
+            proto_path_to_axum("/v1/files/{rest=**}"),
+            "/v1/files/{*rest}"
+        );
+    }
+
+    #[test]
+    fn multi_segment_field_template_does_not_fracture() {
+        // google.api.http resource-name templates (AIP-127) embed slashes
+        // inside a SINGLE brace span: `{name=shelves/*/books/*}`. Splitting on
+        // `/` before brace parsing fractured this into invalid fragments and
+        // produced a mangled axum path that panicked at `Router::route()`.
+        // It must collapse to a single catch-all capture instead.
+        assert_eq!(
+            proto_path_to_axum("/v1/{name=shelves/*/books/*}"),
+            "/v1/{*name}"
+        );
+        // And the produced path must actually register on axum 0.8.
+        let path = proto_path_to_axum("/v1/{name=shelves/*/books/*}");
+        let _router: Router<()> = Router::new().route(&path, get(|| async { "ok" }));
+    }
+
+    /// Regression for the axum 0.7→0.8 migration bug: `proto_path_to_axum`
+    /// emitted `:id` syntax, which axum 0.8 rejects at `Router::route()` with
+    /// a startup panic ("Path segments must not start with `:`"). Building the
+    /// router over a brace-param path must NOT panic. Pre-fix this panicked.
+    #[test]
+    fn router_builds_with_brace_path_params_on_axum_0_8() {
+        let axum_path = proto_path_to_axum("/v1/profiles/{id}");
+        let _router: Router<()> = Router::new().route(&axum_path, get(|| async { "ok" }));
+
+        // Deeper nesting and a catch-all also route without panicking.
+        let nested = proto_path_to_axum("/v1/admin/profiles/{profile_id}/metadata/{key}");
+        let catch_all = proto_path_to_axum("/v1/files/{path=**}");
+        let _router: Router<()> = Router::new()
+            .route(&nested, get(|| async { "ok" }))
+            .route(&catch_all, get(|| async { "ok" }));
     }
 }
