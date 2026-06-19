@@ -571,6 +571,29 @@ mod tests {
     }
 
     #[test]
+    fn non_terminal_catch_all_degrades_to_single_capture() {
+        // A catch-all `{*name}` is only valid in axum's LAST path segment.
+        // An unsupported/multi-segment field template in a NON-terminal position
+        // (`/v1/{name=projects/*}/topics`) must NOT emit a mid-path catch-all —
+        // axum rejects `/v1/{*name}/topics` at `Router::route()`. It degrades to
+        // a single-segment capture instead.
+        assert_eq!(
+            proto_path_to_axum("/v1/{name=projects/*}/topics"),
+            "/v1/{name}/topics"
+        );
+        let path = proto_path_to_axum("/v1/{name=projects/*}/topics");
+        let _router: Router<()> = Router::new().route(&path, get(|| async { "ok" }));
+
+        // The same guard applies to an explicit `**` template in non-terminal
+        // position and a terminal one still yields a real catch-all.
+        assert_eq!(proto_path_to_axum("/v1/{rest=**}/tail"), "/v1/{rest}/tail");
+        assert_eq!(
+            proto_path_to_axum("/v1/files/{rest=**}"),
+            "/v1/files/{*rest}"
+        );
+    }
+
+    #[test]
     fn multi_segment_field_template_does_not_fracture() {
         // google.api.http resource-name templates (AIP-127) embed slashes
         // inside a SINGLE brace span: `{name=shelves/*/books/*}`. Splitting on
