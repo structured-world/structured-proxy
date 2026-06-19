@@ -64,7 +64,11 @@ service:
   name: "my-service"
 
 cors:
-  origins: ["*"] # empty list = permissive (dev mode)
+  # Empty list = permissive CORS (dev mode, reflects any Origin).
+  # A non-empty list allows those exact origins; there is no "*" wildcard
+  # (browsers never send `Origin: *`, so listing "*" would block everything).
+  origins: []
+  # e.g. origins: ["https://app.example.com", "https://admin.example.com"]
 
 # Optional: path aliases (rewrite before routing)
 aliases:

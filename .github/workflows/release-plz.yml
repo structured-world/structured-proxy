@@ -52,6 +52,11 @@ jobs:
     permissions:
       contents: write
       id-token: write
+    # Serialize releases per ref: two pushes landing together must not both
+    # try to tag and publish the same version (the second would fail noisily).
+    concurrency:
+      group: release-plz-release-${{ github.ref }}
+      cancel-in-progress: false
     steps:
       - name: Generate release token
         uses: actions/create-github-app-token@v3
