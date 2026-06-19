@@ -9,8 +9,9 @@ pub mod body;
 pub mod codec;
 pub mod error;
 pub mod metadata;
+pub mod request;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put, MethodRouter};
@@ -52,6 +53,10 @@ struct RouteEntry {
     grpc_path: String,
     /// Method descriptor for input/output message resolution.
     method: MethodDescriptor,
+    /// How the request body maps onto the gRPC request message.
+    body: request::BodyMapping,
+    /// Optional response subfield to return as the HTTP body (`response_body`).
+    response_body: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -83,8 +88,16 @@ pub fn routes<S: TranscodeState>(pool: &DescriptorPool, aliases: &[AliasConfig])
         let handler = move |proxy_state: State<S>,
                             headers: HeaderMap,
                             path_params: Path<std::collections::HashMap<String, String>>,
+                            raw_query: RawQuery,
                             body: axum::body::Bytes| {
-            transcode_handler(proxy_state, headers, path_params, body, entry_clone)
+            transcode_handler(
+                proxy_state,
+                headers,
+                path_params,
+                raw_query,
+                body,
+                entry_clone,
+            )
         };
 
         let method_router: MethodRouter<S> = match entry.http_method {
@@ -114,8 +127,16 @@ pub fn routes<S: TranscodeState>(pool: &DescriptorPool, aliases: &[AliasConfig])
                     move |proxy_state: State<S>,
                           headers: HeaderMap,
                           path_params: Path<std::collections::HashMap<String, String>>,
+                          raw_query: RawQuery,
                           body: axum::body::Bytes| {
-                        transcode_handler(proxy_state, headers, path_params, body, alias_entry)
+                        transcode_handler(
+                            proxy_state,
+                            headers,
+                            path_params,
+                            raw_query,
+                            body,
+                            alias_entry,
+                        )
                     };
                 let alias_method: MethodRouter<S> = match entry.http_method {
                     HttpMethod::Get => get(alias_handler),
@@ -240,36 +261,72 @@ async fn transcode_handler<S: TranscodeState>(
     State(proxy_state): State<S>,
     headers: HeaderMap,
     Path(path_params): Path<std::collections::HashMap<String, String>>,
+    RawQuery(raw_query): RawQuery,
     body_bytes: axum::body::Bytes,
     entry: RouteEntry,
 ) -> Response {
     let channel = proxy_state.grpc_channel();
 
-    let ct = body::content_type(&headers);
-    let mut json_body = match body::parse_body(ct, &body_bytes) {
-        Ok(v) => v,
+    // Only read the body when the rule maps it onto the message.
+    let json_body = match entry.body {
+        request::BodyMapping::None => serde_json::Value::Null,
+        _ => {
+            let ct = body::content_type(&headers);
+            match body::parse_body(ct, &body_bytes) {
+                Ok(v) => v,
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": "INVALID_ARGUMENT",
+                            "message": format!("failed to parse request body: {e}"),
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    };
+
+    // Query string → field bindings (fields not bound by path or body).
+    // A malformed query is a client error: reject it rather than silently
+    // dropping every query-bound field.
+    let query_pairs = match request::parse_query(raw_query.as_deref()) {
+        Ok(pairs) => pairs,
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
                     "error": "INVALID_ARGUMENT",
-                    "message": format!("failed to parse request body: {e}"),
+                    "message": e,
                 })),
             )
                 .into_response();
         }
     };
 
-    if !path_params.is_empty() {
-        if let Some(obj) = json_body.as_object_mut() {
-            for (key, value) in &path_params {
-                obj.insert(key.clone(), serde_json::Value::String(value.clone()));
-            }
-        }
-    }
-
     let input_desc = entry.method.input();
-    let request_msg = match DynamicMessage::deserialize(input_desc, json_body) {
+    let request_json = match request::build_request_json(
+        &input_desc,
+        &entry.body,
+        json_body,
+        &path_params,
+        &query_pairs,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "INVALID_ARGUMENT",
+                    "message": e,
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let request_msg = match DynamicMessage::deserialize(input_desc, request_json) {
         Ok(msg) => msg,
         Err(e) => {
             return (
@@ -326,7 +383,22 @@ async fn transcode_handler<S: TranscodeState>(
             match response_msg
                 .serialize_with_options(serde_json::value::Serializer, &serialize_opts)
             {
-                Ok(json_value) => (StatusCode::OK, Json(json_value)).into_response(),
+                Ok(json_value) => {
+                    // `response_body` returns just that subfield as the HTTP body.
+                    let out = match &entry.response_body {
+                        Some(path) => request::extract_response_body(&json_value, path)
+                            .unwrap_or_else(|| {
+                                tracing::warn!(
+                                    response_body = %path,
+                                    "configured response_body path not found in response; \
+                                     returning null"
+                                );
+                                serde_json::Value::Null
+                            }),
+                        None => json_value,
+                    };
+                    (StatusCode::OK, Json(out)).into_response()
+                }
                 Err(e) => {
                     tracing::error!("Failed to serialize gRPC response: {e}");
                     (
@@ -364,12 +436,14 @@ fn extract_routes(pool: &DescriptorPool) -> Vec<RouteEntry> {
 
             let grpc_path = format!("/{}/{}", service.full_name(), method.name());
 
-            if let Some((http_method, http_path)) = extract_http_rule(&method, &http_ext) {
+            for binding in extract_http_bindings(&method, &http_ext) {
                 entries.push(RouteEntry {
-                    http_path,
-                    http_method,
-                    grpc_path,
+                    http_path: binding.http_path,
+                    http_method: binding.http_method,
+                    grpc_path: grpc_path.clone(),
                     method: method.clone(),
+                    body: binding.body,
+                    response_body: binding.response_body,
                 });
             }
         }
@@ -395,22 +469,24 @@ fn extract_streaming_routes(pool: &DescriptorPool) -> Vec<RouteEntry> {
 
             let grpc_path = format!("/{}/{}", service.full_name(), method.name());
 
-            if let Some((http_method, http_path)) = extract_http_rule(&method, &http_ext) {
+            for binding in extract_http_bindings(&method, &http_ext) {
                 tracing::info!(
                     "Registering streaming route: {} {} → {}",
-                    match http_method {
+                    match binding.http_method {
                         HttpMethod::Get => "GET",
                         HttpMethod::Post => "POST",
                         _ => "OTHER",
                     },
-                    http_path,
+                    binding.http_path,
                     grpc_path
                 );
                 entries.push(RouteEntry {
-                    http_path,
-                    http_method,
-                    grpc_path,
+                    http_path: binding.http_path,
+                    http_method: binding.http_method,
+                    grpc_path: grpc_path.clone(),
                     method: method.clone(),
+                    body: binding.body,
+                    response_body: binding.response_body,
                 });
             }
         }
@@ -419,37 +495,97 @@ fn extract_streaming_routes(pool: &DescriptorPool) -> Vec<RouteEntry> {
     entries
 }
 
-/// Extract the HTTP method and path from a method's `google.api.http` extension.
-fn extract_http_rule(
+/// A single HTTP binding parsed from a `google.api.http` rule.
+struct HttpBinding {
+    http_method: HttpMethod,
+    http_path: String,
+    body: request::BodyMapping,
+    response_body: Option<String>,
+}
+
+/// Extract all HTTP bindings (the primary rule plus any `additional_bindings`)
+/// from a method's `google.api.http` extension.
+fn extract_http_bindings(
     method: &MethodDescriptor,
     http_ext: &prost_reflect::ExtensionDescriptor,
-) -> Option<(HttpMethod, String)> {
+) -> Vec<HttpBinding> {
     let options = method.options();
-
     if !options.has_extension(http_ext) {
-        return None;
+        return Vec::new();
     }
 
-    let http_rule = options.get_extension(http_ext);
-    if let prost_reflect::Value::Message(rule_msg) = http_rule.into_owned() {
-        for (method_name, http_method) in [
-            ("get", HttpMethod::Get),
-            ("post", HttpMethod::Post),
-            ("put", HttpMethod::Put),
-            ("delete", HttpMethod::Delete),
-            ("patch", HttpMethod::Patch),
-        ] {
-            if let Some(val) = rule_msg.get_field_by_name(method_name) {
-                if let prost_reflect::Value::String(path) = val.into_owned() {
-                    if !path.is_empty() {
-                        return Some((http_method, path));
+    let prost_reflect::Value::Message(rule_msg) = options.get_extension(http_ext).into_owned()
+    else {
+        return Vec::new();
+    };
+
+    collect_bindings(&rule_msg)
+}
+
+/// Collect the primary binding plus every `additional_bindings` entry from an
+/// `HttpRule` message.
+fn collect_bindings(rule_msg: &DynamicMessage) -> Vec<HttpBinding> {
+    let mut bindings = Vec::new();
+    if let Some(binding) = parse_http_rule(rule_msg) {
+        bindings.push(binding);
+    }
+
+    // additional_bindings is a repeated HttpRule; each carries its own
+    // method/path/body. The proto forbids nesting them further.
+    if let Some(field) = rule_msg.get_field_by_name("additional_bindings") {
+        if let prost_reflect::Value::List(list) = field.into_owned() {
+            for item in list {
+                if let prost_reflect::Value::Message(sub) = item {
+                    if let Some(binding) = parse_http_rule(&sub) {
+                        bindings.push(binding);
                     }
                 }
             }
         }
     }
 
-    None
+    bindings
+}
+
+/// Parse a single `HttpRule` message into a binding (method+path required).
+fn parse_http_rule(rule_msg: &DynamicMessage) -> Option<HttpBinding> {
+    let (http_method, http_path) = [
+        ("get", HttpMethod::Get),
+        ("post", HttpMethod::Post),
+        ("put", HttpMethod::Put),
+        ("delete", HttpMethod::Delete),
+        ("patch", HttpMethod::Patch),
+    ]
+    .into_iter()
+    .find_map(
+        |(name, http_method)| match rule_msg.get_field_by_name(name)?.into_owned() {
+            prost_reflect::Value::String(path) if !path.is_empty() => Some((http_method, path)),
+            _ => None,
+        },
+    )?;
+
+    let body = rule_msg
+        .get_field_by_name("body")
+        .and_then(|v| match v.into_owned() {
+            prost_reflect::Value::String(s) => Some(request::BodyMapping::parse(&s)),
+            _ => None,
+        })
+        .unwrap_or(request::BodyMapping::None);
+
+    let response_body =
+        rule_msg
+            .get_field_by_name("response_body")
+            .and_then(|v| match v.into_owned() {
+                prost_reflect::Value::String(s) if !s.is_empty() => Some(s),
+                _ => None,
+            });
+
+    Some(HttpBinding {
+        http_method,
+        http_path,
+        body,
+        response_body,
+    })
 }
 
 /// Convert a `google.api.http` path template to axum 0.8 path syntax.
@@ -568,6 +704,93 @@ fn catch_all(name: &str, is_last: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a standalone `HttpRule`-shaped descriptor (self-referential
+    /// `additional_bindings`) so the binding parser can be tested without the
+    /// google.api extension wiring.
+    fn http_rule_descriptor() -> prost_reflect::MessageDescriptor {
+        use prost_reflect::prost::Message;
+        use prost_reflect::prost_types::{
+            field_descriptor_proto::{Label, Type},
+            DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
+        };
+
+        let str_field = |name: &str, num: i32| FieldDescriptorProto {
+            name: Some(name.to_string()),
+            number: Some(num),
+            label: Some(Label::Optional as i32),
+            r#type: Some(Type::String as i32),
+            ..Default::default()
+        };
+        let rule = DescriptorProto {
+            name: Some("HttpRule".to_string()),
+            field: vec![
+                str_field("get", 2),
+                str_field("put", 3),
+                str_field("post", 4),
+                str_field("delete", 5),
+                str_field("patch", 6),
+                str_field("body", 7),
+                str_field("response_body", 12),
+                FieldDescriptorProto {
+                    name: Some("additional_bindings".to_string()),
+                    number: Some(11),
+                    label: Some(Label::Repeated as i32),
+                    r#type: Some(Type::Message as i32),
+                    type_name: Some(".gapi.HttpRule".to_string()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let file = FileDescriptorProto {
+            name: Some("http.proto".to_string()),
+            package: Some("gapi".to_string()),
+            message_type: vec![rule],
+            syntax: Some("proto3".to_string()),
+            ..Default::default()
+        };
+        let fds = FileDescriptorSet { file: vec![file] };
+        let pool = DescriptorPool::decode(fds.encode_to_vec().as_slice()).unwrap();
+        pool.get_message_by_name("gapi.HttpRule").unwrap()
+    }
+
+    #[test]
+    fn collect_bindings_reads_body_response_and_additional() {
+        let desc = http_rule_descriptor();
+
+        // additional_bindings entry: POST /v1/items with whole-body mapping.
+        let mut extra = DynamicMessage::new(desc.clone());
+        extra.set_field_by_name("post", prost_reflect::Value::String("/v1/items".into()));
+        extra.set_field_by_name("body", prost_reflect::Value::String("*".into()));
+
+        // primary rule: GET /v1/items/{id}, returns only the `result` subfield.
+        let mut rule = DynamicMessage::new(desc);
+        rule.set_field_by_name("get", prost_reflect::Value::String("/v1/items/{id}".into()));
+        rule.set_field_by_name(
+            "response_body",
+            prost_reflect::Value::String("result".into()),
+        );
+        rule.set_field_by_name(
+            "additional_bindings",
+            prost_reflect::Value::List(vec![prost_reflect::Value::Message(extra)]),
+        );
+
+        let bindings = collect_bindings(&rule);
+        assert_eq!(bindings.len(), 2);
+
+        // Primary: GET, no body, response_body = result.
+        assert!(matches!(bindings[0].http_method, HttpMethod::Get));
+        assert_eq!(bindings[0].http_path, "/v1/items/{id}");
+        assert_eq!(bindings[0].body, request::BodyMapping::None);
+        assert_eq!(bindings[0].response_body.as_deref(), Some("result"));
+
+        // Additional: POST, whole-body mapping, no response_body.
+        assert!(matches!(bindings[1].http_method, HttpMethod::Post));
+        assert_eq!(bindings[1].http_path, "/v1/items");
+        assert_eq!(bindings[1].body, request::BodyMapping::Root);
+        assert_eq!(bindings[1].response_body, None);
+    }
 
     #[test]
     fn test_proto_path_to_axum() {
