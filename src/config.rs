@@ -248,6 +248,14 @@ pub struct JwtConfig {
     /// Claims → HTTP headers mapping.
     #[serde(default)]
     pub claims_headers: std::collections::HashMap<String, String>,
+    /// Claim holding the user's roles (array of strings). Supports a dotted
+    /// path for nested claims, e.g. "realm_access.roles". Default: "roles".
+    #[serde(default = "default_roles_claim")]
+    pub roles_claim: String,
+}
+
+fn default_roles_claim() -> String {
+    "roles".into()
 }
 
 /// Forward auth config.

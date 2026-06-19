@@ -65,7 +65,8 @@ ipnet = "2"
 redis = { version = "0.27", features = ["tokio-comp"], optional = true }
 
 # Auth (JWT validation, route policies)
-jsonwebtoken = "10"
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 globset = "0.4"
 base64 = "0.22"
 sha2 = "0.11"
