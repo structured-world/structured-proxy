@@ -12,7 +12,9 @@ Works with **any** gRPC service via proto descriptor files. No code generation, 
 
 ## Features
 
-- **Dynamic REST routes** from proto descriptors using `google.api.http` annotations (path params + JSON body)
+- **Dynamic REST routes** from proto descriptors using `google.api.http` annotations
+- **Full request mapping**: path params, query parameters (typed + repeated + nested), and `body` (`*` / named field / none)
+- **`response_body`** to return a single response subfield, and **`additional_bindings`** for multiple routes per RPC
 - **Auto-generated OpenAPI** documentation from proto messages, served at `/openapi.json`
 - **Server-streaming** RPC → chunked HTTP responses
 - **gRPC → HTTP status mapping** following the standard `google.rpc.Code` table
@@ -32,7 +34,6 @@ These have config scaffolding in place but are not yet enforced by the proxy. Tr
 - **JWT auth**: validation with JWKS auto-discovery + route-level policies
 - **OIDC discovery**: `/.well-known/openid-configuration` + JWKS endpoint for IdP proxies
 - **Forward-auth / external AuthZ / BFF sessions**
-- **Transcoding completeness**: query-parameter binding, `response_body`, `additional_bindings`
 - **Context propagation**: W3C trace-context and deadline (`grpc-timeout`) across the REST↔gRPC boundary
 
 ## Quick Start
@@ -159,7 +160,7 @@ async fn main() -> anyhow::Result<()> {
 
 1. Load the proto descriptor from a pre-compiled descriptor file
 2. Parse `google.api.http` annotations → generate REST routes
-3. Incoming HTTP request → transcode to gRPC (path params + JSON body → protobuf)
+3. Incoming HTTP request → transcode to gRPC (path params + query params + JSON body → protobuf)
 4. Forward to the upstream gRPC service
 5. Response protobuf → transcode to JSON
 6. Serve the OpenAPI spec at `/openapi.json`
