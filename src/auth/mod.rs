@@ -342,19 +342,82 @@ mod tests {
     }
 
     fn app(auth: Arc<Auth>) -> axum::Router {
+        // Both routes echo the x-user header the upstream would receive.
+        let echo = |headers: HeaderMap| async move {
+            headers
+                .get("x-user")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string()
+        };
         axum::Router::new()
-            .route(
-                "/secure",
-                axum::routing::get(|headers: HeaderMap| async move {
-                    // Echo the injected claim header so tests can assert it.
-                    headers
-                        .get("x-user")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("")
-                        .to_string()
-                }),
-            )
+            .route("/secure", axum::routing::get(echo))
+            .route("/open", axum::routing::get(echo))
             .layer(axum::middleware::from_fn_with_state(auth, middleware))
+    }
+
+    async fn body_string(resp: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn strips_client_supplied_claim_headers() {
+        // A client forges x-user on an unprotected route with no token; the
+        // proxy must not forward the forged value to the upstream.
+        let app = app(auth_with_policy(&[]));
+        let resp = app
+            .oneshot(
+                HttpRequest::get("/open")
+                    .header("x-user", "forged-admin")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(body_string(resp).await, "");
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_role_check_is_401_not_403() {
+        // Policy requires a role but not auth; a request with no token is
+        // unauthenticated, so it must get 401, not 403.
+        let cfg = AuthConfig {
+            mode: "jwt".into(),
+            jwt: Some(JwtConfig {
+                jwks_uri: None,
+                issuer: None,
+                audience: None,
+                public_key_pem_file: Some(temp_pub_pem()),
+                claims_headers: HashMap::new(),
+                roles_claim: "roles".into(),
+            }),
+            forward_auth: Some(ForwardAuthConfig {
+                enabled: true,
+                path: "/auth/verify".into(),
+                policies: vec![RoutePolicyConfig {
+                    path: "/secure".into(),
+                    methods: vec!["*".into()],
+                    require_auth: false,
+                    required_roles: vec!["admin".into()],
+                }],
+                login_url: None,
+                applications_path: None,
+            }),
+            authz: None,
+            bff: None,
+        };
+        let auth = Auth::build(&cfg).unwrap().unwrap();
+        let resp = app(auth)
+            .oneshot(
+                HttpRequest::get("/secure")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
