@@ -300,6 +300,18 @@ mod tests {
     }
 
     #[test]
+    fn client_ip_uses_rightmost_untrusted_hop() {
+        // Appending LBs (nginx proxy_add_x_forwarded_for, AWS ALB, GCP LB) add
+        // the connecting IP on the RIGHT, so the leftmost entry is attacker
+        // controlled. The real client is the rightmost hop outside trusted ranges.
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "1.1.1.1, 203.0.113.7".parse().unwrap());
+        let trusted = vec![parse_cidr("10.0.0.0/8").unwrap()];
+        let lb: std::net::IpAddr = "10.0.0.5".parse().unwrap();
+        assert_eq!(client_ip(Some(lb), &h, &trusted), "203.0.113.7");
+    }
+
+    #[test]
     fn client_ip_without_peer_info_uses_headers_then_unknown() {
         let mut h = HeaderMap::new();
         h.insert("x-real-ip", "198.51.100.2".parse().unwrap());
