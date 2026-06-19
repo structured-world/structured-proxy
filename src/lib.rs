@@ -12,6 +12,7 @@
 
 pub mod auth;
 pub mod config;
+pub mod oidc;
 pub mod openapi;
 pub mod shield;
 pub mod transcode;
@@ -211,6 +212,15 @@ impl ProxyServer {
         // OpenAPI + docs routes (if enabled).
         let openapi_routes = self.build_openapi_routes(&pool);
 
+        // OIDC discovery routes (if enabled). Public, like the health endpoints.
+        let oidc_routes = match &self.config.oidc_discovery {
+            Some(cfg) => oidc::Oidc::build(cfg)
+                .map_err(|e| anyhow::anyhow!("invalid oidc_discovery config: {e}"))?
+                .map(|o| o.routes())
+                .unwrap_or_default(),
+            None => Router::new(),
+        };
+
         // Rate limiting (Shield), if configured and enabled.
         let shield = match &self.config.shield {
             Some(cfg) => shield::Shield::build(cfg)
@@ -229,6 +239,7 @@ impl ProxyServer {
         let mut router = Router::new()
             .merge(health_routes)
             .merge(openapi_routes)
+            .merge(oidc_routes)
             .merge(transcode_routes)
             .layer(cors);
 
