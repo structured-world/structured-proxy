@@ -338,6 +338,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn identifier_limit_not_bypassed_when_field_absent() {
+        // Omitting the identifier field must not skip the limit: requests with
+        // no extractable identifier fall back to a client-keyed counter.
+        let shield = Shield::build(&shield_config(
+            vec![],
+            vec![IdentifierEndpointConfig {
+                path: "/login".into(),
+                body_field: "email".into(),
+                rate: "1/min".into(),
+            }],
+        ))
+        .unwrap()
+        .unwrap();
+        let app = app(shield);
+
+        let post_no_email = || {
+            HttpRequest::post("/login")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap()
+        };
+        assert_eq!(
+            app.clone().oneshot(post_no_email()).await.unwrap().status(),
+            200
+        );
+        // Second request without the field is still counted → blocked.
+        assert_eq!(
+            app.clone().oneshot(post_no_email()).await.unwrap().status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[tokio::test]
     async fn middleware_ignores_unmatched_paths() {
         let shield = Shield::build(&shield_config(
             vec![EndpointClassConfig {
