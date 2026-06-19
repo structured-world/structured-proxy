@@ -1,0 +1,11 @@
+{
+  "rules": [
+    {
+      "id": "no-sha-pin-trusted-actions",
+      "rule": "Do not suggest pinning GitHub Actions to commit SHAs for actions from trusted publishers (actions/*, github/*, rust-lang/*, release-plz/*, googleapis/release-please*, dtolnay/*). Tag or branch refs are acceptable for those. SHA-pinning is expected only for third-party / unofficial actions.",
+      "scope": [".github/workflows/*.yml", ".github/workflows/*.yaml"],
+      "severity": "low",
+      "enabled": true
+    }
+  ]
+}
