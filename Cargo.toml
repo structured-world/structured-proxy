@@ -59,6 +59,9 @@ prometheus = "0.14"
 
 # Rate limiting (Shield middleware)
 dashmap = "6"
+async-trait = "0.1"
+# Optional shared rate-limit store for multi-instance deployments.
+redis = { version = "0.27", features = ["tokio-comp"], optional = true }
 
 # Auth (JWT validation, route policies)
 jsonwebtoken = "10"
@@ -70,6 +73,10 @@ getrandom = "0.4"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
+
+[features]
+# Shared Redis-backed rate-limit store for multi-instance deployments.
+redis = ["dep:redis"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

@@ -342,6 +342,12 @@ pub struct ShieldConfig {
     /// Window size in seconds (default: 60).
     #[serde(default = "default_window_secs")]
     pub window_secs: u64,
+    /// Redis URL for shared counters across replicas (e.g. "redis://127.0.0.1/").
+    /// When unset, an in-process per-replica store is used. Requires the `redis`
+    /// build feature; otherwise the proxy logs a warning and uses the in-process
+    /// store.
+    #[serde(default)]
+    pub redis_url: Option<String>,
 }
 
 fn default_window_secs() -> u64 {
