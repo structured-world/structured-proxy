@@ -1,0 +1,17 @@
+# Action-pinning policy for the unpinned-uses audit.
+#
+# Trusted publishers (GitHub-official, Rust-official, the release tooling we
+# already depend on for publishing) may be referenced by tag/branch: a symbolic
+# ref is enough. Everything else is third-party and must be pinned to a full
+# commit SHA. Most specific pattern wins.
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        actions/*: ref-pin
+        github/*: ref-pin
+        rust-lang/*: ref-pin
+        release-plz/*: ref-pin
+        googleapis/release-please*: ref-pin
+        dtolnay/*: ref-pin
+        "*": hash-pin

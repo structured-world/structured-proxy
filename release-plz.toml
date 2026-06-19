@@ -1,0 +1,5 @@
+[[package]]
+name = "structured-proxy"
+# Preserve the existing tag scheme (v1.0.0, v1.0.1, ...) instead of the
+# release-plz default of "{package}-v{version}", so tag history stays continuous.
+git_tag_name = "v{{ version }}"

@@ -1,0 +1,94 @@
+name: Release-plz
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  # Opens / updates the release PR: version bump + CHANGELOG from conventional commits.
+  release-pr:
+    name: Release PR
+    runs-on: ubuntu-latest
+    if: github.repository_owner == 'structured-world'
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Generate release token
+        uses: actions/create-github-app-token@v3
+        id: app-token
+        with:
+          app-id: ${{ secrets.RELEASER_APP_ID }}
+          private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          # Least privilege: this job only opens/updates the release PR.
+          permission-contents: write
+          permission-pull-requests: write
+
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Run release-plz (release-pr)
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+
+  # On release-PR merge: tag, GitHub release, and publish to crates.io.
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    if: github.repository_owner == 'structured-world'
+    permissions:
+      contents: write
+      id-token: write
+    # Serialize releases per ref: two pushes landing together must not both
+    # try to tag and publish the same version (the second would fail noisily).
+    concurrency:
+      group: release-plz-release-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Generate release token
+        uses: actions/create-github-app-token@v3
+        id: app-token
+        with:
+          app-id: ${{ secrets.RELEASER_APP_ID }}
+          private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          # Least privilege: this job only tags, releases, and publishes.
+          permission-contents: write
+
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # crates.io trusted publishing (OIDC): mints a short-lived registry token.
+      - name: Authenticate with crates.io (OIDC)
+        id: crates-auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Run release-plz (release)
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}

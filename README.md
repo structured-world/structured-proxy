@@ -1,21 +1,39 @@
 # structured-proxy
 
-Universal, config-driven gRPC→REST transcoding proxy. One binary, different YAML configs — different products.
+[![crates.io](https://img.shields.io/crates/v/structured-proxy.svg)](https://crates.io/crates/structured-proxy)
+[![docs.rs](https://img.shields.io/docsrs/structured-proxy)](https://docs.rs/structured-proxy)
+[![CI](https://github.com/structured-world/structured-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/structured-world/structured-proxy/actions/workflows/ci.yml)
+[![downloads](https://img.shields.io/crates/d/structured-proxy.svg)](https://crates.io/crates/structured-proxy)
+[![license](https://img.shields.io/crates/l/structured-proxy.svg)](https://github.com/structured-world/structured-proxy/blob/main/LICENSE)
 
-Works with **any** gRPC service via proto descriptor files. No code generation, no custom handlers — just configuration.
+Universal, config-driven gRPC→REST transcoding proxy. One binary, different YAML configs, different products.
+
+Works with **any** gRPC service via proto descriptor files. No code generation, no custom handlers, just configuration.
 
 ## Features
 
-- **Dynamic REST routes** from proto descriptors using `google.api.http` annotations
-- **Auto-generated OpenAPI** documentation from proto messages
-- **Server-streaming** RPC → SSE/chunked HTTP responses
-- **Rate limiting (Shield)** — endpoint classification + per-identifier limiting via YAML
-- **JWT/OIDC validation** — route-level auth policies with JWKS auto-discovery
-- **Path aliasing** — configurable route remapping (e.g., `/oauth2/*` → `/v1/oauth2/*`)
-- **Maintenance mode** — 503 with configurable exempt paths
-- **Health endpoints** — `/health/live`, `/health/ready`, `/health/startup`
-- **Prometheus metrics** — `/metrics` endpoint
-- **Zero code changes** between services — same binary, different config
+- **Dynamic REST routes** from proto descriptors using `google.api.http` annotations (path params + JSON body)
+- **Auto-generated OpenAPI** documentation from proto messages, served at `/openapi.json`
+- **Server-streaming** RPC → chunked HTTP responses
+- **gRPC → HTTP status mapping** following the standard `google.rpc.Code` table
+- **Header forwarding** from HTTP requests to gRPC metadata (configurable allow-list)
+- **Path aliasing** for route remapping (e.g. `/oauth2/*` → `/v1/oauth2/*`)
+- **Maintenance mode** returning 503 with a configurable exempt-path list
+- **Health endpoints** `/health/live`, `/health/ready` (upstream gRPC health probe), `/health/startup`
+- **Prometheus metrics** at `/metrics`
+- **CORS** with a configurable origin allow-list
+- **Zero code changes** between services: same binary, different config
+
+## Roadmap
+
+These have config scaffolding in place but are not yet enforced by the proxy. Tracked for implementation; do not rely on them yet.
+
+- **Rate limiting (Shield)**: endpoint classification + per-identifier limiting
+- **JWT auth**: validation with JWKS auto-discovery + route-level policies
+- **OIDC discovery**: `/.well-known/openid-configuration` + JWKS endpoint for IdP proxies
+- **Forward-auth / external AuthZ / BFF sessions**
+- **Transcoding completeness**: query-parameter binding, `response_body`, `additional_bindings`
+- **Context propagation**: W3C trace-context and deadline (`grpc-timeout`) across the REST↔gRPC boundary
 
 ## Quick Start
 
@@ -31,32 +49,70 @@ structured-proxy --config my-service.yaml
 
 ```yaml
 # my-service.yaml
-listen: "0.0.0.0:8080"
+listen:
+  http: "0.0.0.0:8080"
 
 upstream:
-  address: "http://127.0.0.1:50051"
+  default: "http://127.0.0.1:50051"
 
-descriptor:
-  file: "my-service.descriptor.bin"
-  # OR: reflection: true
+# Pre-compiled proto descriptor sources (one or more, merged into one pool)
+descriptors:
+  - file: "my-service.descriptor.bin"
+
+# Service identity (drives /health response and metrics namespace)
+service:
+  name: "my-service"
 
 cors:
-  allow_origins: ["*"]
+  # Empty list = permissive CORS (dev mode, reflects any Origin).
+  # A non-empty list allows those exact origins; there is no "*" wildcard
+  # (browsers never send `Origin: *`, so listing "*" would block everything).
+  origins: []
+  # e.g. origins: ["https://app.example.com", "https://admin.example.com"]
 
-# Optional: path aliases
+# Optional: path aliases (rewrite before routing)
 aliases:
   - from: "/api/v1/*"
     to: "/my.package.v1.MyService/*"
 
-# Optional: rate limiting
+# Optional: maintenance mode (returns 503 except for exempt paths)
+maintenance:
+  enabled: false
+  message: "Service is under maintenance. Please try again later."
+
+# Rate limiting (Shield) [roadmap]: config is parsed but not yet enforced
 shield:
   enabled: true
-  default_rpm: 60
-  endpoints:
+  window_secs: 60
+  # Classify endpoints by glob pattern → class → rate
+  endpoint_classes:
     - pattern: "/api/v1/heavy-*"
-      rpm: 10
-      identifier: header:x-api-key
+      class: "heavy"
+      rate: "10/min"
+  # Per-identifier limits keyed by a request body field
+  identifier_endpoints:
+    - path: "/api/v1/login"
+      body_field: "email"
+      rate: "5/min"
+
+# JWT auth [roadmap]: config is parsed but not yet enforced
+auth:
+  mode: "jwt"
+  jwt:
+    jwks_uri: "https://idp.example.com/.well-known/jwks.json"
+    issuer: "https://idp.example.com"
+    audience: "my-api"
+
+# OIDC discovery [roadmap]: config is parsed but no endpoints are served yet
+oidc_discovery:
+  enabled: true
+  issuer: "https://idp.example.com"
+  signing_key:
+    algorithm: "EdDSA"
+    public_key_pem_file: "/etc/proxy/oidc-signing.pub.pem"
 ```
+
+> Sections tagged **[roadmap]** (`shield`, `auth`, `oidc_discovery`) are accepted by the config loader today but not yet wired into the request path. See the [Roadmap](#roadmap) for status.
 
 Generate the descriptor file from your proto:
 
@@ -69,12 +125,29 @@ protoc --descriptor_set_out=my-service.descriptor.bin --include_imports *.proto
 ## Library Usage
 
 ```rust
-use structured_proxy::{ProxyConfig, build_proxy};
+use std::path::Path;
+use structured_proxy::{config::ProxyConfig, ProxyServer};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let config = ProxyConfig::from_file("my-service.yaml")?;
-    let app = build_proxy(config).await?;
+    let config = ProxyConfig::from_file(Path::new("my-service.yaml"))?;
+
+    // Run the proxy on the configured listen address.
+    ProxyServer::from_config(config).serve().await?;
+    Ok(())
+}
+```
+
+Or build the axum `Router` yourself for custom serving / embedding:
+
+```rust
+use std::path::Path;
+use structured_proxy::{config::ProxyConfig, ProxyServer};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let config = ProxyConfig::from_file(Path::new("my-service.yaml"))?;
+    let app = ProxyServer::from_config(config).router()?;
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
     axum::serve(listener, app).await?;
@@ -84,12 +157,12 @@ async fn main() -> anyhow::Result<()> {
 
 ## How It Works
 
-1. Load proto descriptor (file or gRPC reflection)
+1. Load the proto descriptor from a pre-compiled descriptor file
 2. Parse `google.api.http` annotations → generate REST routes
-3. Incoming HTTP request → transcode to gRPC (path params, query params, JSON body → protobuf)
-4. Forward to upstream gRPC service
+3. Incoming HTTP request → transcode to gRPC (path params + JSON body → protobuf)
+4. Forward to the upstream gRPC service
 5. Response protobuf → transcode to JSON
-6. Serve OpenAPI spec at `/openapi.json`
+6. Serve the OpenAPI spec at `/openapi.json`
 
 ## Architecture
 
@@ -97,20 +170,23 @@ async fn main() -> anyhow::Result<()> {
 Client (HTTP/JSON)
     │
     ▼
-┌─────────────────────┐
-│  structured-proxy    │
-│                      │
-│  ┌────────────────┐  │
-│  │ Shield (rate)  │  │
-│  ├────────────────┤  │
-│  │ Auth (JWT)     │  │
-│  ├────────────────┤  │
-│  │ Transcoder     │  │  REST → gRPC
-│  │ (prost-reflect)│  │  JSON → Protobuf
-│  ├────────────────┤  │
-│  │ OpenAPI gen    │  │  /openapi.json
-│  └────────────────┘  │
-└─────────┬────────────┘
+┌──────────────────────┐
+│  structured-proxy     │
+│                       │
+│  ┌─────────────────┐  │
+│  │ CORS            │  │
+│  ├─────────────────┤  │
+│  │ Maintenance     │  │  503 gate (exempt paths)
+│  ├─────────────────┤  │
+│  │ Transcoder      │  │  REST → gRPC
+│  │ (prost-reflect) │  │  JSON → Protobuf
+│  ├─────────────────┤  │
+│  │ OpenAPI gen     │  │  /openapi.json
+│  └─────────────────┘  │
+│  ┌─────────────────┐  │
+│  │ Shield · Auth   │  │  (roadmap, not yet wired)
+│  └─────────────────┘  │
+└─────────┬─────────────┘
           │ gRPC
           ▼
    Upstream Service
