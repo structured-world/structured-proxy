@@ -183,8 +183,10 @@ fn parse_cidr(s: &str) -> Result<ipnet::IpNet, String> {
 
 /// Resolve the client identity for keying.
 ///
-/// `X-Forwarded-For` / `X-Real-IP` are trusted only when the direct `peer` is a
-/// configured trusted proxy (so a direct client can't spoof them). Without
+/// `X-Forwarded-For` is trusted only when the direct `peer` is a configured
+/// trusted proxy, and even then the *rightmost* hop outside the trusted ranges
+/// is used: appending load balancers (nginx, ALB, GCP) add the connecting IP on
+/// the right, so the leftmost entries are attacker-controlled. Without
 /// connection info (e.g. a custom server that does not provide it) the headers
 /// are taken as a best effort.
 fn client_ip(
@@ -192,39 +194,62 @@ fn client_ip(
     headers: &HeaderMap,
     trusted: &[ipnet::IpNet],
 ) -> String {
-    let trust_headers = match peer {
-        Some(ip) => trusted.iter().any(|net| net.contains(&ip)),
-        None => true,
-    };
-    if trust_headers {
-        if let Some(forwarded) = forwarded_for(headers) {
-            return forwarded;
-        }
-    }
     match peer {
-        Some(ip) => ip.to_string(),
-        None => "unknown".to_string(),
+        Some(ip) => {
+            if trusted.iter().any(|net| net.contains(&ip)) {
+                if let Some(client) = rightmost_untrusted(headers, trusted) {
+                    return client;
+                }
+            }
+            ip.to_string()
+        }
+        // No connection info: fall back to the headers as a best effort.
+        None => best_effort_forwarded(headers).unwrap_or_else(|| "unknown".to_string()),
     }
 }
 
-/// First hop of `X-Forwarded-For`, falling back to `X-Real-IP`.
-fn forwarded_for(headers: &HeaderMap) -> Option<String> {
-    let first = |name: &str, split: bool| {
-        headers
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .map(|v| {
-                if split {
-                    v.split(',').next().unwrap_or(v)
-                } else {
-                    v
-                }
-            })
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-    };
-    first("x-forwarded-for", true).or_else(|| first("x-real-ip", false))
+/// Rightmost `X-Forwarded-For` hop that is not within a trusted range, i.e. the
+/// last address appended by an untrusted party. Falls back to `X-Real-IP`.
+fn rightmost_untrusted(headers: &HeaderMap, trusted: &[ipnet::IpNet]) -> Option<String> {
+    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        for hop in xff.split(',').rev() {
+            let hop = hop.trim();
+            if hop.is_empty() {
+                continue;
+            }
+            let trusted_hop = hop
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| trusted.iter().any(|net| net.contains(&ip)));
+            if !trusted_hop {
+                return Some(hop.to_string());
+            }
+        }
+    }
+    // X-Real-IP is set by the proxy to the single real client address.
+    header_str(headers, "x-real-ip")
+}
+
+/// Best-effort client from forwarding headers when no peer is known: leftmost
+/// `X-Forwarded-For`, then `X-Real-IP`.
+fn best_effort_forwarded(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| header_str(headers, "x-real-ip"))
+}
+
+/// Trimmed, non-empty value of a header.
+fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// Read a (possibly dotted) field from a JSON body as a string identifier.
