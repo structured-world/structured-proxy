@@ -221,12 +221,11 @@ impl ProxyServer {
             .merge(health_routes)
             .merge(openapi_routes)
             .merge(transcode_routes)
-            .layer(cors)
-            .layer(axum::middleware::from_fn_with_state(
-                state.clone(),
-                maintenance_middleware,
-            ));
+            .layer(cors);
 
+        // Shield is added before maintenance so maintenance wraps it (outer
+        // layers run first): a request rejected by the maintenance gate must
+        // not be charged against its rate-limit budget.
         if let Some(shield) = shield {
             router = router.layer(axum::middleware::from_fn_with_state(
                 shield,
@@ -234,7 +233,13 @@ impl ProxyServer {
             ));
         }
 
-        let router = router.layer(TraceLayer::new_for_http()).with_state(state);
+        let router = router
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                maintenance_middleware,
+            ))
+            .layer(TraceLayer::new_for_http())
+            .with_state(state);
 
         Ok(router)
     }

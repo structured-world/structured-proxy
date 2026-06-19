@@ -32,6 +32,8 @@ pub struct Shield {
     store: Arc<dyn RateLimitStore>,
     classes: Vec<EndpointClass>,
     identifiers: Vec<IdentifierEndpoint>,
+    /// CIDR ranges whose `X-Forwarded-For` / `X-Real-IP` headers we trust.
+    trusted_proxies: Vec<ipnet::IpNet>,
 }
 
 impl Shield {
@@ -57,11 +59,18 @@ impl Shield {
         let identifiers =
             matcher::compile_identifier_endpoints(&config.identifier_endpoints, default_window)?;
 
+        let trusted_proxies = config
+            .trusted_proxies
+            .iter()
+            .map(|s| parse_cidr(s))
+            .collect::<Result<Vec<_>, _>>()?;
+
         let store = build_store(config)?;
         Ok(Some(Arc::new(Self {
             store,
             classes,
             identifiers,
+            trusted_proxies,
         })))
     }
 
@@ -105,17 +114,23 @@ pub async fn middleware(
     next: Next,
 ) -> Response {
     let path = request.uri().path().to_string();
+    let peer = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip());
+    let client = client_ip(peer, request.headers(), &shield.trusted_proxies);
+
+    // The decision whose budget we surface to the client via headers.
+    let mut report = None;
 
     // Endpoint-class limit (per client IP), no body needed.
-    let mut class_decision = None;
     if let Some(class) = shield.match_class(&path) {
-        let ip = client_ip(request.headers());
-        let key = format!("class:{}:{ip}", class.class);
+        let key = format!("class:{}:{client}", class.class);
         let decision = shield.store.hit(&key, &class.rate).await;
         if !decision.allowed {
             return too_many_requests(decision);
         }
-        class_decision = Some(decision);
+        report = Some(decision);
     }
 
     // Per-identifier limit: buffer the body, read the field, then restore it.
@@ -125,20 +140,25 @@ pub async fn middleware(
             Ok(b) => b,
             Err(_) => return payload_too_large(),
         };
-        if let Some(ident) = extract_body_field(&bytes, &id_ep.body_field) {
-            let key = format!("id:{path}:{}:{ident}", id_ep.body_field);
-            let decision = shield.store.hit(&key, &id_ep.rate).await;
-            if !decision.allowed {
-                return too_many_requests(decision);
-            }
+        // Key by the identifier value, or fall back to the client IP when the
+        // field is absent so the limit can't be bypassed by omitting it.
+        let key = match extract_body_field(&bytes, &id_ep.body_field) {
+            Some(ident) => format!("id:{path}:{}:{ident}", id_ep.body_field),
+            None => format!("id:{path}:{}:ip:{client}", id_ep.body_field),
+        };
+        let decision = shield.store.hit(&key, &id_ep.rate).await;
+        if !decision.allowed {
+            return too_many_requests(decision);
         }
+        // The identifier rule is more specific than a class rule, so report it.
+        report = Some(decision);
         Request::from_parts(parts, Body::from(bytes))
     } else {
         request
     };
 
     let mut response = next.run(request).await;
-    if let Some(decision) = class_decision {
+    if let Some(decision) = report {
         attach_rate_headers(response.headers_mut(), &decision);
     }
     response
@@ -147,17 +167,64 @@ pub async fn middleware(
 /// Convenience alias for the axum request type used by the middleware.
 type Request = axum::extract::Request;
 
-/// Extract the client IP from forwarding headers, falling back to `unknown`.
-fn client_ip(headers: &HeaderMap) -> String {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .or_else(|| headers.get("x-real-ip").and_then(|v| v.to_str().ok()))
-        .unwrap_or("unknown")
-        .to_string()
+/// Parse a trusted-proxy entry as a CIDR range, accepting a bare IP as a /32
+/// or /128 host range.
+fn parse_cidr(s: &str) -> Result<ipnet::IpNet, String> {
+    if let Ok(net) = s.parse::<ipnet::IpNet>() {
+        return Ok(net);
+    }
+    if let Ok(ip) = s.parse::<std::net::IpAddr>() {
+        let prefix = if ip.is_ipv4() { 32 } else { 128 };
+        return ipnet::IpNet::new(ip, prefix)
+            .map_err(|e| format!("invalid trusted_proxies entry {s:?}: {e}"));
+    }
+    Err(format!("invalid trusted_proxies CIDR/IP: {s:?}"))
+}
+
+/// Resolve the client identity for keying.
+///
+/// `X-Forwarded-For` / `X-Real-IP` are trusted only when the direct `peer` is a
+/// configured trusted proxy (so a direct client can't spoof them). Without
+/// connection info (e.g. a custom server that does not provide it) the headers
+/// are taken as a best effort.
+fn client_ip(
+    peer: Option<std::net::IpAddr>,
+    headers: &HeaderMap,
+    trusted: &[ipnet::IpNet],
+) -> String {
+    let trust_headers = match peer {
+        Some(ip) => trusted.iter().any(|net| net.contains(&ip)),
+        None => true,
+    };
+    if trust_headers {
+        if let Some(forwarded) = forwarded_for(headers) {
+            return forwarded;
+        }
+    }
+    match peer {
+        Some(ip) => ip.to_string(),
+        None => "unknown".to_string(),
+    }
+}
+
+/// First hop of `X-Forwarded-For`, falling back to `X-Real-IP`.
+fn forwarded_for(headers: &HeaderMap) -> Option<String> {
+    let first = |name: &str, split: bool| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| {
+                if split {
+                    v.split(',').next().unwrap_or(v)
+                } else {
+                    v
+                }
+            })
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    first("x-forwarded-for", true).or_else(|| first("x-real-ip", false))
 }
 
 /// Read a (possibly dotted) field from a JSON body as a string identifier.
@@ -219,18 +286,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn client_ip_prefers_forwarded_for_first_hop() {
+    fn client_ip_trusts_headers_only_from_trusted_peer() {
         let mut h = HeaderMap::new();
         h.insert("x-forwarded-for", "203.0.113.7, 10.0.0.1".parse().unwrap());
-        assert_eq!(client_ip(&h), "203.0.113.7");
+        let trusted = vec![parse_cidr("10.0.0.0/8").unwrap()];
+        let lb: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let direct: std::net::IpAddr = "198.51.100.9".parse().unwrap();
+
+        // From a trusted proxy: trust the forwarded first hop.
+        assert_eq!(client_ip(Some(lb), &h, &trusted), "203.0.113.7");
+        // From an untrusted direct client: ignore the spoofable header, key by peer.
+        assert_eq!(client_ip(Some(direct), &h, &trusted), "198.51.100.9");
     }
 
     #[test]
-    fn client_ip_falls_back_to_real_ip_then_unknown() {
+    fn client_ip_without_peer_info_uses_headers_then_unknown() {
         let mut h = HeaderMap::new();
         h.insert("x-real-ip", "198.51.100.2".parse().unwrap());
-        assert_eq!(client_ip(&h), "198.51.100.2");
-        assert_eq!(client_ip(&HeaderMap::new()), "unknown");
+        assert_eq!(client_ip(None, &h, &[]), "198.51.100.2");
+        assert_eq!(client_ip(None, &HeaderMap::new(), &[]), "unknown");
     }
 
     #[test]
@@ -264,6 +338,7 @@ mod tests {
             identifier_endpoints: ids,
             window_secs: 60,
             redis_url: None,
+            trusted_proxies: Vec::new(),
         }
     }
 
@@ -335,6 +410,35 @@ mod tests {
             app.clone().oneshot(post("bob")).await.unwrap().status(),
             200
         );
+    }
+
+    #[tokio::test]
+    async fn identifier_response_carries_ratelimit_headers() {
+        let shield = Shield::build(&shield_config(
+            vec![],
+            vec![IdentifierEndpointConfig {
+                path: "/login".into(),
+                body_field: "email".into(),
+                rate: "5/min".into(),
+            }],
+        ))
+        .unwrap()
+        .unwrap();
+        let app = app(shield);
+
+        let resp = app
+            .oneshot(
+                HttpRequest::post("/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"email":"a"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        // Headers come from the identifier decision, not just class decisions.
+        assert_eq!(resp.headers()["x-ratelimit-limit"], "5");
+        assert_eq!(resp.headers()["x-ratelimit-remaining"], "4");
     }
 
     #[tokio::test]

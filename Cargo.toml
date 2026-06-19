@@ -60,6 +60,7 @@ prometheus = "0.14"
 # Rate limiting (Shield middleware)
 dashmap = "6"
 async-trait = "0.1"
+ipnet = "2"
 # Optional shared rate-limit store for multi-instance deployments.
 redis = { version = "0.27", features = ["tokio-comp"], optional = true }
 

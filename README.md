@@ -88,6 +88,9 @@ shield:
   # Optional: shared counters across replicas (needs the `redis` build feature).
   # Omit for an in-process per-replica store.
   # redis_url: "redis://127.0.0.1/"
+  # CIDR ranges of trusted proxies/LBs. X-Forwarded-For is honored only from
+  # these peers; set this behind a load balancer for correct per-client limits.
+  trusted_proxies: ["10.0.0.0/8"]
   # Classify endpoints by glob pattern → class → rate (limited per client IP)
   endpoint_classes:
     - pattern: "/api/v1/heavy-*"

@@ -348,6 +348,13 @@ pub struct ShieldConfig {
     /// store.
     #[serde(default)]
     pub redis_url: Option<String>,
+    /// CIDR ranges of trusted reverse proxies / load balancers (e.g.
+    /// "10.0.0.0/8"). `X-Forwarded-For` / `X-Real-IP` are honored only when the
+    /// direct peer falls in one of these ranges; otherwise the peer socket
+    /// address is used as the client identity. Empty (the default) means do not
+    /// trust forwarding headers — set this behind a load balancer.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
 }
 
 fn default_window_secs() -> u64 {

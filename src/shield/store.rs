@@ -37,22 +37,64 @@ pub trait RateLimitStore: Send + Sync {
 ///
 /// Counters are not shared between replicas, so global limits only hold for a
 /// single instance. Use [`RedisStore`] for multi-instance deployments.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MemoryStore {
     // no-std: caller-provided Clock + spin/hashbrown map.
     windows: dashmap::DashMap<String, Window>,
+    base: std::time::Instant,
+    last_sweep_ms: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct Window {
-    start: std::time::Instant,
+    expires_at: std::time::Instant,
     count: u64,
+}
+
+/// Run eviction of expired entries at most once per this interval.
+const SWEEP_INTERVAL_MS: u64 = 60_000;
+
+impl Default for MemoryStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MemoryStore {
     /// Create an empty store.
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            windows: dashmap::DashMap::new(),
+            base: std::time::Instant::now(),
+            last_sweep_ms: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Drop every entry whose window has elapsed.
+    ///
+    /// Entries are reset lazily on access, but keys that are never hit again
+    /// would otherwise linger forever; with client-controlled key cardinality
+    /// (IP / identifier) that is an unbounded-growth / OOM risk.
+    fn evict_expired(&self, now: std::time::Instant) {
+        self.windows.retain(|_, w| w.expires_at > now);
+    }
+
+    /// Evict expired entries at most once per [`SWEEP_INTERVAL_MS`]; the first
+    /// thread past the interval claims the sweep so it stays O(n) infrequently.
+    fn maybe_sweep(&self, now: std::time::Instant) {
+        use std::sync::atomic::Ordering;
+        let now_ms = now.duration_since(self.base).as_millis() as u64;
+        let last = self.last_sweep_ms.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last) < SWEEP_INTERVAL_MS {
+            return;
+        }
+        if self
+            .last_sweep_ms
+            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            self.evict_expired(now);
+        }
     }
 }
 
@@ -60,20 +102,22 @@ impl MemoryStore {
 impl RateLimitStore for MemoryStore {
     async fn hit(&self, key: &str, rate: &Rate) -> Decision {
         let now = std::time::Instant::now();
+        self.maybe_sweep(now);
+
         let mut entry = self.windows.entry(key.to_string()).or_insert(Window {
-            start: now,
+            expires_at: now + rate.window,
             count: 0,
         });
 
         // Reset the counter once the current window has elapsed.
-        if now.duration_since(entry.start) >= rate.window {
-            entry.start = now;
+        if now >= entry.expires_at {
+            entry.expires_at = now + rate.window;
             entry.count = 0;
         }
         entry.count += 1;
 
         let count = entry.count;
-        let elapsed = now.duration_since(entry.start);
+        let expires_at = entry.expires_at;
         drop(entry);
 
         let allowed = count <= rate.limit;
@@ -81,7 +125,7 @@ impl RateLimitStore for MemoryStore {
             allowed,
             limit: rate.limit,
             remaining: rate.limit.saturating_sub(count),
-            retry_after: (!allowed).then(|| rate.window.saturating_sub(elapsed)),
+            retry_after: (!allowed).then(|| expires_at.saturating_duration_since(now)),
         }
     }
 }
@@ -118,58 +162,54 @@ impl RedisStore {
             .await
             .cloned()
     }
+
+    /// Allow the request when Redis is unreachable: an outage must not take the
+    /// proxy down.
+    fn fail_open(rate: &Rate, err: redis::RedisError) -> Decision {
+        tracing::warn!("rate-limit store unavailable, allowing request: {err}");
+        Decision {
+            allowed: true,
+            limit: rate.limit,
+            remaining: rate.limit,
+            retry_after: None,
+        }
+    }
 }
 
 #[cfg(feature = "redis")]
 #[async_trait::async_trait]
 impl RateLimitStore for RedisStore {
     async fn hit(&self, key: &str, rate: &Rate) -> Decision {
-        use redis::AsyncCommands;
-        let window_secs = rate.window.as_secs().max(1);
+        let window_ms = rate.window.as_millis().max(1) as u64;
         let mut conn = match self.connection().await {
             Ok(c) => c,
-            Err(e) => {
-                tracing::warn!("rate-limit store unavailable, allowing request: {e}");
-                return Decision {
-                    allowed: true,
-                    limit: rate.limit,
-                    remaining: rate.limit,
-                    retry_after: None,
-                };
-            }
+            Err(e) => return Self::fail_open(rate, e),
         };
 
-        // INCR then set the TTL on the first hit of a window. The key expiring
-        // is what rolls the window over.
-        let count: u64 = match conn.incr(key, 1u64).await {
-            Ok(c) => c,
-            // Fail open: a Redis outage must not take down the proxy.
-            Err(e) => {
-                tracing::warn!("rate-limit store unavailable, allowing request: {e}");
-                return Decision {
-                    allowed: true,
-                    limit: rate.limit,
-                    remaining: rate.limit,
-                    retry_after: None,
-                };
-            }
-        };
-        if count == 1 {
-            let _: Result<(), _> = conn.expire(key, window_secs as i64).await;
-        }
+        // INCR and (re)set the TTL atomically in one round trip. Doing them in
+        // separate commands risks an immortal key if INCR lands but EXPIRE does
+        // not; the PTTL<0 guard also re-arms the TTL on any key that somehow
+        // lost it, so a key can never accumulate increments forever.
+        let script = redis::Script::new(
+            r"local c = redis.call('INCR', KEYS[1])
+              if redis.call('PTTL', KEYS[1]) < 0 then
+                redis.call('PEXPIRE', KEYS[1], ARGV[1])
+              end
+              return {c, redis.call('PTTL', KEYS[1])}",
+        );
+        let (count, pttl): (i64, i64) =
+            match script.key(key).arg(window_ms).invoke_async(&mut conn).await {
+                Ok(v) => v,
+                Err(e) => return Self::fail_open(rate, e),
+            };
 
+        let count = count.max(0) as u64;
         let allowed = count <= rate.limit;
-        let retry_after = if allowed {
-            None
-        } else {
-            let ttl: i64 = conn.ttl(key).await.unwrap_or(window_secs as i64);
-            Some(Duration::from_secs(ttl.max(0) as u64))
-        };
         Decision {
             allowed,
             limit: rate.limit,
             remaining: rate.limit.saturating_sub(count),
-            retry_after,
+            retry_after: (!allowed).then(|| Duration::from_millis(pttl.max(0) as u64)),
         }
     }
 }
@@ -177,6 +217,24 @@ impl RateLimitStore for RedisStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn memory_store_evicts_expired_entries() {
+        let store = MemoryStore::new();
+        let rate = Rate {
+            limit: 5,
+            window: Duration::from_millis(20),
+        };
+        store.hit("a", &rate).await;
+        store.hit("b", &rate).await;
+        assert_eq!(store.windows.len(), 2);
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        // Both windows have elapsed; eviction reclaims them so the map can't
+        // grow without bound from keys that are never hit again.
+        store.evict_expired(std::time::Instant::now());
+        assert_eq!(store.windows.len(), 0);
+    }
 
     #[tokio::test]
     async fn memory_store_allows_then_blocks_within_window() {
