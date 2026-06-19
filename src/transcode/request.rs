@@ -265,6 +265,26 @@ mod tests {
     }
 
     #[test]
+    fn coerce_unsigned_32_rejects_out_of_range() {
+        // u32 fields must not accept negatives or values above u32::MAX; those
+        // fall back to a raw string so prost-reflect rejects them precisely.
+        assert_eq!(coerce(&Kind::Uint32, "-1"), Value::String("-1".into()));
+        assert_eq!(
+            coerce(&Kind::Uint32, "4294967296"),
+            Value::String("4294967296".into())
+        );
+        assert_eq!(coerce(&Kind::Uint32, "42"), Value::Number(42.into()));
+        assert_eq!(coerce(&Kind::Fixed32, "-1"), Value::String("-1".into()));
+        // Signed 32-bit still accepts negatives.
+        assert_eq!(coerce(&Kind::Int32, "-5"), Value::Number((-5).into()));
+        // And rejects values outside i32 range.
+        assert_eq!(
+            coerce(&Kind::Int32, "2147483648"),
+            Value::String("2147483648".into())
+        );
+    }
+
+    #[test]
     fn body_mapping_parse() {
         assert_eq!(BodyMapping::parse(""), BodyMapping::None);
         assert_eq!(BodyMapping::parse("*"), BodyMapping::Root);
