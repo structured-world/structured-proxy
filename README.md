@@ -19,6 +19,7 @@ Works with **any** gRPC service via proto descriptor files. No code generation, 
 - **Server-streaming** RPC → chunked HTTP responses
 - **gRPC → HTTP status mapping** following the standard `google.rpc.Code` table
 - **Header forwarding** from HTTP requests to gRPC metadata (configurable allow-list)
+- **Context propagation**: W3C trace-context (`traceparent` forwarded or synthesized) and client deadlines (`grpc-timeout`) carried across the REST↔gRPC boundary
 - **Path aliasing** for route remapping (e.g. `/oauth2/*` → `/v1/oauth2/*`)
 - **Maintenance mode** returning 503 with a configurable exempt-path list
 - **Health endpoints** `/health/live`, `/health/ready` (upstream gRPC health probe), `/health/startup`
@@ -34,7 +35,6 @@ Works with **any** gRPC service via proto descriptor files. No code generation, 
 These have config scaffolding in place but are not yet enforced by the proxy. Tracked for implementation; do not rely on them yet.
 
 - **Forward-auth / external AuthZ / BFF sessions**
-- **Context propagation**: W3C trace-context and deadline (`grpc-timeout`) across the REST↔gRPC boundary
 
 ## Quick Start
 
