@@ -24,13 +24,13 @@ Works with **any** gRPC service via proto descriptor files. No code generation, 
 - **Health endpoints** `/health/live`, `/health/ready` (upstream gRPC health probe), `/health/startup`
 - **Prometheus metrics** at `/metrics`
 - **CORS** with a configurable origin allow-list
+- **Rate limiting (Shield)**: per-client endpoint classes + per-identifier limits, in-process by default or Redis-backed (feature `redis`) for multi-instance
 - **Zero code changes** between services: same binary, different config
 
 ## Roadmap
 
 These have config scaffolding in place but are not yet enforced by the proxy. Tracked for implementation; do not rely on them yet.
 
-- **Rate limiting (Shield)**: endpoint classification + per-identifier limiting
 - **JWT auth**: validation with JWKS auto-discovery + route-level policies
 - **OIDC discovery**: `/.well-known/openid-configuration` + JWKS endpoint for IdP proxies
 - **Forward-auth / external AuthZ / BFF sessions**
@@ -81,11 +81,17 @@ maintenance:
   enabled: false
   message: "Service is under maintenance. Please try again later."
 
-# Rate limiting (Shield) [roadmap]: config is parsed but not yet enforced
+# Rate limiting (Shield)
 shield:
   enabled: true
-  window_secs: 60
-  # Classify endpoints by glob pattern → class → rate
+  window_secs: 60 # default window for bare counts like "20"
+  # Optional: shared counters across replicas (needs the `redis` build feature).
+  # Omit for an in-process per-replica store.
+  # redis_url: "redis://127.0.0.1/"
+  # CIDR ranges of trusted proxies/LBs. X-Forwarded-For is honored only from
+  # these peers; set this behind a load balancer for correct per-client limits.
+  trusted_proxies: ["10.0.0.0/8"]
+  # Classify endpoints by glob pattern → class → rate (limited per client IP)
   endpoint_classes:
     - pattern: "/api/v1/heavy-*"
       class: "heavy"
@@ -113,7 +119,7 @@ oidc_discovery:
     public_key_pem_file: "/etc/proxy/oidc-signing.pub.pem"
 ```
 
-> Sections tagged **[roadmap]** (`shield`, `auth`, `oidc_discovery`) are accepted by the config loader today but not yet wired into the request path. See the [Roadmap](#roadmap) for status.
+> Sections tagged **[roadmap]** (`auth`, `oidc_discovery`) are accepted by the config loader today but not yet wired into the request path. See the [Roadmap](#roadmap) for status.
 
 Generate the descriptor file from your proto:
 
@@ -179,13 +185,15 @@ Client (HTTP/JSON)
 │  ├─────────────────┤  │
 │  │ Maintenance     │  │  503 gate (exempt paths)
 │  ├─────────────────┤  │
+│  │ Shield          │  │  rate limiting (429)
+│  ├─────────────────┤  │
 │  │ Transcoder      │  │  REST → gRPC
 │  │ (prost-reflect) │  │  JSON → Protobuf
 │  ├─────────────────┤  │
 │  │ OpenAPI gen     │  │  /openapi.json
 │  └─────────────────┘  │
 │  ┌─────────────────┐  │
-│  │ Shield · Auth   │  │  (roadmap, not yet wired)
+│  │ Auth            │  │  (roadmap, not yet wired)
 │  └─────────────────┘  │
 └─────────┬─────────────┘
           │ gRPC

@@ -342,6 +342,19 @@ pub struct ShieldConfig {
     /// Window size in seconds (default: 60).
     #[serde(default = "default_window_secs")]
     pub window_secs: u64,
+    /// Redis URL for shared counters across replicas (e.g. "redis://127.0.0.1/").
+    /// When unset, an in-process per-replica store is used. Requires the `redis`
+    /// build feature; otherwise the proxy logs a warning and uses the in-process
+    /// store.
+    #[serde(default)]
+    pub redis_url: Option<String>,
+    /// CIDR ranges of trusted reverse proxies / load balancers (e.g.
+    /// "10.0.0.0/8"). `X-Forwarded-For` / `X-Real-IP` are honored only when the
+    /// direct peer falls in one of these ranges; otherwise the peer socket
+    /// address is used as the client identity. Empty (the default) means do not
+    /// trust forwarding headers — set this behind a load balancer.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
 }
 
 fn default_window_secs() -> u64 {

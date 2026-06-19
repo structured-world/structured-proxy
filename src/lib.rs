@@ -12,6 +12,7 @@
 
 pub mod config;
 pub mod openapi;
+pub mod shield;
 pub mod transcode;
 
 use axum::extract::State;
@@ -209,11 +210,30 @@ impl ProxyServer {
         // OpenAPI + docs routes (if enabled).
         let openapi_routes = self.build_openapi_routes(&pool);
 
-        let router = Router::new()
+        // Rate limiting (Shield), if configured and enabled.
+        let shield = match &self.config.shield {
+            Some(cfg) => shield::Shield::build(cfg)
+                .map_err(|e| anyhow::anyhow!("invalid shield config: {e}"))?,
+            None => None,
+        };
+
+        let mut router = Router::new()
             .merge(health_routes)
             .merge(openapi_routes)
             .merge(transcode_routes)
-            .layer(cors)
+            .layer(cors);
+
+        // Shield is added before maintenance so maintenance wraps it (outer
+        // layers run first): a request rejected by the maintenance gate must
+        // not be charged against its rate-limit budget.
+        if let Some(shield) = shield {
+            router = router.layer(axum::middleware::from_fn_with_state(
+                shield,
+                shield::middleware,
+            ));
+        }
+
+        let router = router
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 maintenance_middleware,
