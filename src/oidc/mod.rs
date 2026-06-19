@@ -1,9 +1,10 @@
 //! OpenID Connect discovery surface.
 //!
 //! When `oidc_discovery.enabled`, the proxy serves the OpenID Provider metadata
-//! document at `/.well-known/openid-configuration` and, when a signing key is
-//! configured, a JWKS document built from its public key. This lets the proxy
-//! front an identity provider so relying parties can discover endpoints + keys.
+//! document at `/.well-known/openid-configuration` and a JWKS document at the
+//! advertised `jwks_uri` path (built from the configured signing key, or an
+//! empty set when none is set). This lets the proxy front an identity provider
+//! so relying parties can discover endpoints and keys.
 
 use std::path::Path;
 
@@ -19,10 +20,16 @@ use crate::config::OidcDiscoveryConfig;
 /// Length of an Ed25519 public key in bytes (the tail of its SPKI encoding).
 const ED25519_PUBLIC_KEY_LEN: usize = 32;
 
+/// Fixed 12-byte SPKI header that precedes the 32-byte key in an Ed25519
+/// `SubjectPublicKeyInfo` (`AlgorithmIdentifier` for `id-Ed25519` + BIT STRING).
+const ED25519_SPKI_PREFIX: [u8; 12] = [
+    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+];
+
 /// Precomputed OIDC discovery responses.
 pub struct Oidc {
     discovery: Value,
-    jwks: Option<Value>,
+    jwks: Value,
     jwks_path: String,
 }
 
@@ -51,9 +58,11 @@ impl Oidc {
 
         let discovery = discovery_document(config, &alg, &jwks_uri);
 
+        // Always have a JWKS to serve: an empty set when no signing key is
+        // configured, so the advertised `jwks_uri` never 404s.
         let jwks = match &config.signing_key {
-            Some(sk) => Some(json!({ "keys": [ed25519_jwk(&sk.public_key_pem_file, &alg)?] })),
-            None => None,
+            Some(sk) => json!({ "keys": [ed25519_jwk(&sk.public_key_pem_file, &alg)?] }),
+            None => json!({ "keys": [] }),
         };
 
         Ok(Some(Self {
@@ -63,30 +72,35 @@ impl Oidc {
         }))
     }
 
-    /// Routes serving the discovery document and (if configured) the JWKS.
+    /// Routes serving the discovery document and the JWKS.
     pub fn routes<S>(&self) -> Router<S>
     where
         S: Clone + Send + Sync + 'static,
     {
         let discovery = self.discovery.clone();
-        let mut router = Router::new().route(
-            "/.well-known/openid-configuration",
-            get(move || {
-                let doc = discovery.clone();
-                async move { Json(doc) }
-            }),
-        );
-        if let Some(jwks) = &self.jwks {
-            let jwks = jwks.clone();
-            router = router.route(
+        // Serialize the JWKS once; serve it with the RFC 7517 media type.
+        let jwks_body =
+            serde_json::to_string(&self.jwks).unwrap_or_else(|_| "{\"keys\":[]}".to_string());
+        Router::new()
+            .route(
+                "/.well-known/openid-configuration",
+                get(move || {
+                    let doc = discovery.clone();
+                    async move { Json(doc) }
+                }),
+            )
+            .route(
                 &self.jwks_path,
                 get(move || {
-                    let keys = jwks.clone();
-                    async move { Json(keys) }
+                    let body = jwks_body.clone();
+                    async move {
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "application/jwk-set+json")],
+                            body,
+                        )
+                    }
                 }),
-            );
-        }
-        router
+            )
     }
 }
 
@@ -146,11 +160,17 @@ fn ed25519_jwk(pem_path: &Path, alg: &str) -> Result<Value, String> {
     let pem = std::fs::read_to_string(pem_path)
         .map_err(|e| format!("failed to read oidc signing key {pem_path:?}: {e}"))?;
     let der = decode_pem_body(&pem)?;
-    if der.len() < ED25519_PUBLIC_KEY_LEN {
-        return Err("oidc signing key is not a valid Ed25519 public key".to_string());
+    // An Ed25519 SPKI is exactly the 12-byte prefix + 32-byte key. Verify both,
+    // so an RSA/EC key (which would also be longer than 32 bytes) is rejected
+    // loudly instead of having its tail bytes published as a bogus Ed25519 key.
+    if der.len() != ED25519_SPKI_PREFIX.len() + ED25519_PUBLIC_KEY_LEN
+        || der[..ED25519_SPKI_PREFIX.len()] != ED25519_SPKI_PREFIX
+    {
+        return Err(
+            "oidc signing key is not a valid Ed25519 (EdDSA) public key in SPKI form".to_string(),
+        );
     }
-    // The Ed25519 public key is the final 32 bytes of the SPKI structure.
-    let raw = &der[der.len() - ED25519_PUBLIC_KEY_LEN..];
+    let raw = &der[ED25519_SPKI_PREFIX.len()..];
     Ok(json!({
         "kty": "OKP",
         "crv": "Ed25519",
@@ -313,7 +333,7 @@ mod tests {
         };
         let oidc = Oidc::build(&cfg).unwrap().unwrap();
         assert_eq!(oidc.jwks_path, "/keys.json");
-        assert!(oidc.jwks.is_some());
+        assert_eq!(oidc.jwks["keys"][0]["kty"], "OKP");
         assert_eq!(
             oidc.discovery["jwks_uri"],
             "https://idp.example.com/keys.json"
