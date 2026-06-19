@@ -25,13 +25,13 @@ Works with **any** gRPC service via proto descriptor files. No code generation, 
 - **Prometheus metrics** at `/metrics`
 - **CORS** with a configurable origin allow-list
 - **Rate limiting (Shield)**: per-client endpoint classes + per-identifier limits, in-process by default or Redis-backed (feature `redis`) for multi-instance
+- **JWT auth**: validate `Bearer` tokens via an Ed25519 PEM key or JWKS auto-discovery, enforce per-route `require_auth` / `required_roles`, and forward claims as headers
 - **Zero code changes** between services: same binary, different config
 
 ## Roadmap
 
 These have config scaffolding in place but are not yet enforced by the proxy. Tracked for implementation; do not rely on them yet.
 
-- **JWT auth**: validation with JWKS auto-discovery + route-level policies
 - **OIDC discovery**: `/.well-known/openid-configuration` + JWKS endpoint for IdP proxies
 - **Forward-auth / external AuthZ / BFF sessions**
 - **Context propagation**: W3C trace-context and deadline (`grpc-timeout`) across the REST↔gRPC boundary
@@ -102,13 +102,24 @@ shield:
       body_field: "email"
       rate: "5/min"
 
-# JWT auth [roadmap]: config is parsed but not yet enforced
+# JWT auth
 auth:
   mode: "jwt"
   jwt:
     jwks_uri: "https://idp.example.com/.well-known/jwks.json"
+    # OR a static key: public_key_pem_file: "/etc/proxy/idp-ed25519.pub.pem"
     issuer: "https://idp.example.com"
     audience: "my-api"
+    roles_claim: "roles" # array-of-strings claim used for required_roles
+    claims_headers: # forward claims to the upstream as headers
+      sub: "x-user-id"
+  # Route-level policies (require_auth + required_roles → 401 / 403)
+  forward_auth:
+    policies:
+      - path: "/v1/admin/**"
+        methods: ["*"]
+        require_auth: true
+        required_roles: ["admin"]
 
 # OIDC discovery [roadmap]: config is parsed but no endpoints are served yet
 oidc_discovery:
@@ -119,7 +130,7 @@ oidc_discovery:
     public_key_pem_file: "/etc/proxy/oidc-signing.pub.pem"
 ```
 
-> Sections tagged **[roadmap]** (`auth`, `oidc_discovery`) are accepted by the config loader today but not yet wired into the request path. See the [Roadmap](#roadmap) for status.
+> The `oidc_discovery` section is tagged **[roadmap]**: accepted by the config loader today but not yet wired into the request path. See the [Roadmap](#roadmap) for status.
 
 Generate the descriptor file from your proto:
 
@@ -187,13 +198,12 @@ Client (HTTP/JSON)
 │  ├─────────────────┤  │
 │  │ Shield          │  │  rate limiting (429)
 │  ├─────────────────┤  │
+│  │ Auth (JWT)      │  │  validate + policies (401/403)
+│  ├─────────────────┤  │
 │  │ Transcoder      │  │  REST → gRPC
 │  │ (prost-reflect) │  │  JSON → Protobuf
 │  ├─────────────────┤  │
 │  │ OpenAPI gen     │  │  /openapi.json
-│  └─────────────────┘  │
-│  ┌─────────────────┐  │
-│  │ Auth            │  │  (roadmap, not yet wired)
 │  └─────────────────┘  │
 └─────────┬─────────────┘
           │ gRPC

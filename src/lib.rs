@@ -10,6 +10,7 @@
 //! structured-proxy --config sflow-proxy.yaml
 //! ```
 
+pub mod auth;
 pub mod config;
 pub mod openapi;
 pub mod shield;
@@ -217,11 +218,25 @@ impl ProxyServer {
             None => None,
         };
 
+        // JWT auth, if configured (auth.mode == "jwt").
+        let auth = match &self.config.auth {
+            Some(cfg) => {
+                auth::Auth::build(cfg).map_err(|e| anyhow::anyhow!("invalid auth config: {e}"))?
+            }
+            None => None,
+        };
+
         let mut router = Router::new()
             .merge(health_routes)
             .merge(openapi_routes)
             .merge(transcode_routes)
             .layer(cors);
+
+        // Auth runs inside Shield (added first = inner): rate limiting sheds
+        // load before any signature verification work.
+        if let Some(auth) = auth {
+            router = router.layer(axum::middleware::from_fn_with_state(auth, auth::middleware));
+        }
 
         // Shield is added before maintenance so maintenance wraps it (outer
         // layers run first): a request rejected by the maintenance gate must
