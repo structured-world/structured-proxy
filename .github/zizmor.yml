@@ -12,6 +12,6 @@ rules:
         github/*: ref-pin
         rust-lang/*: ref-pin
         release-plz/*: ref-pin
-        googleapis/*: ref-pin
+        googleapis/release-please*: ref-pin
         dtolnay/*: ref-pin
         "*": hash-pin
