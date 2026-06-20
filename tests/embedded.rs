@@ -37,6 +37,10 @@ fn embedded_config_is_constructible() {
         cors: Default::default(),
         logging: Default::default(),
         metrics_classes: vec![],
+        // Arbitrary: this test only exercises that the config is constructible,
+        // not header forwarding. NOTE for real embeddings: a programmatic literal
+        // bypasses the serde defaults, so set every header you need here (or load
+        // the config via from_file / from_yaml_str, where the default list applies).
         forwarded_headers: vec!["authorization".into()],
     };
     // The server accepts a programmatically-built config (the embedded path).
