@@ -249,13 +249,46 @@ mod tests {
     }
 
     #[test]
-    fn grpc_timeout_rejects_malformed_and_overflow() {
+    fn grpc_timeout_rejects_malformed() {
         assert_eq!(parse_grpc_timeout(""), None);
         assert_eq!(parse_grpc_timeout("S"), None);
         assert_eq!(parse_grpc_timeout("10X"), None);
         assert_eq!(parse_grpc_timeout("abcS"), None);
-        // n * 3600 overflows u64.
-        assert_eq!(parse_grpc_timeout("99999999999999999999H"), None);
+    }
+
+    #[test]
+    fn grpc_timeout_rejects_zero_duration() {
+        // A zero deadline would make tonic's timeout expire immediately, failing
+        // every such request with DEADLINE_EXCEEDED before it reaches upstream.
+        assert_eq!(parse_grpc_timeout("0S"), None);
+        assert_eq!(parse_grpc_timeout("0m"), None);
+        assert_eq!(parse_grpc_timeout("0n"), None);
+    }
+
+    #[test]
+    fn grpc_timeout_enforces_8_digit_limit() {
+        // The gRPC wire spec caps TimeoutValue at 8 digits.
+        assert_eq!(
+            parse_grpc_timeout("99999999S"),
+            Some(Duration::from_secs(99_999_999))
+        );
+        assert_eq!(parse_grpc_timeout("999999999S"), None); // 9 digits
+    }
+
+    #[test]
+    fn malformed_or_zero_traceparent_is_not_forwarded() {
+        // An all-zeros traceparent is invalid per W3C §3.2.2 and must not be
+        // propagated; a fresh one is synthesized instead.
+        let zeros = "00-00000000000000000000000000000000-0000000000000000-01";
+        let mut headers = HeaderMap::new();
+        headers.insert("traceparent", HeaderValue::from_static(zeros));
+        let meta = http_headers_to_grpc_metadata(&headers, &[]);
+        let tp = meta.get("traceparent").unwrap().to_str().unwrap();
+        assert_ne!(tp, zeros);
+        assert!(
+            is_valid_traceparent(tp),
+            "synthesized traceparent invalid: {tp}"
+        );
     }
 
     #[test]
