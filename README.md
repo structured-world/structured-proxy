@@ -28,13 +28,14 @@ Works with **any** gRPC service via proto descriptor files. No code generation, 
 - **Rate limiting (Shield)**: per-client endpoint classes + per-identifier limits, in-process by default or Redis-backed (feature `redis`) for multi-instance
 - **JWT auth**: validate `Bearer` tokens via an Ed25519 PEM key or JWKS auto-discovery, enforce per-route `require_auth` / `required_roles`, and forward claims as headers
 - **OIDC discovery**: serve `/.well-known/openid-configuration` and a JWKS endpoint (Ed25519) built from config, to front an identity provider
+- **Forward-auth**: a verification endpoint (`/auth/verify`) for a fronting proxy (nginx `auth_request`, Traefik `forwardAuth`) to delegate auth, returning the verified identity as headers
 - **Zero code changes** between services: same binary, different config
 
 ## Roadmap
 
 These have config scaffolding in place but are not yet enforced by the proxy. Tracked for implementation; do not rely on them yet.
 
-- **Forward-auth / external AuthZ / BFF sessions**
+- **External AuthZ (gRPC ext_authz) / BFF sessions**
 
 ## Quick Start
 

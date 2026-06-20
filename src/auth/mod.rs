@@ -5,6 +5,7 @@
 //! (`require_auth` / `required_roles`), and forwards selected claims to the
 //! upstream as request headers. Active only when `auth.mode == "jwt"`.
 
+pub mod forward;
 pub mod jwks;
 pub mod policy;
 
@@ -116,6 +117,60 @@ impl Auth {
     }
 }
 
+/// The outcome of an auth check for a request.
+pub(crate) enum AuthDecision {
+    /// Allowed; forward these (verified) claim headers to the upstream.
+    Allow(HeaderMap),
+    /// Rejected: no/invalid credentials (HTTP 401).
+    Unauthenticated(&'static str),
+    /// Rejected: authenticated but lacking a required role (HTTP 403).
+    Forbidden(&'static str),
+}
+
+impl Auth {
+    /// Evaluate auth for a request: validate the bearer token, apply the route
+    /// policy, and render the claim headers to forward. This is the single
+    /// source of truth shared by the middleware and the forward-auth endpoint.
+    pub(crate) async fn decide(
+        &self,
+        headers: &HeaderMap,
+        path: &str,
+        method: &str,
+    ) -> AuthDecision {
+        // A token that is present but invalid is always a 401, regardless of policy.
+        let claims = match bearer_token(headers) {
+            Some(token) => match self.verify(&token).await {
+                Some(c) => Some(c),
+                None => return AuthDecision::Unauthenticated("invalid or expired token"),
+            },
+            None => None,
+        };
+
+        if let Some(policy) = self.policies.match_rule(path, method) {
+            if policy.require_auth && claims.is_none() {
+                return AuthDecision::Unauthenticated("authentication required");
+            }
+            if !policy.required_roles.is_empty() {
+                // An unauthenticated caller is told to authenticate (401), not
+                // that they lack a role (403).
+                let Some(claims) = claims.as_ref() else {
+                    return AuthDecision::Unauthenticated("authentication required");
+                };
+                let roles = extract_roles(claims, &self.roles_claim);
+                if !policy.required_roles.iter().all(|r| roles.contains(r)) {
+                    return AuthDecision::Forbidden("insufficient role");
+                }
+            }
+        }
+
+        let mut claim_headers = HeaderMap::new();
+        if let Some(claims) = &claims {
+            inject_claim_headers(&mut claim_headers, claims, &self.claims_headers);
+        }
+        AuthDecision::Allow(claim_headers)
+    }
+}
+
 /// Axum middleware enforcing JWT auth and route policies.
 pub async fn middleware(
     State(auth): State<Arc<Auth>>,
@@ -124,43 +179,23 @@ pub async fn middleware(
 ) -> Response {
     let path = request.uri().path().to_string();
     let method = request.method().as_str().to_ascii_uppercase();
-    let policy = auth.policies.match_rule(&path, &method);
 
     // Strip any client-supplied values for proxy-controlled claim headers, so a
     // client can never forge them onto the upstream (only verified claims set
     // them below).
     strip_claim_headers(request.headers_mut(), &auth.claims_headers);
 
-    // A token that is present but invalid is always a 401, regardless of policy.
-    let claims = match bearer_token(request.headers()) {
-        Some(token) => match auth.verify(&token).await {
-            Some(c) => Some(c),
-            None => return unauthorized("invalid or expired token"),
-        },
-        None => None,
-    };
-
-    if let Some(policy) = policy {
-        if policy.require_auth && claims.is_none() {
-            return unauthorized("authentication required");
-        }
-        if !policy.required_roles.is_empty() {
-            // An unauthenticated caller is told to authenticate (401), not that
-            // they lack a role (403).
-            let Some(claims) = claims.as_ref() else {
-                return unauthorized("authentication required");
-            };
-            let roles = extract_roles(claims, &auth.roles_claim);
-            if !policy.required_roles.iter().all(|r| roles.contains(r)) {
-                return forbidden("insufficient role");
+    match auth.decide(request.headers(), &path, &method).await {
+        AuthDecision::Unauthenticated(msg) => unauthorized(msg),
+        AuthDecision::Forbidden(msg) => forbidden(msg),
+        AuthDecision::Allow(claim_headers) => {
+            let dst = request.headers_mut();
+            for (name, value) in &claim_headers {
+                dst.insert(name.clone(), value.clone());
             }
+            next.run(request).await
         }
     }
-
-    if let Some(claims) = &claims {
-        inject_claim_headers(request.headers_mut(), claims, &auth.claims_headers);
-    }
-    next.run(request).await
 }
 
 /// Extract the bearer token from the `Authorization` header.

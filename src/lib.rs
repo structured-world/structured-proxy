@@ -243,10 +243,21 @@ impl ProxyServer {
             .merge(transcode_routes)
             .layer(cors);
 
+        // Forward-auth verification endpoint, sharing the built Auth. Mounted
+        // after the auth layer below so the endpoint itself is not gated by the
+        // JWT middleware (it answers the gate, it isn't behind it).
+        let forward_auth = auth.as_ref().and_then(|built| {
+            auth::forward::ForwardAuth::build(self.config.auth.as_ref()?, built.clone())
+        });
+
         // Auth runs inside Shield (added first = inner): rate limiting sheds
         // load before any signature verification work.
         if let Some(auth) = auth {
             router = router.layer(axum::middleware::from_fn_with_state(auth, auth::middleware));
+        }
+
+        if let Some(forward_auth) = &forward_auth {
+            router = router.merge(forward_auth.routes());
         }
 
         // Shield is added before maintenance so maintenance wraps it (outer
