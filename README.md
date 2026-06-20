@@ -210,11 +210,11 @@ Client (HTTP/JSON)
    Upstream Service
 ```
 
-## Support the Project
-
 <div align="center">
 
-![USDT TRC-20 Donation QR Code](./assets/usdt-qr.svg)
+## Support the Project
+
+<img src="./assets/usdt-qr.svg" alt="USDT TRC-20 Donation QR Code" width="200">
 
 USDT (TRC-20): `TFDsezHa1cBkoeZT5q2T49Wp66K8t2DmdA`
 
