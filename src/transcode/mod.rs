@@ -49,8 +49,9 @@ struct RouteEntry {
     http_path: String,
     /// HTTP method (GET, POST, PUT, PATCH, DELETE).
     http_method: HttpMethod,
-    /// gRPC path (e.g., "/sid.v1.AuthService/OpaqueLoginStart").
-    grpc_path: String,
+    /// gRPC path (e.g., "/sid.v1.AuthService/OpaqueLoginStart"), parsed once at
+    /// route-build time so each request clones a cheap `Bytes` refcount.
+    grpc_path: axum::http::uri::PathAndQuery,
     /// Method descriptor for input/output message resolution.
     method: MethodDescriptor,
     /// How the request body maps onto the gRPC request message.
@@ -83,7 +84,7 @@ pub fn routes<S: TranscodeState>(pool: &DescriptorPool, aliases: &[AliasConfig])
 
     let mut router: Router<S> = Router::new();
     for entry in &entries {
-        let entry_clone = entry.clone();
+        let entry_clone = std::sync::Arc::new(entry.clone());
 
         let handler = move |proxy_state: State<S>,
                             headers: HeaderMap,
@@ -122,7 +123,7 @@ pub fn routes<S: TranscodeState>(pool: &DescriptorPool, aliases: &[AliasConfig])
                     continue;
                 };
 
-                let alias_entry = entry.clone();
+                let alias_entry = std::sync::Arc::new(entry.clone());
                 let alias_handler =
                     move |proxy_state: State<S>,
                           headers: HeaderMap,
@@ -153,7 +154,7 @@ pub fn routes<S: TranscodeState>(pool: &DescriptorPool, aliases: &[AliasConfig])
     // Server-streaming RPCs
     let streaming_entries = extract_streaming_routes(pool);
     for entry in &streaming_entries {
-        let entry_clone = entry.clone();
+        let entry_clone = std::sync::Arc::new(entry.clone());
         let axum_path = proto_path_to_axum(&entry.http_path);
 
         let handler = move |proxy_state: State<S>, headers: HeaderMap| {
@@ -176,7 +177,7 @@ pub fn routes<S: TranscodeState>(pool: &DescriptorPool, aliases: &[AliasConfig])
 async fn streaming_handler<S: TranscodeState>(
     State(proxy_state): State<S>,
     headers: HeaderMap,
-    entry: RouteEntry,
+    entry: std::sync::Arc<RouteEntry>,
 ) -> Response {
     let channel = proxy_state.grpc_channel();
 
@@ -191,20 +192,7 @@ async fn streaming_handler<S: TranscodeState>(
 
     let output_desc = entry.method.output();
     let grpc_codec = codec::DynamicCodec::new(output_desc.clone());
-    let grpc_path: axum::http::uri::PathAndQuery = match entry.grpc_path.parse() {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::error!("Invalid gRPC path '{}': {e}", entry.grpc_path);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": "INTERNAL",
-                    "message": "invalid gRPC path configuration",
-                })),
-            )
-                .into_response();
-        }
-    };
+    let grpc_path = entry.grpc_path.clone();
 
     let mut grpc_client = Grpc::new(channel);
     if let Err(e) = grpc_client.ready().await {
@@ -264,7 +252,7 @@ async fn transcode_handler<S: TranscodeState>(
     Path(path_params): Path<std::collections::HashMap<String, String>>,
     RawQuery(raw_query): RawQuery,
     body_bytes: axum::body::Bytes,
-    entry: RouteEntry,
+    entry: std::sync::Arc<RouteEntry>,
 ) -> Response {
     let channel = proxy_state.grpc_channel();
 
@@ -349,20 +337,7 @@ async fn transcode_handler<S: TranscodeState>(
 
     let output_desc = entry.method.output();
     let grpc_codec = codec::DynamicCodec::new(output_desc.clone());
-    let grpc_path: axum::http::uri::PathAndQuery = match entry.grpc_path.parse() {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::error!("Invalid gRPC path '{}': {e}", entry.grpc_path);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": "INTERNAL",
-                    "message": "invalid gRPC path configuration",
-                })),
-            )
-                .into_response();
-        }
-    };
+    let grpc_path = entry.grpc_path.clone();
 
     let mut grpc_client = Grpc::new(channel);
     if let Err(e) = grpc_client.ready().await {
@@ -437,6 +412,13 @@ fn extract_routes(pool: &DescriptorPool) -> Vec<RouteEntry> {
             }
 
             let grpc_path = format!("/{}/{}", service.full_name(), method.name());
+            let grpc_path: axum::http::uri::PathAndQuery = match grpc_path.parse() {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!("skipping route with invalid gRPC path '{grpc_path}': {e}");
+                    continue;
+                }
+            };
 
             for binding in extract_http_bindings(&method, &http_ext) {
                 entries.push(RouteEntry {
@@ -470,6 +452,13 @@ fn extract_streaming_routes(pool: &DescriptorPool) -> Vec<RouteEntry> {
             }
 
             let grpc_path = format!("/{}/{}", service.full_name(), method.name());
+            let grpc_path: axum::http::uri::PathAndQuery = match grpc_path.parse() {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!("skipping route with invalid gRPC path '{grpc_path}': {e}");
+                    continue;
+                }
+            };
 
             for binding in extract_http_bindings(&method, &http_ext) {
                 tracing::info!(
