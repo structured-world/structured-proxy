@@ -389,7 +389,6 @@ mod tests {
                 applications_path: None,
             }),
             authz: None,
-            bff: None,
         };
         Auth::build(&cfg).unwrap().unwrap()
     }
@@ -459,7 +458,6 @@ mod tests {
                 applications_path: None,
             }),
             authz: None,
-            bff: None,
         };
         let auth = Auth::build(&cfg).unwrap().unwrap();
         let resp = app(auth)

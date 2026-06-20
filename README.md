@@ -32,11 +32,9 @@ Works with **any** gRPC service via proto descriptor files. No code generation, 
 - **External AuthZ**: gate proxied requests through an Envoy ext_authz gRPC server (`envoy.service.auth.v3.Authorization/Check`), interoperating with OPA and any ext_authz server, with fail-open/closed control
 - **Zero code changes** between services: same binary, different config
 
-## Roadmap
+## Non-goals
 
-These have config scaffolding in place but are not yet enforced by the proxy. Tracked for implementation; do not rely on them yet.
-
-- **BFF sessions** (cookie-to-token exchange)
+- **Session / BFF management** (cookie-based login, server-side token storage, refresh flows). This proxy is a stateless transcoding data plane with stateless auth primitives; session lifecycle is a separate, stateful concern. Put a dedicated BFF (e.g. `oauth2-proxy`, Pomerium) in front, or drive auth through the forward-auth / external-authz hooks above.
 
 ## Quick Start
 

@@ -220,10 +220,6 @@ pub struct AuthConfig {
     /// AuthZ integration (optional gRPC call).
     #[serde(default)]
     pub authz: Option<AuthzConfig>,
-
-    /// BFF (Backend-for-Frontend) session config.
-    #[serde(default)]
-    pub bff: Option<BffConfig>,
 }
 
 fn default_auth_mode() -> String {
@@ -319,31 +315,6 @@ pub struct AuthzConfig {
 
 fn default_authz_timeout_ms() -> u64 {
     200
-}
-
-/// BFF session config.
-#[derive(Debug, Clone, Deserialize)]
-pub struct BffConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_bff_cookie")]
-    pub cookie_name: String,
-    #[serde(default = "default_bff_max_age")]
-    pub max_age: u64,
-    #[serde(default = "default_bff_idle_timeout")]
-    pub idle_timeout: u64,
-    #[serde(default)]
-    pub external_url: Option<String>,
-}
-
-fn default_bff_cookie() -> String {
-    "__Host-proxy-bff".into()
-}
-fn default_bff_max_age() -> u64 {
-    86400
-}
-fn default_bff_idle_timeout() -> u64 {
-    3600
 }
 
 /// Shield (rate limiting) configuration.
