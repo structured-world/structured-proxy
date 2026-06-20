@@ -69,10 +69,7 @@ pub async fn middleware(
     match client.check(grpc_req).await {
         Ok(resp) => match evaluate(resp.into_inner()) {
             Decision::Allow(headers) => {
-                let dst = request.headers_mut();
-                for (name, value) in headers {
-                    dst.insert(name, value);
-                }
+                apply_headers(request.headers_mut(), headers);
                 next.run(request).await
             }
             Decision::Deny(response) => response,
@@ -158,6 +155,14 @@ fn evaluate(resp: CheckResponse) -> Decision {
     }
 }
 
+/// Append authz-supplied headers, preserving multiple values for the same name
+/// (e.g. several `Set-Cookie`) instead of overwriting all but the last.
+fn apply_headers(dst: &mut HeaderMap, headers: Vec<(HeaderName, HeaderValue)>) {
+    for (name, value) in headers {
+        dst.append(name, value);
+    }
+}
+
 /// Convert an Envoy `HeaderValueOption` into an axum header pair.
 fn header_kv(opt: HeaderValueOption) -> Option<(HeaderName, HeaderValue)> {
     let header = opt.header?;
@@ -175,9 +180,10 @@ fn denied_to_response(denied: DeniedHttpResponse) -> Response {
         .and_then(|c| StatusCode::from_u16(c).ok())
         .unwrap_or(StatusCode::FORBIDDEN);
     let mut headers = HeaderMap::new();
-    for (name, value) in denied.headers.into_iter().filter_map(header_kv) {
-        headers.insert(name, value);
-    }
+    apply_headers(
+        &mut headers,
+        denied.headers.into_iter().filter_map(header_kv).collect(),
+    );
     (status, headers, denied.body).into_response()
 }
 
@@ -257,6 +263,32 @@ mod tests {
             }
             Decision::Deny(_) => panic!("expected allow"),
         }
+    }
+
+    #[test]
+    fn apply_headers_preserves_duplicate_names() {
+        // Multiple authz headers with the same name (e.g. Set-Cookie) must all
+        // survive, not collapse to the last one.
+        let mut dst = HeaderMap::new();
+        apply_headers(
+            &mut dst,
+            vec![
+                (
+                    HeaderName::from_static("set-cookie"),
+                    HeaderValue::from_static("a=1"),
+                ),
+                (
+                    HeaderName::from_static("set-cookie"),
+                    HeaderValue::from_static("b=2"),
+                ),
+            ],
+        );
+        let values: Vec<_> = dst
+            .get_all("set-cookie")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(values, vec!["a=1", "b=2"]);
     }
 
     #[test]

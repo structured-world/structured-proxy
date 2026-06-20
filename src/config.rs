@@ -304,7 +304,9 @@ pub struct AuthzConfig {
     /// Enable external authorization for proxied API requests.
     #[serde(default)]
     pub enabled: bool,
-    /// gRPC address of the ext_authz server, e.g. `http://opa:9191`.
+    /// gRPC address of the ext_authz server, e.g. `http://opa:9191`. Required
+    /// when enabled; defaults to empty so a disabled block can omit it.
+    #[serde(default)]
     pub endpoint: String,
     /// Per-request authorization call timeout, in milliseconds.
     #[serde(default = "default_authz_timeout_ms")]
