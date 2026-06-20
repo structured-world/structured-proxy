@@ -44,18 +44,42 @@ fn insert_ascii(metadata: &mut MetadataMap, key: &str, value: &[u8]) {
 
 /// Propagate W3C trace-context into gRPC metadata.
 ///
-/// Forwards an incoming `traceparent` (and `tracestate`) verbatim; when no
-/// `traceparent` is present, synthesizes one so a non-instrumented client still
-/// produces a single joinable trace across the boundary.
+/// Forwards an incoming `traceparent` (and `tracestate`) only when it is
+/// well-formed per W3C §3.2.2; otherwise (missing or malformed) synthesizes a
+/// fresh one so the upstream always receives a single valid, joinable trace.
 fn inject_trace_context(metadata: &mut MetadataMap, headers: &HeaderMap) {
-    if let Some(tp) = headers.get("traceparent") {
-        insert_ascii(metadata, "traceparent", tp.as_bytes());
-        if let Some(ts) = headers.get("tracestate") {
-            insert_ascii(metadata, "tracestate", ts.as_bytes());
+    if let Some(tp) = headers.get("traceparent").and_then(|v| v.to_str().ok()) {
+        if is_valid_traceparent(tp) {
+            insert_ascii(metadata, "traceparent", tp.as_bytes());
+            // tracestate only travels with the trace it annotates.
+            if let Some(ts) = headers.get("tracestate") {
+                insert_ascii(metadata, "tracestate", ts.as_bytes());
+            }
+            return;
         }
-    } else if let Some(tp) = new_traceparent() {
+    }
+    if let Some(tp) = new_traceparent() {
         insert_ascii(metadata, "traceparent", tp.as_bytes());
     }
+}
+
+/// Validate a W3C `traceparent`: `00-<32 hex>-<16 hex>-<2 hex>` with a non-zero
+/// trace-id and parent-id (all-zero IDs are forbidden by W3C §3.2.2).
+fn is_valid_traceparent(tp: &str) -> bool {
+    let parts: [&str; 4] = match tp.split('-').collect::<Vec<_>>().try_into() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let [version, trace_id, parent_id, flags] = parts;
+    version == "00"
+        && trace_id.len() == 32
+        && parent_id.len() == 16
+        && flags.len() == 2
+        && [trace_id, parent_id, flags]
+            .iter()
+            .all(|p| p.bytes().all(|b| b.is_ascii_hexdigit()))
+        && trace_id.bytes().any(|b| b != b'0')
+        && parent_id.bytes().any(|b| b != b'0')
 }
 
 /// Build a fresh W3C `traceparent`: `00-<16-byte trace-id>-<8-byte span-id>-01`
@@ -99,21 +123,32 @@ pub fn apply_request_deadline<T>(
 /// Parse a gRPC `grpc-timeout` value (`<int><unit>`) into a [`Duration`].
 ///
 /// Units: `H` hours, `M` minutes, `S` seconds, `m` milliseconds, `u`
-/// microseconds, `n` nanoseconds. Returns `None` on a malformed value or on
-/// arithmetic overflow.
+/// microseconds, `n` nanoseconds. Per the gRPC wire spec the value is at most 8
+/// digits. Returns `None` on a malformed value, an over-long digit run, or a
+/// zero duration (which would expire the call immediately, so the channel
+/// default is used instead).
 fn parse_grpc_timeout(value: &str) -> Option<Duration> {
     let value = value.trim();
     let (digits, unit) = value.split_at(value.len().checked_sub(1)?);
+    // The gRPC spec caps TimeoutValue at 8 ASCII digits.
+    if digits.is_empty() || digits.len() > 8 {
+        return None;
+    }
     let n: u64 = digits.parse().ok()?;
+    // With at most 8 digits, n <= 99_999_999, so n * 3600 < 4e11 << u64::MAX:
+    // the multiplications cannot overflow.
     let dur = match unit {
-        "H" => Duration::from_secs(n.checked_mul(3600)?),
-        "M" => Duration::from_secs(n.checked_mul(60)?),
+        "H" => Duration::from_secs(n * 3600),
+        "M" => Duration::from_secs(n * 60),
         "S" => Duration::from_secs(n),
         "m" => Duration::from_millis(n),
         "u" => Duration::from_micros(n),
         "n" => Duration::from_nanos(n),
         _ => return None,
     };
+    if dur.is_zero() {
+        return None;
+    }
     Some(dur)
 }
 
@@ -198,19 +233,6 @@ mod tests {
         assert!(is_valid_traceparent(tp), "bad traceparent: {tp}");
         // Nothing else leaks in.
         assert!(meta.get("authorization").is_none());
-    }
-
-    /// A W3C traceparent is `00-<32 hex>-<16 hex>-<2 hex>`.
-    fn is_valid_traceparent(tp: &str) -> bool {
-        let parts: Vec<&str> = tp.split('-').collect();
-        parts.len() == 4
-            && parts[0] == "00"
-            && parts[1].len() == 32
-            && parts[2].len() == 16
-            && parts[3].len() == 2
-            && parts[1..4]
-                .iter()
-                .all(|p| p.chars().all(|c| c.is_ascii_hexdigit()))
     }
 
     #[test]
