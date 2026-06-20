@@ -298,6 +298,17 @@ mod tests {
     }
 
     #[test]
+    fn versioned_traceparent_is_forwarded() {
+        // W3C 3.2.1 requires accepting future versions (anything but ff); a
+        // valid version-01 header must be propagated, not dropped + resynthesized.
+        let incoming = "01-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        let mut headers = HeaderMap::new();
+        headers.insert("traceparent", HeaderValue::from_static(incoming));
+        let meta = http_headers_to_grpc_metadata(&headers, &[]);
+        assert_eq!(meta.get("traceparent").unwrap().to_str().unwrap(), incoming);
+    }
+
+    #[test]
     fn malformed_or_zero_traceparent_is_not_forwarded() {
         // An all-zeros traceparent is invalid per W3C §3.2.2 and must not be
         // propagated; a fresh one is synthesized instead.
