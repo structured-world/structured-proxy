@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 /// Top-level proxy configuration (loaded from YAML).
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct ProxyConfig {
     /// Upstream gRPC service(s).
     pub upstream: UpstreamConfig,
@@ -81,6 +82,7 @@ fn default_forwarded_headers() -> Vec<String> {
 
 /// Upstream gRPC service configuration.
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct UpstreamConfig {
     /// gRPC upstream address (e.g., "http://localhost:4180").
     pub default: String,
@@ -88,6 +90,7 @@ pub struct UpstreamConfig {
 
 /// Descriptor loading source.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum DescriptorSource {
     /// Pre-compiled descriptor file.
     File { file: PathBuf },
@@ -128,6 +131,7 @@ where
 
 /// Listen address configuration.
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct ListenConfig {
     /// HTTP listen address (default: "0.0.0.0:8080").
     #[serde(default = "default_http_listen")]
@@ -148,6 +152,7 @@ impl Default for ListenConfig {
 
 /// Service identity.
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct ServiceConfig {
     /// Service name (appears in /health response and metrics namespace).
     #[serde(default = "default_service_name")]
@@ -168,6 +173,7 @@ impl Default for ServiceConfig {
 
 /// Path alias (rewrite before routing).
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct AliasConfig {
     pub from: String,
     pub to: String,
@@ -175,6 +181,7 @@ pub struct AliasConfig {
 
 /// OpenAPI generation config.
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct OpenApiConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -204,6 +211,7 @@ fn default_true() -> bool {
 
 /// Auth configuration.
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct AuthConfig {
     /// Auth mode: "none", "jwt", "api_key".
     #[serde(default = "default_auth_mode")]
@@ -228,6 +236,7 @@ fn default_auth_mode() -> String {
 
 /// JWT validation config.
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct JwtConfig {
     /// JWKS URI for key discovery.
     #[serde(default)]
@@ -256,6 +265,7 @@ fn default_roles_claim() -> String {
 
 /// Forward auth config.
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct ForwardAuthConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -278,6 +288,7 @@ fn default_forward_auth_path() -> String {
 
 /// Route policy entry.
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct RoutePolicyConfig {
     pub path: String,
     #[serde(default = "default_methods_all")]
@@ -296,6 +307,7 @@ fn default_methods_all() -> Vec<String> {
 /// (`envoy.service.auth.v3.Authorization/Check`). Interops with OPA and any
 /// ext_authz server.
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct AuthzConfig {
     /// Enable external authorization for proxied API requests.
     #[serde(default)]
@@ -319,6 +331,7 @@ fn default_authz_timeout_ms() -> u64 {
 
 /// Shield (rate limiting) configuration.
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct ShieldConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -352,6 +365,7 @@ fn default_window_secs() -> u64 {
 
 /// Endpoint classification for rate limiting.
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct EndpointClassConfig {
     /// Glob pattern (e.g., "/v1/auth/**").
     pub pattern: String,
@@ -363,6 +377,7 @@ pub struct EndpointClassConfig {
 
 /// Per-identifier rate limiting config.
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct IdentifierEndpointConfig {
     pub path: String,
     pub body_field: String,
@@ -371,6 +386,7 @@ pub struct IdentifierEndpointConfig {
 
 /// OIDC discovery config.
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct OidcDiscoveryConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -389,6 +405,7 @@ pub struct OidcDiscoveryConfig {
 
 /// Signing key config for JWKS endpoint.
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct SigningKeyConfig {
     #[serde(default = "default_algorithm")]
     pub algorithm: String,
@@ -401,6 +418,7 @@ fn default_algorithm() -> String {
 
 /// Maintenance mode config.
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct MaintenanceConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -436,6 +454,7 @@ impl Default for MaintenanceConfig {
 
 /// CORS configuration.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[non_exhaustive]
 pub struct CorsConfig {
     /// Allowed origins. Empty = permissive (dev mode).
     #[serde(default)]
@@ -444,6 +463,7 @@ pub struct CorsConfig {
 
 /// Logging configuration.
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct LoggingConfig {
     #[serde(default = "default_log_level")]
     pub level: String,
@@ -469,6 +489,7 @@ impl Default for LoggingConfig {
 
 /// Metrics endpoint classification.
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct MetricsClassConfig {
     /// Glob pattern for path matching.
     pub pattern: String,
