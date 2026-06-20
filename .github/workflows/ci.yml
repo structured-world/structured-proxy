@@ -58,3 +58,17 @@ jobs:
       - name: Publish dry-run
         if: matrix.backend.name == 'rust_crypto'
         run: cargo publish --dry-run
+
+  security-audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      # Scans Cargo.lock for RustSec advisories; honors the ignore list in
+      # deny.toml. Third-party action: pinned to a commit SHA (dependabot
+      # keeps it fresh).
+      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
+        with:
+          command: check advisories
