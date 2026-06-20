@@ -9,6 +9,21 @@
 //! structured-proxy --config sid-proxy.yaml
 //! structured-proxy --config sflow-proxy.yaml
 //! ```
+//!
+//! ## JWT crypto backend
+//!
+//! Exactly one crypto backend feature must be enabled (they are mutually
+//! exclusive): `rust_crypto` (default, pure Rust) or `aws_lc_rs` (opt-in,
+//! constant-time / FIPS-capable, links aws-lc via C FFI). Enabling both or
+//! neither is rejected at compile time by the guards below.
+
+// jsonwebtoken selects its provider from these features and would otherwise
+// panic at runtime on an invalid combination; turn that into a build error.
+#[cfg(all(feature = "rust_crypto", feature = "aws_lc_rs"))]
+compile_error!("features `rust_crypto` and `aws_lc_rs` are mutually exclusive; enable exactly one");
+
+#[cfg(not(any(feature = "rust_crypto", feature = "aws_lc_rs")))]
+compile_error!("exactly one JWT crypto backend must be enabled: `rust_crypto` or `aws_lc_rs`");
 
 pub mod auth;
 pub mod config;

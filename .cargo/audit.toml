@@ -1,0 +1,14 @@
+# cargo-audit configuration.
+# Run: cargo audit
+#
+# RUSTSEC-2023-0071 — "Marvin Attack" timing sidechannel in `rsa` 0.9.x
+# (rsa -> jsonwebtoken rust_crypto backend -> structured-proxy).
+#
+# Ignored deliberately; mirror of the rationale in deny.toml.
+# See https://github.com/structured-world/structured-proxy/issues/48
+#   - No fixed `rsa` release exists (latest 0.10.0-rc; advisory patched:[]).
+#   - We keep the pure-Rust `rust_crypto` backend over `aws_lc_rs` (C FFI).
+#   - RSA is used for JWT verification (public key) only; Marvin targets
+#     private-key timing, not exploitable on the verify path.
+[advisories]
+ignore = ["RUSTSEC-2023-0071"]

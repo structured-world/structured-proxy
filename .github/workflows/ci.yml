@@ -16,8 +16,21 @@ env:
 
 jobs:
   quality-checks:
-    name: Quality Checks
+    name: Quality Checks (${{ matrix.backend.name }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend:
+          # The jsonwebtoken crypto backends are mutually exclusive (enabling
+          # both panics at runtime), so each is exercised on its own leg instead
+          # of via `--all-features`.
+          - name: rust_crypto
+            # Pure-Rust default backend (RustCrypto / rsa).
+            flags: "--features redis"
+          - name: aws_lc_rs
+            # Opt-in constant-time backend (aws-lc, C FFI); disables the default.
+            flags: "--no-default-features --features aws_lc_rs,redis"
     steps:
       - uses: actions/checkout@v6
         with:
@@ -30,16 +43,32 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Format
+        if: matrix.backend.name == 'rust_crypto'
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features
+        run: cargo clippy --all-targets ${{ matrix.backend.flags }}
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --release ${{ matrix.backend.flags }}
 
       - name: Test
-        run: cargo test --all-features
+        run: cargo test ${{ matrix.backend.flags }}
 
       - name: Publish dry-run
+        if: matrix.backend.name == 'rust_crypto'
         run: cargo publish --dry-run
+
+  security-audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      # Scans Cargo.lock for RustSec advisories; honors the ignore list in
+      # deny.toml. Third-party action: pinned to a commit SHA (dependabot
+      # keeps it fresh).
+      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
+        with:
+          command: check advisories
