@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0](https://github.com/structured-world/structured-proxy/compare/v1.1.0...v2.0.0) - 2026-06-20
+
+### Added
+
+- *(authz)* external authorization via Envoy ext_authz gRPC
+- *(auth)* add forward-auth verification endpoint
+- *(transcode)* propagate W3C trace-context and request deadlines
+- *(oidc)* serve OpenID discovery document and JWKS endpoint
+- *(auth)* enforce JWT validation with JWKS and route policies
+- *(shield)* enforce rate limiting via pluggable store
+
+### Fixed
+
+- *(config)* [**breaking**] mark config structs non_exhaustive
+- *(authz)* default authz endpoint and preserve duplicate headers
+- *(transcode)* accept future W3C traceparent versions
+- *(transcode)* validate trace-context and bound deadline parsing
+- *(oidc)* validate Ed25519 SPKI, always serve JWKS, set media type
+- *(auth)* harden claim headers, alg mapping, JWKS fetch, 401 vs 403
+- *(shield)* use rightmost untrusted X-Forwarded-For hop
+- *(shield)* close identifier bypass, harden store and IP trust
+
+### Other
+
+- center the Support the Project section
+- Merge branch 'main' into docs/#39-donation-badge
+- *(transcode)* remove per-request route allocations on the hot path
+- drop unimplemented BFF session config
+- *(config)* add regression test for disabled authz without endpoint
+- *(authz)* log authz call failures and assert parsed authz config
+- *(auth)* simplify forward-auth query strip and cover invalid token
+- *(transcode)* add regression test for versioned traceparent
+- *(transcode)* add regression tests for deadline and trace validation
+- *(oidc)* add regression tests for SPKI validation and empty JWKS
+- *(auth)* add regression tests for header spoof and 401/403
+- *(shield)* add regression test for spoofable XFF first hop
+- *(shield)* add regression test for identifier-limit bypass
+
 ## [1.1.0](https://github.com/structured-world/structured-proxy/compare/v1.0.3...v1.1.0) - 2026-06-19
 
 ### Added
