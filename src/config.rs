@@ -640,6 +640,25 @@ forwarded_headers:
     }
 
     #[test]
+    fn authz_disabled_without_endpoint_parses() {
+        // A disabled authz block need not supply an endpoint.
+        let yaml = r#"
+upstream:
+  default: "grpc://localhost:4180"
+descriptors:
+  - file: "/x.bin"
+auth:
+  mode: "jwt"
+  authz:
+    enabled: false
+"#;
+        let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        let authz = config.auth.unwrap().authz.unwrap();
+        assert!(!authz.enabled);
+        assert_eq!(authz.endpoint, "");
+    }
+
+    #[test]
     fn test_descriptor_source_file() {
         let yaml = r#"
 upstream:
