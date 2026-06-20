@@ -296,19 +296,29 @@ fn default_methods_all() -> Vec<String> {
     vec!["*".into()]
 }
 
-/// AuthZ gRPC integration.
+/// External authorization via the Envoy ext_authz gRPC contract
+/// (`envoy.service.auth.v3.Authorization/Check`). Interops with OPA and any
+/// ext_authz server.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthzConfig {
+    /// Enable external authorization for proxied API requests.
     #[serde(default)]
     pub enabled: bool,
-    pub service: String,
-    pub method: String,
+    /// gRPC address of the ext_authz server, e.g. `http://opa:9191`. Required
+    /// when enabled; defaults to empty so a disabled block can omit it.
     #[serde(default)]
-    pub subject_template: Option<String>,
+    pub endpoint: String,
+    /// Per-request authorization call timeout, in milliseconds.
+    #[serde(default = "default_authz_timeout_ms")]
+    pub timeout_ms: u64,
+    /// When the authz call itself fails (unreachable / timeout), allow the
+    /// request through instead of denying. Defaults to false (fail closed).
     #[serde(default)]
-    pub resource_template: Option<String>,
-    #[serde(default)]
-    pub action_template: Option<String>,
+    pub failure_mode_allow: bool,
+}
+
+fn default_authz_timeout_ms() -> u64 {
+    200
 }
 
 /// BFF session config.
@@ -568,6 +578,11 @@ auth:
         required_roles: ["admin"]
       - path: "/v1/public/**"
         require_auth: false
+  authz:
+    enabled: true
+    endpoint: "http://opa:9191"   # Envoy ext_authz server (gRPC)
+    timeout_ms: 200
+    failure_mode_allow: false      # fail closed: deny if authz is unreachable
 
 shield:
   enabled: true
@@ -614,11 +629,35 @@ forwarded_headers:
         assert_eq!(config.service.name, "sid-proxy");
         assert_eq!(config.aliases.len(), 1);
         assert!(config.auth.is_some());
+        let authz = config.auth.as_ref().unwrap().authz.as_ref().unwrap();
+        assert!(authz.enabled);
+        assert_eq!(authz.endpoint, "http://opa:9191");
+        assert_eq!(authz.timeout_ms, 200);
+        assert!(!authz.failure_mode_allow);
         assert!(config.shield.is_some());
         assert!(config.oidc_discovery.is_some());
         assert_eq!(config.cors.origins.len(), 1);
         assert_eq!(config.metrics_classes.len(), 2);
         assert_eq!(config.forwarded_headers.len(), 3);
+    }
+
+    #[test]
+    fn authz_disabled_without_endpoint_parses() {
+        // A disabled authz block need not supply an endpoint.
+        let yaml = r#"
+upstream:
+  default: "grpc://localhost:4180"
+descriptors:
+  - file: "/x.bin"
+auth:
+  mode: "jwt"
+  authz:
+    enabled: false
+"#;
+        let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        let authz = config.auth.unwrap().authz.unwrap();
+        assert!(!authz.enabled);
+        assert_eq!(authz.endpoint, "");
     }
 
     #[test]

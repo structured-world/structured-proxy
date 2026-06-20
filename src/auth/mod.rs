@@ -5,6 +5,7 @@
 //! (`require_auth` / `required_roles`), and forwards selected claims to the
 //! upstream as request headers. Active only when `auth.mode == "jwt"`.
 
+pub mod authz;
 pub mod forward;
 pub mod jwks;
 pub mod policy;

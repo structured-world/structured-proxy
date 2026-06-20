@@ -75,6 +75,7 @@ getrandom = "0.4"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
+envoy-types = "0.7"
 
 [features]
 # Shared Redis-backed rate-limit store for multi-instance deployments.

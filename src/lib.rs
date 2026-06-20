@@ -143,8 +143,24 @@ impl ProxyServer {
 
         let cors = self.build_cors();
 
-        // Build transcoding routes from descriptor pool
-        let transcode_routes = transcode::routes(&pool, &self.config.aliases);
+        // Build transcoding routes from descriptor pool.
+        let mut transcode_routes = transcode::routes(&pool, &self.config.aliases);
+
+        // External authorization (Envoy ext_authz) gates only the proxied API
+        // routes, never health / metrics / discovery. It runs inside the auth
+        // layer below, so the Check call sees the identity headers the JWT
+        // middleware injected.
+        let authz = match self.config.auth.as_ref().and_then(|a| a.authz.as_ref()) {
+            Some(cfg) => auth::authz::Authz::build(cfg)
+                .map_err(|e| anyhow::anyhow!("invalid authz config: {e}"))?,
+            None => None,
+        };
+        if let Some(authz) = authz {
+            transcode_routes = transcode_routes.layer(axum::middleware::from_fn_with_state(
+                authz,
+                auth::authz::middleware,
+            ));
+        }
 
         // Health routes
         let health_service_name = service_name.clone();
