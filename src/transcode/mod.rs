@@ -187,6 +187,7 @@ async fn streaming_handler<S: TranscodeState>(
         metadata::http_headers_to_grpc_metadata(&headers, proxy_state.forwarded_headers());
     let mut grpc_request = tonic::Request::new(request_msg);
     *grpc_request.metadata_mut() = grpc_metadata;
+    metadata::apply_request_deadline(&mut grpc_request, &headers);
 
     let output_desc = entry.method.output();
     let grpc_codec = codec::DynamicCodec::new(output_desc.clone());
@@ -344,6 +345,7 @@ async fn transcode_handler<S: TranscodeState>(
         metadata::http_headers_to_grpc_metadata(&headers, proxy_state.forwarded_headers());
     let mut grpc_request = tonic::Request::new(request_msg);
     *grpc_request.metadata_mut() = grpc_metadata;
+    metadata::apply_request_deadline(&mut grpc_request, &headers);
 
     let output_desc = entry.method.output();
     let grpc_codec = codec::DynamicCodec::new(output_desc.clone());
