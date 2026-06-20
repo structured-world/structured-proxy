@@ -1,0 +1,21 @@
+# cargo-deny configuration.
+# Run: cargo deny check advisories
+#
+# Only the advisories section is configured here; license/bans/sources checks
+# fall back to cargo-deny defaults.
+
+[advisories]
+# RUSTSEC-2023-0071 — "Marvin Attack" timing sidechannel in `rsa` 0.9.x.
+# Chain: rsa -> jsonwebtoken (rust_crypto backend) -> structured-proxy.
+#
+# Ignored deliberately. See https://github.com/structured-world/structured-proxy/issues/48
+#   1. No fix exists: latest `rsa` is 0.10.0-rc and the advisory has patched:[] /
+#      unaffected:[] in the RustSec DB. Nothing to upgrade to.
+#   2. We keep jsonwebtoken's pure-Rust `rust_crypto` backend over `aws_lc_rs`
+#      (C FFI), required by no-FFI consumers (e.g. CoordiNode ADR-013).
+#   3. RSA here is used for JWT *verification* (public key) only. Marvin targets
+#      private-key timing (decrypt/sign), which never runs on the verify path.
+#      Revisit when RustCrypto ships a constant-time `rsa` stable release.
+ignore = [
+  { id = "RUSTSEC-2023-0071", reason = "No fixed `rsa` release exists (latest 0.10.0-rc; advisory patched:[]). We deliberately keep jsonwebtoken's pure-Rust `rust_crypto` backend over `aws_lc_rs` (C FFI). RSA is used for JWT verification (public key) only; Marvin targets private-key timing, not exploitable on the verify path. Revisit when RustCrypto ships a constant-time `rsa` stable. Tracking: structured-world/structured-proxy#48" },
+]

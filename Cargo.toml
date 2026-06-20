@@ -64,8 +64,11 @@ ipnet = "2"
 # Optional shared rate-limit store for multi-instance deployments.
 redis = { version = "0.27", features = ["tokio-comp"], optional = true }
 
-# Auth (JWT validation, route policies)
-jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+# Auth (JWT validation, route policies).
+# Crypto backend is selected via this crate's `rust_crypto` / `aws_lc_rs`
+# features (see [features] below); `use_pem` is always required for PEM key
+# parsing and is therefore enabled unconditionally.
+jsonwebtoken = { version = "10", default-features = false, features = ["use_pem"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 globset = "0.4"
 base64 = "0.22"
@@ -78,6 +81,21 @@ clap = { version = "4", features = ["derive"] }
 envoy-types = "0.7"
 
 [features]
+default = ["rust_crypto"]
+
+# JWT crypto backend. Mutually exclusive: enable exactly one. jsonwebtoken
+# picks its provider from these features and panics at runtime if both (or
+# neither) are on, so do NOT build with `--all-features`.
+#
+# `rust_crypto` (default): pure-Rust RustCrypto backend. Pulls in `rsa`, which
+# carries RUSTSEC-2023-0071 (Marvin Attack). Not exploitable on our verify-only
+# path (public key, no private-key ops); see deny.toml / issue #48.
+rust_crypto = ["jsonwebtoken/rust_crypto"]
+# `aws_lc_rs`: constant-time / FIPS-capable backend via aws-lc (C FFI),
+# advisory-free. Opt-in for consumers that allow FFI; enable with
+# `default-features = false, features = ["aws_lc_rs"]`.
+aws_lc_rs = ["jsonwebtoken/aws_lc_rs"]
+
 # Shared Redis-backed rate-limit store for multi-instance deployments.
 redis = ["dep:redis"]
 
