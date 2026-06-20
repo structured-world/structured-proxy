@@ -210,6 +210,16 @@ Client (HTTP/JSON)
    Upstream Service
 ```
 
+## Support the Project
+
+<div align="center">
+
+![USDT TRC-20 Donation QR Code](./assets/usdt-qr.svg)
+
+USDT (TRC-20): `TFDsezHa1cBkoeZT5q2T49Wp66K8t2DmdA`
+
+</div>
+
 ## License
 
 Apache-2.0
