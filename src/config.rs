@@ -7,8 +7,13 @@ use serde::Deserialize;
 use std::path::PathBuf;
 
 /// Top-level proxy configuration (loaded from YAML).
+///
+/// This and the wiring structs below (`UpstreamConfig`, `ListenConfig`,
+/// `ServiceConfig`, `DescriptorSource`) are intentionally NOT
+/// `#[non_exhaustive]`: embedding consumers build them programmatically with
+/// runtime values. The leaf auth/shield/oidc config structs are
+/// `#[non_exhaustive]` instead, since those are deserialized, not hand-built.
 #[derive(Debug, Clone, Deserialize)]
-#[non_exhaustive]
 pub struct ProxyConfig {
     /// Upstream gRPC service(s).
     pub upstream: UpstreamConfig,
@@ -82,7 +87,6 @@ fn default_forwarded_headers() -> Vec<String> {
 
 /// Upstream gRPC service configuration.
 #[derive(Debug, Clone, Deserialize)]
-#[non_exhaustive]
 pub struct UpstreamConfig {
     /// gRPC upstream address (e.g., "http://localhost:4180").
     pub default: String,
@@ -90,7 +94,6 @@ pub struct UpstreamConfig {
 
 /// Descriptor loading source.
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub enum DescriptorSource {
     /// Pre-compiled descriptor file.
     File { file: PathBuf },
@@ -131,7 +134,6 @@ where
 
 /// Listen address configuration.
 #[derive(Debug, Clone, Deserialize)]
-#[non_exhaustive]
 pub struct ListenConfig {
     /// HTTP listen address (default: "0.0.0.0:8080").
     #[serde(default = "default_http_listen")]
@@ -152,7 +154,6 @@ impl Default for ListenConfig {
 
 /// Service identity.
 #[derive(Debug, Clone, Deserialize)]
-#[non_exhaustive]
 pub struct ServiceConfig {
     /// Service name (appears in /health response and metrics namespace).
     #[serde(default = "default_service_name")]
@@ -500,9 +501,15 @@ pub struct MetricsClassConfig {
 impl ProxyConfig {
     /// Load configuration from a YAML file.
     pub fn from_file(path: &std::path::Path) -> anyhow::Result<Self> {
-        let content = std::fs::read_to_string(path)?;
-        let config: Self = serde_yaml::from_str(&content)?;
-        Ok(config)
+        Self::from_yaml_str(&std::fs::read_to_string(path)?)
+    }
+
+    /// Parse configuration from a YAML string.
+    ///
+    /// Useful for embedding the proxy: load a baked-in config (e.g. via
+    /// `include_str!`) without touching the filesystem.
+    pub fn from_yaml_str(yaml: &str) -> anyhow::Result<Self> {
+        Ok(serde_yaml::from_str(yaml)?)
     }
 
     /// Parse rate string like "20/min" → requests per window.
