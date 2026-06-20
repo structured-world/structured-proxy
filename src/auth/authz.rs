@@ -79,8 +79,14 @@ pub async fn middleware(
         },
         // The authz call itself failed (unreachable / timeout): fail open or
         // closed per config. Fail-closed is a 503, distinct from a policy 403.
-        Err(_) if authz.failure_mode_allow => next.run(request).await,
-        Err(_) => service_unavailable("authorization service unavailable"),
+        Err(status) if authz.failure_mode_allow => {
+            tracing::warn!(error = %status, "authz check failed; failing open");
+            next.run(request).await
+        }
+        Err(status) => {
+            tracing::warn!(error = %status, "authz check failed; failing closed");
+            service_unavailable("authorization service unavailable")
+        }
     }
 }
 

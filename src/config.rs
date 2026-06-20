@@ -627,6 +627,11 @@ forwarded_headers:
         assert_eq!(config.service.name, "sid-proxy");
         assert_eq!(config.aliases.len(), 1);
         assert!(config.auth.is_some());
+        let authz = config.auth.as_ref().unwrap().authz.as_ref().unwrap();
+        assert!(authz.enabled);
+        assert_eq!(authz.endpoint, "http://opa:9191");
+        assert_eq!(authz.timeout_ms, 200);
+        assert!(!authz.failure_mode_allow);
         assert!(config.shield.is_some());
         assert!(config.oidc_discovery.is_some());
         assert_eq!(config.cors.origins.len(), 1);
