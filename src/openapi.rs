@@ -90,12 +90,6 @@ pub fn generate(pool: &DescriptorPool, config: &OpenApiConfig, aliases: &[AliasC
             "scheme": "bearer",
             "bearerFormat": "JWT",
         },
-        "cookieAuth": {
-            "type": "apiKey",
-            "in": "cookie",
-            "name": "session",
-            "description": "Browser session cookie (same-origin, set by BFF login flow)",
-        },
     });
 
     spec

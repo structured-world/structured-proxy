@@ -179,7 +179,6 @@ mod tests {
                 applications_path: None,
             }),
             authz: None,
-            bff: None,
         };
         let auth = Auth::build(&config).unwrap().unwrap();
         ForwardAuth::build(&config, auth).unwrap()
