@@ -94,7 +94,7 @@ fn original_method(headers: &HeaderMap) -> Option<String> {
 /// The original request path (query stripped), from the forwarding headers.
 fn original_path(headers: &HeaderMap) -> Option<String> {
     let raw = forwarded(headers, &["x-forwarded-uri", "x-original-uri"])?;
-    let path = raw.split('?').next().unwrap_or(&raw);
+    let path = raw.split_once('?').map_or(raw.as_str(), |(p, _)| p);
     Some(path.to_string())
 }
 
@@ -233,6 +233,21 @@ mod tests {
         );
         let resp = call(&fa, verify_request("GET", "/v1/admin/things", Some(&token))).await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn denies_invalid_token() {
+        // A token signed by a different key fails verification; the endpoint
+        // must reject it (401), never leak it through as authenticated.
+        let (_sk, pem) = keypair();
+        let fa = forward_auth(write_pem(&pem), None);
+        let wrong_key = SigningKey::from_bytes(&[9u8; 32]);
+        let token = sign(
+            &wrong_key,
+            &serde_json::json!({ "sub": "mallory", "roles": ["admin"], "exp": 9999999999u64 }),
+        );
+        let resp = call(&fa, verify_request("GET", "/v1/admin/things", Some(&token))).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
