@@ -296,19 +296,27 @@ fn default_methods_all() -> Vec<String> {
     vec!["*".into()]
 }
 
-/// AuthZ gRPC integration.
+/// External authorization via the Envoy ext_authz gRPC contract
+/// (`envoy.service.auth.v3.Authorization/Check`). Interops with OPA and any
+/// ext_authz server.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthzConfig {
+    /// Enable external authorization for proxied API requests.
     #[serde(default)]
     pub enabled: bool,
-    pub service: String,
-    pub method: String,
+    /// gRPC address of the ext_authz server, e.g. `http://opa:9191`.
+    pub endpoint: String,
+    /// Per-request authorization call timeout, in milliseconds.
+    #[serde(default = "default_authz_timeout_ms")]
+    pub timeout_ms: u64,
+    /// When the authz call itself fails (unreachable / timeout), allow the
+    /// request through instead of denying. Defaults to false (fail closed).
     #[serde(default)]
-    pub subject_template: Option<String>,
-    #[serde(default)]
-    pub resource_template: Option<String>,
-    #[serde(default)]
-    pub action_template: Option<String>,
+    pub failure_mode_allow: bool,
+}
+
+fn default_authz_timeout_ms() -> u64 {
+    200
 }
 
 /// BFF session config.
@@ -568,6 +576,11 @@ auth:
         required_roles: ["admin"]
       - path: "/v1/public/**"
         require_auth: false
+  authz:
+    enabled: true
+    endpoint: "http://opa:9191"   # Envoy ext_authz server (gRPC)
+    timeout_ms: 200
+    failure_mode_allow: false      # fail closed: deny if authz is unreachable
 
 shield:
   enabled: true

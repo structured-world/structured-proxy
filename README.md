@@ -29,13 +29,14 @@ Works with **any** gRPC service via proto descriptor files. No code generation, 
 - **JWT auth**: validate `Bearer` tokens via an Ed25519 PEM key or JWKS auto-discovery, enforce per-route `require_auth` / `required_roles`, and forward claims as headers
 - **OIDC discovery**: serve `/.well-known/openid-configuration` and a JWKS endpoint (Ed25519) built from config, to front an identity provider
 - **Forward-auth**: a verification endpoint (`/auth/verify`) for a fronting proxy (nginx `auth_request`, Traefik `forwardAuth`) to delegate auth, returning the verified identity as headers
+- **External AuthZ**: gate proxied requests through an Envoy ext_authz gRPC server (`envoy.service.auth.v3.Authorization/Check`), interoperating with OPA and any ext_authz server, with fail-open/closed control
 - **Zero code changes** between services: same binary, different config
 
 ## Roadmap
 
 These have config scaffolding in place but are not yet enforced by the proxy. Tracked for implementation; do not rely on them yet.
 
-- **External AuthZ (gRPC ext_authz) / BFF sessions**
+- **BFF sessions** (cookie-to-token exchange)
 
 ## Quick Start
 
