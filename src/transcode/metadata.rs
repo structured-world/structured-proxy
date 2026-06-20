@@ -63,21 +63,27 @@ fn inject_trace_context(metadata: &mut MetadataMap, headers: &HeaderMap) {
     }
 }
 
-/// Validate a W3C `traceparent`: `00-<32 hex>-<16 hex>-<2 hex>` with a non-zero
-/// trace-id and parent-id (all-zero IDs are forbidden by W3C §3.2.2).
+/// Validate a W3C `traceparent`: `<version>-<32 hex>-<16 hex>-<2 hex>` with a
+/// non-zero trace-id and parent-id (all-zero IDs are forbidden by W3C §3.2.2).
+///
+/// Per W3C §3.2.1 any 2-hex version except `ff` is accepted; future versions may
+/// append extra `-`-delimited fields, while the baseline `00` must be exactly
+/// the four fields.
 fn is_valid_traceparent(tp: &str) -> bool {
-    let parts: [&str; 4] = match tp.split('-').collect::<Vec<_>>().try_into() {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    let [version, trace_id, parent_id, flags] = parts;
-    version == "00"
-        && trace_id.len() == 32
-        && parent_id.len() == 16
-        && flags.len() == 2
-        && [trace_id, parent_id, flags]
-            .iter()
-            .all(|p| p.bytes().all(|b| b.is_ascii_hexdigit()))
+    let parts: Vec<&str> = tp.split('-').collect();
+    if parts.len() < 4 {
+        return false;
+    }
+    let (version, trace_id, parent_id, flags) = (parts[0], parts[1], parts[2], parts[3]);
+    if version == "00" && parts.len() != 4 {
+        return false;
+    }
+    let is_hex = |s: &str, len: usize| s.len() == len && s.bytes().all(|b| b.is_ascii_hexdigit());
+    is_hex(version, 2)
+        && !version.eq_ignore_ascii_case("ff")
+        && is_hex(trace_id, 32)
+        && is_hex(parent_id, 16)
+        && is_hex(flags, 2)
         && trace_id.bytes().any(|b| b != b'0')
         && parent_id.bytes().any(|b| b != b'0')
 }
@@ -306,6 +312,18 @@ mod tests {
         headers.insert("traceparent", HeaderValue::from_static(incoming));
         let meta = http_headers_to_grpc_metadata(&headers, &[]);
         assert_eq!(meta.get("traceparent").unwrap().to_str().unwrap(), incoming);
+    }
+
+    #[test]
+    fn ff_version_traceparent_is_rejected() {
+        // The reserved "ff" version is invalid per W3C and must be replaced.
+        let invalid = "ff-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        let mut headers = HeaderMap::new();
+        headers.insert("traceparent", HeaderValue::from_static(invalid));
+        let meta = http_headers_to_grpc_metadata(&headers, &[]);
+        let tp = meta.get("traceparent").unwrap().to_str().unwrap();
+        assert_ne!(tp, invalid);
+        assert!(is_valid_traceparent(tp));
     }
 
     #[test]
