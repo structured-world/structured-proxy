@@ -52,7 +52,11 @@ jobs:
 
       - name: Build static binary
         run: |
-          cargo build --release --target ${{ matrix.target }} --bin structured-proxy
+          # `redis` is compiled in so the packaged `shield.redis_url` config
+          # works (multi-instance shared rate limits) instead of silently
+          # falling back to per-process counters. It is a pure-Rust dependency,
+          # so it stays musl-static-clean.
+          cargo build --release --target ${{ matrix.target }} --features redis --bin structured-proxy
           strip target/${{ matrix.target }}/release/structured-proxy || true
 
       - name: Package
