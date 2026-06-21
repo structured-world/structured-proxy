@@ -134,6 +134,9 @@ impl ProxyServer {
 
     /// Build the axum router with all endpoints.
     pub fn router(&self) -> anyhow::Result<Router> {
+        // Enforce cross-field invariants on the embedded path too, where the
+        // config is built directly instead of through `from_yaml_str`.
+        self.config.validate()?;
         let pool = self.load_descriptors()?;
 
         let grpc_upstream = self.config.upstream.default.clone();
