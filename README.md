@@ -16,7 +16,7 @@ Works with **any** gRPC service via proto descriptor files. No code generation, 
 - **Full request mapping**: path params, query parameters (typed + repeated + nested), and `body` (`*` / named field / none)
 - **`response_body`** to return a single response subfield, and **`additional_bindings`** for multiple routes per RPC
 - **Auto-generated OpenAPI** documentation from proto messages, served at `/openapi.json`
-- **Server-streaming** RPC → NDJSON by default, or Server-Sent Events when the client sends `Accept: text/event-stream` (configurable keep-alive); an error mid-stream is delivered as an explicit terminal frame in both formats (SSE uses the `stream-error` event type, consumed via `addEventListener("stream-error", ...)` — distinct from the browser `EventSource` `onerror`, which fires only on transport failures)
+- **Server-streaming** RPC → NDJSON by default, or Server-Sent Events via `Accept: text/event-stream` negotiation
 - **gRPC → HTTP status mapping** following the standard `google.rpc.Code` table
 - **Header forwarding** from HTTP requests to gRPC metadata (configurable allow-list)
 - **Context propagation**: W3C trace-context (`traceparent` forwarded or synthesized) and client deadlines (`grpc-timeout`) carried across the REST↔gRPC boundary
@@ -83,7 +83,11 @@ maintenance:
 
 # Optional: server-streaming response behavior.
 # Streaming RPCs return NDJSON by default; clients sending
-# `Accept: text/event-stream` get Server-Sent Events instead.
+# `Accept: text/event-stream` get Server-Sent Events instead. An error
+# mid-stream is delivered as an explicit terminal frame in both formats. For
+# SSE it uses the `stream-error` event type (consumed via
+# `addEventListener("stream-error", ...)`), distinct from the browser
+# `EventSource` `onerror`, which fires only on transport failures.
 streaming:
   # SSE keep-alive interval (seconds). Comment frames keep idle streams alive
   # through load balancers / nginx read timeouts. Default: 15.
