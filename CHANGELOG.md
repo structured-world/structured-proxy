@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.1](https://github.com/structured-world/structured-proxy/compare/v2.2.0...v2.2.1) - 2026-06-21
+
+### Fixed
+
+- *(packaging)* check out the released tag in package jobs
+- *(packaging)* declare both published Fedora arches in manifest
+- *(packaging)* do not mask config ownership failures in postinst
+- *(packaging)* compile the redis feature into release binaries
+
+### Other
+
+- *(packaging)* note sandbox-readable paths for configured files
+- *(packaging)* add RPM/DEB packaging and release workflow
+
 ## [2.2.0](https://github.com/structured-world/structured-proxy/compare/v2.1.0...v2.2.0) - 2026-06-21
 
 ### Added
