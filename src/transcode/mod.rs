@@ -320,10 +320,12 @@ where
     });
 
     let body = axum::body::Body::from_stream(byte_stream);
+    // Body framing (chunked on HTTP/1.1, DATA frames on HTTP/2) is chosen by
+    // hyper from the protocol version; setting transfer-encoding by hand would
+    // be redundant on HTTP/1.1 and illegal on HTTP/2.
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/x-ndjson")
-        .header("transfer-encoding", "chunked")
         .body(body)
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
@@ -1077,6 +1079,20 @@ mod tests {
         assert_eq!(value["name"], "alice");
         // 64-bit integers are stringified to survive JS number precision limits.
         assert_eq!(value["count"], "42");
+    }
+
+    #[test]
+    fn ndjson_response_omits_manual_transfer_encoding() {
+        // hyper picks the framing per protocol version; a hand-set
+        // transfer-encoding would be illegal on HTTP/2.
+        let resp = ndjson_response(futures::stream::empty::<
+            Result<DynamicMessage, tonic::Status>,
+        >());
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/x-ndjson"
+        );
+        assert!(resp.headers().get("transfer-encoding").is_none());
     }
 
     #[test]
