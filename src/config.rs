@@ -69,6 +69,10 @@ pub struct ProxyConfig {
     /// Headers to forward from HTTP to gRPC metadata.
     #[serde(default = "default_forwarded_headers")]
     pub forwarded_headers: Vec<String>,
+
+    /// Server-streaming response behavior.
+    #[serde(default)]
+    pub streaming: StreamingConfig,
 }
 
 fn default_forwarded_headers() -> Vec<String> {
@@ -83,6 +87,32 @@ fn default_forwarded_headers() -> Vec<String> {
         "user-agent".into(),
         "idempotency-key".into(),
     ]
+}
+
+/// Server-streaming response behavior.
+///
+/// Server-streaming RPCs are exposed as NDJSON by default and as Server-Sent
+/// Events when the client sends `Accept: text/event-stream`. The keep-alive
+/// interval applies only to the SSE path.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StreamingConfig {
+    /// SSE keep-alive interval in seconds. Comment frames are emitted on idle
+    /// streams to keep intermediaries (load balancers, nginx) from closing the
+    /// connection on read timeout. Default: 15.
+    #[serde(default = "default_sse_keep_alive_secs")]
+    pub sse_keep_alive_secs: u64,
+}
+
+fn default_sse_keep_alive_secs() -> u64 {
+    15
+}
+
+impl Default for StreamingConfig {
+    fn default() -> Self {
+        Self {
+            sse_keep_alive_secs: default_sse_keep_alive_secs(),
+        }
+    }
 }
 
 /// Upstream gRPC service configuration.

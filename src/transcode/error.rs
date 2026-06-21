@@ -44,7 +44,7 @@ pub fn status_to_response(status: tonic::Status) -> Response {
 }
 
 /// Human-readable gRPC code name for JSON error responses.
-fn grpc_code_name(code: tonic::Code) -> &'static str {
+pub(crate) fn grpc_code_name(code: tonic::Code) -> &'static str {
     match code {
         tonic::Code::Ok => "OK",
         tonic::Code::Cancelled => "CANCELLED",

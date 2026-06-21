@@ -66,6 +66,8 @@ pub struct ProxyState {
     pub metrics_namespace: String,
     /// Path class patterns for metrics.
     pub metrics_classes: Vec<config::MetricsClassConfig>,
+    /// SSE keep-alive interval (seconds) for server-streaming responses.
+    pub sse_keep_alive_secs: u64,
 }
 
 /// Universal proxy server.
@@ -154,6 +156,7 @@ impl ProxyServer {
             forwarded_headers: self.config.forwarded_headers.clone(),
             metrics_namespace,
             metrics_classes: self.config.metrics_classes.clone(),
+            sse_keep_alive_secs: self.config.streaming.sse_keep_alive_secs,
         };
 
         let cors = self.build_cors();
@@ -461,6 +464,7 @@ upstream:
             forwarded_headers: vec![],
             metrics_namespace: "test".into(),
             metrics_classes: vec![],
+            sse_keep_alive_secs: 15,
         };
 
         let check = |path: &str| -> bool {
