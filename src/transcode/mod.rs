@@ -978,9 +978,15 @@ mod tests {
             .route(&catch_all, get(|| async { "ok" }));
     }
 
-    /// Build a single-message descriptor pool with one `Item { name, count }`
-    /// message, used to exercise the streaming serialization helpers.
+    /// `Item { name: "alice", count: 42 }` — default fixture for the
+    /// serialization helpers.
     fn item_message() -> DynamicMessage {
+        item_message_named("alice", 42)
+    }
+
+    /// Build an `Item { name, count }` message from a freshly-decoded
+    /// descriptor pool, used to exercise the streaming serialization helpers.
+    fn item_message_named(name: &str, count: i64) -> DynamicMessage {
         use prost_reflect::prost::Message;
         use prost_reflect::prost_types::{
             field_descriptor_proto::{Label, Type},
@@ -1022,9 +1028,50 @@ mod tests {
         let desc = pool.get_message_by_name("test.v1.Item").unwrap();
 
         let mut msg = DynamicMessage::new(desc);
-        msg.set_field_by_name("name", prost_reflect::Value::String("alice".to_string()));
-        msg.set_field_by_name("count", prost_reflect::Value::I64(42));
+        msg.set_field_by_name("name", prost_reflect::Value::String(name.to_string()));
+        msg.set_field_by_name("count", prost_reflect::Value::I64(count));
         msg
+    }
+
+    /// Collect a streaming response body into a single UTF-8 string.
+    async fn collect_body(resp: Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn ndjson_error_frame_is_terminal() {
+        // A gRPC error mid-stream must be the LAST frame: messages the upstream
+        // would yield after the error are dropped, so the error line is an
+        // unambiguous end-of-stream signal rather than a mid-stream marker.
+        let items = vec![
+            Ok(item_message_named("alice", 1)),
+            Err(tonic::Status::internal("boom")),
+            Ok(item_message_named("bob", 2)),
+        ];
+        let body = collect_body(ndjson_response(futures::stream::iter(items))).await;
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 2, "stream must stop after the error frame");
+        assert!(lines[0].contains("alice"));
+        assert!(lines[1].contains("INTERNAL") && lines[1].contains("boom"));
+        assert!(!body.contains("bob"), "post-error message must be dropped");
+    }
+
+    #[tokio::test]
+    async fn sse_error_uses_distinct_event_name() {
+        // The terminal error is sent as `event: stream-error`, not the reserved
+        // `error` type that collides with the browser EventSource onerror.
+        let items = vec![
+            Ok(item_message_named("alice", 1)),
+            Err(tonic::Status::permission_denied("nope")),
+            Ok(item_message_named("bob", 2)),
+        ];
+        let body = collect_body(sse_response(futures::stream::iter(items), 15)).await;
+        assert!(body.contains("stream-error"));
+        assert!(body.contains("PERMISSION_DENIED"));
+        assert!(!body.contains("bob"), "post-error message must be dropped");
     }
 
     #[test]
