@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.0](https://github.com/structured-world/structured-proxy/compare/v2.1.0...v2.2.0) - 2026-06-21
+
+### Added
+
+- *(streaming)* expose server-streaming RPCs as SSE
+
+### Fixed
+
+- *(streaming)* make error frames terminal and rename SSE error event
+- *(config)* reject zero SSE keep-alive interval
+- *(streaming)* let hyper choose NDJSON body framing
+- *(streaming)* parse all Accept headers and quality factors for SSE
+
+### Other
+
+- *(readme)* trim streaming feature bullet to a headline
+- *(streaming)* cover terminal error frames and SSE event name
+- *(streaming)* add regression tests for Accept negotiation
+
 ## [2.1.0](https://github.com/structured-world/structured-proxy/compare/v2.0.1...v2.1.0) - 2026-06-20
 
 ### Added
