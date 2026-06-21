@@ -207,19 +207,38 @@ fn stream_error_json(status: &tonic::Status) -> serde_json::Value {
 
 /// Whether the client negotiated a Server-Sent Events response via `Accept`.
 ///
-/// Matches `text/event-stream` in any position of a comma-separated `Accept`
-/// list, ignoring media-type parameters (`;q=...`) and case.
+/// Considers every `Accept` header line (a client may send more than one) and
+/// every comma-separated media range within each. Matches `text/event-stream`
+/// case-insensitively and honors the quality factor: per RFC 7231 §5.3.1 a
+/// `q=0` weight means the type is explicitly not acceptable, so it does not
+/// select the SSE path.
 fn wants_sse(headers: &HeaderMap) -> bool {
     headers
-        .get(axum::http::header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|accept| {
-            accept.split(',').any(|part| {
-                part.split(';')
-                    .next()
-                    .is_some_and(|media| media.trim().eq_ignore_ascii_case("text/event-stream"))
-            })
-        })
+        .get_all(axum::http::header::ACCEPT)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|accept| accept.split(','))
+        .any(accept_range_selects_sse)
+}
+
+/// Whether a single `Accept` media range selects `text/event-stream` with a
+/// non-zero quality factor.
+fn accept_range_selects_sse(range: &str) -> bool {
+    let mut parts = range.split(';');
+    let media = parts.next().unwrap_or("").trim();
+    if !media.eq_ignore_ascii_case("text/event-stream") {
+        return false;
+    }
+    // Default weight is 1.0; only an explicit `q=0` (or unparseable-as-positive)
+    // disqualifies the match. A malformed weight falls back to acceptable.
+    for param in parts {
+        let mut kv = param.splitn(2, '=');
+        if kv.next().unwrap_or("").trim().eq_ignore_ascii_case("q") {
+            let q: f32 = kv.next().unwrap_or("").trim().parse().unwrap_or(1.0);
+            return q > 0.0;
+        }
+    }
+    true
 }
 
 /// Handler for server-streaming RPCs.
