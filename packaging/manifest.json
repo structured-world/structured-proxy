@@ -25,7 +25,7 @@
           "name": "Fedora",
           "versions": ["42", "43", "44"],
           "prefix": "fc",
-          "arch": "x86_64"
+          "arch": "x86_64, aarch64"
         }
       ],
       "repoSetup": "sudo curl -fsSL https://repo.sw.foundation/rpm/fc$(rpm -E %fedora)/sw.repo -o /etc/yum.repos.d/sw.repo",
