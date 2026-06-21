@@ -13,6 +13,7 @@ pub mod request;
 
 use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put, MethodRouter};
 use axum::{Json, Router};
@@ -31,6 +32,8 @@ pub trait TranscodeState: Clone + Send + Sync + 'static {
     fn grpc_channel(&self) -> tonic::transport::Channel;
     /// Headers to forward from HTTP to gRPC metadata.
     fn forwarded_headers(&self) -> &[String];
+    /// SSE keep-alive interval (seconds) for server-streaming responses.
+    fn sse_keep_alive_secs(&self) -> u64;
 }
 
 impl TranscodeState for crate::ProxyState {
@@ -39,6 +42,9 @@ impl TranscodeState for crate::ProxyState {
     }
     fn forwarded_headers(&self) -> &[String] {
         &self.forwarded_headers
+    }
+    fn sse_keep_alive_secs(&self) -> u64 {
+        self.sse_keep_alive_secs
     }
 }
 
@@ -173,7 +179,74 @@ pub fn routes<S: TranscodeState>(pool: &DescriptorPool, aliases: &[AliasConfig])
     router
 }
 
-/// Handler for server-streaming RPCs (NDJSON response).
+/// JSON serialization options shared by the unary and streaming response paths,
+/// so a given message serializes identically regardless of RPC kind.
+fn response_serialize_options() -> SerializeOptions {
+    SerializeOptions::new()
+        .skip_default_fields(false)
+        .stringify_64_bit_integers(true)
+}
+
+/// Serialize one streamed gRPC message to a compact JSON string.
+fn message_to_json_string(msg: &DynamicMessage, opts: &SerializeOptions) -> Result<String, String> {
+    let value = msg
+        .serialize_with_options(serde_json::value::Serializer, opts)
+        .map_err(|e| e.to_string())?;
+    serde_json::to_string(&value).map_err(|e| e.to_string())
+}
+
+/// Terminal error frame for a stream that failed mid-flight. Shared by the
+/// NDJSON and SSE paths so a client sees the same shape in either format.
+fn stream_error_json(status: &tonic::Status) -> serde_json::Value {
+    serde_json::json!({
+        "error": error::grpc_code_name(status.code()),
+        "message": status.message(),
+        "code": status.code() as i32,
+    })
+}
+
+/// Whether the client negotiated a Server-Sent Events response via `Accept`.
+///
+/// Considers every `Accept` header line (a client may send more than one) and
+/// every comma-separated media range within each. Matches `text/event-stream`
+/// case-insensitively and honors the quality factor: per RFC 7231 §5.3.1 a
+/// `q=0` weight means the type is explicitly not acceptable, so it does not
+/// select the SSE path.
+fn wants_sse(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(axum::http::header::ACCEPT)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|accept| accept.split(','))
+        .any(accept_range_selects_sse)
+}
+
+/// Whether a single `Accept` media range selects `text/event-stream` with a
+/// non-zero quality factor.
+fn accept_range_selects_sse(range: &str) -> bool {
+    let mut parts = range.split(';');
+    let media = parts.next().unwrap_or("").trim();
+    if !media.eq_ignore_ascii_case("text/event-stream") {
+        return false;
+    }
+    // Default weight is 1.0; only an explicit `q=0` (or unparseable-as-positive)
+    // disqualifies the match. A malformed weight falls back to acceptable.
+    for param in parts {
+        let mut kv = param.splitn(2, '=');
+        if kv.next().unwrap_or("").trim().eq_ignore_ascii_case("q") {
+            let q: f32 = kv.next().unwrap_or("").trim().parse().unwrap_or(1.0);
+            return q > 0.0;
+        }
+    }
+    true
+}
+
+/// Handler for server-streaming RPCs.
+///
+/// Returns Server-Sent Events when the client sends `Accept: text/event-stream`,
+/// otherwise newline-delimited JSON (NDJSON). In both formats a gRPC error
+/// mid-stream is delivered as an explicit terminal frame before the stream is
+/// closed cleanly, rather than truncating the HTTP body.
 async fn streaming_handler<S: TranscodeState>(
     State(proxy_state): State<S>,
     headers: HeaderMap,
@@ -206,43 +279,117 @@ async fn streaming_handler<S: TranscodeState>(
             .into_response();
     }
 
+    let use_sse = wants_sse(&headers);
+
     match grpc_client
         .server_streaming(grpc_request, grpc_path, grpc_codec)
         .await
     {
         Ok(response) => {
             let stream = response.into_inner();
-            let serialize_opts = SerializeOptions::new()
-                .skip_default_fields(false)
-                .stringify_64_bit_integers(true);
-
-            let byte_stream = stream.map(move |result| match result {
-                Ok(msg) => {
-                    match msg.serialize_with_options(serde_json::value::Serializer, &serialize_opts)
-                    {
-                        Ok(json_value) => {
-                            let mut bytes = serde_json::to_vec(&json_value).unwrap_or_default();
-                            bytes.push(b'\n');
-                            Ok::<axum::body::Bytes, std::io::Error>(axum::body::Bytes::from(bytes))
-                        }
-                        Err(e) => Err(std::io::Error::other(format!("serialization error: {e}"))),
-                    }
-                }
-                Err(status) => Err(std::io::Error::other(format!(
-                    "gRPC stream error: {status}"
-                ))),
-            });
-
-            let body = axum::body::Body::from_stream(byte_stream);
-            Response::builder()
-                .status(StatusCode::OK)
-                .header("content-type", "application/x-ndjson")
-                .header("transfer-encoding", "chunked")
-                .body(body)
-                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+            if use_sse {
+                sse_response(stream, proxy_state.sse_keep_alive_secs())
+            } else {
+                ndjson_response(stream)
+            }
         }
         Err(status) => error::status_to_response(status),
     }
+}
+
+/// One JSON frame of a streaming response, already serialized.
+///
+/// `Error` is terminal: [`json_frames`] stops the stream right after yielding
+/// it, so an error frame is always the last thing a client sees regardless of
+/// whether it came from a gRPC status or a serialization failure.
+enum StreamFrame {
+    Data(String),
+    Error(String),
+}
+
+/// Turn a gRPC message stream into a stream of serialized JSON frames, stopping
+/// after the first error so error frames are unambiguously terminal.
+///
+/// Both a gRPC `Status` and a per-message serialization failure become a
+/// terminal [`StreamFrame::Error`]; downstream messages the upstream might
+/// still emit are dropped rather than streamed past the error.
+fn json_frames<St>(stream: St) -> impl futures::Stream<Item = StreamFrame> + Send + 'static
+where
+    St: futures::Stream<Item = Result<DynamicMessage, tonic::Status>> + Send + 'static,
+{
+    let opts = response_serialize_options();
+    stream.scan(false, move |stopped, result| {
+        if *stopped {
+            return futures::future::ready(None);
+        }
+        let frame = match result {
+            Ok(msg) => match message_to_json_string(&msg, &opts) {
+                Ok(s) => StreamFrame::Data(s),
+                Err(e) => {
+                    *stopped = true;
+                    StreamFrame::Error(
+                        serde_json::json!({
+                            "error": "INTERNAL",
+                            "message": format!("serialization error: {e}"),
+                        })
+                        .to_string(),
+                    )
+                }
+            },
+            Err(status) => {
+                *stopped = true;
+                StreamFrame::Error(stream_error_json(&status).to_string())
+            }
+        };
+        futures::future::ready(Some(frame))
+    })
+}
+
+/// Build an NDJSON (`application/x-ndjson`) streaming response.
+fn ndjson_response<St>(stream: St) -> Response
+where
+    St: futures::Stream<Item = Result<DynamicMessage, tonic::Status>> + Send + 'static,
+{
+    // Data and error frames are both JSON lines; an error is distinguished by
+    // its `error` field and by being the final line (see `json_frames`).
+    let byte_stream = json_frames(stream).map(|frame| {
+        let mut line = match frame {
+            StreamFrame::Data(s) | StreamFrame::Error(s) => s,
+        };
+        line.push('\n');
+        Ok::<axum::body::Bytes, std::io::Error>(axum::body::Bytes::from(line))
+    });
+
+    let body = axum::body::Body::from_stream(byte_stream);
+    // Body framing (chunked on HTTP/1.1, DATA frames on HTTP/2) is chosen by
+    // hyper from the protocol version; setting transfer-encoding by hand would
+    // be redundant on HTTP/1.1 and illegal on HTTP/2.
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/x-ndjson")
+        .body(body)
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// Build a Server-Sent Events (`text/event-stream`) streaming response.
+fn sse_response<St>(stream: St, keep_alive_secs: u64) -> Response
+where
+    St: futures::Stream<Item = Result<DynamicMessage, tonic::Status>> + Send + 'static,
+{
+    // Terminal errors use the `stream-error` event type, not the reserved
+    // `error` type that the browser EventSource dispatches for transport
+    // failures — clients listen for it via addEventListener("stream-error").
+    let event_stream = json_frames(stream).map(|frame| {
+        let event = match frame {
+            StreamFrame::Data(s) => Event::default().data(s),
+            StreamFrame::Error(s) => Event::default().event("stream-error").data(s),
+        };
+        Ok::<Event, std::convert::Infallible>(event)
+    });
+
+    Sse::new(event_stream)
+        .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(keep_alive_secs)))
+        .into_response()
 }
 
 /// Generic transcoding handler.
@@ -354,9 +501,7 @@ async fn transcode_handler<S: TranscodeState>(
     match grpc_client.unary(grpc_request, grpc_path, grpc_codec).await {
         Ok(response) => {
             let response_msg = response.into_inner();
-            let serialize_opts = SerializeOptions::new()
-                .skip_default_fields(false)
-                .stringify_64_bit_integers(true);
+            let serialize_opts = response_serialize_options();
             match response_msg
                 .serialize_with_options(serde_json::value::Serializer, &serialize_opts)
             {
@@ -863,5 +1008,178 @@ mod tests {
         let _router: Router<()> = Router::new()
             .route(&nested, get(|| async { "ok" }))
             .route(&catch_all, get(|| async { "ok" }));
+    }
+
+    /// `Item { name: "alice", count: 42 }` — default fixture for the
+    /// serialization helpers.
+    fn item_message() -> DynamicMessage {
+        item_message_named("alice", 42)
+    }
+
+    /// Build an `Item { name, count }` message from a freshly-decoded
+    /// descriptor pool, used to exercise the streaming serialization helpers.
+    fn item_message_named(name: &str, count: i64) -> DynamicMessage {
+        use prost_reflect::prost::Message;
+        use prost_reflect::prost_types::{
+            field_descriptor_proto::{Label, Type},
+            DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
+        };
+
+        let item = DescriptorProto {
+            name: Some("Item".to_string()),
+            field: vec![
+                FieldDescriptorProto {
+                    name: Some("name".to_string()),
+                    number: Some(1),
+                    label: Some(Label::Optional as i32),
+                    r#type: Some(Type::String as i32),
+                    ..Default::default()
+                },
+                FieldDescriptorProto {
+                    name: Some("count".to_string()),
+                    number: Some(2),
+                    label: Some(Label::Optional as i32),
+                    r#type: Some(Type::Int64 as i32),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let file = FileDescriptorProto {
+            name: Some("item.proto".to_string()),
+            package: Some("test.v1".to_string()),
+            message_type: vec![item],
+            syntax: Some("proto3".to_string()),
+            ..Default::default()
+        };
+        let mut bytes = Vec::new();
+        FileDescriptorSet { file: vec![file] }
+            .encode(&mut bytes)
+            .unwrap();
+        let pool = DescriptorPool::decode(bytes.as_slice()).unwrap();
+        let desc = pool.get_message_by_name("test.v1.Item").unwrap();
+
+        let mut msg = DynamicMessage::new(desc);
+        msg.set_field_by_name("name", prost_reflect::Value::String(name.to_string()));
+        msg.set_field_by_name("count", prost_reflect::Value::I64(count));
+        msg
+    }
+
+    /// Collect a streaming response body into a single UTF-8 string.
+    async fn collect_body(resp: Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn ndjson_error_frame_is_terminal() {
+        // A gRPC error mid-stream must be the LAST frame: messages the upstream
+        // would yield after the error are dropped, so the error line is an
+        // unambiguous end-of-stream signal rather than a mid-stream marker.
+        let items = vec![
+            Ok(item_message_named("alice", 1)),
+            Err(tonic::Status::internal("boom")),
+            Ok(item_message_named("bob", 2)),
+        ];
+        let body = collect_body(ndjson_response(futures::stream::iter(items))).await;
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 2, "stream must stop after the error frame");
+        assert!(lines[0].contains("alice"));
+        assert!(lines[1].contains("INTERNAL") && lines[1].contains("boom"));
+        assert!(!body.contains("bob"), "post-error message must be dropped");
+    }
+
+    #[tokio::test]
+    async fn sse_error_uses_distinct_event_name() {
+        // The terminal error is sent as `event: stream-error`, not the reserved
+        // `error` type that collides with the browser EventSource onerror.
+        let items = vec![
+            Ok(item_message_named("alice", 1)),
+            Err(tonic::Status::permission_denied("nope")),
+            Ok(item_message_named("bob", 2)),
+        ];
+        let body = collect_body(sse_response(futures::stream::iter(items), 15)).await;
+        assert!(body.contains("stream-error"));
+        assert!(body.contains("PERMISSION_DENIED"));
+        assert!(!body.contains("bob"), "post-error message must be dropped");
+    }
+
+    #[test]
+    fn wants_sse_detects_event_stream_accept() {
+        let mut headers = HeaderMap::new();
+        headers.insert("accept", "text/event-stream".parse().unwrap());
+        assert!(wants_sse(&headers));
+    }
+
+    #[test]
+    fn wants_sse_matches_within_list_and_ignores_params() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "accept",
+            "application/json, text/event-stream;q=0.9".parse().unwrap(),
+        );
+        assert!(wants_sse(&headers));
+    }
+
+    #[test]
+    fn wants_sse_false_for_json_and_missing() {
+        let mut headers = HeaderMap::new();
+        headers.insert("accept", "application/json".parse().unwrap());
+        assert!(!wants_sse(&headers));
+        assert!(!wants_sse(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn wants_sse_rejects_explicit_q_zero() {
+        // RFC 7231 §5.3.1: `q=0` means the media type is explicitly NOT
+        // acceptable, so it must not select the SSE path.
+        let mut headers = HeaderMap::new();
+        headers.insert("accept", "text/event-stream;q=0".parse().unwrap());
+        assert!(!wants_sse(&headers));
+    }
+
+    #[test]
+    fn wants_sse_honors_second_accept_header_line() {
+        // A client may send multiple `Accept` header lines; the negotiation
+        // must consider all of them, not just the first.
+        let mut headers = HeaderMap::new();
+        headers.append("accept", "application/json".parse().unwrap());
+        headers.append("accept", "text/event-stream".parse().unwrap());
+        assert!(wants_sse(&headers));
+    }
+
+    #[test]
+    fn message_to_json_string_stringifies_64bit() {
+        let opts = response_serialize_options();
+        let json = message_to_json_string(&item_message(), &opts).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["name"], "alice");
+        // 64-bit integers are stringified to survive JS number precision limits.
+        assert_eq!(value["count"], "42");
+    }
+
+    #[test]
+    fn ndjson_response_omits_manual_transfer_encoding() {
+        // hyper picks the framing per protocol version; a hand-set
+        // transfer-encoding would be illegal on HTTP/2.
+        let resp = ndjson_response(futures::stream::empty::<
+            Result<DynamicMessage, tonic::Status>,
+        >());
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/x-ndjson"
+        );
+        assert!(resp.headers().get("transfer-encoding").is_none());
+    }
+
+    #[test]
+    fn stream_error_json_carries_grpc_code_name() {
+        let status = tonic::Status::permission_denied("nope");
+        let value = stream_error_json(&status);
+        assert_eq!(value["error"], "PERMISSION_DENIED");
+        assert_eq!(value["message"], "nope");
+        assert_eq!(value["code"], tonic::Code::PermissionDenied as i32);
     }
 }

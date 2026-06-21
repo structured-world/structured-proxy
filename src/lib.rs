@@ -66,6 +66,8 @@ pub struct ProxyState {
     pub metrics_namespace: String,
     /// Path class patterns for metrics.
     pub metrics_classes: Vec<config::MetricsClassConfig>,
+    /// SSE keep-alive interval (seconds) for server-streaming responses.
+    pub sse_keep_alive_secs: u64,
 }
 
 /// Universal proxy server.
@@ -132,6 +134,9 @@ impl ProxyServer {
 
     /// Build the axum router with all endpoints.
     pub fn router(&self) -> anyhow::Result<Router> {
+        // Enforce cross-field invariants on the embedded path too, where the
+        // config is built directly instead of through `from_yaml_str`.
+        self.config.validate()?;
         let pool = self.load_descriptors()?;
 
         let grpc_upstream = self.config.upstream.default.clone();
@@ -154,6 +159,7 @@ impl ProxyServer {
             forwarded_headers: self.config.forwarded_headers.clone(),
             metrics_namespace,
             metrics_classes: self.config.metrics_classes.clone(),
+            sse_keep_alive_secs: self.config.streaming.sse_keep_alive_secs,
         };
 
         let cors = self.build_cors();
@@ -461,6 +467,7 @@ upstream:
             forwarded_headers: vec![],
             metrics_namespace: "test".into(),
             metrics_classes: vec![],
+            sse_keep_alive_secs: 15,
         };
 
         let check = |path: &str| -> bool {

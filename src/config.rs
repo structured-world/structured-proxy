@@ -69,6 +69,10 @@ pub struct ProxyConfig {
     /// Headers to forward from HTTP to gRPC metadata.
     #[serde(default = "default_forwarded_headers")]
     pub forwarded_headers: Vec<String>,
+
+    /// Server-streaming response behavior.
+    #[serde(default)]
+    pub streaming: StreamingConfig,
 }
 
 fn default_forwarded_headers() -> Vec<String> {
@@ -83,6 +87,32 @@ fn default_forwarded_headers() -> Vec<String> {
         "user-agent".into(),
         "idempotency-key".into(),
     ]
+}
+
+/// Server-streaming response behavior.
+///
+/// Server-streaming RPCs are exposed as NDJSON by default and as Server-Sent
+/// Events when the client sends `Accept: text/event-stream`. The keep-alive
+/// interval applies only to the SSE path.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StreamingConfig {
+    /// SSE keep-alive interval in seconds. Comment frames are emitted on idle
+    /// streams to keep intermediaries (load balancers, nginx) from closing the
+    /// connection on read timeout. Default: 15.
+    #[serde(default = "default_sse_keep_alive_secs")]
+    pub sse_keep_alive_secs: u64,
+}
+
+fn default_sse_keep_alive_secs() -> u64 {
+    15
+}
+
+impl Default for StreamingConfig {
+    fn default() -> Self {
+        Self {
+            sse_keep_alive_secs: default_sse_keep_alive_secs(),
+        }
+    }
 }
 
 /// Upstream gRPC service configuration.
@@ -509,7 +539,21 @@ impl ProxyConfig {
     /// Useful for embedding the proxy: load a baked-in config (e.g. via
     /// `include_str!`) without touching the filesystem.
     pub fn from_yaml_str(yaml: &str) -> anyhow::Result<Self> {
-        Ok(serde_yaml::from_str(yaml)?)
+        let config: Self = serde_yaml::from_str(yaml)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Validate cross-field constraints that the type system can't express.
+    ///
+    /// Called automatically by [`from_yaml_str`](Self::from_yaml_str); call it
+    /// directly when building a [`ProxyConfig`] programmatically so the same
+    /// invariants are enforced on the embedded path.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.streaming.sse_keep_alive_secs == 0 {
+            anyhow::bail!("streaming.sse_keep_alive_secs must be greater than 0");
+        }
+        Ok(())
     }
 
     /// Parse rate string like "20/min" → requests per window.
@@ -536,9 +580,24 @@ upstream:
         assert_eq!(config.upstream.default, "grpc://localhost:4180");
         assert_eq!(config.listen.http, "0.0.0.0:8080");
         assert_eq!(config.service.name, "structured-proxy");
+        assert_eq!(config.streaming.sse_keep_alive_secs, 15);
         assert!(config.descriptors.is_empty());
         assert!(config.auth.is_none());
         assert!(config.shield.is_none());
+    }
+
+    #[test]
+    fn test_zero_sse_keep_alive_is_rejected() {
+        // A zero keep-alive would make axum's SSE timer fire continuously
+        // instead of acting as a periodic heartbeat — reject it at load time.
+        let yaml = r#"
+upstream:
+  default: "grpc://localhost:4180"
+streaming:
+  sse_keep_alive_secs: 0
+"#;
+        let err = ProxyConfig::from_yaml_str(yaml).unwrap_err();
+        assert!(err.to_string().contains("sse_keep_alive_secs"));
     }
 
     #[test]
