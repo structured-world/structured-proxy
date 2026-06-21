@@ -11,6 +11,12 @@
 #
 # Marked as a config file in the RPM/DEB package, so local edits survive
 # upgrades. Full reference: https://github.com/structured-world/structured-proxy
+#
+# Any file path referenced below (descriptor sets, JWT/OIDC PEM keys, JWKS
+# caches) must live somewhere the hardened unit can read. The service runs with
+# ProtectHome=yes and ProtectSystem=strict, so /home, /root and /run/user are
+# hidden and most of the filesystem is read-only — keep referenced files under
+# /etc/structured-proxy (readable) rather than an operator home directory.
 
 # HTTP listen address for the transcoded REST surface.
 listen:

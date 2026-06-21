@@ -25,6 +25,10 @@ StandardError=journal
 
 # Sandboxing. The proxy only needs to read its config (and any key/JWKS files
 # referenced from it) and open network sockets — it writes nothing to disk.
+# ProtectHome=yes hides /home, /root and /run/user: keep any file referenced
+# from the config (descriptors, PEM keys) under /etc/structured-proxy, not in a
+# home directory. To intentionally read elsewhere, add a ReadOnlyPaths= override
+# via `systemctl edit structured-proxy`.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
