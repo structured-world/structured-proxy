@@ -1,0 +1,27 @@
+#!/bin/sh
+set -e
+
+# Debian/Ubuntu does not auto-process /usr/lib/sysusers.d on package install
+# (unlike Fedora). Create the system user explicitly so the config file can be
+# owned by it.
+if ! getent passwd structured-proxy >/dev/null; then
+    adduser --system --group --no-create-home \
+            --home /nonexistent \
+            --shell /usr/sbin/nologin \
+            --gecos "structured-proxy transcoding proxy" \
+            structured-proxy >/dev/null
+fi
+
+# Lock down the config: readable by the service user, not world-readable (it
+# may reference key/JWKS paths or a Redis URL with credentials). Do not mask
+# failures (set -e is in effect): if ownership can't be set the service would
+# not be able to read its config, so the install must fail loudly rather than
+# report success with an unreadable config.
+if [ -f /etc/structured-proxy/config.yaml ]; then
+    chown root:structured-proxy /etc/structured-proxy/config.yaml
+    chmod 0640 /etc/structured-proxy/config.yaml
+fi
+
+#DEBHELPER#
+
+exit 0

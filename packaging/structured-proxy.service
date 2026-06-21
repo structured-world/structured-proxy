@@ -1,0 +1,45 @@
+[Unit]
+Description=structured-proxy gRPC to REST transcoding proxy
+Documentation=https://github.com/structured-world/structured-proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=structured-proxy
+Group=structured-proxy
+# The proxy is stateless: it transcodes requests and keeps no on-disk state,
+# so there is no StateDirectory / data path to manage.
+ExecStart=/usr/bin/structured-proxy --config /etc/structured-proxy/config.yaml
+# Logging is controlled through the environment (standard Rust ecosystem knobs).
+# Override via `systemctl edit structured-proxy`:
+#   [Service]
+#   Environment=RUST_LOG=debug
+Environment=RUST_LOG=info
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+
+# Sandboxing. The proxy only needs to read its config (and any key/JWKS files
+# referenced from it) and open network sockets — it writes nothing to disk.
+# ProtectHome=yes hides /home, /root and /run/user: keep any file referenced
+# from the config (descriptors, PEM keys) under /etc/structured-proxy, not in a
+# home directory. To intentionally read elsewhere, add a ReadOnlyPaths= override
+# via `systemctl edit structured-proxy`.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

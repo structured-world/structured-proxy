@@ -1,0 +1,19 @@
+#!/bin/sh
+set -e
+
+# Drop the system user on purge only. `remove` keeps it so a reinstall keeps
+# config ownership intact.
+case "$1" in
+    purge)
+        if getent passwd structured-proxy >/dev/null; then
+            deluser --quiet --system structured-proxy 2>/dev/null || true
+        fi
+        if getent group structured-proxy >/dev/null; then
+            delgroup --quiet --system structured-proxy 2>/dev/null || true
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0
