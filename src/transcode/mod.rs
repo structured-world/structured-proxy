@@ -1032,6 +1032,25 @@ mod tests {
     }
 
     #[test]
+    fn wants_sse_rejects_explicit_q_zero() {
+        // RFC 7231 §5.3.1: `q=0` means the media type is explicitly NOT
+        // acceptable, so it must not select the SSE path.
+        let mut headers = HeaderMap::new();
+        headers.insert("accept", "text/event-stream;q=0".parse().unwrap());
+        assert!(!wants_sse(&headers));
+    }
+
+    #[test]
+    fn wants_sse_honors_second_accept_header_line() {
+        // A client may send multiple `Accept` header lines; the negotiation
+        // must consider all of them, not just the first.
+        let mut headers = HeaderMap::new();
+        headers.append("accept", "application/json".parse().unwrap());
+        headers.append("accept", "text/event-stream".parse().unwrap());
+        assert!(wants_sse(&headers));
+    }
+
+    #[test]
     fn message_to_json_string_stringifies_64bit() {
         let opts = response_serialize_options();
         let json = message_to_json_string(&item_message(), &opts).unwrap();
