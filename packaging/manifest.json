@@ -1,0 +1,54 @@
+{
+  "project": {
+    "id": "structured-proxy",
+    "name": "structured-proxy",
+    "description": "Universal, config-driven gRPC to REST transcoding proxy. One binary, different YAML configs, different products. Works with any gRPC service via proto descriptor files.",
+    "homepage": "https://github.com/structured-world/structured-proxy",
+    "license": "Apache-2.0",
+    "upstream": "https://github.com/structured-world/structured-proxy"
+  },
+  "packages": [
+    {
+      "name": "structured-proxy",
+      "displayName": "structured-proxy",
+      "summary": "Universal gRPC to REST transcoding proxy",
+      "category": "main",
+      "icon": "exchange",
+      "requires": null
+    }
+  ],
+  "platforms": {
+    "rpm": {
+      "distros": [
+        {
+          "id": "fedora",
+          "name": "Fedora",
+          "versions": ["42", "43", "44"],
+          "prefix": "fc",
+          "arch": "x86_64"
+        }
+      ],
+      "repoSetup": "sudo curl -fsSL https://repo.sw.foundation/rpm/fc$(rpm -E %fedora)/sw.repo -o /etc/yum.repos.d/sw.repo",
+      "installCmd": "sudo dnf install"
+    },
+    "deb": {
+      "distros": [
+        {
+          "id": "ubuntu",
+          "name": "Ubuntu",
+          "codenames": ["noble", "jammy"],
+          "versions": ["24.04", "22.04"]
+        },
+        {
+          "id": "debian",
+          "name": "Debian",
+          "codenames": ["bookworm"],
+          "versions": ["12"]
+        }
+      ],
+      "repoSetup": "curl -fsSL https://repo.sw.foundation/keys/sw.gpg | sudo gpg --dearmor -o /etc/apt/keyrings/sw.gpg\necho \"deb [signed-by=/etc/apt/keyrings/sw.gpg] https://repo.sw.foundation/deb $(lsb_release -cs) main\" | sudo tee /etc/apt/sources.list.d/sw.list\nsudo apt-get update",
+      "installCmd": "sudo apt-get install"
+    }
+  },
+  "docs": []
+}

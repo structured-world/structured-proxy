@@ -1,0 +1,18 @@
+Source: structured-proxy
+Section: net
+Priority: optional
+Maintainer: Structured World Foundation <oss@sw.foundation>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+Homepage: https://github.com/structured-world/structured-proxy
+
+Package: structured-proxy
+Architecture: amd64 arm64
+Depends: ${misc:Depends}, systemd, adduser
+Description: Universal gRPC to REST transcoding proxy
+ structured-proxy is a config-driven gRPC to REST transcoding proxy. One
+ binary serves any gRPC service from a proto descriptor set and a YAML config,
+ with no code generation and no custom handlers.
+ .
+ The service ships disabled: set an upstream address and proto descriptors in
+ /etc/structured-proxy/config.yaml, then enable it with systemctl.

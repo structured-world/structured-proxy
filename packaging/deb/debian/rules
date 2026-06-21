@@ -1,0 +1,30 @@
+#!/usr/bin/make -f
+# structured-proxy Debian rules.
+#
+# We do NOT compile from this rules file. The CI release pipeline produces a
+# musl-static binary via cargo, drops it into the build tree as
+# `structured-proxy`, then calls `dpkg-buildpackage -us -uc -b`. This rules
+# file only stages pre-built artefacts into debian/structured-proxy/.
+
+%:
+	dh $@
+
+# Skip configure/build/test — the binary is pre-compiled by CI.
+override_dh_auto_configure:
+override_dh_auto_build:
+override_dh_auto_test:
+override_dh_auto_install:
+
+# Don't strip again: the upstream binary is already stripped post-link.
+override_dh_strip:
+
+override_dh_install:
+	install -D -m 0755 structured-proxy                         debian/structured-proxy/usr/bin/structured-proxy
+	install -D -m 0644 packaging/structured-proxy.service       debian/structured-proxy/lib/systemd/system/structured-proxy.service
+	install -D -m 0640 packaging/config.yaml                    debian/structured-proxy/etc/structured-proxy/config.yaml
+	install -D -m 0644 packaging/structured-proxy.sysusers      debian/structured-proxy/usr/lib/sysusers.d/structured-proxy.conf
+
+# Install the unit but do not enable or start it: the proxy needs a
+# service-specific config (descriptors + upstream) before it can run.
+override_dh_installsystemd:
+	dh_installsystemd --name=structured-proxy --no-enable --no-start structured-proxy.service

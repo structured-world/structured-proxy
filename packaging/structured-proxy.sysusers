@@ -1,0 +1,9 @@
+# Declarative user/group creation for structured-proxy.
+# Processed by systemd-sysusers on first boot and on package install/upgrade.
+# Reference: sysusers.d(5).
+#
+# The proxy is stateless, so the account owns no home/state directory — it
+# exists only to run the service unprivileged and read /etc/structured-proxy.
+#
+# Type Name              ID  GECOS                                   Home  Shell
+u     structured-proxy   -   "structured-proxy transcoding proxy"    -     /usr/sbin/nologin

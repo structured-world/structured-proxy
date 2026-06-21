@@ -1,0 +1,37 @@
+# structured-proxy configuration.
+#
+# This is a TEMPLATE. The service ships disabled because the proxy needs a
+# service-specific config before it can do anything useful: at minimum an
+# upstream gRPC address and one proto descriptor set. Edit this file, then:
+#
+#   sudo systemctl enable --now structured-proxy
+#
+# Read by /usr/lib/systemd/system/structured-proxy.service via:
+#   ExecStart=/usr/bin/structured-proxy --config /etc/structured-proxy/config.yaml
+#
+# Marked as a config file in the RPM/DEB package, so local edits survive
+# upgrades. Full reference: https://github.com/structured-world/structured-proxy
+
+# HTTP listen address for the transcoded REST surface.
+listen:
+  http: "0.0.0.0:8080"
+
+# Upstream gRPC service this proxy transcodes to. REQUIRED — replace with your
+# service address.
+upstream:
+  default: "http://127.0.0.1:50051"
+
+# Pre-compiled proto descriptor sources (one or more, merged into one pool).
+# REQUIRED for any routes to be generated. Build one with:
+#   buf build -o my-service.descriptor.bin
+#   # or: protoc --descriptor_set_out=my-service.descriptor.bin --include_imports *.proto
+descriptors: []
+#  - file: "/etc/structured-proxy/my-service.descriptor.bin"
+
+# Service identity (drives the /health response and metrics namespace).
+service:
+  name: "structured-proxy"
+
+# CORS: empty list = permissive (dev). List exact origins for production.
+cors:
+  origins: []
