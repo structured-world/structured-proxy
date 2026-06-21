@@ -16,7 +16,7 @@ Works with **any** gRPC service via proto descriptor files. No code generation, 
 - **Full request mapping**: path params, query parameters (typed + repeated + nested), and `body` (`*` / named field / none)
 - **`response_body`** to return a single response subfield, and **`additional_bindings`** for multiple routes per RPC
 - **Auto-generated OpenAPI** documentation from proto messages, served at `/openapi.json`
-- **Server-streaming** RPC → NDJSON by default, or Server-Sent Events when the client sends `Accept: text/event-stream` (configurable keep-alive); a gRPC error mid-stream is delivered as an explicit terminal frame in both formats
+- **Server-streaming** RPC → NDJSON by default, or Server-Sent Events when the client sends `Accept: text/event-stream` (configurable keep-alive); an error mid-stream is delivered as an explicit terminal frame in both formats (SSE uses the `stream-error` event type, consumed via `addEventListener("stream-error", ...)` — distinct from the browser `EventSource` `onerror`, which fires only on transport failures)
 - **gRPC → HTTP status mapping** following the standard `google.rpc.Code` table
 - **Header forwarding** from HTTP requests to gRPC metadata (configurable allow-list)
 - **Context propagation**: W3C trace-context (`traceparent` forwarded or synthesized) and client deadlines (`grpc-timeout`) carried across the REST↔gRPC boundary

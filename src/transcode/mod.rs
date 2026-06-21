@@ -297,23 +297,64 @@ async fn streaming_handler<S: TranscodeState>(
     }
 }
 
+/// One JSON frame of a streaming response, already serialized.
+///
+/// `Error` is terminal: [`json_frames`] stops the stream right after yielding
+/// it, so an error frame is always the last thing a client sees regardless of
+/// whether it came from a gRPC status or a serialization failure.
+enum StreamFrame {
+    Data(String),
+    Error(String),
+}
+
+/// Turn a gRPC message stream into a stream of serialized JSON frames, stopping
+/// after the first error so error frames are unambiguously terminal.
+///
+/// Both a gRPC `Status` and a per-message serialization failure become a
+/// terminal [`StreamFrame::Error`]; downstream messages the upstream might
+/// still emit are dropped rather than streamed past the error.
+fn json_frames<St>(stream: St) -> impl futures::Stream<Item = StreamFrame> + Send + 'static
+where
+    St: futures::Stream<Item = Result<DynamicMessage, tonic::Status>> + Send + 'static,
+{
+    let opts = response_serialize_options();
+    stream.scan(false, move |stopped, result| {
+        if *stopped {
+            return futures::future::ready(None);
+        }
+        let frame = match result {
+            Ok(msg) => match message_to_json_string(&msg, &opts) {
+                Ok(s) => StreamFrame::Data(s),
+                Err(e) => {
+                    *stopped = true;
+                    StreamFrame::Error(
+                        serde_json::json!({
+                            "error": "INTERNAL",
+                            "message": format!("serialization error: {e}"),
+                        })
+                        .to_string(),
+                    )
+                }
+            },
+            Err(status) => {
+                *stopped = true;
+                StreamFrame::Error(stream_error_json(&status).to_string())
+            }
+        };
+        futures::future::ready(Some(frame))
+    })
+}
+
 /// Build an NDJSON (`application/x-ndjson`) streaming response.
 fn ndjson_response<St>(stream: St) -> Response
 where
     St: futures::Stream<Item = Result<DynamicMessage, tonic::Status>> + Send + 'static,
 {
-    let opts = response_serialize_options();
-    let byte_stream = stream.map(move |result| {
-        let mut line = match result {
-            Ok(msg) => match message_to_json_string(&msg, &opts) {
-                Ok(s) => s,
-                Err(e) => serde_json::json!({
-                    "error": "INTERNAL",
-                    "message": format!("serialization error: {e}"),
-                })
-                .to_string(),
-            },
-            Err(status) => stream_error_json(&status).to_string(),
+    // Data and error frames are both JSON lines; an error is distinguished by
+    // its `error` field and by being the final line (see `json_frames`).
+    let byte_stream = json_frames(stream).map(|frame| {
+        let mut line = match frame {
+            StreamFrame::Data(s) | StreamFrame::Error(s) => s,
         };
         line.push('\n');
         Ok::<axum::body::Bytes, std::io::Error>(axum::body::Bytes::from(line))
@@ -335,22 +376,13 @@ fn sse_response<St>(stream: St, keep_alive_secs: u64) -> Response
 where
     St: futures::Stream<Item = Result<DynamicMessage, tonic::Status>> + Send + 'static,
 {
-    let opts = response_serialize_options();
-    let event_stream = stream.map(move |result| {
-        let event = match result {
-            Ok(msg) => match message_to_json_string(&msg, &opts) {
-                Ok(s) => Event::default().data(s),
-                Err(e) => Event::default().event("error").data(
-                    serde_json::json!({
-                        "error": "INTERNAL",
-                        "message": format!("serialization error: {e}"),
-                    })
-                    .to_string(),
-                ),
-            },
-            Err(status) => Event::default()
-                .event("error")
-                .data(stream_error_json(&status).to_string()),
+    // Terminal errors use the `stream-error` event type, not the reserved
+    // `error` type that the browser EventSource dispatches for transport
+    // failures — clients listen for it via addEventListener("stream-error").
+    let event_stream = json_frames(stream).map(|frame| {
+        let event = match frame {
+            StreamFrame::Data(s) => Event::default().data(s),
+            StreamFrame::Error(s) => Event::default().event("stream-error").data(s),
         };
         Ok::<Event, std::convert::Infallible>(event)
     });
