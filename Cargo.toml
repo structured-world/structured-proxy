@@ -69,7 +69,7 @@ redis = { version = "0.27", features = ["tokio-comp"], optional = true }
 # features (see [features] below); `use_pem` is always required for PEM key
 # parsing and is therefore enabled unconditionally.
 jsonwebtoken = { version = "10", default-features = false, features = ["use_pem"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-tls", "json"] }
 globset = "0.4"
 base64 = "0.22"
 sha2 = "0.11"
