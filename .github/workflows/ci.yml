@@ -32,7 +32,7 @@ jobs:
             # Opt-in constant-time backend (aws-lc, C FFI); disables the default.
             flags: "--no-default-features --features aws_lc_rs,redis"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -63,7 +63,7 @@ jobs:
     name: Security Audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       # Scans Cargo.lock for RustSec advisories; honors the ignore list in
