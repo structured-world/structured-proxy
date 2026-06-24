@@ -70,7 +70,7 @@ jobs:
              structured-proxy-${{ env.TAG_NAME }}-${{ matrix.artifact }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: structured-proxy-${{ env.TAG_NAME }}-${{ matrix.artifact }}
@@ -151,7 +151,7 @@ jobs:
           cp ~/rpmbuild/RPMS/${{ matrix.arch }}/*.rpm /tmp/artifacts/
 
       - name: Upload RPM artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rpm-fc${{ matrix.fedora }}-${{ matrix.arch }}
           path: /tmp/artifacts/*.rpm
@@ -245,7 +245,7 @@ jobs:
           cp /tmp/structured-proxy_${VERSION}_${{ matrix.arch }}.deb /tmp/artifacts/
 
       - name: Upload DEB artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: deb-${{ matrix.codename }}-${{ matrix.arch }}
           path: /tmp/artifacts/*.deb
@@ -275,7 +275,7 @@ jobs:
           cp packaging/manifest.json /tmp/repo-meta/
 
       - name: Upload repo-meta artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: repo-meta-structured-proxy
           path: /tmp/repo-meta/
