@@ -34,7 +34,7 @@ jobs:
             artifact: structured-proxy-linux-arm64
             runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # Build from the exact released tag, so a manual re-run for an older
           # tag packages that tag's commit rather than whatever ref triggered
@@ -105,7 +105,7 @@ jobs:
             rpm-build rpmdevtools systemd-rpm-macros findutils tar
           rpmdev-setuptree
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # Build from the exact released tag, so a manual re-run for an older
           # tag packages that tag's commit rather than whatever ref triggered
@@ -191,7 +191,7 @@ jobs:
             debhelper dpkg-dev dh-make ca-certificates findutils \
             build-essential adduser
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # Build from the exact released tag, so a manual re-run for an older
           # tag packages that tag's commit rather than whatever ref triggered
@@ -262,7 +262,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [build-rpm, build-deb]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # Build from the exact released tag, so a manual re-run for an older
           # tag packages that tag's commit rather than whatever ref triggered
