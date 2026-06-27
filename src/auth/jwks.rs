@@ -33,16 +33,30 @@ const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// Bound the worst-case latency of a slow/stalled JWKS endpoint.
 const JWKS_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Build the rustls client config for the JWKS HTTPS client.
+///
+/// Uses the pure-Rust `ring` provider (installed per-config, not process-global)
+/// and bundles Mozilla's root store via `webpki-roots`, so the binary needs no
+/// system CA bundle and works in musl / scratch / distroless images.
+fn build_tls_config() -> rustls::ClientConfig {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .expect("ring provider supports the default TLS protocol versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth()
+}
+
 impl JwksCache {
     /// Create a cache for `uri` (keys are loaded lazily on first lookup).
     pub fn new(uri: String) -> Self {
-        // reqwest is built with `rustls-no-provider`, so it resolves the rustls
-        // CryptoProvider from the process default. Install ring (idempotent: a
-        // returned Err just means it was already set) before constructing the
-        // client, otherwise the TLS handshake has no provider to use.
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let client = reqwest::Client::builder()
             .timeout(JWKS_HTTP_TIMEOUT)
+            // Hand reqwest a fully preconfigured rustls backend rather than
+            // relying on a process-global default provider: no install ordering
+            // constraint, no global side effect, safe for library/test callers.
+            .tls_backend_preconfigured(build_tls_config())
             .build()
             .unwrap_or_default();
         Self {
