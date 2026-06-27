@@ -34,7 +34,7 @@ jobs:
             artifact: structured-proxy-linux-arm64
             runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # Build from the exact released tag, so a manual re-run for an older
           # tag packages that tag's commit rather than whatever ref triggered
@@ -70,7 +70,7 @@ jobs:
              structured-proxy-${{ env.TAG_NAME }}-${{ matrix.artifact }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: structured-proxy-${{ env.TAG_NAME }}-${{ matrix.artifact }}
@@ -105,7 +105,7 @@ jobs:
             rpm-build rpmdevtools systemd-rpm-macros findutils tar
           rpmdev-setuptree
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # Build from the exact released tag, so a manual re-run for an older
           # tag packages that tag's commit rather than whatever ref triggered
@@ -151,7 +151,7 @@ jobs:
           cp ~/rpmbuild/RPMS/${{ matrix.arch }}/*.rpm /tmp/artifacts/
 
       - name: Upload RPM artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rpm-fc${{ matrix.fedora }}-${{ matrix.arch }}
           path: /tmp/artifacts/*.rpm
@@ -191,7 +191,7 @@ jobs:
             debhelper dpkg-dev dh-make ca-certificates findutils \
             build-essential adduser
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # Build from the exact released tag, so a manual re-run for an older
           # tag packages that tag's commit rather than whatever ref triggered
@@ -245,7 +245,7 @@ jobs:
           cp /tmp/structured-proxy_${VERSION}_${{ matrix.arch }}.deb /tmp/artifacts/
 
       - name: Upload DEB artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: deb-${{ matrix.codename }}-${{ matrix.arch }}
           path: /tmp/artifacts/*.deb
@@ -262,7 +262,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [build-rpm, build-deb]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # Build from the exact released tag, so a manual re-run for an older
           # tag packages that tag's commit rather than whatever ref triggered
@@ -275,7 +275,7 @@ jobs:
           cp packaging/manifest.json /tmp/repo-meta/
 
       - name: Upload repo-meta artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: repo-meta-structured-proxy
           path: /tmp/repo-meta/
