@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.2](https://github.com/structured-world/structured-proxy/compare/v2.2.1...v2.2.2) - 2026-06-27
+
+### Fixed
+
+- *(auth)* pin self-contained rustls TLS for the JWKS client
+
+### Other
+
+- *(deps)* bump reqwest to 0.13, refresh dependencies
+- Merge branch 'main' into dependabot/cargo/redis-1.2
+- Merge branch 'main' into dependabot/github_actions/actions/download-artifact-8
+- Merge branch 'main' into dependabot/github_actions/softprops/action-gh-release-3
+- Merge branch 'main' into dependabot/github_actions/actions/create-github-app-token-3
+- Merge branch 'main' into dependabot/github_actions/actions/checkout-7
+- *(deps)* bump actions/upload-artifact from 4 to 7
+
 ## [2.2.1](https://github.com/structured-world/structured-proxy/compare/v2.2.0...v2.2.1) - 2026-06-21
 
 ### Fixed
