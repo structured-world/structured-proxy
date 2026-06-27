@@ -36,6 +36,11 @@ const JWKS_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 impl JwksCache {
     /// Create a cache for `uri` (keys are loaded lazily on first lookup).
     pub fn new(uri: String) -> Self {
+        // reqwest is built with `rustls-no-provider`, so it resolves the rustls
+        // CryptoProvider from the process default. Install ring (idempotent: a
+        // returned Err just means it was already set) before constructing the
+        // client, otherwise the TLS handshake has no provider to use.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let client = reqwest::Client::builder()
             .timeout(JWKS_HTTP_TIMEOUT)
             .build()
