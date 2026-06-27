@@ -69,7 +69,16 @@ redis = { version = "1.2", features = ["tokio-comp"], optional = true }
 # features (see [features] below); `use_pem` is always required for PEM key
 # parsing and is therefore enabled unconditionally.
 jsonwebtoken = { version = "10", default-features = false, features = ["use_pem"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# reqwest 0.13's `rustls` feature hardwires the aws-lc-rs provider (C FFI, awkward
+# for the musl static build). We keep the pure-Rust `ring` provider instead:
+# `rustls-no-provider` builds rustls without a bundled provider, and auth/jwks.rs
+# hands reqwest a fully preconfigured rustls ClientConfig (ring provider + bundled
+# Mozilla roots from webpki-roots). Bundling the roots keeps the binary self-
+# contained, so it works on musl / scratch / distroless images with no system CA
+# bundle (matching reqwest 0.12's old `rustls-tls` behaviour).
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
 globset = "0.4"
 base64 = "0.22"
 sha2 = "0.11"
