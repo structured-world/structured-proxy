@@ -325,7 +325,31 @@ auth:
     assert!(result
         .unwrap_err()
         .to_string()
-        .contains("collides with a health/metrics endpoint"));
+        .contains("collides with a built-in endpoint"));
+}
+
+#[tokio::test]
+async fn verify_path_colliding_with_openapi_docs_is_a_clean_error() {
+    // The collision guard must cover every built-in GET route mounted before
+    // verify, including the OpenAPI spec/docs paths (not just health/metrics).
+    let config = ProxyConfig::from_yaml_str(
+        r#"
+upstream:
+  default: "http://127.0.0.1:50051"
+openapi:
+  enabled: true
+"#,
+    )
+    .unwrap();
+    let result = ProxyServer::from_config(config)
+        .with_auth_decider(Arc::new(DemoDecider))
+        .with_verify_path("/docs")
+        .router();
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("collides with a built-in endpoint"));
 }
 
 #[tokio::test]
@@ -342,7 +366,7 @@ async fn verify_path_colliding_with_probe_is_a_clean_error() {
     assert!(result
         .unwrap_err()
         .to_string()
-        .contains("collides with a health/metrics endpoint"));
+        .contains("collides with a built-in endpoint"));
 }
 
 #[tokio::test]

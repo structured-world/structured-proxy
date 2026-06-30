@@ -200,8 +200,11 @@ impl ProxyServer {
         })
     }
 
-    /// The built-in `GET` paths that are actually mounted (enabled health probes
-    /// and metrics), used to detect collisions before registering more routes.
+    /// The built-in `GET` paths that are actually mounted (enabled health probes,
+    /// metrics, and OpenAPI spec/docs), used to detect collisions before
+    /// registering more routes (e.g. the verify endpoint). Must list EVERY
+    /// built-in route mounted before verify, or a colliding verify path slips
+    /// past the guard and panics axum at route registration.
     fn builtin_get_paths(&self) -> Vec<String> {
         let mut paths = Vec::new();
         if self.config.health.enabled {
@@ -212,6 +215,10 @@ impl ProxyServer {
         }
         if self.config.metrics.enabled {
             paths.push(self.config.metrics.path.clone());
+        }
+        if let Some(openapi) = self.config.openapi.as_ref().filter(|o| o.enabled) {
+            paths.push(openapi.path.clone());
+            paths.push(openapi.docs_path.clone());
         }
         paths
     }
@@ -288,21 +295,22 @@ impl ProxyServer {
                 .map_err(|e| anyhow::anyhow!("invalid authz config: {e}"))?,
             None => None,
         };
-        if let Some(authz) = authz {
-            transcode_routes = transcode_routes.layer(axum::middleware::from_fn_with_state(
-                authz,
-                auth::authz::middleware,
-            ));
-        }
 
-        // Embedded Tier-2 in-process gate: an injected AuthDecider runs inline on
-        // the proxied routes (it sees the JWT-injected identity headers, like the
-        // ext_authz layer above). Added after authz so authz, when both are set,
-        // runs first (inner layer).
+        // Order matters: in axum the LAST-added layer is outermost and runs
+        // FIRST. We want `authz -> AuthDecider -> handler`, so add the decider
+        // layer first (inner) and the authz layer second (outer). That way, when
+        // both are configured, ext_authz runs first and the in-process decider
+        // sees any headers the authz Check injected.
         if let Some(decider) = &self.auth_decider {
             transcode_routes = transcode_routes.layer(axum::middleware::from_fn_with_state(
                 decider.clone(),
                 embed::auth_decider_gate,
+            ));
+        }
+        if let Some(authz) = authz {
+            transcode_routes = transcode_routes.layer(axum::middleware::from_fn_with_state(
+                authz,
+                auth::authz::middleware,
             ));
         }
 
@@ -435,9 +443,7 @@ impl ProxyServer {
         if (self.auth_decider.is_some() || forward_auth.is_some())
             && self.builtin_get_paths().iter().any(|p| p == &verify_path)
         {
-            anyhow::bail!(
-                "verify path {verify_path:?} collides with a health/metrics endpoint path"
-            );
+            anyhow::bail!("verify path {verify_path:?} collides with a built-in endpoint path");
         }
 
         // Auth runs inside Shield (added first = inner): rate limiting sheds

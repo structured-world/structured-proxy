@@ -640,12 +640,16 @@ impl ProxyConfig {
         Ok(())
     }
 
-    /// Reject duplicate built-in edge paths up front, so the router does not
-    /// panic at construction registering the same path twice (e.g. setting
+    /// Reject malformed or duplicate built-in edge paths up front, so the router
+    /// does not panic at construction (axum rejects a route that does not start
+    /// with `/`, and panics on a path registered twice, e.g. setting
     /// `health.path` to the default `live_path`).
     fn validate_edge_paths(&self) -> anyhow::Result<()> {
         let mut seen = std::collections::HashSet::new();
         let mut check = |label: &str, path: &str| -> anyhow::Result<()> {
+            if !path.starts_with('/') {
+                anyhow::bail!("endpoint path {path:?} ({label}) must start with '/'");
+            }
             if !seen.insert(path.to_string()) {
                 anyhow::bail!("duplicate endpoint path {path:?} ({label}); each built-in endpoint must have a distinct path");
             }
@@ -754,6 +758,20 @@ health:
   path: "/metrics"
 "#;
         assert!(ProxyConfig::from_yaml_str(yaml3).is_ok());
+    }
+
+    #[test]
+    fn malformed_edge_path_is_rejected() {
+        // A path without a leading '/' would make axum reject the route at
+        // construction; catch it at config load with a clear message.
+        let yaml = r#"
+upstream:
+  default: "grpc://x:1"
+health:
+  path: "health"
+"#;
+        let err = ProxyConfig::from_yaml_str(yaml).unwrap_err();
+        assert!(err.to_string().contains("must start with '/'"));
     }
 
     #[test]

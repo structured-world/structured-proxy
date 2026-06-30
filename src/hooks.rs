@@ -113,9 +113,12 @@ pub trait OidcBackend: Send + Sync {
         "/userinfo".to_string()
     }
 
-    /// Resolve UserInfo claims for a verified bearer token. `None` yields `401`.
-    /// `bearer` is the raw token (the `Bearer ` prefix already stripped), or an
-    /// empty string when no credentials were presented.
+    /// Resolve UserInfo claims for a bearer token. `None` yields `401`.
+    ///
+    /// `bearer` is always a present, non-empty token (the `Bearer ` prefix
+    /// already stripped): a request with no credentials is rejected with a
+    /// `401` Bearer challenge before this method is called, so implementations
+    /// never receive an empty string.
     async fn userinfo(&self, bearer: &str) -> Option<serde_json::Value>;
 }
 
