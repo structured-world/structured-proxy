@@ -202,8 +202,9 @@ async fn main() -> anyhow::Result<()> {
 
 Inject *stateless* service-specific logic without naming an HTTP framework in
 your own crate: implement the hook traits with foundational types (`http`,
-`bytes`, `serde_json`) only, and `cargo tree -i axum` in your crate shows `axum`
-solely under `structured-proxy`.
+`bytes`, `serde_json`) plus `async-trait` (the traits are `#[async_trait]`),
+none of which is an HTTP framework. `cargo tree -i axum` in your crate then
+shows `axum` solely under `structured-proxy`.
 
 ```rust
 use std::sync::Arc;
@@ -215,7 +216,7 @@ struct MyPdp; // your forward-auth / policy decision
 #[async_trait::async_trait]
 impl AuthDecider for MyPdp {
     async fn decide(&self, req: &RequestParts<'_>) -> Decision {
-        // method / path / headers / peer in, a decision out — no axum types
+        // method / path / headers / peer in, a decision out (no axum types)
         Decision::Allow { inject_headers: http::HeaderMap::new() }
     }
 }
