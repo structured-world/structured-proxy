@@ -50,6 +50,14 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub oidc_discovery: Option<OidcDiscoveryConfig>,
 
+    /// Health-probe endpoints (paths configurable; can be disabled).
+    #[serde(default)]
+    pub health: HealthConfig,
+
+    /// Prometheus metrics endpoint (path configurable; can be disabled).
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+
     /// Maintenance mode.
     #[serde(default)]
     pub maintenance: MaintenanceConfig,
@@ -447,6 +455,81 @@ fn default_algorithm() -> String {
     "EdDSA".into()
 }
 
+/// Health-probe endpoint configuration.
+///
+/// Paths are configurable so an embedder can relocate the probes (e.g. behind a
+/// `/internal/` prefix) or disable them when a fronting platform supplies its
+/// own. Defaults match the conventional `/health*` layout.
+#[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
+pub struct HealthConfig {
+    /// Mount the health endpoints. Default: true.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Aggregate health endpoint. Default: `/health`.
+    #[serde(default = "default_health_path")]
+    pub path: String,
+    /// Liveness probe. Default: `/health/live`.
+    #[serde(default = "default_health_live_path")]
+    pub live_path: String,
+    /// Readiness probe (checks the upstream gRPC health). Default: `/health/ready`.
+    #[serde(default = "default_health_ready_path")]
+    pub ready_path: String,
+    /// Startup probe. Default: `/health/startup`.
+    #[serde(default = "default_health_startup_path")]
+    pub startup_path: String,
+}
+
+fn default_health_path() -> String {
+    "/health".into()
+}
+fn default_health_live_path() -> String {
+    "/health/live".into()
+}
+fn default_health_ready_path() -> String {
+    "/health/ready".into()
+}
+fn default_health_startup_path() -> String {
+    "/health/startup".into()
+}
+
+impl Default for HealthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            path: default_health_path(),
+            live_path: default_health_live_path(),
+            ready_path: default_health_ready_path(),
+            startup_path: default_health_startup_path(),
+        }
+    }
+}
+
+/// Prometheus metrics endpoint configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
+pub struct MetricsConfig {
+    /// Mount the metrics endpoint. Default: true.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Scrape path. Default: `/metrics`.
+    #[serde(default = "default_metrics_path")]
+    pub path: String,
+}
+
+fn default_metrics_path() -> String {
+    "/metrics".into()
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            path: default_metrics_path(),
+        }
+    }
+}
+
 /// Maintenance mode config.
 #[derive(Debug, Clone, Deserialize)]
 #[non_exhaustive]
@@ -584,6 +667,35 @@ upstream:
         assert!(config.descriptors.is_empty());
         assert!(config.auth.is_none());
         assert!(config.shield.is_none());
+    }
+
+    #[test]
+    fn health_and_metrics_defaults_and_overrides() {
+        // Defaults: enabled, conventional paths.
+        let min: ProxyConfig =
+            serde_yaml::from_str("upstream:\n  default: \"grpc://x:1\"\n").unwrap();
+        assert!(min.health.enabled);
+        assert_eq!(min.health.path, "/health");
+        assert_eq!(min.health.ready_path, "/health/ready");
+        assert!(min.metrics.enabled);
+        assert_eq!(min.metrics.path, "/metrics");
+
+        // Overrides apply; unspecified sub-paths keep their defaults.
+        let yaml = r#"
+upstream:
+  default: "grpc://x:1"
+health:
+  path: "/internal/health"
+metrics:
+  enabled: false
+  path: "/internal/metrics"
+"#;
+        let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.health.path, "/internal/health");
+        // live_path was not overridden, so it stays at the default.
+        assert_eq!(cfg.health.live_path, "/health/live");
+        assert!(!cfg.metrics.enabled);
+        assert_eq!(cfg.metrics.path, "/internal/metrics");
     }
 
     #[test]

@@ -27,6 +27,8 @@ compile_error!("exactly one JWT crypto backend must be enabled: `rust_crypto` or
 
 pub mod auth;
 pub mod config;
+mod embed;
+pub mod hooks;
 pub mod oidc;
 pub mod openapi;
 pub mod shield;
@@ -43,7 +45,10 @@ use std::net::SocketAddr;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
+use std::sync::Arc;
+
 use config::{DescriptorSource, ProxyConfig};
+use hooks::{AuthDecider, ExtraRoute, OidcBackend};
 
 /// Shared state for all proxy handlers.
 #[derive(Clone, Debug)]
@@ -75,6 +80,14 @@ pub struct ProxyServer {
     config: ProxyConfig,
     /// Optional pre-loaded descriptor pool (for embedded mode).
     descriptor_pool: Option<DescriptorPool>,
+    /// Optional in-process forward-auth/PDP gate (embedded Tier-2 hook).
+    auth_decider: Option<Arc<dyn AuthDecider>>,
+    /// Optional stateless OIDC surface backing (embedded Tier-2 hook).
+    oidc_backend: Option<Arc<dyn OidcBackend>>,
+    /// Embedder-supplied extra stateless routes (embedded Tier-2 hook).
+    extra_routes: Vec<ExtraRoute>,
+    /// Override for the `/verify` forward-auth path of an injected AuthDecider.
+    verify_path: Option<String>,
 }
 
 impl ProxyServer {
@@ -83,12 +96,54 @@ impl ProxyServer {
         Self {
             config,
             descriptor_pool: None,
+            auth_decider: None,
+            oidc_backend: None,
+            extra_routes: Vec::new(),
+            verify_path: None,
         }
     }
 
     /// Create with an embedded descriptor pool (for sid-proxy backward compat).
     pub fn with_descriptors(mut self, pool: DescriptorPool) -> Self {
         self.descriptor_pool = Some(pool);
+        self
+    }
+
+    /// Inject an in-process forward-auth / PDP decision (embedded Tier-2 hook).
+    ///
+    /// The decider gates every proxied request inline and also backs the
+    /// `/verify` forward-auth endpoint. Its signature is `axum`-free (see
+    /// [`hooks::AuthDecider`]), so the embedder never names an HTTP framework.
+    pub fn with_auth_decider(mut self, decider: Arc<dyn AuthDecider>) -> Self {
+        self.auth_decider = Some(decider);
+        self
+    }
+
+    /// Back the stateless OIDC surface (discovery, JWKS, userinfo) with the
+    /// embedder's key/client metadata (embedded Tier-2 hook).
+    ///
+    /// When set, this supersedes the config-driven static `oidc_discovery`
+    /// routes. See [`hooks::OidcBackend`].
+    pub fn with_oidc_backend(mut self, backend: Arc<dyn OidcBackend>) -> Self {
+        self.oidc_backend = Some(backend);
+        self
+    }
+
+    /// Register extra stateless routes through an `axum`-free adapter (embedded
+    /// Tier-2 hook). See [`hooks::ExtraRoute`] / [`hooks::ExtraRouteHandler`].
+    pub fn with_extra_routes(mut self, routes: impl IntoIterator<Item = ExtraRoute>) -> Self {
+        self.extra_routes.extend(routes);
+        self
+    }
+
+    /// Set the path at which the injected [`AuthDecider`] answers forward-auth
+    /// sub-requests (`/verify`). Independent of any JWT `forward_auth` config, so
+    /// a decider-only embedder can place it without a JWT block.
+    ///
+    /// Resolution order for the path: this override, then
+    /// `auth.forward_auth.path` from config, then the default `/auth/verify`.
+    pub fn with_verify_path(mut self, path: impl Into<String>) -> Self {
+        self.verify_path = Some(path.into());
         self
     }
 
@@ -183,51 +238,70 @@ impl ProxyServer {
             ));
         }
 
-        // Health routes
-        let health_service_name = service_name.clone();
-        let health_routes = Router::new()
-            .route(
-                "/health",
-                get({
-                    let name = health_service_name.clone();
-                    move || async move {
-                        Json(serde_json::json!({
-                            "status": "ok",
-                            "service": name,
-                        }))
-                    }
-                }),
-            )
-            .route("/health/live", get(|| async { StatusCode::OK }))
-            .route(
-                "/health/ready",
-                get(|State(state): State<ProxyState>| async move {
-                    let mut client =
-                        tonic_health::pb::health_client::HealthClient::new(state.grpc_channel);
-                    match client
-                        .check(tonic_health::pb::HealthCheckRequest {
-                            service: String::new(),
-                        })
-                        .await
-                    {
-                        Ok(resp) => {
-                            let status = resp.into_inner().status;
-                            if status
-                                == tonic_health::pb::health_check_response::ServingStatus::Serving
-                                    as i32
-                            {
-                                StatusCode::OK
-                            } else {
-                                StatusCode::SERVICE_UNAVAILABLE
-                            }
+        // Embedded Tier-2 in-process gate: an injected AuthDecider runs inline on
+        // the proxied routes (it sees the JWT-injected identity headers, like the
+        // ext_authz layer above). Added after authz so authz, when both are set,
+        // runs first (inner layer).
+        if let Some(decider) = &self.auth_decider {
+            transcode_routes = transcode_routes.layer(axum::middleware::from_fn_with_state(
+                decider.clone(),
+                embed::auth_decider_gate,
+            ));
+        }
+
+        // Health routes. Paths are configurable; the whole group is skippable.
+        let health_routes = if self.config.health.enabled {
+            let health = &self.config.health;
+            let health_service_name = service_name.clone();
+            Router::new()
+                .route(
+                    &health.path,
+                    get({
+                        let name = health_service_name.clone();
+                        move || async move {
+                            Json(serde_json::json!({
+                                "status": "ok",
+                                "service": name,
+                            }))
                         }
-                        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
-                    }
-                }),
-            )
-            .route("/health/startup", get(|| async { StatusCode::OK }))
-            .route(
-                "/metrics",
+                    }),
+                )
+                .route(&health.live_path, get(|| async { StatusCode::OK }))
+                .route(
+                    &health.ready_path,
+                    get(|State(state): State<ProxyState>| async move {
+                        let mut client =
+                            tonic_health::pb::health_client::HealthClient::new(state.grpc_channel);
+                        match client
+                            .check(tonic_health::pb::HealthCheckRequest {
+                                service: String::new(),
+                            })
+                            .await
+                        {
+                            Ok(resp) => {
+                                let status = resp.into_inner().status;
+                                if status
+                                    == tonic_health::pb::health_check_response::ServingStatus::Serving
+                                        as i32
+                                {
+                                    StatusCode::OK
+                                } else {
+                                    StatusCode::SERVICE_UNAVAILABLE
+                                }
+                            }
+                            Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+                        }
+                    }),
+                )
+                .route(&health.startup_path, get(|| async { StatusCode::OK }))
+        } else {
+            Router::new()
+        };
+
+        // Metrics route. Path is configurable; the endpoint is skippable.
+        let metrics_routes = if self.config.metrics.enabled {
+            Router::new().route(
+                &self.config.metrics.path,
                 get(|| async {
                     let encoder = prometheus::TextEncoder::new();
                     let metric_families = prometheus::default_registry().gather();
@@ -244,18 +318,26 @@ impl ProxyServer {
                         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
                     }
                 }),
-            );
+            )
+        } else {
+            Router::new()
+        };
 
         // OpenAPI + docs routes (if enabled).
         let openapi_routes = self.build_openapi_routes(&pool);
 
-        // OIDC discovery routes (if enabled). Public, like the health endpoints.
-        let oidc_routes = match &self.config.oidc_discovery {
-            Some(cfg) => oidc::Oidc::build(cfg)
-                .map_err(|e| anyhow::anyhow!("invalid oidc_discovery config: {e}"))?
-                .map(|o| o.routes())
-                .unwrap_or_default(),
-            None => Router::new(),
+        // OIDC routes (public, like the health endpoints). An injected
+        // OidcBackend supersedes the config-driven static discovery: the proxy
+        // hosts the HTTP surface, the embedder supplies the content.
+        let oidc_routes = match &self.oidc_backend {
+            Some(backend) => embed::oidc_backend_routes(backend.clone()),
+            None => match &self.config.oidc_discovery {
+                Some(cfg) => oidc::Oidc::build(cfg)
+                    .map_err(|e| anyhow::anyhow!("invalid oidc_discovery config: {e}"))?
+                    .map(|o| o.routes())
+                    .unwrap_or_default(),
+                None => Router::new(),
+            },
         };
 
         // Rate limiting (Shield), if configured and enabled.
@@ -275,8 +357,10 @@ impl ProxyServer {
 
         let mut router = Router::new()
             .merge(health_routes)
+            .merge(metrics_routes)
             .merge(openapi_routes)
             .merge(oidc_routes)
+            .merge(embed::extra_routes_router(&self.extra_routes))
             .merge(transcode_routes)
             .layer(cors);
 
@@ -293,7 +377,27 @@ impl ProxyServer {
             router = router.layer(axum::middleware::from_fn_with_state(auth, auth::middleware));
         }
 
-        if let Some(forward_auth) = &forward_auth {
+        // Forward-auth `/verify` endpoint. An injected AuthDecider owns it when
+        // present (in-process PDP); otherwise the config-driven JWT ForwardAuth
+        // backs it. Mounted after the auth layer so it is not itself JWT-gated.
+        if let Some(decider) = &self.auth_decider {
+            let verify_path = self.verify_path.clone().unwrap_or_else(|| {
+                self.config
+                    .auth
+                    .as_ref()
+                    .and_then(|a| a.forward_auth.as_ref())
+                    .map(|fa| fa.path.clone())
+                    .unwrap_or_else(|| "/auth/verify".to_string())
+            });
+            let decider = decider.clone();
+            router = router.route(
+                &verify_path,
+                axum::routing::any(move |req: axum::extract::Request| {
+                    let decider = decider.clone();
+                    async move { embed::verify_via_decider(decider, req).await }
+                }),
+            );
+        } else if let Some(forward_auth) = &forward_auth {
             router = router.merge(forward_auth.routes());
         }
 
@@ -434,6 +538,24 @@ pub(crate) fn test_channel() -> tonic::transport::Channel {
     tonic::transport::Channel::from_static("http://127.0.0.1:1")
         .connect_timeout(std::time::Duration::from_millis(100))
         .connect_lazy()
+}
+
+/// A minimal [`ProxyState`] for tests that only need a state to satisfy a
+/// `Router<ProxyState>` (the hook routers do not read it).
+#[cfg(test)]
+pub(crate) fn test_state() -> ProxyState {
+    ProxyState {
+        service_name: "test".into(),
+        grpc_upstream: "http://127.0.0.1:1".into(),
+        grpc_channel: test_channel(),
+        maintenance_mode: false,
+        maintenance_exempt: vec![],
+        maintenance_message: String::new(),
+        forwarded_headers: vec![],
+        metrics_namespace: "test".into(),
+        metrics_classes: vec![],
+        sse_keep_alive_secs: 15,
+    }
 }
 
 #[cfg(test)]

@@ -34,7 +34,7 @@ Works with **any** gRPC service via proto descriptor files. No code generation, 
 
 ## Non-goals
 
-- **Session / BFF management** (cookie-based login, server-side token storage, refresh flows). This proxy is a stateless transcoding data plane with stateless auth primitives; session lifecycle is a separate, stateful concern. Put a dedicated BFF (e.g. `oauth2-proxy`, Pomerium) in front, or drive auth through the forward-auth / external-authz hooks above.
+- **Session / BFF management** (cookie-based login, server-side token storage, refresh flows) and **stateful OIDC** (`authorize` / `token` with auth codes / PKCE state). The **default build** is a stateless transcoding data plane with stateless auth primitives; session lifecycle is a separate, stateful concern. Put a dedicated BFF (e.g. `oauth2-proxy`, Pomerium) in front, or drive auth through the stateless forward-auth / external-authz hooks below. (A stateful surface behind an opt-in, default-off `bff` Cargo feature is planned; it does not affect the default data-plane build.)
 
 ## Quick Start
 
@@ -75,6 +75,20 @@ cors:
 aliases:
   - from: "/api/v1/*"
     to: "/my.package.v1.MyService/*"
+
+# Optional: health-probe endpoints. Paths are configurable (relocate behind an
+# internal prefix) and the whole group can be disabled. Defaults shown.
+health:
+  enabled: true
+  path: "/health"
+  live_path: "/health/live"
+  ready_path: "/health/ready" # checks the upstream gRPC health
+  startup_path: "/health/startup"
+
+# Optional: Prometheus metrics endpoint. Path configurable; can be disabled.
+metrics:
+  enabled: true
+  path: "/metrics"
 
 # Optional: maintenance mode (returns 503 except for exempt paths)
 maintenance:
@@ -183,6 +197,49 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 ```
+
+### Embedding hooks (axum-free)
+
+Inject *stateless* service-specific logic without naming an HTTP framework in
+your own crate: implement the hook traits with foundational types (`http`,
+`bytes`, `serde_json`) only, and `cargo tree -i axum` in your crate shows `axum`
+solely under `structured-proxy`.
+
+```rust
+use std::sync::Arc;
+use structured_proxy::{config::ProxyConfig, ProxyServer};
+use structured_proxy::hooks::{AuthDecider, Decision, RequestParts};
+
+struct MyPdp; // your forward-auth / policy decision
+
+#[async_trait::async_trait]
+impl AuthDecider for MyPdp {
+    async fn decide(&self, req: &RequestParts<'_>) -> Decision {
+        // method / path / headers / peer in, a decision out — no axum types
+        Decision::Allow { inject_headers: http::HeaderMap::new() }
+    }
+}
+
+# async fn run(config: ProxyConfig) -> anyhow::Result<()> {
+ProxyServer::from_config(config)
+    .with_auth_decider(Arc::new(MyPdp))   // inline gate + /verify endpoint
+    // .with_oidc_backend(...)            // stateless discovery / JWKS / userinfo
+    // .with_extra_routes(...)            // extra stateless routes, axum-free
+    .serve()
+    .await
+# }
+```
+
+The hooks are:
+
+- **`with_auth_decider`** — an in-process forward-auth / PDP decision, run inline
+  on every proxied request and exposed at `/verify` (path configurable via
+  `with_verify_path`).
+- **`with_oidc_backend`** — backs the stateless OIDC surface (discovery, JWKS,
+  userinfo) with your key/client metadata; supersedes the config-driven static
+  discovery.
+- **`with_extra_routes`** — registers extra stateless routes through a
+  framework-agnostic adapter (request parts in, response parts out).
 
 ## How It Works
 
