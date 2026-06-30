@@ -179,6 +179,32 @@ pub fn routes<S: TranscodeState>(pool: &DescriptorPool, aliases: &[AliasConfig])
     router
 }
 
+/// The axum paths [`routes`] would register for this pool and aliases.
+///
+/// Mirrors the registration in [`routes`] (unary RPCs, their config aliases, and
+/// server-streaming RPCs) without building handlers, so callers can detect path
+/// collisions before mounting additional routes (e.g. a forward-auth endpoint).
+pub fn route_paths(pool: &DescriptorPool, aliases: &[AliasConfig]) -> Vec<String> {
+    let mut paths = Vec::new();
+    for entry in extract_routes(pool) {
+        paths.push(proto_path_to_axum(&entry.http_path));
+        for alias in aliases {
+            if let Some(suffix) = entry.http_path.strip_prefix(&alias.to) {
+                if alias.from.ends_with("/{path}") {
+                    let prefix = alias.from.trim_end_matches("/{path}");
+                    paths.push(format!("{prefix}{suffix}"));
+                }
+            }
+        }
+    }
+    for entry in extract_streaming_routes(pool) {
+        if matches!(entry.http_method, HttpMethod::Get | HttpMethod::Post) {
+            paths.push(proto_path_to_axum(&entry.http_path));
+        }
+    }
+    paths
+}
+
 /// JSON serialization options shared by the unary and streaming response paths,
 /// so a given message serializes identically regardless of RPC kind.
 fn response_serialize_options() -> SerializeOptions {

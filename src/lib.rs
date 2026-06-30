@@ -200,12 +200,14 @@ impl ProxyServer {
         })
     }
 
-    /// The built-in `GET` paths that are actually mounted (enabled health probes,
-    /// metrics, and OpenAPI spec/docs), used to detect collisions before
-    /// registering more routes (e.g. the verify endpoint). Must list EVERY
-    /// built-in route mounted before verify, or a colliding verify path slips
-    /// past the guard and panics axum at route registration.
-    fn builtin_get_paths(&self) -> Vec<String> {
+    /// Every path mounted before the verify endpoint, used to reject a colliding
+    /// verify path with a clear error instead of an axum duplicate-route panic.
+    ///
+    /// Must stay exhaustive: health probes, metrics, OpenAPI spec/docs, the OIDC
+    /// surface (injected backend or config-driven static discovery), embedder
+    /// extra routes, and the transcoded REST routes. A category omitted here lets
+    /// a colliding verify path slip past the guard and panic at registration.
+    fn reserved_get_paths(&self, pool: &DescriptorPool) -> anyhow::Result<Vec<String>> {
         let mut paths = Vec::new();
         if self.config.health.enabled {
             paths.push(self.config.health.path.clone());
@@ -220,7 +222,23 @@ impl ProxyServer {
             paths.push(openapi.path.clone());
             paths.push(openapi.docs_path.clone());
         }
-        paths
+        // OIDC: an injected backend supersedes config-driven static discovery.
+        if let Some(backend) = &self.oidc_backend {
+            paths.extend(backend.metadata_documents().into_iter().map(|d| d.path));
+            paths.push(backend.jwks().path);
+            paths.push(backend.userinfo_path());
+        } else if let Some(cfg) = &self.config.oidc_discovery {
+            if let Some(oidc) = oidc::Oidc::build(cfg)
+                .map_err(|e| anyhow::anyhow!("invalid oidc_discovery config: {e}"))?
+            {
+                paths.extend(oidc.paths());
+            }
+        }
+        for route in &self.extra_routes {
+            paths.push(route.path.clone());
+        }
+        paths.extend(transcode::route_paths(pool, &self.config.aliases));
+        Ok(paths)
     }
 
     /// Build the axum router with all endpoints.
@@ -436,14 +454,21 @@ impl ProxyServer {
             auth::forward::ForwardAuth::build(self.config.auth.as_ref()?, built.clone())
         });
 
-        // Guard the verify path against colliding with a built-in GET route
-        // (axum panics on duplicate path registration); fail with a clear error
-        // instead. Covers BOTH a verify endpoint owned by an injected decider
-        // and a config-driven JWT forward-auth mount (both land at `verify_path`).
-        if (self.auth_decider.is_some() || forward_auth.is_some())
-            && self.builtin_get_paths().iter().any(|p| p == &verify_path)
-        {
-            anyhow::bail!("verify path {verify_path:?} collides with a built-in endpoint path");
+        // Guard the verify endpoint (owned by an injected decider or a
+        // config-driven JWT forward-auth mount, both at `verify_path`) against a
+        // malformed or colliding path, so the router returns a clear error
+        // instead of axum panicking at route registration.
+        if self.auth_decider.is_some() || forward_auth.is_some() {
+            if !verify_path.starts_with('/') {
+                anyhow::bail!("verify path {verify_path:?} must start with '/'");
+            }
+            if self
+                .reserved_get_paths(&pool)?
+                .iter()
+                .any(|p| p == &verify_path)
+            {
+                anyhow::bail!("verify path {verify_path:?} collides with an already-mounted route");
+            }
         }
 
         // Auth runs inside Shield (added first = inner): rate limiting sheds

@@ -325,7 +325,7 @@ auth:
     assert!(result
         .unwrap_err()
         .to_string()
-        .contains("collides with a built-in endpoint"));
+        .contains("collides with an already-mounted route"));
 }
 
 #[tokio::test]
@@ -349,7 +349,40 @@ openapi:
     assert!(result
         .unwrap_err()
         .to_string()
-        .contains("collides with a built-in endpoint"));
+        .contains("collides with an already-mounted route"));
+}
+
+#[tokio::test]
+async fn verify_path_colliding_with_oidc_route_is_a_clean_error() {
+    // The reserved-path set must include OIDC backend routes; a verify path on
+    // top of the discovery document is a clean error, not a panic.
+    let config =
+        ProxyConfig::from_yaml_str("upstream:\n  default: \"http://127.0.0.1:50051\"\n").unwrap();
+    let result = ProxyServer::from_config(config)
+        .with_oidc_backend(Arc::new(DemoOidc))
+        .with_auth_decider(Arc::new(DemoDecider))
+        .with_verify_path("/.well-known/openid-configuration")
+        .router();
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("collides with an already-mounted route"));
+}
+
+#[tokio::test]
+async fn malformed_verify_path_is_a_clean_error() {
+    let config =
+        ProxyConfig::from_yaml_str("upstream:\n  default: \"http://127.0.0.1:50051\"\n").unwrap();
+    let result = ProxyServer::from_config(config)
+        .with_auth_decider(Arc::new(DemoDecider))
+        .with_verify_path("auth/verify") // missing leading '/'
+        .router();
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("must start with '/'"));
 }
 
 #[tokio::test]
@@ -366,7 +399,7 @@ async fn verify_path_colliding_with_probe_is_a_clean_error() {
     assert!(result
         .unwrap_err()
         .to_string()
-        .contains("collides with a built-in endpoint"));
+        .contains("collides with an already-mounted route"));
 }
 
 #[tokio::test]

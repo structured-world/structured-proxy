@@ -664,6 +664,10 @@ impl ProxyConfig {
         if self.metrics.enabled {
             check("metrics.path", &self.metrics.path)?;
         }
+        if let Some(openapi) = self.openapi.as_ref().filter(|o| o.enabled) {
+            check("openapi.path", &openapi.path)?;
+            check("openapi.docs_path", &openapi.docs_path)?;
+        }
         Ok(())
     }
 
