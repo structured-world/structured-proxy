@@ -260,6 +260,28 @@ impl ProxyServer {
 
         let verify_path = self.resolved_verify_path();
 
+        // Reject duplicate routes across the WHOLE mounted edge BEFORE any router
+        // is built, so a collision (between built-in routes, the OIDC surface,
+        // embedder extra routes, transcoded paths, or the verify endpoint) is a
+        // clear error instead of an axum duplicate-route panic at `.route`/`.merge`.
+        let verify_mounted = self.auth_decider.is_some()
+            || self.config.auth.as_ref().is_some_and(|a| {
+                a.mode == "jwt" && a.forward_auth.as_ref().is_some_and(|fa| fa.enabled)
+            });
+        let mut mounted = self.reserved_get_paths(&pool)?;
+        if verify_mounted {
+            if !verify_path.starts_with('/') {
+                anyhow::bail!("verify path {verify_path:?} must start with '/'");
+            }
+            mounted.push(verify_path.clone());
+        }
+        let mut seen = std::collections::HashSet::with_capacity(mounted.len());
+        for path in &mounted {
+            if !seen.insert(path.as_str()) {
+                anyhow::bail!("route path {path:?} is registered by more than one endpoint");
+            }
+        }
+
         // Keep the actually-configured probe / metrics / verify paths reachable
         // under maintenance mode. The default exempt list names the default
         // paths; once those are relocated via config, the relocated paths must
@@ -454,22 +476,8 @@ impl ProxyServer {
             auth::forward::ForwardAuth::build(self.config.auth.as_ref()?, built.clone())
         });
 
-        // Guard the verify endpoint (owned by an injected decider or a
-        // config-driven JWT forward-auth mount, both at `verify_path`) against a
-        // malformed or colliding path, so the router returns a clear error
-        // instead of axum panicking at route registration.
-        if self.auth_decider.is_some() || forward_auth.is_some() {
-            if !verify_path.starts_with('/') {
-                anyhow::bail!("verify path {verify_path:?} must start with '/'");
-            }
-            if self
-                .reserved_get_paths(&pool)?
-                .iter()
-                .any(|p| p == &verify_path)
-            {
-                anyhow::bail!("verify path {verify_path:?} collides with an already-mounted route");
-            }
-        }
+        // Duplicate-route collisions (including the verify path) were already
+        // rejected up front, before any router was built.
 
         // Auth runs inside Shield (added first = inner): rate limiting sheds
         // load before any signature verification work.

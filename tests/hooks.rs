@@ -325,7 +325,7 @@ auth:
     assert!(result
         .unwrap_err()
         .to_string()
-        .contains("collides with an already-mounted route"));
+        .contains("registered by more than one endpoint"));
 }
 
 #[tokio::test]
@@ -349,7 +349,7 @@ openapi:
     assert!(result
         .unwrap_err()
         .to_string()
-        .contains("collides with an already-mounted route"));
+        .contains("registered by more than one endpoint"));
 }
 
 #[tokio::test]
@@ -367,7 +367,27 @@ async fn verify_path_colliding_with_oidc_route_is_a_clean_error() {
     assert!(result
         .unwrap_err()
         .to_string()
-        .contains("collides with an already-mounted route"));
+        .contains("registered by more than one endpoint"));
+}
+
+#[tokio::test]
+async fn extra_route_colliding_with_builtin_is_a_clean_error() {
+    // A collision BETWEEN mounted routes (here an extra route over the health
+    // endpoint), not involving verify, is also a clean error rather than a panic.
+    let config =
+        ProxyConfig::from_yaml_str("upstream:\n  default: \"http://127.0.0.1:50051\"\n").unwrap();
+    let result = ProxyServer::from_config(config)
+        .with_extra_routes([ExtraRoute::new(
+            Method::GET,
+            "/health",
+            Arc::new(PingHandler),
+        )])
+        .router();
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("registered by more than one endpoint"));
 }
 
 #[tokio::test]
@@ -399,7 +419,7 @@ async fn verify_path_colliding_with_probe_is_a_clean_error() {
     assert!(result
         .unwrap_err()
         .to_string()
-        .contains("collides with an already-mounted route"));
+        .contains("registered by more than one endpoint"));
 }
 
 #[tokio::test]
