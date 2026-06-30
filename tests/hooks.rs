@@ -294,6 +294,41 @@ metrics:
 }
 
 #[tokio::test]
+async fn config_forward_auth_path_colliding_with_probe_is_a_clean_error() {
+    // The same collision guard must cover plain JWT forward-auth (no decider):
+    // a forward_auth.path equal to a built-in GET path is a clean error, not an
+    // axum duplicate-route panic.
+    const PUB_PEM: &str = "-----BEGIN PUBLIC KEY-----\n\
+        MCowBQYDK2VwAyEARCMxEnaM2/dblLuPNgBZpTvSUXO5ir+XQ1nyzJm4CFw=\n\
+        -----END PUBLIC KEY-----\n";
+    let pem_path = std::env::temp_dir().join(format!("sp_hooks_fa_{}.pem", std::process::id()));
+    std::fs::write(&pem_path, PUB_PEM).unwrap();
+
+    let config = ProxyConfig::from_yaml_str(&format!(
+        r#"
+upstream:
+  default: "http://127.0.0.1:50051"
+auth:
+  mode: "jwt"
+  jwt:
+    public_key_pem_file: "{}"
+  forward_auth:
+    enabled: true
+    path: "/health"
+"#,
+        pem_path.display()
+    ))
+    .unwrap();
+    let result = ProxyServer::from_config(config).router();
+    let _ = std::fs::remove_file(&pem_path);
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("collides with a health/metrics endpoint"));
+}
+
+#[tokio::test]
 async fn verify_path_colliding_with_probe_is_a_clean_error() {
     // A verify path that collides with a built-in GET route must surface a
     // config error, not an axum duplicate-route panic.

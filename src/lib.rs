@@ -428,6 +428,18 @@ impl ProxyServer {
             auth::forward::ForwardAuth::build(self.config.auth.as_ref()?, built.clone())
         });
 
+        // Guard the verify path against colliding with a built-in GET route
+        // (axum panics on duplicate path registration); fail with a clear error
+        // instead. Covers BOTH a verify endpoint owned by an injected decider
+        // and a config-driven JWT forward-auth mount (both land at `verify_path`).
+        if (self.auth_decider.is_some() || forward_auth.is_some())
+            && self.builtin_get_paths().iter().any(|p| p == &verify_path)
+        {
+            anyhow::bail!(
+                "verify path {verify_path:?} collides with a health/metrics endpoint path"
+            );
+        }
+
         // Auth runs inside Shield (added first = inner): rate limiting sheds
         // load before any signature verification work.
         if let Some(auth) = auth {
@@ -438,14 +450,7 @@ impl ProxyServer {
         // present (in-process PDP); otherwise the config-driven JWT ForwardAuth
         // backs it. Mounted after the auth layer so it is not itself JWT-gated.
         if let Some(decider) = &self.auth_decider {
-            // Guard against the verify path colliding with a built-in GET route
-            // (axum panics on duplicate path registration); fail with a clear
-            // error instead. `verify_path` was resolved once above.
-            if self.builtin_get_paths().iter().any(|p| p == &verify_path) {
-                anyhow::bail!(
-                    "verify path {verify_path:?} collides with a health/metrics endpoint path"
-                );
-            }
+            // Collision with a built-in GET path was already rejected above.
             let decider = decider.clone();
             router = router.route(
                 &verify_path,

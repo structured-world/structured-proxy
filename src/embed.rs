@@ -150,25 +150,26 @@ pub(crate) fn oidc_backend_routes(backend: Arc<dyn OidcBackend>) -> Router<Proxy
         get(move |headers: HeaderMap| {
             let backend = userinfo_backend.clone();
             async move {
-                let token = bearer_token(&headers);
-                match backend.userinfo(token.as_deref().unwrap_or("")).await {
+                // RFC 6750 §3 Bearer challenge lets clients classify the failure.
+                // No credentials: answer `Bearer` without invoking the backend at
+                // all (never call it with an empty token).
+                let Some(token) = bearer_token(&headers) else {
+                    return unauthorized_with_challenge(
+                        bytes::Bytes::from_static(
+                            br#"{"error":"invalid_request","message":"missing bearer token"}"#,
+                        ),
+                        "Bearer",
+                    );
+                };
+                match backend.userinfo(&token).await {
                     Some(claims) => Json(claims).into_response(),
-                    // RFC 6750 §3: a Bearer challenge lets clients classify the
-                    // failure. Plain `Bearer` when no credentials were sent;
-                    // `error="invalid_token"` when a presented token was rejected.
-                    None => {
-                        let challenge = if token.is_some() {
-                            r#"Bearer error="invalid_token""#
-                        } else {
-                            "Bearer"
-                        };
-                        unauthorized_with_challenge(
-                            bytes::Bytes::from_static(
-                                br#"{"error":"invalid_token","message":"invalid or expired token"}"#,
-                            ),
-                            challenge,
-                        )
-                    }
+                    // Presented token rejected by the backend.
+                    None => unauthorized_with_challenge(
+                        bytes::Bytes::from_static(
+                            br#"{"error":"invalid_token","message":"invalid or expired token"}"#,
+                        ),
+                        r#"Bearer error="invalid_token""#,
+                    ),
                 }
             }
         }),

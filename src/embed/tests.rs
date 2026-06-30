@@ -580,9 +580,15 @@ async fn oidc_paths_are_consumer_configurable() {
     assert_eq!(jwks.headers()["content-type"], "application/jwk-set+json");
 
     // UserInfo at the consumer's custom path; the default /userinfo is unmounted.
+    // A bearer token is required (the no-credentials path short-circuits to 401).
     let custom = app
         .clone()
-        .oneshot(Request::get("/oauth/userinfo").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::get("/oauth/userinfo")
+                .header("authorization", "Bearer any")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(custom.status(), StatusCode::OK);
@@ -651,4 +657,34 @@ async fn extra_route_oversized_body_is_rejected_not_emptied() {
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     // The handler's echo body ("h|...") must NOT appear: it never ran.
     assert!(!body_string(resp).await.starts_with("h|"));
+}
+
+// --- edge case: userinfo does not call the backend without credentials --
+
+/// Panics if `userinfo` is ever invoked, proving the no-credentials path
+/// short-circuits before reaching the backend.
+struct NeverCalledOidc;
+
+#[async_trait]
+impl OidcBackend for NeverCalledOidc {
+    fn metadata_documents(&self) -> Vec<MetadataDocument> {
+        Vec::new()
+    }
+    fn jwks(&self) -> MetadataDocument {
+        MetadataDocument::new("/jwks", serde_json::json!({ "keys": [] }))
+    }
+    async fn userinfo(&self, _bearer: &str) -> Option<serde_json::Value> {
+        panic!("userinfo must not be called when no bearer token is present");
+    }
+}
+
+#[tokio::test]
+async fn userinfo_without_token_does_not_invoke_backend() {
+    let app = oidc_backend_routes(Arc::new(NeverCalledOidc)).with_state(crate::test_state());
+    let resp = app
+        .oneshot(Request::get("/userinfo").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(resp.headers()["www-authenticate"], "Bearer");
 }
