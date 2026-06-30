@@ -187,6 +187,35 @@ impl ProxyServer {
         Ok(pool)
     }
 
+    /// Resolve the `/verify` forward-auth path: the `with_verify_path` override,
+    /// then `auth.forward_auth.path` from config, then the default `/auth/verify`.
+    fn resolved_verify_path(&self) -> String {
+        self.verify_path.clone().unwrap_or_else(|| {
+            self.config
+                .auth
+                .as_ref()
+                .and_then(|a| a.forward_auth.as_ref())
+                .map(|fa| fa.path.clone())
+                .unwrap_or_else(|| "/auth/verify".to_string())
+        })
+    }
+
+    /// The built-in `GET` paths that are actually mounted (enabled health probes
+    /// and metrics), used to detect collisions before registering more routes.
+    fn builtin_get_paths(&self) -> Vec<String> {
+        let mut paths = Vec::new();
+        if self.config.health.enabled {
+            paths.push(self.config.health.path.clone());
+            paths.push(self.config.health.live_path.clone());
+            paths.push(self.config.health.ready_path.clone());
+            paths.push(self.config.health.startup_path.clone());
+        }
+        if self.config.metrics.enabled {
+            paths.push(self.config.metrics.path.clone());
+        }
+        paths
+    }
+
     /// Build the axum router with all endpoints.
     pub fn router(&self) -> anyhow::Result<Router> {
         // Enforce cross-field invariants on the embedded path too, where the
@@ -204,12 +233,40 @@ impl ProxyServer {
         let service_name = self.config.service.name.clone();
         let metrics_namespace = service_name.replace('-', "_");
 
+        let verify_path = self.resolved_verify_path();
+
+        // Keep the actually-configured probe / metrics / verify paths reachable
+        // under maintenance mode. The default exempt list names the default
+        // paths; once those are relocated via config, the relocated paths must
+        // be exempted too, or maintenance would 503 probe and forward-auth
+        // traffic that was intentionally exempt before.
+        let mut maintenance_exempt = self.config.maintenance.exempt_paths.clone();
+        if self.config.health.enabled {
+            maintenance_exempt.push(self.config.health.path.clone());
+            maintenance_exempt.push(self.config.health.live_path.clone());
+            maintenance_exempt.push(self.config.health.ready_path.clone());
+            maintenance_exempt.push(self.config.health.startup_path.clone());
+        }
+        if self.config.metrics.enabled {
+            maintenance_exempt.push(self.config.metrics.path.clone());
+        }
+        if self.auth_decider.is_some()
+            || self
+                .config
+                .auth
+                .as_ref()
+                .and_then(|a| a.forward_auth.as_ref())
+                .is_some_and(|fa| fa.enabled)
+        {
+            maintenance_exempt.push(verify_path.clone());
+        }
+
         let state = ProxyState {
             service_name: service_name.clone(),
             grpc_upstream,
             grpc_channel,
             maintenance_mode: self.config.maintenance.enabled,
-            maintenance_exempt: self.config.maintenance.exempt_paths.clone(),
+            maintenance_exempt,
             maintenance_message: self.config.maintenance.message.clone(),
             forwarded_headers: self.config.forwarded_headers.clone(),
             metrics_namespace,
@@ -381,14 +438,14 @@ impl ProxyServer {
         // present (in-process PDP); otherwise the config-driven JWT ForwardAuth
         // backs it. Mounted after the auth layer so it is not itself JWT-gated.
         if let Some(decider) = &self.auth_decider {
-            let verify_path = self.verify_path.clone().unwrap_or_else(|| {
-                self.config
-                    .auth
-                    .as_ref()
-                    .and_then(|a| a.forward_auth.as_ref())
-                    .map(|fa| fa.path.clone())
-                    .unwrap_or_else(|| "/auth/verify".to_string())
-            });
+            // Guard against the verify path colliding with a built-in GET route
+            // (axum panics on duplicate path registration); fail with a clear
+            // error instead. `verify_path` was resolved once above.
+            if self.builtin_get_paths().iter().any(|p| p == &verify_path) {
+                anyhow::bail!(
+                    "verify path {verify_path:?} collides with a health/metrics endpoint path"
+                );
+            }
             let decider = decider.clone();
             router = router.route(
                 &verify_path,

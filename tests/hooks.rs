@@ -294,6 +294,85 @@ metrics:
 }
 
 #[tokio::test]
+async fn verify_path_colliding_with_probe_is_a_clean_error() {
+    // A verify path that collides with a built-in GET route must surface a
+    // config error, not an axum duplicate-route panic.
+    let config =
+        ProxyConfig::from_yaml_str("upstream:\n  default: \"http://127.0.0.1:50051\"\n").unwrap();
+    let result = ProxyServer::from_config(config)
+        .with_auth_decider(Arc::new(DemoDecider))
+        .with_verify_path("/health")
+        .router();
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("collides with a health/metrics endpoint"));
+}
+
+#[tokio::test]
+async fn relocated_paths_stay_exempt_under_maintenance() {
+    // With maintenance enabled, relocated probe / metrics / verify paths must
+    // stay reachable (they were exempt at their default locations).
+    let config = ProxyConfig::from_yaml_str(
+        r#"
+upstream:
+  default: "http://127.0.0.1:50051"
+maintenance:
+  enabled: true
+health:
+  path: "/internal/health"
+metrics:
+  path: "/internal/metrics"
+"#,
+    )
+    .unwrap();
+    let app = ProxyServer::from_config(config)
+        .with_auth_decider(Arc::new(DemoDecider))
+        .with_verify_path("/internal/verify")
+        .router()
+        .unwrap();
+
+    // Probe + metrics reachable despite maintenance.
+    for path in ["/internal/health", "/internal/metrics"] {
+        let resp = app
+            .clone()
+            .oneshot(axum::http::Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "{path} blocked by maintenance"
+        );
+    }
+
+    // Relocated verify endpoint is exempt and answers the decider's decision.
+    let verify = app
+        .clone()
+        .oneshot(
+            axum::http::Request::get("/internal/verify")
+                .header("x-forwarded-uri", "/v1/public/info")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(verify.status(), StatusCode::OK);
+
+    // A non-exempt proxied path still gets the 503 maintenance response.
+    let blocked = app
+        .oneshot(
+            axum::http::Request::get("/v1/anything")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(blocked.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
 async fn extra_route_is_mounted() {
     let app = server().router().unwrap();
     let resp = app

@@ -636,6 +636,30 @@ impl ProxyConfig {
         if self.streaming.sse_keep_alive_secs == 0 {
             anyhow::bail!("streaming.sse_keep_alive_secs must be greater than 0");
         }
+        self.validate_edge_paths()?;
+        Ok(())
+    }
+
+    /// Reject duplicate built-in edge paths up front, so the router does not
+    /// panic at construction registering the same path twice (e.g. setting
+    /// `health.path` to the default `live_path`).
+    fn validate_edge_paths(&self) -> anyhow::Result<()> {
+        let mut seen = std::collections::HashSet::new();
+        let mut check = |label: &str, path: &str| -> anyhow::Result<()> {
+            if !seen.insert(path.to_string()) {
+                anyhow::bail!("duplicate endpoint path {path:?} ({label}); each built-in endpoint must have a distinct path");
+            }
+            Ok(())
+        };
+        if self.health.enabled {
+            check("health.path", &self.health.path)?;
+            check("health.live_path", &self.health.live_path)?;
+            check("health.ready_path", &self.health.ready_path)?;
+            check("health.startup_path", &self.health.startup_path)?;
+        }
+        if self.metrics.enabled {
+            check("metrics.path", &self.metrics.path)?;
+        }
         Ok(())
     }
 
@@ -696,6 +720,40 @@ metrics:
         assert_eq!(cfg.health.live_path, "/health/live");
         assert!(!cfg.metrics.enabled);
         assert_eq!(cfg.metrics.path, "/internal/metrics");
+    }
+
+    #[test]
+    fn duplicate_probe_paths_are_rejected() {
+        // health.path set to the default live_path collides on a single GET
+        // route; reject at load instead of panicking in the router.
+        let yaml = r#"
+upstream:
+  default: "grpc://x:1"
+health:
+  path: "/health/live"
+"#;
+        let err = ProxyConfig::from_yaml_str(yaml).unwrap_err();
+        assert!(err.to_string().contains("duplicate endpoint path"));
+
+        // A health path colliding with the metrics path is also rejected.
+        let yaml2 = r#"
+upstream:
+  default: "grpc://x:1"
+metrics:
+  path: "/health"
+"#;
+        let err2 = ProxyConfig::from_yaml_str(yaml2).unwrap_err();
+        assert!(err2.to_string().contains("duplicate endpoint path"));
+
+        // Disabling a group frees its paths from the collision check.
+        let yaml3 = r#"
+upstream:
+  default: "grpc://x:1"
+health:
+  enabled: false
+  path: "/metrics"
+"#;
+        assert!(ProxyConfig::from_yaml_str(yaml3).is_ok());
     }
 
     #[test]
