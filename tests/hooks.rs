@@ -406,6 +406,45 @@ async fn malformed_verify_path_is_a_clean_error() {
 }
 
 #[tokio::test]
+async fn config_forward_auth_guard_uses_config_path_not_override() {
+    // With no decider, config-driven JWT forward-auth mounts at
+    // auth.forward_auth.path; the with_verify_path override does NOT apply there.
+    // The guard must validate the CONFIG path (which collides with /health), not
+    // be fooled by the override pointing somewhere harmless.
+    const PUB_PEM: &str = "-----BEGIN PUBLIC KEY-----\n\
+        MCowBQYDK2VwAyEARCMxEnaM2/dblLuPNgBZpTvSUXO5ir+XQ1nyzJm4CFw=\n\
+        -----END PUBLIC KEY-----\n";
+    let pem_path = std::env::temp_dir().join(format!("sp_hooks_ov_{}.pem", std::process::id()));
+    std::fs::write(&pem_path, PUB_PEM).unwrap();
+
+    let config = ProxyConfig::from_yaml_str(&format!(
+        r#"
+upstream:
+  default: "http://127.0.0.1:50051"
+auth:
+  mode: "jwt"
+  jwt:
+    public_key_pem_file: "{}"
+  forward_auth:
+    enabled: true
+    path: "/health"
+"#,
+        pem_path.display()
+    ))
+    .unwrap();
+    // Override points elsewhere, but it is ignored for config-driven forward-auth.
+    let result = ProxyServer::from_config(config)
+        .with_verify_path("/elsewhere")
+        .router();
+    let _ = std::fs::remove_file(&pem_path);
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("registered by more than one endpoint"));
+}
+
+#[tokio::test]
 async fn verify_path_colliding_with_probe_is_a_clean_error() {
     // A verify path that collides with a built-in GET route must surface a
     // config error, not an axum duplicate-route panic.

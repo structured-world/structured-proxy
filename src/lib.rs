@@ -187,9 +187,11 @@ impl ProxyServer {
         Ok(pool)
     }
 
-    /// Resolve the `/verify` forward-auth path: the `with_verify_path` override,
-    /// then `auth.forward_auth.path` from config, then the default `/auth/verify`.
-    fn resolved_verify_path(&self) -> String {
+    /// The path an injected [`AuthDecider`] answers `/verify` at: the
+    /// `with_verify_path` override, then `auth.forward_auth.path`, then the
+    /// default `/auth/verify`. Only meaningful when a decider is set (the
+    /// override does not apply to config-driven JWT forward-auth).
+    fn decider_verify_path(&self) -> String {
         self.verify_path.clone().unwrap_or_else(|| {
             self.config
                 .auth
@@ -197,6 +199,30 @@ impl ProxyServer {
                 .and_then(|a| a.forward_auth.as_ref())
                 .map(|fa| fa.path.clone())
                 .unwrap_or_else(|| "/auth/verify".to_string())
+        })
+    }
+
+    /// The verify path that is ACTUALLY mounted, or `None` when no verify route
+    /// is mounted. This is what the collision guard and maintenance-exempt list
+    /// must use, since the two mount sites use different paths:
+    /// - an injected decider mounts at [`decider_verify_path`](Self::decider_verify_path)
+    ///   (the `with_verify_path` override applies), whereas
+    /// - config-driven JWT forward-auth mounts `forward_auth.routes()` at
+    ///   `auth.forward_auth.path` (the override does NOT apply, and it mounts
+    ///   only when `auth.mode == "jwt"`, since the endpoint shares the built JWT
+    ///   `Auth`).
+    fn mounted_verify_path(&self) -> Option<String> {
+        if self.auth_decider.is_some() {
+            return Some(self.decider_verify_path());
+        }
+        self.config.auth.as_ref().and_then(|a| {
+            if a.mode != "jwt" {
+                return None;
+            }
+            a.forward_auth
+                .as_ref()
+                .filter(|fa| fa.enabled)
+                .map(|fa| fa.path.clone())
         })
     }
 
@@ -258,22 +284,19 @@ impl ProxyServer {
         let service_name = self.config.service.name.clone();
         let metrics_namespace = service_name.replace('-', "_");
 
-        let verify_path = self.resolved_verify_path();
+        // The verify path that is actually mounted (branch-correct), if any.
+        let verify_path = self.mounted_verify_path();
 
         // Reject duplicate routes across the WHOLE mounted edge BEFORE any router
         // is built, so a collision (between built-in routes, the OIDC surface,
         // embedder extra routes, transcoded paths, or the verify endpoint) is a
         // clear error instead of an axum duplicate-route panic at `.route`/`.merge`.
-        let verify_mounted = self.auth_decider.is_some()
-            || self.config.auth.as_ref().is_some_and(|a| {
-                a.mode == "jwt" && a.forward_auth.as_ref().is_some_and(|fa| fa.enabled)
-            });
         let mut mounted = self.reserved_get_paths(&pool)?;
-        if verify_mounted {
-            if !verify_path.starts_with('/') {
-                anyhow::bail!("verify path {verify_path:?} must start with '/'");
+        if let Some(vp) = &verify_path {
+            if !vp.starts_with('/') {
+                anyhow::bail!("verify path {vp:?} must start with '/'");
             }
-            mounted.push(verify_path.clone());
+            mounted.push(vp.clone());
         }
         let mut seen = std::collections::HashSet::with_capacity(mounted.len());
         for path in &mounted {
@@ -297,15 +320,8 @@ impl ProxyServer {
         if self.config.metrics.enabled {
             maintenance_exempt.push(self.config.metrics.path.clone());
         }
-        if self.auth_decider.is_some()
-            || self
-                .config
-                .auth
-                .as_ref()
-                .and_then(|a| a.forward_auth.as_ref())
-                .is_some_and(|fa| fa.enabled)
-        {
-            maintenance_exempt.push(verify_path.clone());
+        if let Some(vp) = &verify_path {
+            maintenance_exempt.push(vp.clone());
         }
 
         let state = ProxyState {
@@ -489,10 +505,11 @@ impl ProxyServer {
         // present (in-process PDP); otherwise the config-driven JWT ForwardAuth
         // backs it. Mounted after the auth layer so it is not itself JWT-gated.
         if let Some(decider) = &self.auth_decider {
-            // Collision with a built-in GET path was already rejected above.
+            // Collision / shape of this path was already validated above.
             let decider = decider.clone();
+            let path = self.decider_verify_path();
             router = router.route(
-                &verify_path,
+                &path,
                 axum::routing::any(move |req: axum::extract::Request| {
                     let decider = decider.clone();
                     async move { embed::verify_via_decider(decider, req).await }
