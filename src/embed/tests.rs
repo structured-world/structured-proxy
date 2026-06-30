@@ -64,6 +64,11 @@ fn bearer_token_parses_either_case_and_rejects_other_schemes() {
     lower.insert("authorization", "bearer xyz".parse().unwrap());
     assert_eq!(bearer_token(&lower).as_deref(), Some("xyz"));
 
+    // Scheme name is case-insensitive (RFC 7235).
+    let mut upper = HeaderMap::new();
+    upper.insert("authorization", "BEARER tok".parse().unwrap());
+    assert_eq!(bearer_token(&upper).as_deref(), Some("tok"));
+
     let mut basic = HeaderMap::new();
     basic.insert("authorization", "Basic xyz".parse().unwrap());
     assert_eq!(bearer_token(&basic), None);
@@ -587,4 +592,63 @@ async fn oidc_paths_are_consumer_configurable() {
         .await
         .unwrap();
     assert_eq!(default.status(), StatusCode::NOT_FOUND);
+}
+
+// --- edge cases: userinfo WWW-Authenticate challenge --------------------
+
+#[tokio::test]
+async fn userinfo_401_carries_bearer_challenge() {
+    let app = oidc_backend_routes(Arc::new(TestOidc)).with_state(crate::test_state());
+
+    // No credentials → plain `Bearer` challenge.
+    let missing = app
+        .clone()
+        .oneshot(Request::get("/userinfo").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(missing.headers()["www-authenticate"], "Bearer");
+
+    // Presented-but-rejected token → invalid_token challenge.
+    let bad = app
+        .oneshot(
+            Request::get("/userinfo")
+                .header("authorization", "Bearer wrong")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        bad.headers()["www-authenticate"],
+        "Bearer error=\"invalid_token\""
+    );
+}
+
+// --- edge cases: extra-route oversized body -----------------------------
+
+#[tokio::test]
+async fn extra_route_oversized_body_is_rejected_not_emptied() {
+    // A body past MAX_EXTRA_ROUTE_BODY must yield 413, never reach the handler
+    // as an empty payload (which a body-parsing handler would misread).
+    let routes = vec![ExtraRoute::new(
+        Method::POST,
+        "/echo",
+        Arc::new(EchoBodyHandler),
+    )];
+    let app = extra_routes_router(&routes).with_state(crate::test_state());
+    let oversized = vec![b'x'; MAX_EXTRA_ROUTE_BODY + 1];
+    let resp = app
+        .oneshot(
+            Request::post("/echo")
+                .header("x-in", "h")
+                .body(Body::from(oversized))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    // The handler's echo body ("h|...") must NOT appear: it never ran.
+    assert!(!body_string(resp).await.starts_with("h|"));
 }

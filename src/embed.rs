@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::header::{CONTENT_TYPE, LOCATION};
+use axum::http::header::{CONTENT_TYPE, LOCATION, WWW_AUTHENTICATE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -150,15 +150,25 @@ pub(crate) fn oidc_backend_routes(backend: Arc<dyn OidcBackend>) -> Router<Proxy
         get(move |headers: HeaderMap| {
             let backend = userinfo_backend.clone();
             async move {
-                let token = bearer_token(&headers).unwrap_or_default();
-                match backend.userinfo(&token).await {
+                let token = bearer_token(&headers);
+                match backend.userinfo(token.as_deref().unwrap_or("")).await {
                     Some(claims) => Json(claims).into_response(),
-                    None => deny_response(
-                        StatusCode::UNAUTHORIZED,
-                        bytes::Bytes::from_static(
-                            br#"{"error":"invalid_token","message":"invalid or expired token"}"#,
-                        ),
-                    ),
+                    // RFC 6750 §3: a Bearer challenge lets clients classify the
+                    // failure. Plain `Bearer` when no credentials were sent;
+                    // `error="invalid_token"` when a presented token was rejected.
+                    None => {
+                        let challenge = if token.is_some() {
+                            r#"Bearer error="invalid_token""#
+                        } else {
+                            "Bearer"
+                        };
+                        unauthorized_with_challenge(
+                            bytes::Bytes::from_static(
+                                br#"{"error":"invalid_token","message":"invalid or expired token"}"#,
+                            ),
+                            challenge,
+                        )
+                    }
                 }
             }
         }),
@@ -188,9 +198,20 @@ pub(crate) fn extra_routes_router(routes: &[ExtraRoute]) -> Router<ProxyState> {
             async move {
                 let peer = peer_of(&request);
                 let (parts, body) = request.into_parts();
-                let body = axum::body::to_bytes(body, MAX_EXTRA_ROUTE_BODY)
-                    .await
-                    .unwrap_or_default();
+                // A failed/oversized read must NOT reach the handler as an empty
+                // body: a handler that verifies or parses the body would treat
+                // the truncation as a real empty payload. Reject instead.
+                let body = match axum::body::to_bytes(body, MAX_EXTRA_ROUTE_BODY).await {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        return deny_response(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            bytes::Bytes::from_static(
+                                br#"{"error":"payload_too_large","message":"request body exceeded limit or could not be read"}"#,
+                            ),
+                        )
+                    }
+                };
                 let resp = handler
                     .handle(RouteRequest {
                         method: parts.method,
@@ -239,6 +260,19 @@ fn deny_response(status: StatusCode, body: bytes::Bytes) -> Response {
     (status, [(CONTENT_TYPE, "application/json")], body).into_response()
 }
 
+/// A `401` JSON response carrying an RFC 6750 `WWW-Authenticate` Bearer challenge.
+fn unauthorized_with_challenge(body: bytes::Bytes, challenge: &'static str) -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [
+            (CONTENT_TYPE, "application/json"),
+            (WWW_AUTHENTICATE, challenge),
+        ],
+        body,
+    )
+        .into_response()
+}
+
 /// Render a `Decision::Redirect` at the given status with a `Location` header.
 /// A malformed `location` (not a valid header value) yields the bare status.
 fn redirect_response(status: StatusCode, location: &str) -> Response {
@@ -250,12 +284,14 @@ fn redirect_response(status: StatusCode, location: &str) -> Response {
 }
 
 /// The bearer token from an `Authorization` header (prefix stripped), if present.
+/// The `Bearer` scheme name is matched case-insensitively per RFC 7235.
 fn bearer_token(headers: &HeaderMap) -> Option<String> {
     let value = headers.get("authorization")?.to_str().ok()?;
-    let token = value
-        .strip_prefix("Bearer ")
-        .or_else(|| value.strip_prefix("bearer "))?
-        .trim();
+    let (scheme, rest) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = rest.trim();
     (!token.is_empty()).then(|| token.to_string())
 }
 
