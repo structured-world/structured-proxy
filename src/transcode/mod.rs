@@ -75,6 +75,19 @@ enum HttpMethod {
     Delete,
 }
 
+impl HttpMethod {
+    /// The uppercase HTTP method token (e.g. `"GET"`).
+    fn as_str(self) -> &'static str {
+        match self {
+            HttpMethod::Get => "GET",
+            HttpMethod::Post => "POST",
+            HttpMethod::Put => "PUT",
+            HttpMethod::Patch => "PATCH",
+            HttpMethod::Delete => "DELETE",
+        }
+    }
+}
+
 /// Build transcoded REST→gRPC routes from a descriptor pool.
 ///
 /// Takes a `DescriptorPool` and optional path aliases from config.
@@ -182,27 +195,34 @@ pub fn routes<S: TranscodeState>(pool: &DescriptorPool, aliases: &[AliasConfig])
 /// The axum paths [`routes`] would register for this pool and aliases.
 ///
 /// Mirrors the registration in [`routes`] (unary RPCs, their config aliases, and
-/// server-streaming RPCs) without building handlers, so callers can detect path
+/// server-streaming RPCs) without building handlers, so callers can detect route
 /// collisions before mounting additional routes (e.g. a forward-auth endpoint).
-pub fn route_paths(pool: &DescriptorPool, aliases: &[AliasConfig]) -> Vec<String> {
-    let mut paths = Vec::new();
+///
+/// Each entry is `(method, path)` where `method` is the uppercase HTTP token, so
+/// callers can distinguish same-path/different-method routes from real conflicts.
+pub fn route_paths(pool: &DescriptorPool, aliases: &[AliasConfig]) -> Vec<(String, String)> {
+    let mut routes = Vec::new();
     for entry in extract_routes(pool) {
-        paths.push(proto_path_to_axum(&entry.http_path));
+        let method = entry.http_method.as_str().to_string();
+        routes.push((method.clone(), proto_path_to_axum(&entry.http_path)));
         for alias in aliases {
             if let Some(suffix) = entry.http_path.strip_prefix(&alias.to) {
                 if alias.from.ends_with("/{path}") {
                     let prefix = alias.from.trim_end_matches("/{path}");
-                    paths.push(format!("{prefix}{suffix}"));
+                    routes.push((method.clone(), format!("{prefix}{suffix}")));
                 }
             }
         }
     }
     for entry in extract_streaming_routes(pool) {
         if matches!(entry.http_method, HttpMethod::Get | HttpMethod::Post) {
-            paths.push(proto_path_to_axum(&entry.http_path));
+            routes.push((
+                entry.http_method.as_str().to_string(),
+                proto_path_to_axum(&entry.http_path),
+            ));
         }
     }
-    paths
+    routes
 }
 
 /// JSON serialization options shared by the unary and streaming response paths,

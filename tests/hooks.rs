@@ -394,6 +394,39 @@ async fn extra_route_colliding_with_builtin_is_a_clean_error() {
 }
 
 #[tokio::test]
+async fn extra_routes_sharing_a_path_with_different_methods_are_allowed() {
+    // GET /c and POST /c are a legal shape (the adapter merges them by method);
+    // the collision guard must key on (method, path) and NOT reject them.
+    let config =
+        ProxyConfig::from_yaml_str("upstream:\n  default: \"http://127.0.0.1:50051\"\n").unwrap();
+    let app = ProxyServer::from_config(config)
+        .with_extra_routes([
+            ExtraRoute::new(Method::GET, "/c", Arc::new(PingHandler)),
+            ExtraRoute::new(Method::POST, "/c", Arc::new(PingHandler)),
+        ])
+        .router()
+        .unwrap();
+    for method in [Method::GET, Method::POST] {
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(method.clone())
+                    .uri("/c")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "{method} /c should be served"
+        );
+    }
+}
+
+#[tokio::test]
 async fn malformed_extra_route_path_is_a_clean_error() {
     // A consumer-supplied path without a leading '/' (here an extra route) would
     // panic axum at registration; it must be a clean build error instead.

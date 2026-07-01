@@ -226,45 +226,53 @@ impl ProxyServer {
         })
     }
 
-    /// Every path mounted before the verify endpoint, used to reject a colliding
-    /// verify path with a clear error instead of an axum duplicate-route panic.
+    /// Every `(method, path)` route mounted before the verify endpoint, used to
+    /// reject a real collision with a clear error instead of an axum
+    /// duplicate-route panic. `method` is the uppercase HTTP token; same-path
+    /// routes with different methods do NOT collide (the extra-route adapter and
+    /// axum merge them), so the key is the pair, not the path alone.
     ///
     /// Must stay exhaustive: health probes, metrics, OpenAPI spec/docs, the OIDC
     /// surface (injected backend or config-driven static discovery), embedder
-    /// extra routes, and the transcoded REST routes. A category omitted here lets
-    /// a colliding verify path slip past the guard and panic at registration.
-    fn reserved_get_paths(&self, pool: &DescriptorPool) -> anyhow::Result<Vec<String>> {
-        let mut paths = Vec::new();
+    /// extra routes, and the transcoded REST routes. All built-in surfaces here
+    /// are `GET`.
+    fn reserved_routes(&self, pool: &DescriptorPool) -> anyhow::Result<Vec<(String, String)>> {
+        let mut routes = Vec::new();
+        let mut get = |path: String| routes.push(("GET".to_string(), path));
         if self.config.health.enabled {
-            paths.push(self.config.health.path.clone());
-            paths.push(self.config.health.live_path.clone());
-            paths.push(self.config.health.ready_path.clone());
-            paths.push(self.config.health.startup_path.clone());
+            get(self.config.health.path.clone());
+            get(self.config.health.live_path.clone());
+            get(self.config.health.ready_path.clone());
+            get(self.config.health.startup_path.clone());
         }
         if self.config.metrics.enabled {
-            paths.push(self.config.metrics.path.clone());
+            get(self.config.metrics.path.clone());
         }
         if let Some(openapi) = self.config.openapi.as_ref().filter(|o| o.enabled) {
-            paths.push(openapi.path.clone());
-            paths.push(openapi.docs_path.clone());
+            get(openapi.path.clone());
+            get(openapi.docs_path.clone());
         }
         // OIDC: an injected backend supersedes config-driven static discovery.
         if let Some(backend) = &self.oidc_backend {
-            paths.extend(backend.metadata_documents().into_iter().map(|d| d.path));
-            paths.push(backend.jwks().path);
-            paths.push(backend.userinfo_path());
+            for doc in backend.metadata_documents() {
+                get(doc.path);
+            }
+            get(backend.jwks().path);
+            get(backend.userinfo_path());
         } else if let Some(cfg) = &self.config.oidc_discovery {
             if let Some(oidc) = oidc::Oidc::build(cfg)
                 .map_err(|e| anyhow::anyhow!("invalid oidc_discovery config: {e}"))?
             {
-                paths.extend(oidc.paths());
+                for path in oidc.paths() {
+                    get(path);
+                }
             }
         }
         for route in &self.extra_routes {
-            paths.push(route.path.clone());
+            routes.push((route.method.as_str().to_string(), route.path.clone()));
         }
-        paths.extend(transcode::route_paths(pool, &self.config.aliases));
-        Ok(paths)
+        routes.extend(transcode::route_paths(pool, &self.config.aliases));
+        Ok(routes)
     }
 
     /// Build the axum router with all endpoints.
@@ -291,20 +299,32 @@ impl ProxyServer {
         // malformed path (missing leading '/') or a collision (between built-in
         // routes, the OIDC surface, embedder extra routes, transcoded paths, or
         // the verify endpoint) is a clear error instead of an axum panic at
-        // `.route`/`.merge`. Consumer-supplied paths (OIDC backend, extra routes,
-        // verify) are not otherwise validated, so check every entry here.
-        let mut mounted = self.reserved_get_paths(&pool)?;
+        // `.route`/`.merge`. Collisions are keyed by (method, path): same-path
+        // routes with different methods are legal (they merge), so only a
+        // repeated (method, path) — or any overlap with the verify endpoint,
+        // which answers ALL methods (`*`) — is a real conflict.
+        let mut mounted = self.reserved_routes(&pool)?;
         if let Some(vp) = &verify_path {
-            mounted.push(vp.clone());
+            mounted.push(("*".to_string(), vp.clone()));
         }
-        let mut seen = std::collections::HashSet::with_capacity(mounted.len());
-        for path in &mounted {
+        let mut methods_by_path: std::collections::HashMap<&str, std::collections::HashSet<&str>> =
+            std::collections::HashMap::new();
+        for (method, path) in &mounted {
             if !path.starts_with('/') {
                 anyhow::bail!("route path {path:?} must start with '/'");
             }
-            if !seen.insert(path.as_str()) {
+            let methods = methods_by_path.entry(path.as_str()).or_default();
+            // `*` (the verify endpoint) claims every method, so it conflicts with
+            // any other route on the same path, and vice versa.
+            let conflict = if method == "*" {
+                !methods.is_empty()
+            } else {
+                methods.contains("*") || methods.contains(method.as_str())
+            };
+            if conflict {
                 anyhow::bail!("route path {path:?} is registered by more than one endpoint");
             }
+            methods.insert(method.as_str());
         }
 
         // Keep the actually-configured probe / metrics / verify paths reachable
