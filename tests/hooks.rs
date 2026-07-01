@@ -316,7 +316,10 @@ auth:
     enabled: true
     path: "/health"
 "#,
-        pem_path.display()
+        // Forward slashes are valid in file paths on every platform and, unlike
+        // Windows backslashes, are not escape sequences in a double-quoted YAML
+        // scalar, so the generated config parses on Windows runners too.
+        pem_path.display().to_string().replace('\\', "/")
     ))
     .unwrap();
     let result = ProxyServer::from_config(config).router();
@@ -391,6 +394,22 @@ async fn extra_route_colliding_with_builtin_is_a_clean_error() {
 }
 
 #[tokio::test]
+async fn malformed_extra_route_path_is_a_clean_error() {
+    // A consumer-supplied path without a leading '/' (here an extra route) would
+    // panic axum at registration; it must be a clean build error instead.
+    let config =
+        ProxyConfig::from_yaml_str("upstream:\n  default: \"http://127.0.0.1:50051\"\n").unwrap();
+    let result = ProxyServer::from_config(config)
+        .with_extra_routes([ExtraRoute::new(Method::GET, "ping", Arc::new(PingHandler))])
+        .router();
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("must start with '/'"));
+}
+
+#[tokio::test]
 async fn malformed_verify_path_is_a_clean_error() {
     let config =
         ProxyConfig::from_yaml_str("upstream:\n  default: \"http://127.0.0.1:50051\"\n").unwrap();
@@ -429,7 +448,10 @@ auth:
     enabled: true
     path: "/health"
 "#,
-        pem_path.display()
+        // Forward slashes are valid in file paths on every platform and, unlike
+        // Windows backslashes, are not escape sequences in a double-quoted YAML
+        // scalar, so the generated config parses on Windows runners too.
+        pem_path.display().to_string().replace('\\', "/")
     ))
     .unwrap();
     // Override points elsewhere, but it is ignored for config-driven forward-auth.

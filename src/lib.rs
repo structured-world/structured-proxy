@@ -287,19 +287,21 @@ impl ProxyServer {
         // The verify path that is actually mounted (branch-correct), if any.
         let verify_path = self.mounted_verify_path();
 
-        // Reject duplicate routes across the WHOLE mounted edge BEFORE any router
-        // is built, so a collision (between built-in routes, the OIDC surface,
-        // embedder extra routes, transcoded paths, or the verify endpoint) is a
-        // clear error instead of an axum duplicate-route panic at `.route`/`.merge`.
+        // Validate the WHOLE mounted edge BEFORE any router is built, so a
+        // malformed path (missing leading '/') or a collision (between built-in
+        // routes, the OIDC surface, embedder extra routes, transcoded paths, or
+        // the verify endpoint) is a clear error instead of an axum panic at
+        // `.route`/`.merge`. Consumer-supplied paths (OIDC backend, extra routes,
+        // verify) are not otherwise validated, so check every entry here.
         let mut mounted = self.reserved_get_paths(&pool)?;
         if let Some(vp) = &verify_path {
-            if !vp.starts_with('/') {
-                anyhow::bail!("verify path {vp:?} must start with '/'");
-            }
             mounted.push(vp.clone());
         }
         let mut seen = std::collections::HashSet::with_capacity(mounted.len());
         for path in &mounted {
+            if !path.starts_with('/') {
+                anyhow::bail!("route path {path:?} must start with '/'");
+            }
             if !seen.insert(path.as_str()) {
                 anyhow::bail!("route path {path:?} is registered by more than one endpoint");
             }
