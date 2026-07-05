@@ -427,6 +427,26 @@ async fn extra_routes_sharing_a_path_with_different_methods_are_allowed() {
 }
 
 #[tokio::test]
+async fn structurally_identical_dynamic_routes_are_a_clean_error() {
+    // `/x/{a}` and `/x/{b}` are the same shape to axum/matchit (differ only in
+    // param name) and would panic when merged. The guard normalizes shape, so
+    // this is a clean build error.
+    let config =
+        ProxyConfig::from_yaml_str("upstream:\n  default: \"http://127.0.0.1:50051\"\n").unwrap();
+    let result = ProxyServer::from_config(config)
+        .with_extra_routes([
+            ExtraRoute::new(Method::GET, "/x/{a}", Arc::new(PingHandler)),
+            ExtraRoute::new(Method::GET, "/x/{b}", Arc::new(PingHandler)),
+        ])
+        .router();
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("registered by more than one endpoint"));
+}
+
+#[tokio::test]
 async fn malformed_extra_route_path_is_a_clean_error() {
     // A consumer-supplied path without a leading '/' (here an extra route) would
     // panic axum at registration; it must be a clean build error instead.

@@ -93,103 +93,93 @@ impl HttpMethod {
 /// Takes a `DescriptorPool` and optional path aliases from config.
 /// Returns an axum Router that transcodes REST requests to gRPC calls.
 pub fn routes<S: TranscodeState>(pool: &DescriptorPool, aliases: &[AliasConfig]) -> Router<S> {
-    let entries = extract_routes(pool);
-    if entries.is_empty() {
+    let bindings = route_bindings(pool, aliases);
+    if bindings.is_empty() {
         tracing::warn!("No HTTP-annotated RPCs found in proto descriptors");
         return Router::new();
     }
 
-    tracing::info!("Registering {} transcoded REST→gRPC routes", entries.len());
+    tracing::info!("Registering {} transcoded REST→gRPC routes", bindings.len());
 
     let mut router: Router<S> = Router::new();
-    for entry in &entries {
-        let entry_clone = std::sync::Arc::new(entry.clone());
-
-        let handler = move |proxy_state: State<S>,
-                            headers: HeaderMap,
-                            path_params: Path<std::collections::HashMap<String, String>>,
-                            raw_query: RawQuery,
-                            body: axum::body::Bytes| {
-            transcode_handler(
-                proxy_state,
-                headers,
-                path_params,
-                raw_query,
-                body,
-                entry_clone,
-            )
-        };
-
-        let method_router: MethodRouter<S> = match entry.http_method {
-            HttpMethod::Get => get(handler),
-            HttpMethod::Post => post(handler),
-            HttpMethod::Put => put(handler),
-            HttpMethod::Patch => patch(handler),
-            HttpMethod::Delete => delete(handler),
-        };
-
-        let axum_path = proto_path_to_axum(&entry.http_path);
-        router = router.route(&axum_path, method_router);
-
-        // Register aliases from config
-        for alias in aliases {
-            if let Some(suffix) = entry.http_path.strip_prefix(&alias.to) {
-                // Build alias path: alias.from with the matched suffix
-                let alias_path = if alias.from.ends_with("/{path}") {
-                    let prefix = alias.from.trim_end_matches("/{path}");
-                    format!("{}{}", prefix, suffix)
-                } else {
-                    continue;
-                };
-
-                let alias_entry = std::sync::Arc::new(entry.clone());
-                let alias_handler =
-                    move |proxy_state: State<S>,
-                          headers: HeaderMap,
-                          path_params: Path<std::collections::HashMap<String, String>>,
-                          raw_query: RawQuery,
-                          body: axum::body::Bytes| {
-                        transcode_handler(
-                            proxy_state,
-                            headers,
-                            path_params,
-                            raw_query,
-                            body,
-                            alias_entry,
-                        )
-                    };
-                let alias_method: MethodRouter<S> = match entry.http_method {
-                    HttpMethod::Get => get(alias_handler),
-                    HttpMethod::Post => post(alias_handler),
-                    HttpMethod::Put => put(alias_handler),
-                    HttpMethod::Patch => patch(alias_handler),
-                    HttpMethod::Delete => delete(alias_handler),
-                };
-                router = router.route(&alias_path, alias_method);
+    for binding in bindings {
+        let method = binding.entry.http_method;
+        let entry = std::sync::Arc::new(binding.entry);
+        let method_router: MethodRouter<S> = if binding.streaming {
+            let handler = move |proxy_state: State<S>, headers: HeaderMap| {
+                streaming_handler(proxy_state, headers, entry)
+            };
+            match method {
+                HttpMethod::Get => get(handler),
+                HttpMethod::Post => post(handler),
+                // route_bindings only yields GET/POST streaming bindings.
+                _ => unreachable!("streaming routes are GET/POST only"),
             }
-        }
-    }
-
-    // Server-streaming RPCs
-    let streaming_entries = extract_streaming_routes(pool);
-    for entry in &streaming_entries {
-        let entry_clone = std::sync::Arc::new(entry.clone());
-        let axum_path = proto_path_to_axum(&entry.http_path);
-
-        let handler = move |proxy_state: State<S>, headers: HeaderMap| {
-            streaming_handler(proxy_state, headers, entry_clone)
+        } else {
+            let handler = move |proxy_state: State<S>,
+                                headers: HeaderMap,
+                                path_params: Path<std::collections::HashMap<String, String>>,
+                                raw_query: RawQuery,
+                                body: axum::body::Bytes| {
+                transcode_handler(proxy_state, headers, path_params, raw_query, body, entry)
+            };
+            match method {
+                HttpMethod::Get => get(handler),
+                HttpMethod::Post => post(handler),
+                HttpMethod::Put => put(handler),
+                HttpMethod::Patch => patch(handler),
+                HttpMethod::Delete => delete(handler),
+            }
         };
-
-        let method_router: MethodRouter<S> = match entry.http_method {
-            HttpMethod::Get => get(handler),
-            HttpMethod::Post => post(handler),
-            _ => continue,
-        };
-
-        router = router.route(&axum_path, method_router);
+        router = router.route(&binding.axum_path, method_router);
     }
 
     router
+}
+
+/// One transcode route to mount: the RPC entry that serves it, the axum path to
+/// register it at, and whether it is the server-streaming variant.
+struct RouteBinding {
+    entry: RouteEntry,
+    axum_path: String,
+    streaming: bool,
+}
+
+/// The single source of truth for what [`routes`] mounts: unary RPCs, their
+/// config aliases, and server-streaming RPCs. Both [`routes`] (to build handlers)
+/// and [`route_paths`] (to enumerate paths for collision checks) consume this, so
+/// the mounted set and the enumerated set cannot drift apart.
+fn route_bindings(pool: &DescriptorPool, aliases: &[AliasConfig]) -> Vec<RouteBinding> {
+    let mut bindings = Vec::new();
+    for entry in extract_routes(pool) {
+        bindings.push(RouteBinding {
+            axum_path: proto_path_to_axum(&entry.http_path),
+            entry: entry.clone(),
+            streaming: false,
+        });
+        for alias in aliases {
+            if let Some(suffix) = entry.http_path.strip_prefix(&alias.to) {
+                if alias.from.ends_with("/{path}") {
+                    let prefix = alias.from.trim_end_matches("/{path}");
+                    bindings.push(RouteBinding {
+                        axum_path: format!("{prefix}{suffix}"),
+                        entry: entry.clone(),
+                        streaming: false,
+                    });
+                }
+            }
+        }
+    }
+    for entry in extract_streaming_routes(pool) {
+        if matches!(entry.http_method, HttpMethod::Get | HttpMethod::Post) {
+            bindings.push(RouteBinding {
+                axum_path: proto_path_to_axum(&entry.http_path),
+                entry,
+                streaming: true,
+            });
+        }
+    }
+    bindings
 }
 
 /// The axum paths [`routes`] would register for this pool and aliases.
@@ -201,28 +191,10 @@ pub fn routes<S: TranscodeState>(pool: &DescriptorPool, aliases: &[AliasConfig])
 /// Each entry is `(method, path)` where `method` is the uppercase HTTP token, so
 /// callers can distinguish same-path/different-method routes from real conflicts.
 pub fn route_paths(pool: &DescriptorPool, aliases: &[AliasConfig]) -> Vec<(String, String)> {
-    let mut routes = Vec::new();
-    for entry in extract_routes(pool) {
-        let method = entry.http_method.as_str().to_string();
-        routes.push((method.clone(), proto_path_to_axum(&entry.http_path)));
-        for alias in aliases {
-            if let Some(suffix) = entry.http_path.strip_prefix(&alias.to) {
-                if alias.from.ends_with("/{path}") {
-                    let prefix = alias.from.trim_end_matches("/{path}");
-                    routes.push((method.clone(), format!("{prefix}{suffix}")));
-                }
-            }
-        }
-    }
-    for entry in extract_streaming_routes(pool) {
-        if matches!(entry.http_method, HttpMethod::Get | HttpMethod::Post) {
-            routes.push((
-                entry.http_method.as_str().to_string(),
-                proto_path_to_axum(&entry.http_path),
-            ));
-        }
-    }
-    routes
+    route_bindings(pool, aliases)
+        .into_iter()
+        .map(|b| (b.entry.http_method.as_str().to_string(), b.axum_path))
+        .collect()
 }
 
 /// JSON serialization options shared by the unary and streaming response paths,

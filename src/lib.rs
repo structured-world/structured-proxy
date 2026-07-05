@@ -307,15 +307,22 @@ impl ProxyServer {
         if let Some(vp) = &verify_path {
             mounted.push(("*".to_string(), vp.clone()));
         }
-        let mut methods_by_path: std::collections::HashMap<&str, std::collections::HashSet<&str>> =
-            std::collections::HashMap::new();
+        // Key by NORMALIZED shape, not raw text: axum/matchit treats two dynamic
+        // routes with the same structure but different param names (e.g.
+        // `/v1/x/{a}` and `/v1/x/{b}`) as a conflict, so they must collide here.
+        let mut methods_by_shape: std::collections::HashMap<
+            String,
+            std::collections::HashSet<&str>,
+        > = std::collections::HashMap::new();
         for (method, path) in &mounted {
             if !path.starts_with('/') {
                 anyhow::bail!("route path {path:?} must start with '/'");
             }
-            let methods = methods_by_path.entry(path.as_str()).or_default();
+            let methods = methods_by_shape
+                .entry(normalize_route_shape(path))
+                .or_default();
             // `*` (the verify endpoint) claims every method, so it conflicts with
-            // any other route on the same path, and vice versa.
+            // any other route on the same shape, and vice versa.
             let conflict = if method == "*" {
                 !methods.is_empty()
             } else {
@@ -644,6 +651,26 @@ impl ProxyServer {
     }
 }
 
+/// Canonical shape of an axum route path for collision detection: every dynamic
+/// segment (`{name}` capture or `{*name}` wildcard) is replaced by a
+/// name-independent placeholder, so structurally identical routes that differ
+/// only in parameter name (which axum/matchit rejects as a conflict) map to the
+/// same key. Literal segments are unchanged.
+fn normalize_route_shape(path: &str) -> String {
+    path.split('/')
+        .map(|seg| {
+            if seg.starts_with("{*") && seg.ends_with('}') {
+                "{*}"
+            } else if seg.starts_with('{') && seg.ends_with('}') {
+                "{}"
+            } else {
+                seg
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Maintenance mode middleware.
 async fn maintenance_middleware(
     State(state): State<ProxyState>,
@@ -701,6 +728,22 @@ pub(crate) fn test_state() -> ProxyState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_route_shape_collapses_param_names() {
+        // Same shape, different param names → same key.
+        assert_eq!(
+            normalize_route_shape("/v1/x/{profile_id}"),
+            normalize_route_shape("/v1/x/{id}")
+        );
+        // Wildcard vs named capture stay distinct; literals are untouched.
+        assert_eq!(normalize_route_shape("/a/{p}/b"), "/a/{}/b");
+        assert_eq!(normalize_route_shape("/a/{*rest}"), "/a/{*}");
+        assert_ne!(
+            normalize_route_shape("/a/{p}"),
+            normalize_route_shape("/a/b")
+        );
+    }
 
     #[test]
     fn test_minimal_config_server() {
