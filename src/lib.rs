@@ -27,6 +27,8 @@ compile_error!("exactly one JWT crypto backend must be enabled: `rust_crypto` or
 
 pub mod auth;
 pub mod config;
+mod embed;
+pub mod hooks;
 pub mod oidc;
 pub mod openapi;
 pub mod shield;
@@ -43,7 +45,10 @@ use std::net::SocketAddr;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
+use std::sync::Arc;
+
 use config::{DescriptorSource, ProxyConfig};
+use hooks::{AuthDecider, ExtraRoute, OidcBackend};
 
 /// Shared state for all proxy handlers.
 #[derive(Clone, Debug)]
@@ -75,6 +80,14 @@ pub struct ProxyServer {
     config: ProxyConfig,
     /// Optional pre-loaded descriptor pool (for embedded mode).
     descriptor_pool: Option<DescriptorPool>,
+    /// Optional in-process forward-auth/PDP gate (embedded Tier-2 hook).
+    auth_decider: Option<Arc<dyn AuthDecider>>,
+    /// Optional stateless OIDC surface backing (embedded Tier-2 hook).
+    oidc_backend: Option<Arc<dyn OidcBackend>>,
+    /// Embedder-supplied extra stateless routes (embedded Tier-2 hook).
+    extra_routes: Vec<ExtraRoute>,
+    /// Override for the `/verify` forward-auth path of an injected AuthDecider.
+    verify_path: Option<String>,
 }
 
 impl ProxyServer {
@@ -83,12 +96,54 @@ impl ProxyServer {
         Self {
             config,
             descriptor_pool: None,
+            auth_decider: None,
+            oidc_backend: None,
+            extra_routes: Vec::new(),
+            verify_path: None,
         }
     }
 
     /// Create with an embedded descriptor pool (for sid-proxy backward compat).
     pub fn with_descriptors(mut self, pool: DescriptorPool) -> Self {
         self.descriptor_pool = Some(pool);
+        self
+    }
+
+    /// Inject an in-process forward-auth / PDP decision (embedded Tier-2 hook).
+    ///
+    /// The decider gates every proxied request inline and also backs the
+    /// `/verify` forward-auth endpoint. Its signature is `axum`-free (see
+    /// [`hooks::AuthDecider`]), so the embedder never names an HTTP framework.
+    pub fn with_auth_decider(mut self, decider: Arc<dyn AuthDecider>) -> Self {
+        self.auth_decider = Some(decider);
+        self
+    }
+
+    /// Back the stateless OIDC surface (discovery, JWKS, userinfo) with the
+    /// embedder's key/client metadata (embedded Tier-2 hook).
+    ///
+    /// When set, this supersedes the config-driven static `oidc_discovery`
+    /// routes. See [`hooks::OidcBackend`].
+    pub fn with_oidc_backend(mut self, backend: Arc<dyn OidcBackend>) -> Self {
+        self.oidc_backend = Some(backend);
+        self
+    }
+
+    /// Register extra stateless routes through an `axum`-free adapter (embedded
+    /// Tier-2 hook). See [`hooks::ExtraRoute`] / [`hooks::ExtraRouteHandler`].
+    pub fn with_extra_routes(mut self, routes: impl IntoIterator<Item = ExtraRoute>) -> Self {
+        self.extra_routes.extend(routes);
+        self
+    }
+
+    /// Set the path at which the injected [`AuthDecider`] answers forward-auth
+    /// sub-requests (`/verify`). Independent of any JWT `forward_auth` config, so
+    /// a decider-only embedder can place it without a JWT block.
+    ///
+    /// Resolution order for the path: this override, then
+    /// `auth.forward_auth.path` from config, then the default `/auth/verify`.
+    pub fn with_verify_path(mut self, path: impl Into<String>) -> Self {
+        self.verify_path = Some(path.into());
         self
     }
 
@@ -132,6 +187,94 @@ impl ProxyServer {
         Ok(pool)
     }
 
+    /// The path an injected [`AuthDecider`] answers `/verify` at: the
+    /// `with_verify_path` override, then `auth.forward_auth.path`, then the
+    /// default `/auth/verify`. Only meaningful when a decider is set (the
+    /// override does not apply to config-driven JWT forward-auth).
+    fn decider_verify_path(&self) -> String {
+        self.verify_path.clone().unwrap_or_else(|| {
+            self.config
+                .auth
+                .as_ref()
+                .and_then(|a| a.forward_auth.as_ref())
+                .map(|fa| fa.path.clone())
+                .unwrap_or_else(|| "/auth/verify".to_string())
+        })
+    }
+
+    /// The verify path that is ACTUALLY mounted, or `None` when no verify route
+    /// is mounted. This is what the collision guard and maintenance-exempt list
+    /// must use, since the two mount sites use different paths:
+    /// - an injected decider mounts at [`decider_verify_path`](Self::decider_verify_path)
+    ///   (the `with_verify_path` override applies), whereas
+    /// - config-driven JWT forward-auth mounts `forward_auth.routes()` at
+    ///   `auth.forward_auth.path` (the override does NOT apply, and it mounts
+    ///   only when `auth.mode == "jwt"`, since the endpoint shares the built JWT
+    ///   `Auth`).
+    fn mounted_verify_path(&self) -> Option<String> {
+        if self.auth_decider.is_some() {
+            return Some(self.decider_verify_path());
+        }
+        self.config.auth.as_ref().and_then(|a| {
+            if a.mode != "jwt" {
+                return None;
+            }
+            a.forward_auth
+                .as_ref()
+                .filter(|fa| fa.enabled)
+                .map(|fa| fa.path.clone())
+        })
+    }
+
+    /// Every `(method, path)` route mounted before the verify endpoint, used to
+    /// reject a real collision with a clear error instead of an axum
+    /// duplicate-route panic. `method` is the uppercase HTTP token; same-path
+    /// routes with different methods do NOT collide (the extra-route adapter and
+    /// axum merge them), so the key is the pair, not the path alone.
+    ///
+    /// Must stay exhaustive: health probes, metrics, OpenAPI spec/docs, the OIDC
+    /// surface (injected backend or config-driven static discovery), embedder
+    /// extra routes, and the transcoded REST routes. All built-in surfaces here
+    /// are `GET`.
+    fn reserved_routes(&self, pool: &DescriptorPool) -> anyhow::Result<Vec<(String, String)>> {
+        let mut routes = Vec::new();
+        let mut get = |path: String| routes.push(("GET".to_string(), path));
+        if self.config.health.enabled {
+            get(self.config.health.path.clone());
+            get(self.config.health.live_path.clone());
+            get(self.config.health.ready_path.clone());
+            get(self.config.health.startup_path.clone());
+        }
+        if self.config.metrics.enabled {
+            get(self.config.metrics.path.clone());
+        }
+        if let Some(openapi) = self.config.openapi.as_ref().filter(|o| o.enabled) {
+            get(openapi.path.clone());
+            get(openapi.docs_path.clone());
+        }
+        // OIDC: an injected backend supersedes config-driven static discovery.
+        if let Some(backend) = &self.oidc_backend {
+            for doc in backend.metadata_documents() {
+                get(doc.path);
+            }
+            get(backend.jwks().path);
+            get(backend.userinfo_path());
+        } else if let Some(cfg) = &self.config.oidc_discovery {
+            if let Some(oidc) = oidc::Oidc::build(cfg)
+                .map_err(|e| anyhow::anyhow!("invalid oidc_discovery config: {e}"))?
+            {
+                for path in oidc.paths() {
+                    get(path);
+                }
+            }
+        }
+        for route in &self.extra_routes {
+            routes.push((route.method.as_str().to_string(), route.path.clone()));
+        }
+        routes.extend(transcode::route_paths(pool, &self.config.aliases));
+        Ok(routes)
+    }
+
     /// Build the axum router with all endpoints.
     pub fn router(&self) -> anyhow::Result<Router> {
         // Enforce cross-field invariants on the embedded path too, where the
@@ -149,12 +292,73 @@ impl ProxyServer {
         let service_name = self.config.service.name.clone();
         let metrics_namespace = service_name.replace('-', "_");
 
+        // The verify path that is actually mounted (branch-correct), if any.
+        let verify_path = self.mounted_verify_path();
+
+        // Validate the WHOLE mounted edge BEFORE any router is built, so a
+        // malformed path (missing leading '/') or a collision (between built-in
+        // routes, the OIDC surface, embedder extra routes, transcoded paths, or
+        // the verify endpoint) is a clear error instead of an axum panic at
+        // `.route`/`.merge`. Collisions are keyed by (method, path): same-path
+        // routes with different methods are legal (they merge), so only a
+        // repeated (method, path) — or any overlap with the verify endpoint,
+        // which answers ALL methods (`*`) — is a real conflict.
+        let mut mounted = self.reserved_routes(&pool)?;
+        if let Some(vp) = &verify_path {
+            mounted.push(("*".to_string(), vp.clone()));
+        }
+        // Key by NORMALIZED shape, not raw text: axum/matchit treats two dynamic
+        // routes with the same structure but different param names (e.g.
+        // `/v1/x/{a}` and `/v1/x/{b}`) as a conflict, so they must collide here.
+        let mut methods_by_shape: std::collections::HashMap<
+            String,
+            std::collections::HashSet<&str>,
+        > = std::collections::HashMap::new();
+        for (method, path) in &mounted {
+            if !path.starts_with('/') {
+                anyhow::bail!("route path {path:?} must start with '/'");
+            }
+            let methods = methods_by_shape
+                .entry(normalize_route_shape(path))
+                .or_default();
+            // `*` (the verify endpoint) claims every method, so it conflicts with
+            // any other route on the same shape, and vice versa.
+            let conflict = if method == "*" {
+                !methods.is_empty()
+            } else {
+                methods.contains("*") || methods.contains(method.as_str())
+            };
+            if conflict {
+                anyhow::bail!("route path {path:?} is registered by more than one endpoint");
+            }
+            methods.insert(method.as_str());
+        }
+
+        // Keep the actually-configured probe / metrics / verify paths reachable
+        // under maintenance mode. The default exempt list names the default
+        // paths; once those are relocated via config, the relocated paths must
+        // be exempted too, or maintenance would 503 probe and forward-auth
+        // traffic that was intentionally exempt before.
+        let mut maintenance_exempt = self.config.maintenance.exempt_paths.clone();
+        if self.config.health.enabled {
+            maintenance_exempt.push(self.config.health.path.clone());
+            maintenance_exempt.push(self.config.health.live_path.clone());
+            maintenance_exempt.push(self.config.health.ready_path.clone());
+            maintenance_exempt.push(self.config.health.startup_path.clone());
+        }
+        if self.config.metrics.enabled {
+            maintenance_exempt.push(self.config.metrics.path.clone());
+        }
+        if let Some(vp) = &verify_path {
+            maintenance_exempt.push(vp.clone());
+        }
+
         let state = ProxyState {
             service_name: service_name.clone(),
             grpc_upstream,
             grpc_channel,
             maintenance_mode: self.config.maintenance.enabled,
-            maintenance_exempt: self.config.maintenance.exempt_paths.clone(),
+            maintenance_exempt,
             maintenance_message: self.config.maintenance.message.clone(),
             forwarded_headers: self.config.forwarded_headers.clone(),
             metrics_namespace,
@@ -176,6 +380,18 @@ impl ProxyServer {
                 .map_err(|e| anyhow::anyhow!("invalid authz config: {e}"))?,
             None => None,
         };
+
+        // Order matters: in axum the LAST-added layer is outermost and runs
+        // FIRST. We want `authz -> AuthDecider -> handler`, so add the decider
+        // layer first (inner) and the authz layer second (outer). That way, when
+        // both are configured, ext_authz runs first and the in-process decider
+        // sees any headers the authz Check injected.
+        if let Some(decider) = &self.auth_decider {
+            transcode_routes = transcode_routes.layer(axum::middleware::from_fn_with_state(
+                decider.clone(),
+                embed::auth_decider_gate,
+            ));
+        }
         if let Some(authz) = authz {
             transcode_routes = transcode_routes.layer(axum::middleware::from_fn_with_state(
                 authz,
@@ -183,51 +399,59 @@ impl ProxyServer {
             ));
         }
 
-        // Health routes
-        let health_service_name = service_name.clone();
-        let health_routes = Router::new()
-            .route(
-                "/health",
-                get({
-                    let name = health_service_name.clone();
-                    move || async move {
-                        Json(serde_json::json!({
-                            "status": "ok",
-                            "service": name,
-                        }))
-                    }
-                }),
-            )
-            .route("/health/live", get(|| async { StatusCode::OK }))
-            .route(
-                "/health/ready",
-                get(|State(state): State<ProxyState>| async move {
-                    let mut client =
-                        tonic_health::pb::health_client::HealthClient::new(state.grpc_channel);
-                    match client
-                        .check(tonic_health::pb::HealthCheckRequest {
-                            service: String::new(),
-                        })
-                        .await
-                    {
-                        Ok(resp) => {
-                            let status = resp.into_inner().status;
-                            if status
-                                == tonic_health::pb::health_check_response::ServingStatus::Serving
-                                    as i32
-                            {
-                                StatusCode::OK
-                            } else {
-                                StatusCode::SERVICE_UNAVAILABLE
-                            }
+        // Health routes. Paths are configurable; the whole group is skippable.
+        let health_routes = if self.config.health.enabled {
+            let health = &self.config.health;
+            let health_service_name = service_name.clone();
+            Router::new()
+                .route(
+                    &health.path,
+                    get({
+                        let name = health_service_name.clone();
+                        move || async move {
+                            Json(serde_json::json!({
+                                "status": "ok",
+                                "service": name,
+                            }))
                         }
-                        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
-                    }
-                }),
-            )
-            .route("/health/startup", get(|| async { StatusCode::OK }))
-            .route(
-                "/metrics",
+                    }),
+                )
+                .route(&health.live_path, get(|| async { StatusCode::OK }))
+                .route(
+                    &health.ready_path,
+                    get(|State(state): State<ProxyState>| async move {
+                        let mut client =
+                            tonic_health::pb::health_client::HealthClient::new(state.grpc_channel);
+                        match client
+                            .check(tonic_health::pb::HealthCheckRequest {
+                                service: String::new(),
+                            })
+                            .await
+                        {
+                            Ok(resp) => {
+                                let status = resp.into_inner().status;
+                                if status
+                                    == tonic_health::pb::health_check_response::ServingStatus::Serving
+                                        as i32
+                                {
+                                    StatusCode::OK
+                                } else {
+                                    StatusCode::SERVICE_UNAVAILABLE
+                                }
+                            }
+                            Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+                        }
+                    }),
+                )
+                .route(&health.startup_path, get(|| async { StatusCode::OK }))
+        } else {
+            Router::new()
+        };
+
+        // Metrics route. Path is configurable; the endpoint is skippable.
+        let metrics_routes = if self.config.metrics.enabled {
+            Router::new().route(
+                &self.config.metrics.path,
                 get(|| async {
                     let encoder = prometheus::TextEncoder::new();
                     let metric_families = prometheus::default_registry().gather();
@@ -244,18 +468,26 @@ impl ProxyServer {
                         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
                     }
                 }),
-            );
+            )
+        } else {
+            Router::new()
+        };
 
         // OpenAPI + docs routes (if enabled).
         let openapi_routes = self.build_openapi_routes(&pool);
 
-        // OIDC discovery routes (if enabled). Public, like the health endpoints.
-        let oidc_routes = match &self.config.oidc_discovery {
-            Some(cfg) => oidc::Oidc::build(cfg)
-                .map_err(|e| anyhow::anyhow!("invalid oidc_discovery config: {e}"))?
-                .map(|o| o.routes())
-                .unwrap_or_default(),
-            None => Router::new(),
+        // OIDC routes (public, like the health endpoints). An injected
+        // OidcBackend supersedes the config-driven static discovery: the proxy
+        // hosts the HTTP surface, the embedder supplies the content.
+        let oidc_routes = match &self.oidc_backend {
+            Some(backend) => embed::oidc_backend_routes(backend.clone()),
+            None => match &self.config.oidc_discovery {
+                Some(cfg) => oidc::Oidc::build(cfg)
+                    .map_err(|e| anyhow::anyhow!("invalid oidc_discovery config: {e}"))?
+                    .map(|o| o.routes())
+                    .unwrap_or_default(),
+                None => Router::new(),
+            },
         };
 
         // Rate limiting (Shield), if configured and enabled.
@@ -275,8 +507,10 @@ impl ProxyServer {
 
         let mut router = Router::new()
             .merge(health_routes)
+            .merge(metrics_routes)
             .merge(openapi_routes)
             .merge(oidc_routes)
+            .merge(embed::extra_routes_router(&self.extra_routes))
             .merge(transcode_routes)
             .layer(cors);
 
@@ -287,13 +521,30 @@ impl ProxyServer {
             auth::forward::ForwardAuth::build(self.config.auth.as_ref()?, built.clone())
         });
 
+        // Duplicate-route collisions (including the verify path) were already
+        // rejected up front, before any router was built.
+
         // Auth runs inside Shield (added first = inner): rate limiting sheds
         // load before any signature verification work.
         if let Some(auth) = auth {
             router = router.layer(axum::middleware::from_fn_with_state(auth, auth::middleware));
         }
 
-        if let Some(forward_auth) = &forward_auth {
+        // Forward-auth `/verify` endpoint. An injected AuthDecider owns it when
+        // present (in-process PDP); otherwise the config-driven JWT ForwardAuth
+        // backs it. Mounted after the auth layer so it is not itself JWT-gated.
+        if let Some(decider) = &self.auth_decider {
+            // Collision / shape of this path was already validated above.
+            let decider = decider.clone();
+            let path = self.decider_verify_path();
+            router = router.route(
+                &path,
+                axum::routing::any(move |req: axum::extract::Request| {
+                    let decider = decider.clone();
+                    async move { embed::verify_via_decider(decider, req).await }
+                }),
+            );
+        } else if let Some(forward_auth) = &forward_auth {
             router = router.merge(forward_auth.routes());
         }
 
@@ -400,6 +651,26 @@ impl ProxyServer {
     }
 }
 
+/// Canonical shape of an axum route path for collision detection: every dynamic
+/// segment (`{name}` capture or `{*name}` wildcard) is replaced by a
+/// name-independent placeholder, so structurally identical routes that differ
+/// only in parameter name (which axum/matchit rejects as a conflict) map to the
+/// same key. Literal segments are unchanged.
+fn normalize_route_shape(path: &str) -> String {
+    path.split('/')
+        .map(|seg| {
+            if seg.starts_with("{*") && seg.ends_with('}') {
+                "{*}"
+            } else if seg.starts_with('{') && seg.ends_with('}') {
+                "{}"
+            } else {
+                seg
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Maintenance mode middleware.
 async fn maintenance_middleware(
     State(state): State<ProxyState>,
@@ -436,9 +707,43 @@ pub(crate) fn test_channel() -> tonic::transport::Channel {
         .connect_lazy()
 }
 
+/// A minimal [`ProxyState`] for tests that only need a state to satisfy a
+/// `Router<ProxyState>` (the hook routers do not read it).
+#[cfg(test)]
+pub(crate) fn test_state() -> ProxyState {
+    ProxyState {
+        service_name: "test".into(),
+        grpc_upstream: "http://127.0.0.1:1".into(),
+        grpc_channel: test_channel(),
+        maintenance_mode: false,
+        maintenance_exempt: vec![],
+        maintenance_message: String::new(),
+        forwarded_headers: vec![],
+        metrics_namespace: "test".into(),
+        metrics_classes: vec![],
+        sse_keep_alive_secs: 15,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_route_shape_collapses_param_names() {
+        // Same shape, different param names → same key.
+        assert_eq!(
+            normalize_route_shape("/v1/x/{profile_id}"),
+            normalize_route_shape("/v1/x/{id}")
+        );
+        // Wildcard vs named capture stay distinct; literals are untouched.
+        assert_eq!(normalize_route_shape("/a/{p}/b"), "/a/{}/b");
+        assert_eq!(normalize_route_shape("/a/{*rest}"), "/a/{*}");
+        assert_ne!(
+            normalize_route_shape("/a/{p}"),
+            normalize_route_shape("/a/b")
+        );
+    }
 
     #[test]
     fn test_minimal_config_server() {

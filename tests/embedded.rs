@@ -33,6 +33,8 @@ fn embedded_config_is_constructible() {
         auth: None,
         shield: None,
         oidc_discovery: None,
+        health: Default::default(),
+        metrics: Default::default(),
         maintenance: Default::default(),
         cors: Default::default(),
         logging: Default::default(),

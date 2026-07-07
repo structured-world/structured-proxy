@@ -12,6 +12,11 @@ readme = "README.md"
 keywords = ["grpc", "rest", "proxy", "transcoding", "protobuf"]
 categories = ["network-programming", "web-programming::http-server"]
 
+# docs.rs builds with the `redis` feature on top of the defaults so the
+# Redis-backed rate-limit store (and its intra-doc links) are documented.
+[package.metadata.docs.rs]
+features = ["redis"]
+
 [[bin]]
 name = "structured-proxy"
 path = "src/main.rs"
@@ -25,6 +30,12 @@ path = "src/lib.rs"
 axum = { version = "0.8", features = ["macros"] }
 tower = "0.5"
 tower-http = { version = "0.7", features = ["cors", "trace"] }
+# Foundational HTTP types, used directly by the framework-agnostic embedding
+# hooks (src/hooks.rs) so an embedder never names `axum`. Already in the tree
+# transitively via both axum and tonic; pinned here to make the public API deps
+# explicit.
+http = "1"
+bytes = "1"
 
 # gRPC client (to upstream service)
 tonic = "0.14"
@@ -112,6 +123,13 @@ redis = ["dep:redis"]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# The embedding-hooks integration test (tests/hooks.rs) writes hook impls using
+# only these (the same crates a real embedder uses — none is an HTTP framework)
+# and drives the resulting router via axum + tower for assertions.
+axum = { version = "0.8", features = ["macros"] }
+http = "1"
+bytes = "1"
+async-trait = "0.1"
 ed25519-dalek = "2"
 rand = "0.10"
 chrono = "0.4"

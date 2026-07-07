@@ -72,6 +72,15 @@ impl Oidc {
         }))
     }
 
+    /// The paths this serves (discovery document + JWKS), for collision checks
+    /// against other routes mounted on the same server.
+    pub(crate) fn paths(&self) -> Vec<String> {
+        vec![
+            "/.well-known/openid-configuration".to_string(),
+            self.jwks_path.clone(),
+        ]
+    }
+
     /// Routes serving the discovery document and the JWKS.
     pub fn routes<S>(&self) -> Router<S>
     where

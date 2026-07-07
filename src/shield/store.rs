@@ -1,10 +1,18 @@
 //! Rate-limit counter storage.
 //!
 //! [`RateLimitStore`] abstracts where per-key counters live. [`MemoryStore`] is
-//! the default and keeps counters in-process (per replica). [`RedisStore`]
-//! (behind the `redis` feature) shares counters across replicas, which is what
-//! a multi-instance deployment behind a load balancer needs for correct global
-//! limits.
+//! the default and keeps counters in-process (per replica).
+// The `RedisStore` reference is an intra-doc link only when the `redis` feature
+// (and thus the type) is compiled in; otherwise a plain code span, so `cargo
+// doc` stays warning-free in every feature combination.
+#![cfg_attr(
+    feature = "redis",
+    doc = "[`RedisStore`] (behind the `redis` feature) shares counters across replicas, which is what a multi-instance deployment behind a load balancer needs for correct global limits."
+)]
+#![cfg_attr(
+    not(feature = "redis"),
+    doc = "`RedisStore` (behind the `redis` feature) shares counters across replicas, which is what a multi-instance deployment behind a load balancer needs for correct global limits."
+)]
 
 use std::time::Duration;
 
@@ -36,7 +44,15 @@ pub trait RateLimitStore: Send + Sync {
 /// In-process fixed-window counter store (per replica).
 ///
 /// Counters are not shared between replicas, so global limits only hold for a
-/// single instance. Use [`RedisStore`] for multi-instance deployments.
+/// single instance.
+#[cfg_attr(
+    feature = "redis",
+    doc = "Use [`RedisStore`] for multi-instance deployments."
+)]
+#[cfg_attr(
+    not(feature = "redis"),
+    doc = "Use `RedisStore` (feature `redis`) for multi-instance deployments."
+)]
 #[derive(Debug)]
 pub struct MemoryStore {
     // no-std: caller-provided Clock + spin/hashbrown map.
