@@ -25,7 +25,7 @@ Works with **any** gRPC service via proto descriptor files. No code generation, 
 - **Health endpoints** `/health/live`, `/health/ready` (upstream gRPC health probe), `/health/startup`
 - **Prometheus metrics** at `/metrics`
 - **CORS** with a configurable origin allow-list
-- **Rate limiting (Shield)**: per-client endpoint classes + per-identifier limits, in-process by default or Redis-backed (feature `redis`) for multi-instance
+- **Rate limiting (Shield)**: local GCRA shaper (no blocking latency) keyed by client IP, header, or validated JWT claim; named limit tiers as config data; optional async cross-instance reconciliation (feature `redis`) for an approximate fleet-wide limit
 - **JWT auth**: validate `Bearer` tokens via an Ed25519 PEM key or JWKS auto-discovery, enforce per-route `require_auth` / `required_roles`, and forward claims as headers
 - **OIDC discovery**: serve `/.well-known/openid-configuration` and a JWKS endpoint (Ed25519) built from config, to front an identity provider
 - **Forward-auth**: a verification endpoint (`/auth/verify`) for a fronting proxy (nginx `auth_request`, Traefik `forwardAuth`) to delegate auth, returning the verified identity as headers
@@ -108,25 +108,38 @@ streaming:
   sse_keep_alive_secs: 15
 
 # Rate limiting (Shield)
+#
+# Every decision is made locally with a GCRA shaper (no blocking latency).
+# Named profiles define tiers as data; rules bind a path glob to a key and a
+# limit. Rules keyed by a JWT claim run after auth (so the claim is verified);
+# the rest run before auth so anonymous floods are shed cheaply.
 shield:
   enabled: true
-  window_secs: 60 # default window for bare counts like "20"
-  # Optional: shared counters across replicas (needs the `redis` build feature).
-  # Omit for an in-process per-replica store.
-  # redis_url: "redis://127.0.0.1/"
   # CIDR ranges of trusted proxies/LBs. X-Forwarded-For is honored only from
   # these peers; set this behind a load balancer for correct per-client limits.
   trusted_proxies: ["10.0.0.0/8"]
-  # Classify endpoints by glob pattern → class → rate (limited per client IP)
-  endpoint_classes:
+  # Limit tiers: sustained rate ("N/unit" or a bare count = per minute) + burst
+  # (max back-to-back requests; defaults to one window of the rate).
+  profiles:
+    anon: { rate: "60/min", burst: 20 }
+    premium: { rate: "1000/min", burst: 100 }
+  # Applied when a matched rule resolves no other limit.
+  default_profile: "anon"
+  rules:
+    # Anonymous heavy endpoints, keyed by client IP (runs before auth).
     - pattern: "/api/v1/heavy-*"
-      class: "heavy"
-      rate: "10/min"
-  # Per-identifier limits keyed by a request body field
-  identifier_endpoints:
-    - path: "/api/v1/login"
-      body_field: "email"
-      rate: "5/min"
+      key: { type: ip }
+      profile: "anon"
+    # Per-principal limit keyed by a validated JWT claim (runs after auth).
+    - pattern: "/api/v1/**"
+      key: { type: jwt_claim, claim: "sub" }
+  # Optional: resolve a key's limit from the JWT itself (tier name → a profile,
+  # or explicit ratelimit_rpm / ratelimit_burst claims).
+  # jwt_limits: { tier_claim: "ratelimit_tier" }
+  # Optional: async cross-instance reconciliation via a shared store for an
+  # approximate fleet-wide limit (needs the `redis` build feature). The request
+  # path never blocks on it; a store outage degrades to per-instance limits.
+  # sync: { redis_url: "redis://127.0.0.1/", interval_ms: 500 }
 
 # JWT auth
 auth:
@@ -164,6 +177,51 @@ buf build -o my-service.descriptor.bin
 # or
 protoc --descriptor_set_out=my-service.descriptor.bin --include_imports *.proto
 ```
+
+## Rate limiting
+
+Shield is an embedded, config-driven limiter designed for a data plane: every
+decision is made in-process by a GCRA shaper, so it adds no blocking latency to
+the request path. GCRA (a token-bucket equivalent storing one timestamp per key)
+lets legitimate bursts through up to a configured `burst` while throttling
+sustained abuse to the `rate`, with no fixed-window boundary burst.
+
+**Keying and phases.** A rule keys on the client IP, a header value (API key),
+or a validated JWT claim. IP/header rules run *before* auth so anonymous floods
+are shed before any signature verification; claim-keyed rules run *after* auth so
+they use the verified, un-forgeable principal. The phase is derived from the key;
+there is no phase setting to misconfigure. Every key falls back to the client IP
+when its value is absent, so a limit can't be dodged by omitting a header or
+staying anonymous.
+
+**Limit sources.** A key's `{rate, burst}` resolves in order: the JWT itself
+(a `ratelimit_tier` claim naming a profile, or explicit `ratelimit_rpm` /
+`ratelimit_burst`), then an external service (cached and refreshed in the
+background, never blocking), then the rule's pinned profile, then the default.
+Tier-name indirection lets you retune the numbers in config without re-issuing
+tokens or changing the service.
+
+**Deployment modes.**
+
+- **Local (default).** No shared store. Each instance enforces the limit
+  independently, so the fleet-wide effect is roughly `N × rate` for `N`
+  instances. Zero dependencies, lowest latency. Set per-instance limits with
+  that multiplier in mind.
+- **Reconciled (`sync` + `redis` feature).** Instances asynchronously push their
+  deltas to a shared store and pull the aggregate on an interval, converging on
+  an approximate fleet-wide limit. The configured `rate` is then the *fleet*
+  budget. The request path still never blocks on the store; if the store is
+  unreachable, instances degrade to local limiting rather than failing requests.
+
+**Sizing the overshoot.** In reconciled mode the aggregate lags by up to one
+`sync.interval_ms`, so the fleet can briefly overshoot the budget by about
+`(N - 1) × rate × interval`. Shorter intervals tighten the bound at the cost of
+more store traffic; the default (500 ms) suits per-minute limits. The global
+view uses a sliding-window counter, so there is no boundary burst on top of this
+lag.
+
+See the `shield:` block under [Configuration](#configuration) for the full
+schema.
 
 ## Library Usage
 

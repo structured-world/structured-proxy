@@ -1,0 +1,339 @@
+//! Middleware-level tests driving the compiled Shield through axum + tower.
+
+use super::*;
+use crate::config::{KeySourceConfig, LimitProfileConfig, RateRuleConfig, ShieldConfig};
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use axum::routing::get;
+use axum::Router;
+use std::collections::HashMap;
+use tower::ServiceExt;
+
+/// A ShieldConfig with the given profiles + rules, everything else off.
+fn config(profiles: Vec<(&str, &str, Option<u64>)>, rules: Vec<RateRuleConfig>) -> ShieldConfig {
+    let profiles = profiles
+        .into_iter()
+        .map(|(name, rate, burst)| {
+            (
+                name.to_string(),
+                LimitProfileConfig {
+                    rate: rate.to_string(),
+                    burst,
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    ShieldConfig {
+        enabled: true,
+        profiles,
+        rules,
+        default_profile: None,
+        jwt_limits: None,
+        limit_service: None,
+        sync: None,
+        trusted_proxies: Vec::new(),
+    }
+}
+
+fn rule(pattern: &str, key: KeySourceConfig, profile: Option<&str>) -> RateRuleConfig {
+    RateRuleConfig {
+        pattern: pattern.to_string(),
+        key,
+        profile: profile.map(str::to_string),
+    }
+}
+
+fn app(cfg: ShieldConfig) -> Router {
+    let shield = Shield::build(&cfg).unwrap().unwrap();
+    Router::new()
+        .route("/api/x", get(|| async { "ok" }))
+        .route("/open", get(|| async { "ok" }))
+        .layer(axum::middleware::from_fn_with_state(
+            shield,
+            pre_auth_middleware,
+        ))
+}
+
+async fn get_req(app: &Router, path: &str, xff: Option<&str>) -> Response {
+    let mut req = Request::builder().uri(path);
+    if let Some(xff) = xff {
+        req = req.header("x-forwarded-for", xff);
+    }
+    app.clone()
+        .oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+async fn get_keyed(app: &Router, path: &str, header: (&str, &str)) -> Response {
+    let req = Request::builder()
+        .uri(path)
+        .header(header.0, header.1)
+        .body(Body::empty())
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap()
+}
+
+#[tokio::test]
+async fn admits_burst_then_rejects() {
+    let app = app(config(
+        vec![("t", "60/min", Some(2))], // 1/s, burst 2
+        vec![rule("/api/**", KeySourceConfig::Ip, Some("t"))],
+    ));
+    // Same client (same XFF) → shared budget of 2.
+    assert_eq!(
+        get_req(&app, "/api/x", Some("9.9.9.9")).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        get_req(&app, "/api/x", Some("9.9.9.9")).await.status(),
+        StatusCode::OK
+    );
+    let third = get_req(&app, "/api/x", Some("9.9.9.9")).await;
+    assert_eq!(third.status(), StatusCode::TOO_MANY_REQUESTS);
+    // A rejected response carries Retry-After.
+    assert!(third.headers().contains_key("retry-after"));
+}
+
+#[tokio::test]
+async fn emits_ratelimit_headers_when_allowed() {
+    let app = app(config(
+        vec![("t", "100/min", Some(10))],
+        vec![rule("/api/**", KeySourceConfig::Ip, Some("t"))],
+    ));
+    let resp = get_req(&app, "/api/x", Some("1.2.3.4")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let h = resp.headers();
+    assert_eq!(h.get("ratelimit-limit").unwrap(), "100");
+    // After one admitted request, 9 of the burst-10 remain.
+    assert_eq!(h.get("ratelimit-remaining").unwrap(), "9");
+    assert!(h.contains_key("ratelimit-reset"));
+}
+
+#[tokio::test]
+async fn unmatched_path_is_not_limited() {
+    let app = app(config(
+        vec![("t", "1/min", Some(1))],
+        vec![rule("/api/**", KeySourceConfig::Ip, Some("t"))],
+    ));
+    // `/open` matches no rule: never limited even past the /api budget.
+    for _ in 0..5 {
+        assert_eq!(
+            get_req(&app, "/open", Some("5.5.5.5")).await.status(),
+            StatusCode::OK
+        );
+    }
+}
+
+#[tokio::test]
+async fn header_key_isolates_clients() {
+    let app = app(config(
+        vec![("t", "60/min", Some(1))], // burst 1
+        vec![rule(
+            "/api/**",
+            KeySourceConfig::Header {
+                name: "x-api-key".to_string(),
+            },
+            Some("t"),
+        )],
+    ));
+    // Key "alice": first ok, second rejected.
+    assert_eq!(
+        get_keyed(&app, "/api/x", ("x-api-key", "alice"))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        get_keyed(&app, "/api/x", ("x-api-key", "alice"))
+            .await
+            .status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    // A different key has its own budget.
+    assert_eq!(
+        get_keyed(&app, "/api/x", ("x-api-key", "bob"))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn rule_without_resolvable_profile_passes() {
+    // Rule pins no profile and there is no default_profile → cannot limit → allow.
+    let app = app(config(
+        vec![("t", "1/min", Some(1))],
+        vec![rule("/api/**", KeySourceConfig::Ip, None)],
+    ));
+    for _ in 0..3 {
+        assert_eq!(
+            get_req(&app, "/api/x", Some("7.7.7.7")).await.status(),
+            StatusCode::OK
+        );
+    }
+}
+
+#[test]
+fn jwt_claim_key_uses_claim_then_falls_back_to_ip() {
+    let claims = serde_json::json!({ "sub": "alice", "org": { "id": "acme" } });
+    let key = KeySource::JwtClaim("sub".to_string());
+    // Present claim keys by its value.
+    assert_eq!(
+        rule_key(0, &key, "1.1.1.1", &HeaderMap::new(), Some(&claims)),
+        "0:jwt:alice"
+    );
+    // Dotted path into a nested claim.
+    let nested = KeySource::JwtClaim("org.id".to_string());
+    assert_eq!(
+        rule_key(0, &nested, "1.1.1.1", &HeaderMap::new(), Some(&claims)),
+        "0:jwt:acme"
+    );
+    // No claims (anonymous) → IP fallback, so the limit can't be dodged.
+    assert_eq!(
+        rule_key(0, &key, "1.1.1.1", &HeaderMap::new(), None),
+        "0:ip:1.1.1.1"
+    );
+    // Claim present but missing the requested field → IP fallback.
+    assert_eq!(
+        rule_key(
+            0,
+            &KeySource::JwtClaim("missing".to_string()),
+            "1.1.1.1",
+            &HeaderMap::new(),
+            Some(&claims)
+        ),
+        "0:ip:1.1.1.1"
+    );
+}
+
+#[test]
+fn rule_index_namespaces_identical_keys() {
+    // The same client under two different rules keeps independent budgets.
+    let key = KeySource::Ip;
+    let a = rule_key(0, &key, "1.1.1.1", &HeaderMap::new(), None);
+    let b = rule_key(1, &key, "1.1.1.1", &HeaderMap::new(), None);
+    assert_ne!(a, b);
+}
+
+#[test]
+fn build_rejects_unknown_default_profile() {
+    let mut cfg = config(vec![("t", "1/min", None)], Vec::new());
+    cfg.rules = vec![rule("/x", KeySourceConfig::Ip, Some("t"))];
+    cfg.default_profile = Some("missing".to_string());
+    assert!(Shield::build(&cfg).is_err());
+}
+
+/// End-to-end two-phase test: a rule keyed by a validated JWT claim, layered in
+/// the same order as the server (pre-auth → auth → post-auth), limits per
+/// principal using the claims the auth middleware verifies and attaches.
+mod two_phase {
+    use super::*;
+    use crate::auth::Auth;
+    use crate::config::{AuthConfig, JwtConfig};
+    use ed25519_dalek::{Signer, SigningKey};
+
+    fn keypair_pem() -> (SigningKey, std::path::PathBuf) {
+        let sk = SigningKey::from_bytes(&[9u8; 32]);
+        let spki_prefix: [u8; 12] = [
+            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+        ];
+        let mut der = spki_prefix.to_vec();
+        der.extend_from_slice(sk.verifying_key().as_bytes());
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&der);
+        let pem = format!("-----BEGIN PUBLIC KEY-----\n{b64}\n-----END PUBLIC KEY-----\n");
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "sp_shield_{}_{}.pem",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, pem).unwrap();
+        (sk, path)
+    }
+
+    fn token(sk: &SigningKey, sub: &str) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"EdDSA","typ":"JWT"}"#);
+        // Far-future exp so default expiry validation passes.
+        let claims = serde_json::json!({ "sub": sub, "exp": 9_999_999_999u64 });
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+        let signing_input = format!("{header}.{payload}");
+        let sig = sk.sign(signing_input.as_bytes());
+        format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()))
+    }
+
+    fn auth(pem: std::path::PathBuf) -> std::sync::Arc<Auth> {
+        let cfg = AuthConfig {
+            mode: "jwt".into(),
+            jwt: Some(JwtConfig {
+                issuer: None,
+                audience: None,
+                jwks_uri: None,
+                public_key_pem_file: Some(pem),
+                claims_headers: HashMap::new(),
+                roles_claim: "roles".into(),
+            }),
+            forward_auth: None,
+            authz: None,
+        };
+        Auth::build(&cfg).unwrap().unwrap()
+    }
+
+    fn stack(shield: std::sync::Arc<Shield>, auth: std::sync::Arc<Auth>) -> Router {
+        // Same layering order as the server: post-auth is innermost (sees the
+        // verified claims), auth in the middle, pre-auth outermost.
+        Router::new()
+            .route("/api/x", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                shield.clone(),
+                post_auth_middleware,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                auth,
+                crate::auth::middleware,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                shield,
+                pre_auth_middleware,
+            ))
+    }
+
+    async fn get_with(app: &Router, bearer: &str) -> StatusCode {
+        let req = Request::builder()
+            .uri("/api/x")
+            .header("authorization", format!("Bearer {bearer}"))
+            .body(Body::empty())
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn limits_per_principal_via_validated_claim() {
+        let (sk, pem) = keypair_pem();
+        let cfg = config(
+            vec![("t", "60/min", Some(1))], // burst 1 per principal
+            vec![rule(
+                "/api/**",
+                KeySourceConfig::JwtClaim {
+                    claim: "sub".to_string(),
+                },
+                Some("t"),
+            )],
+        );
+        let shield = Shield::build(&cfg).unwrap().unwrap();
+        let app = stack(shield, auth(pem));
+
+        let alice = token(&sk, "alice");
+        let bob = token(&sk, "bob");
+        // Alice: first request ok, second over her burst.
+        assert_eq!(get_with(&app, &alice).await, StatusCode::OK);
+        assert_eq!(get_with(&app, &alice).await, StatusCode::TOO_MANY_REQUESTS);
+        // Bob is a different principal with his own budget.
+        assert_eq!(get_with(&app, &bob).await, StatusCode::OK);
+    }
+}

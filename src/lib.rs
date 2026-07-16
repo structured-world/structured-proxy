@@ -524,8 +524,18 @@ impl ProxyServer {
         // Duplicate-route collisions (including the verify path) were already
         // rejected up front, before any router was built.
 
-        // Auth runs inside Shield (added first = inner): rate limiting sheds
-        // load before any signature verification work.
+        // Two-phase rate limiting around auth. The post-auth phase (rules keyed
+        // by a validated JWT claim) is layered first so it sits *inside* auth and
+        // sees the verified claims; the pre-auth phase (IP / header keys) is
+        // layered after auth below so it runs *first* and sheds anonymous floods
+        // before any signature verification.
+        if let Some(shield) = &shield {
+            router = router.layer(axum::middleware::from_fn_with_state(
+                shield.clone(),
+                shield::post_auth_middleware,
+            ));
+        }
+
         if let Some(auth) = auth {
             router = router.layer(axum::middleware::from_fn_with_state(auth, auth::middleware));
         }
@@ -548,13 +558,15 @@ impl ProxyServer {
             router = router.merge(forward_auth.routes());
         }
 
-        // Shield is added before maintenance so maintenance wraps it (outer
-        // layers run first): a request rejected by the maintenance gate must
-        // not be charged against its rate-limit budget.
-        if let Some(shield) = shield {
+        // Pre-auth phase, added before maintenance so maintenance wraps it (outer
+        // layers run first): a request rejected by the maintenance gate must not
+        // be charged against its rate-limit budget. Placed after the auth layer
+        // so it runs before auth, and after the verify route so that endpoint is
+        // rate-limited too (but not JWT-gated).
+        if let Some(shield) = &shield {
             router = router.layer(axum::middleware::from_fn_with_state(
-                shield,
-                shield::middleware,
+                shield.clone(),
+                shield::pre_auth_middleware,
             ));
         }
 

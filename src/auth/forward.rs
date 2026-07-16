@@ -67,7 +67,9 @@ impl ForwardAuth {
         match self.auth.decide(headers, &path, &method).await {
             // 200 carries the verified claim headers for the fronting proxy to
             // copy upstream.
-            AuthDecision::Allow(claim_headers) => (StatusCode::OK, claim_headers).into_response(),
+            AuthDecision::Allow(claim_headers, _) => {
+                (StatusCode::OK, claim_headers).into_response()
+            }
             AuthDecision::Unauthenticated(msg) => self.deny(msg),
             AuthDecision::Forbidden(msg) => forbidden(msg),
         }

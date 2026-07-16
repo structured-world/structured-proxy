@@ -18,6 +18,17 @@ jobs:
   quality-checks:
     name: Quality Checks (${{ matrix.backend.name }})
     runs-on: ubuntu-latest
+    services:
+      # Shared store for the rate-limit cross-instance reconciliation test.
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     strategy:
       fail-fast: false
       matrix:
@@ -53,6 +64,9 @@ jobs:
         run: cargo build --release ${{ matrix.backend.flags }}
 
       - name: Test
+        env:
+          # Exercises the rate-limit reconciliation against the Redis service.
+          SHIELD_REDIS_TEST_URL: redis://127.0.0.1:6379/
         run: cargo test ${{ matrix.backend.flags }}
 
       - name: Publish dry-run

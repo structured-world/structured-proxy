@@ -369,58 +369,176 @@ fn default_authz_timeout_ms() -> u64 {
 }
 
 /// Shield (rate limiting) configuration.
+///
+/// The proxy runs embedded on each service instance, so every limit decision is
+/// made locally with a GCRA shaper (zero blocking latency). A shared store, when
+/// configured via [`sync`](ShieldConfig::sync), is reconciled asynchronously off
+/// the request path to approximate a fleet-wide limit; the request path never
+/// blocks on it.
 #[derive(Debug, Clone, Deserialize)]
 #[non_exhaustive]
 pub struct ShieldConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// Endpoint classification (glob pattern → class → rate limit).
+    /// Named limit tiers referenced by rules and by tier-name resolution (JWT
+    /// claim / limit service). Map of profile name → `{ rate, burst }`.
     #[serde(default)]
-    pub endpoint_classes: Vec<EndpointClassConfig>,
-    /// Per-identifier rate limiting.
+    pub profiles: std::collections::HashMap<String, LimitProfileConfig>,
+    /// Rate-limit rules, evaluated in order; the first whose pattern matches the
+    /// request path applies.
     #[serde(default)]
-    pub identifier_endpoints: Vec<IdentifierEndpointConfig>,
-    /// Window size in seconds (default: 60).
-    #[serde(default = "default_window_secs")]
-    pub window_secs: u64,
-    /// Redis URL for shared counters across replicas (e.g. "redis://127.0.0.1/").
-    /// When unset, an in-process per-replica store is used. Requires the `redis`
-    /// build feature; otherwise the proxy logs a warning and uses the in-process
-    /// store.
+    pub rules: Vec<RateRuleConfig>,
+    /// Profile name applied when a matched rule resolves no other limit (JWT and
+    /// service resolution absent or empty, and the rule sets no explicit
+    /// profile). Must name an entry in `profiles`.
     #[serde(default)]
-    pub redis_url: Option<String>,
+    pub default_profile: Option<String>,
+    /// Resolve a key's limit from claims in the validated JWT. Presence enables
+    /// JWT-based resolution (tier name or explicit numbers).
+    #[serde(default)]
+    pub jwt_limits: Option<JwtLimitConfig>,
+    /// Resolve a key's limit from an external service. The lookup is cached and
+    /// refreshed in the background; the request path never blocks on it.
+    #[serde(default)]
+    pub limit_service: Option<LimitServiceConfig>,
+    /// Asynchronous cross-instance reconciliation via a shared store. When unset,
+    /// each instance limits locally (fleet limit ≈ N × per-instance).
+    #[serde(default)]
+    pub sync: Option<SyncConfig>,
     /// CIDR ranges of trusted reverse proxies / load balancers (e.g.
     /// "10.0.0.0/8"). `X-Forwarded-For` / `X-Real-IP` are honored only when the
     /// direct peer falls in one of these ranges; otherwise the peer socket
     /// address is used as the client identity. Empty (the default) means do not
-    /// trust forwarding headers — set this behind a load balancer.
+    /// trust forwarding headers; set this behind a load balancer.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
 }
 
-fn default_window_secs() -> u64 {
-    60
-}
-
-/// Endpoint classification for rate limiting.
+/// A named limit tier: a sustained rate plus an instantaneous burst capacity.
 #[derive(Debug, Clone, Deserialize)]
 #[non_exhaustive]
-pub struct EndpointClassConfig {
-    /// Glob pattern (e.g., "/v1/auth/**").
+pub struct LimitProfileConfig {
+    /// Sustained rate as `"<count>/<unit>"` (e.g. `"100/min"`, units
+    /// `s`/`min`/`hour`) or a bare count (interpreted per minute).
+    pub rate: String,
+    /// Maximum requests admitted back-to-back before throttling to the rate.
+    /// Defaults to the per-window rate count (one full window of burst).
+    #[serde(default)]
+    pub burst: Option<u64>,
+}
+
+/// One rate-limit rule: a path pattern, how to key it, and an optional static
+/// profile. The rule's *phase* (before or after auth) is derived automatically:
+/// rules that need validated JWT claims (a `jwt_claim` key, or JWT-based limit
+/// resolution) run after auth; the rest run before auth so anonymous floods are
+/// shed before any signature verification.
+#[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
+pub struct RateRuleConfig {
+    /// Glob path pattern (`*` within a segment, `**` across segments).
     pub pattern: String,
-    /// Class name (e.g., "auth").
-    pub class: String,
-    /// Rate limit string (e.g., "20/min").
-    pub rate: String,
+    /// How to derive the limit key (who is limited). Defaults to client IP.
+    #[serde(default)]
+    pub key: KeySourceConfig,
+    /// Static profile name for this rule, used when JWT/service resolution does
+    /// not apply or yields nothing. Must name an entry in `profiles`.
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
-/// Per-identifier rate limiting config.
+/// How a rule derives its limit key. All sources fall back to the client IP when
+/// their value is absent, so a limit can't be bypassed by omitting a header or
+/// authenticating anonymously. Written as a tagged map, e.g.
+/// `key: { type: jwt_claim, claim: sub }`; omitting `key` defaults to `ip`.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum KeySourceConfig {
+    /// Client IP (trusted-proxy `X-Forwarded-For` aware). `{ type: ip }`.
+    #[default]
+    Ip,
+    /// Value of a named request header (e.g. an API key).
+    /// `{ type: header, name: x-api-key }`.
+    Header {
+        /// Header whose value identifies the client.
+        name: String,
+    },
+    /// Value of a claim from the validated JWT (provider-agnostic).
+    /// `{ type: jwt_claim, claim: sub }`.
+    JwtClaim {
+        /// Claim whose value identifies the principal.
+        claim: String,
+    },
+}
+
+/// Claims that carry a key's limit inside the JWT itself. A tier-name claim maps
+/// to a `profiles` entry (numbers stay tunable in config); direct numeric claims
+/// set the limit explicitly.
 #[derive(Debug, Clone, Deserialize)]
 #[non_exhaustive]
-pub struct IdentifierEndpointConfig {
-    pub path: String,
-    pub body_field: String,
-    pub rate: String,
+pub struct JwtLimitConfig {
+    /// Claim naming a profile tier (e.g. `"premium"`). Default: `ratelimit_tier`.
+    #[serde(default = "default_tier_claim")]
+    pub tier_claim: String,
+    /// Claim carrying an explicit sustained rate, requests per minute. Default:
+    /// `ratelimit_rpm`.
+    #[serde(default = "default_rpm_claim")]
+    pub rpm_claim: String,
+    /// Claim carrying an explicit burst capacity. Default: `ratelimit_burst`.
+    #[serde(default = "default_burst_claim")]
+    pub burst_claim: String,
+}
+
+fn default_tier_claim() -> String {
+    "ratelimit_tier".to_string()
+}
+fn default_rpm_claim() -> String {
+    "ratelimit_rpm".to_string()
+}
+fn default_burst_claim() -> String {
+    "ratelimit_burst".to_string()
+}
+
+/// External limit-resolution service. The response names a tier or gives explicit
+/// numbers; results are cached and refreshed asynchronously, never on the request
+/// path.
+#[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
+pub struct LimitServiceConfig {
+    /// HTTP endpoint queried with the limit key; returns `{ tier }` or
+    /// `{ rate_per_min, burst }`.
+    pub endpoint: String,
+    /// How long a resolved limit is cached before a background refresh, in
+    /// seconds (default: 300).
+    #[serde(default = "default_limit_ttl_secs")]
+    pub ttl_secs: u64,
+    /// Timeout for the background fetch, in milliseconds (default: 500).
+    #[serde(default = "default_limit_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_limit_ttl_secs() -> u64 {
+    300
+}
+fn default_limit_timeout_ms() -> u64 {
+    500
+}
+
+/// Asynchronous cross-instance reconciliation via a shared store.
+#[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
+pub struct SyncConfig {
+    /// Shared-store URL (e.g. `"redis://127.0.0.1/"`). Requires the `redis` build
+    /// feature; without it the proxy logs a warning and stays local-only.
+    pub redis_url: String,
+    /// Background push/pull interval in milliseconds (default: 500). The
+    /// worst-case fleet overshoot is bounded by `(N-1) × rate × interval`.
+    #[serde(default = "default_sync_interval_ms")]
+    pub interval_ms: u64,
+}
+
+fn default_sync_interval_ms() -> u64 {
+    500
 }
 
 /// OIDC discovery config.
@@ -836,17 +954,20 @@ auth:
 
 shield:
   enabled: true
-  endpoint_classes:
+  profiles:
+    auth: { rate: "20/min", burst: 5 }
+    default: { rate: "100/min" }
+    premium: { rate: "1000/min", burst: 50 }
+  default_profile: "default"
+  jwt_limits:
+    tier_claim: "ratelimit_tier"
+  rules:
     - pattern: "/v1/auth/**"
-      class: "auth"
-      rate: "20/min"
-    - pattern: "/**"
-      class: "default"
-      rate: "100/min"
-  identifier_endpoints:
-    - path: "/v1/auth/opaque/login/start"
-      body_field: "identifier"
-      rate: "10/min"
+      key: { type: ip }
+      profile: "auth"
+    - pattern: "/v1/**"
+      key: { type: jwt_claim, claim: "sub" }
+  trusted_proxies: ["10.0.0.0/8"]
 
 oidc_discovery:
   enabled: true
