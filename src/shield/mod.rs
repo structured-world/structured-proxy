@@ -108,8 +108,10 @@ impl Shield {
                     &sync.redis_url,
                     Duration::from_millis(sync.interval_ms),
                 )?;
-                g.spawn();
-                Some(g)
+                // Keep the fleet gate only if reconciliation actually started;
+                // otherwise fall back to per-instance limiting rather than gating
+                // on an estimate that would never be refreshed.
+                g.spawn().then_some(g)
             }
             None => None,
         };
@@ -230,7 +232,11 @@ async fn enforce(shield: &Shield, phase: Phase, request: Request, next: Next) ->
     };
 
     // Fleet gate first (read-only, cached), so the local shaper is not charged
-    // for a request the fleet-wide budget will reject.
+    // for a request the fleet-wide budget will reject. The fleet budget is the
+    // sustained rate (`profile.limit`); `burst` is deliberately a per-instance
+    // smoothing allowance, not a fleet-wide entitlement (honouring it fleet-wide
+    // would multiply the effective limit by N). A single instance's burst is
+    // therefore capped by the shared budget when the fleet is near it.
     #[cfg(feature = "redis")]
     let fleet_remaining = shield
         .global
@@ -376,9 +382,10 @@ fn parse_cidr(s: &str) -> Result<ipnet::IpNet, String> {
 /// `X-Forwarded-For` is trusted only when the direct `peer` is a configured
 /// trusted proxy, and even then the *rightmost* hop outside the trusted ranges
 /// is used: appending load balancers (nginx, ALB, GCP) add the connecting IP on
-/// the right, so the leftmost entries are attacker-controlled. Without
-/// connection info (e.g. a custom server that does not provide it) the headers
-/// are taken as a best effort.
+/// the right, so the leftmost entries are attacker-controlled. Without connection
+/// info (a server not wired with `ConnectInfo`) we fail closed to a single
+/// `"unknown"` bucket rather than trusting client-supplied forwarding headers,
+/// which an attacker could otherwise rotate to dodge the limit.
 fn client_ip(
     peer: Option<std::net::IpAddr>,
     headers: &HeaderMap,
@@ -393,8 +400,7 @@ fn client_ip(
             }
             ip.to_string()
         }
-        // No connection info: fall back to the headers as a best effort.
-        None => best_effort_forwarded(headers).unwrap_or_else(|| "unknown".to_string()),
+        None => "unknown".to_string(),
     }
 }
 
@@ -417,19 +423,6 @@ fn rightmost_untrusted(headers: &HeaderMap, trusted: &[ipnet::IpNet]) -> Option<
     }
     // X-Real-IP is set by the proxy to the single real client address.
     header_str(headers, "x-real-ip")
-}
-
-/// Best-effort client from forwarding headers when no peer is known: leftmost
-/// `X-Forwarded-For`, then `X-Real-IP`.
-fn best_effort_forwarded(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .or_else(|| header_str(headers, "x-real-ip"))
 }
 
 /// Trimmed, non-empty value of a header.

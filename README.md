@@ -231,14 +231,16 @@ allowed responses. Behind a browser, these are exposed via CORS.
   unreachable, instances degrade to local limiting rather than failing requests.
 
 **Sizing the overshoot.** In reconciled mode the aggregate lags by up to one
-`sync.interval_ms`, so within that lag each of the other instances can admit up
-to a `rate` fraction of the window. With the interval expressed in the same time
-unit as the window, the worst-case fleet overshoot is about
-`(N - 1) × rate × (interval / window)` requests. For example, `rate = 1000/min`,
-`interval = 500 ms`, `N = 4` gives `3 × 1000 × (0.5 / 60) ≈ 25` extra requests.
-Shorter intervals tighten the bound at the cost of more store traffic. The global
-view uses a sliding-window counter, so there is no boundary burst on top of this
-lag.
+`sync.interval_ms`. Within that lag each of the other instances can admit its
+local `burst` plus a `rate` fraction of the window before the estimate catches
+up (the fleet gate caps sustained fleet volume at `rate`, but `burst` is a
+per-instance allowance the gate does not pre-reserve). With the interval in the
+same time unit as the window, the worst-case fleet overshoot is about
+`(N - 1) × (burst + rate × (interval / window))` requests. For example,
+`burst = 100`, `rate = 1000/min`, `interval = 500 ms`, `N = 4` gives
+`3 × (100 + 1000 × (0.5 / 60)) ≈ 325` extra requests. Smaller `burst` and shorter
+intervals tighten the bound. The global view uses a sliding-window counter, so
+there is no boundary burst on top of this lag.
 
 See the `shield:` block under [Configuration](#configuration) for the full
 schema.
