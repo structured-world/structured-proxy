@@ -231,6 +231,12 @@ async fn enforce(shield: &Shield, phase: Phase, request: Request, next: Next) ->
         }
     }
 
+    // The store key intentionally excludes the profile's numbers, so if a key's
+    // resolved tier changes (a JWT/service tier upgrade), the existing TAT is
+    // reused with the new emission interval. The TAT is an absolute time, so this
+    // only causes a brief transient at the change and self-corrects within one
+    // window. Keying by the tier's numbers instead would reset the budget on
+    // every tier flip, which a client could exploit to shed its own limit.
     let verdict = shield.store.check(&key.store, &profile.gcra);
     if !verdict.allowed {
         return too_many_requests(profile.limit, &verdict);
