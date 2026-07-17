@@ -130,7 +130,7 @@ axum = { version = "0.8", features = ["macros"] }
 http = "1"
 bytes = "1"
 async-trait = "0.1"
-ed25519-dalek = "2"
+ed25519-dalek = "3"
 rand = "0.10"
 chrono = "0.4"
 tokio-stream = "0.1"
