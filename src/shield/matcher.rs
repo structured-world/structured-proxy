@@ -136,7 +136,7 @@ pub fn compile_rules(
                 KeySourceConfig::Header { name } => KeySource::Header(name.clone()),
                 KeySourceConfig::JwtClaim { claim } => KeySource::JwtClaim(claim.clone()),
             };
-            let phase = match key {
+            let phase = match &key {
                 KeySource::JwtClaim(_) => Phase::PostAuth,
                 KeySource::Ip | KeySource::Header(_) => Phase::PreAuth,
             };
