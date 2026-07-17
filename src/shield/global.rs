@@ -45,6 +45,12 @@ struct KeyState {
     local_count: u64,
     /// How much of `local_count` has already been pushed to the store.
     pushed: u64,
+    /// Admits from the previous epoch that were never pushed before the epoch
+    /// rolled, still owed to `carryover_epoch`'s counter. Carried so a boundary
+    /// crossing between the last push and a roll does not silently drop them.
+    carryover: u64,
+    /// The epoch `carryover` is owed to.
+    carryover_epoch: u64,
     /// The rest of the fleet's sliding consumption, from the last pull.
     remote_estimate: u64,
     last_seen: Instant,
@@ -57,16 +63,29 @@ impl KeyState {
             window_secs,
             local_count: 0,
             pushed: 0,
+            carryover: 0,
+            carryover_epoch: 0,
             remote_estimate: 0,
             last_seen: Instant::now(),
         }
     }
 
-    /// Advance to `epoch`, resetting the per-epoch counts. The remote estimate is
-    /// kept (the background task refreshes it) so a fresh epoch does not briefly
-    /// open the full budget fleet-wide.
+    /// Advance to `epoch`, resetting the per-epoch counts. Any admits not yet
+    /// pushed are stashed as `carryover` owed to the epoch being left, so the
+    /// reconciler still publishes them to that epoch's counter. The remote
+    /// estimate is kept (the background task refreshes it) so a fresh epoch does
+    /// not briefly open the full budget fleet-wide.
+    ///
+    /// A single carryover slot assumes the reconcile interval is much shorter
+    /// than the window (the default 500ms vs seconds+), so at most one unpushed
+    /// epoch exists between reconciles.
     fn roll_to(&mut self, epoch: u64) {
         if self.epoch != epoch {
+            let unpushed = self.local_count.saturating_sub(self.pushed);
+            if unpushed > 0 {
+                self.carryover += unpushed;
+                self.carryover_epoch = self.epoch;
+            }
             self.epoch = epoch;
             self.local_count = 0;
             self.pushed = 0;
@@ -189,15 +208,28 @@ impl GlobalCounters {
         for entry in self.states.iter() {
             let s = entry.value();
             let window = Duration::from_secs(s.window_secs);
+            let read_epoch = window::epoch(now, window);
             plans.push(PushPlan {
                 key: entry.key().clone(),
                 push_epoch: s.epoch,
-                read_epoch: window::epoch(now, window),
+                read_epoch,
                 window,
                 delta: s.local_count.saturating_sub(s.pushed),
+                is_carryover: false,
             });
+            // Deltas from a prior epoch that rolled before they were pushed.
+            if s.carryover > 0 {
+                plans.push(PushPlan {
+                    key: entry.key().clone(),
+                    push_epoch: s.carryover_epoch,
+                    read_epoch,
+                    window,
+                    delta: s.carryover,
+                    is_carryover: true,
+                });
+            }
         }
-        if plans.is_empty() {
+        if plans.iter().all(|p| p.delta == 0) {
             return;
         }
 
@@ -235,7 +267,12 @@ impl GlobalCounters {
     fn commit_pushed(&self, plans: &[PushPlan]) {
         for p in plans.iter().filter(|p| p.delta > 0) {
             if let Some(mut s) = self.states.get_mut(&p.key) {
-                if s.epoch == p.push_epoch {
+                if p.is_carryover {
+                    // Clear the carried-over amount now that its epoch counter has it.
+                    if s.carryover_epoch == p.push_epoch {
+                        s.carryover = s.carryover.saturating_sub(p.delta);
+                    }
+                } else if s.epoch == p.push_epoch {
                     s.pushed += p.delta;
                 }
             }
@@ -245,6 +282,11 @@ impl GlobalCounters {
     /// Refresh each key's cached estimate of the rest of the fleet's consumption.
     fn apply_estimates(&self, now: Duration, plans: &[PushPlan], reads: &[(u64, u64)]) {
         for (p, (cur, prev)) in plans.iter().zip(reads) {
+            // Carryover plans only publish a past epoch's delta; the estimate is
+            // driven by the current-epoch plan for the same key.
+            if p.is_carryover {
+                continue;
+            }
             if let Some(mut s) = self.states.get_mut(&p.key) {
                 // A request may have reset the key to a new window, or rolled it
                 // to a newer epoch, while the read was in flight. The estimate we
@@ -331,6 +373,8 @@ struct PushPlan {
     read_epoch: u64,
     window: Duration,
     delta: u64,
+    /// True for a plan publishing a prior epoch's carried-over delta (no estimate).
+    is_carryover: bool,
 }
 
 #[cfg(test)]
@@ -372,6 +416,22 @@ mod tests {
     }
 
     #[test]
+    fn roll_preserves_unpushed_deltas_as_carryover() {
+        // 5 admits in an epoch, 2 already pushed, then the epoch rolls before the
+        // remaining 3 are pushed: they must survive as carryover owed to the old
+        // epoch, not be silently dropped.
+        let mut s = KeyState::new(10, 60);
+        s.local_count = 5;
+        s.pushed = 2;
+        s.roll_to(11);
+        assert_eq!(s.carryover, 3);
+        assert_eq!(s.carryover_epoch, 10);
+        assert_eq!(s.local_count, 0);
+        assert_eq!(s.pushed, 0);
+        assert_eq!(s.epoch, 11);
+    }
+
+    #[test]
     fn stale_estimate_not_applied_after_window_reset() {
         let g = counters();
         let key = "k";
@@ -388,6 +448,7 @@ mod tests {
             read_epoch: window::epoch(now, W),
             window: W,
             delta: 0,
+            is_carryover: false,
         };
         g.apply_estimates(now, &[plan], &[(100, 0)]);
 
@@ -448,6 +509,45 @@ mod tests {
         assert!(
             !b.gate(&key, 3, W),
             "B must reject once the combined budget is reached"
+        );
+    }
+
+    /// A carried-over delta from a rolled epoch is published to that epoch's
+    /// counter (not the current one) and then cleared.
+    #[tokio::test]
+    async fn carryover_is_pushed_to_its_epoch() {
+        let Ok(url) = std::env::var("SHIELD_REDIS_TEST_URL") else {
+            eprintln!("SKIP carryover_is_pushed_to_its_epoch: SHIELD_REDIS_TEST_URL not set");
+            return;
+        };
+        let win = Duration::from_secs(3600);
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let key = format!("it3:{}:{nonce}", std::process::id());
+
+        let g = GlobalCounters::build(&url, Duration::from_millis(200)).unwrap();
+        let cur = window::epoch(unix_now(), win);
+        let mut st = KeyState::new(cur, win.as_secs());
+        st.carryover = 3;
+        st.carryover_epoch = cur - 1;
+        g.states.insert(key.clone(), st);
+
+        g.reconcile().await;
+
+        let client = redis::Client::open(url).unwrap();
+        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+        let prev: i64 = redis::cmd("GET")
+            .arg(epoch_key(&key, cur - 1))
+            .query_async(&mut conn)
+            .await
+            .unwrap_or(0);
+        assert_eq!(prev, 3, "carryover must be published to its own epoch");
+        assert_eq!(
+            g.states.get(&key).unwrap().carryover,
+            0,
+            "carryover must be cleared once published"
         );
     }
 
