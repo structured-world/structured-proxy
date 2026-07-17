@@ -123,16 +123,25 @@ struct Cached {
     at: Instant,
 }
 
+/// Sweep the cache of long-idle keys at most once per this interval.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
 /// External limit-resolution service with an async, non-blocking cache.
 pub struct LimitService {
     endpoint: String,
     ttl: Duration,
+    /// Drop cache entries not refreshed within this window (a key that stopped
+    /// receiving requests), so client-controlled key cardinality can't grow the
+    /// cache without bound.
+    evict_after: Duration,
     client: reqwest::Client,
     /// Profiles for mapping a returned tier name to a compiled limit.
     profiles: HashMap<String, CompiledProfile>,
     cache: dashmap::DashMap<String, Cached>,
     /// Keys with a background fetch already in flight (dedupes refreshes).
     inflight: dashmap::DashMap<String, ()>,
+    base: Instant,
+    last_sweep_ms: std::sync::atomic::AtomicU64,
 }
 
 impl LimitService {
@@ -149,20 +158,45 @@ impl LimitService {
             .tls_backend_preconfigured(crate::auth::jwks::build_tls_config())
             .build()
             .map_err(|e| format!("invalid limit_service client: {e}"))?;
+        let ttl = Duration::from_secs(cfg.ttl_secs.max(1));
         Ok(Arc::new(Self {
             endpoint: cfg.endpoint.clone(),
-            ttl: Duration::from_secs(cfg.ttl_secs.max(1)),
+            ttl,
+            // Keep an idle entry for a few refresh cycles, at least 5 minutes.
+            evict_after: (ttl * 4).max(Duration::from_secs(300)),
             client,
             profiles,
             cache: dashmap::DashMap::new(),
             inflight: dashmap::DashMap::new(),
+            base: Instant::now(),
+            last_sweep_ms: std::sync::atomic::AtomicU64::new(0),
         }))
+    }
+
+    /// Evict cache entries not refreshed within `evict_after`, at most once per
+    /// [`SWEEP_INTERVAL`]; the first caller past the interval claims the sweep.
+    fn maybe_sweep(&self) {
+        use std::sync::atomic::Ordering;
+        let now_ms = u64::try_from(self.base.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let last = self.last_sweep_ms.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last) < SWEEP_INTERVAL.as_millis() as u64 {
+            return;
+        }
+        if self
+            .last_sweep_ms
+            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            let evict_after = self.evict_after;
+            self.cache.retain(|_, c| c.at.elapsed() < evict_after);
+        }
     }
 
     /// Resolve `key`'s limit from the cache, serving a stale value while a
     /// background refresh runs. Returns `None` (fall through to the static
     /// profile) only when nothing is cached yet. Never blocks the request.
     pub fn resolve(self: &Arc<Self>, key: &str) -> Option<CompiledProfile> {
+        self.maybe_sweep();
         let cached = self.cache.get(key).map(|c| *c);
         match cached {
             Some(c) if c.at.elapsed() < self.ttl => c.profile,
