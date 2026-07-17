@@ -404,4 +404,37 @@ mod two_phase {
             "the rejecting inner rule's RateLimit-Limit must not be overwritten"
         );
     }
+
+    #[tokio::test]
+    async fn allowed_response_reports_tighter_outer_budget() {
+        // Pre-auth IP rule is tighter (burst 2) than the post-auth principal rule
+        // (burst 100). An allowed request must advertise the tighter pre-auth
+        // remaining, not the roomy principal one, so the client backs off in time.
+        let (sk, pem) = keypair_pem();
+        let cfg = config(
+            vec![("tight", "60/min", Some(2)), ("wide", "100/min", Some(100))],
+            vec![
+                rule("/api/**", KeySourceConfig::Ip, Some("tight")),
+                rule(
+                    "/api/**",
+                    KeySourceConfig::JwtClaim {
+                        claim: "sub".to_string(),
+                    },
+                    Some("wide"),
+                ),
+            ],
+        );
+        let shield = Shield::build(&cfg).unwrap().unwrap();
+        let app = stack(shield, auth(pem));
+
+        let req = Request::builder()
+            .uri("/api/x")
+            .header("authorization", format!("Bearer {}", token(&sk, "alice")))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // tight burst 2, one admitted → 1 remaining; wide would show 99.
+        assert_eq!(resp.headers().get("ratelimit-remaining").unwrap(), "1");
+    }
 }

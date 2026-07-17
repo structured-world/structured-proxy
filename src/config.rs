@@ -376,6 +376,7 @@ fn default_authz_timeout_ms() -> u64 {
 /// the request path to approximate a fleet-wide limit; the request path never
 /// blocks on it.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ShieldConfig {
     #[serde(default)]
@@ -416,6 +417,7 @@ pub struct ShieldConfig {
 
 /// A named limit tier: a sustained rate plus an instantaneous burst capacity.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct LimitProfileConfig {
     /// Sustained rate as `"<count>/<unit>"` (e.g. `"100/min"`, units
@@ -428,11 +430,13 @@ pub struct LimitProfileConfig {
 }
 
 /// One rate-limit rule: a path pattern, how to key it, and an optional static
-/// profile. The rule's *phase* (before or after auth) is derived automatically:
-/// rules that need validated JWT claims (a `jwt_claim` key, or JWT-based limit
-/// resolution) run after auth; the rest run before auth so anonymous floods are
-/// shed before any signature verification.
+/// profile. The rule's *phase* (before or after auth) is derived from its key
+/// alone: a `jwt_claim` key needs validated claims so it runs after auth; `ip`
+/// and `header` keys run before auth so anonymous floods are shed before any
+/// signature verification. (`jwt_limits` therefore only takes effect on
+/// `jwt_claim` rules, the only ones running with claims available.)
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct RateRuleConfig {
     /// Glob path pattern (`*` within a segment, `**` across segments).
@@ -475,6 +479,7 @@ pub enum KeySourceConfig {
 /// to a `profiles` entry (numbers stay tunable in config); direct numeric claims
 /// set the limit explicitly.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct JwtLimitConfig {
     /// Claim naming a profile tier (e.g. `"premium"`). Default: `ratelimit_tier`.
@@ -503,6 +508,7 @@ fn default_burst_claim() -> String {
 /// numbers; results are cached and refreshed asynchronously, never on the request
 /// path.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct LimitServiceConfig {
     /// HTTP endpoint queried with the limit key; returns `{ tier }` or
@@ -526,6 +532,7 @@ fn default_limit_timeout_ms() -> u64 {
 
 /// Asynchronous cross-instance reconciliation via a shared store.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct SyncConfig {
     /// Shared-store URL (e.g. `"redis://127.0.0.1/"`). Requires the `redis` build
@@ -1072,6 +1079,28 @@ descriptors:
         assert_eq!(ProxyConfig::parse_rate("100/min"), Some(100));
         assert_eq!(ProxyConfig::parse_rate("5/min"), Some(5));
         assert_eq!(ProxyConfig::parse_rate("invalid"), None);
+    }
+
+    #[test]
+    fn shield_rejects_unknown_field() {
+        // A typo in a shield-config field (here `profil` for `profile`) must be a
+        // hard error, not silently ignored: a misspelled security-control key
+        // would otherwise leave the intended limit unapplied. `deny_unknown_fields`
+        // on the shield structs turns the typo into a startup failure.
+        let yaml = r#"
+upstream:
+  default: "grpc://localhost:4180"
+shield:
+  enabled: true
+  profiles:
+    auth: { rate: "20/min", burst: 5 }
+  rules:
+    - pattern: "/v1/**"
+      key: { type: ip }
+      profil: "auth"
+"#;
+        let err = serde_yaml::from_str::<ProxyConfig>(yaml);
+        assert!(err.is_err(), "unknown shield field must be rejected");
     }
 
     #[test]
