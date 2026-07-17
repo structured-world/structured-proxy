@@ -246,6 +246,13 @@ impl GlobalCounters {
     fn apply_estimates(&self, now: Duration, plans: &[PushPlan], reads: &[(u64, u64)]) {
         for (p, (cur, prev)) in plans.iter().zip(reads) {
             if let Some(mut s) = self.states.get_mut(&p.key) {
+                // A request may have reset the key to a new window, or rolled it
+                // to a newer epoch, while the read was in flight. The estimate we
+                // computed is for the plan's (window, epoch); applying it would
+                // clobber the fresh state with a stale value, so skip it.
+                if s.window_secs != p.window.as_secs() || s.epoch > p.read_epoch {
+                    continue;
+                }
                 let elapsed = window::elapsed_in_window(now, p.window);
                 let est = window::sliding_estimate(*cur, *prev, elapsed, p.window);
                 // Subtract only our own contribution to the current epoch's count
@@ -258,13 +265,17 @@ impl GlobalCounters {
         }
     }
 
-    /// `INCRBY` each key with a pending delta and re-arm its TTL, in one pipeline.
+    /// `INCRBY` each key with a pending delta and re-arm its TTL. Wrapped in a
+    /// `MULTI`/`EXEC` transaction so the batch applies all-or-nothing: a
+    /// mid-pipeline failure can't leave some `INCRBY`s applied while the caller
+    /// skips `commit_pushed` and re-pushes the same deltas next tick.
     async fn push_deltas(
         &self,
         conn: &mut redis::aio::MultiplexedConnection,
         plans: &[PushPlan],
     ) -> redis::RedisResult<()> {
         let mut pipe = redis::pipe();
+        pipe.atomic();
         let mut any = false;
         for p in plans.iter().filter(|p| p.delta > 0) {
             any = true;
@@ -358,6 +369,33 @@ mod tests {
         assert!(g.gate("k", 3, W));
         g.record("k", W);
         assert!(!g.gate("k", 3, W));
+    }
+
+    #[test]
+    fn stale_estimate_not_applied_after_window_reset() {
+        let g = counters();
+        let key = "k";
+        // The key currently lives on a 120s window with a fresh remote estimate.
+        g.record(key, Duration::from_secs(120));
+        g.states.get_mut(key).unwrap().remote_estimate = 5;
+
+        // A reconcile plan captured earlier for the OLD 60s window resumes after
+        // its read. Its estimate must not clobber the freshly-reset state.
+        let now = unix_now();
+        let plan = PushPlan {
+            key: key.to_string(),
+            push_epoch: window::epoch(now, W),
+            read_epoch: window::epoch(now, W),
+            window: W,
+            delta: 0,
+        };
+        g.apply_estimates(now, &[plan], &[(100, 0)]);
+
+        assert_eq!(
+            g.states.get(key).unwrap().remote_estimate,
+            5,
+            "an old-window estimate must not overwrite the reset state"
+        );
     }
 
     #[test]
