@@ -133,7 +133,15 @@ pub fn compile_rules(
             }
             let key = match &c.key {
                 KeySourceConfig::Ip => KeySource::Ip,
-                KeySourceConfig::Header { name } => KeySource::Header(name.clone()),
+                KeySourceConfig::Header { name } => {
+                    // Reject an invalid header name at build time: a typo (e.g.
+                    // whitespace) would never match a real header, silently
+                    // downgrading a per-API-key limit into a per-IP one.
+                    http::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                        format!("rule {:?} has invalid header name {name:?}", c.pattern)
+                    })?;
+                    KeySource::Header(name.clone())
+                }
                 KeySourceConfig::JwtClaim { claim } => KeySource::JwtClaim(claim.clone()),
             };
             let phase = match &key {
