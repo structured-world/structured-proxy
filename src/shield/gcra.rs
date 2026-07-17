@@ -22,6 +22,9 @@ pub struct Gcra {
     /// may run. `(burst - 1) * emission_interval`, so a fresh key admits exactly
     /// `burst` requests instantly before throttling to the steady rate.
     tau: Duration,
+    /// Bucket capacity: the most requests admissible at any instant. Caps the
+    /// reported `remaining` so an idle key cannot report above a full bucket.
+    burst: u64,
 }
 
 /// A named limit tier: a sustained rate over a window plus an instantaneous
@@ -68,6 +71,7 @@ impl Gcra {
         Self {
             emission_interval,
             tau,
+            burst,
         }
     }
 
@@ -88,9 +92,11 @@ impl Gcra {
         // admitted request pushes TAT forward by `t`, and a request conforms
         // while `now >= tat + k*t - tau`. `now + tau >= tat` means at least one
         // conforms.
+        // Cap at the bucket: an idle key (TAT far in the past) yields a large
+        // slack, but no more than `burst` requests can ever be admissible at once.
         let admissible = if now + tau >= tat {
             let slack = (now + tau) - tat; // >= 0
-            1 + div_floor(slack, t)
+            (1 + div_floor(slack, t)).min(self.burst)
         } else {
             0
         };
