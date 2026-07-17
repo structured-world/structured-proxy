@@ -136,11 +136,14 @@ pub fn compile_rules(
                 KeySourceConfig::Header { name } => {
                     // Reject an invalid header name at build time: a typo (e.g.
                     // whitespace) would never match a real header, silently
-                    // downgrading a per-API-key limit into a per-IP one.
-                    http::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                    // downgrading a per-API-key limit into a per-IP one. Store the
+                    // normalized (lowercased) form so a casing-only config
+                    // difference between instances (`X-API-Key` vs `x-api-key`)
+                    // yields the same fingerprint and shares one counter namespace.
+                    let hn = http::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
                         format!("rule {:?} has invalid header name {name:?}", c.pattern)
                     })?;
-                    KeySource::Header(name.clone())
+                    KeySource::Header(hn.as_str().to_string())
                 }
                 KeySourceConfig::JwtClaim { claim } => KeySource::JwtClaim(claim.clone()),
             };
@@ -194,6 +197,48 @@ mod tests {
         })
         .unwrap();
         assert_eq!(p.limit, 100);
+    }
+
+    #[test]
+    fn header_key_fingerprint_is_case_insensitive() {
+        // Casing-only differences in the configured header name must map to the
+        // same fingerprint so instances share one counter namespace.
+        let rules = compile_rules(
+            &[
+                RateRuleConfig {
+                    pattern: "/a".to_string(),
+                    key: KeySourceConfig::Header {
+                        name: "X-API-Key".to_string(),
+                    },
+                    profile: Some("auth".to_string()),
+                },
+                RateRuleConfig {
+                    pattern: "/a".to_string(),
+                    key: KeySourceConfig::Header {
+                        name: "x-api-key".to_string(),
+                    },
+                    profile: Some("auth".to_string()),
+                },
+            ],
+            &profiles(),
+        )
+        .unwrap();
+        assert_eq!(rules[0].fingerprint, rules[1].fingerprint);
+    }
+
+    #[test]
+    fn invalid_header_name_is_rejected() {
+        let err = compile_rules(
+            &[RateRuleConfig {
+                pattern: "/a".to_string(),
+                key: KeySourceConfig::Header {
+                    name: "bad name".to_string(),
+                },
+                profile: Some("auth".to_string()),
+            }],
+            &profiles(),
+        );
+        assert!(err.is_err());
     }
 
     #[test]
