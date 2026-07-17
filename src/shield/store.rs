@@ -23,7 +23,7 @@ const SWEEP_INTERVAL_MS: u64 = 60_000;
 // no-std: caller-provided Clock + spin/hashbrown map.
 #[derive(Debug)]
 pub struct GcraStore {
-    /// key → TAT in milliseconds since `base`.
+    /// key → TAT in nanoseconds since `base`.
     tats: dashmap::DashMap<String, u64>,
     base: Instant,
     last_sweep_ms: AtomicU64,
@@ -53,17 +53,17 @@ impl GcraStore {
 
         match self.tats.entry(key.to_string()) {
             Entry::Occupied(mut o) => {
-                let stored = Some(Duration::from_millis(*o.get()));
+                let stored = Some(Duration::from_nanos(*o.get()));
                 let verdict = gcra.check(stored, now);
                 if verdict.allowed {
-                    *o.get_mut() = tat_millis(verdict.new_tat);
+                    *o.get_mut() = dur_nanos(verdict.new_tat);
                 }
                 verdict
             }
             Entry::Vacant(v) => {
                 let verdict = gcra.check(None, now);
                 if verdict.allowed {
-                    v.insert(tat_millis(verdict.new_tat));
+                    v.insert(dur_nanos(verdict.new_tat));
                 }
                 verdict
             }
@@ -80,14 +80,14 @@ impl GcraStore {
     /// on the next hit yields the same result. Without eviction, client-controlled
     /// key cardinality (IP / principal) would grow the map without bound.
     fn evict_drained(&self, now: Duration) {
-        let now_ms = tat_millis(now);
-        self.tats.retain(|_, tat| *tat > now_ms);
+        let now_nanos = dur_nanos(now);
+        self.tats.retain(|_, tat| *tat > now_nanos);
     }
 
     /// Evict at most once per [`SWEEP_INTERVAL_MS`]; the first caller past the
     /// interval claims the sweep so it stays an infrequent O(n) pass.
     fn maybe_sweep(&self, now: Duration) {
-        let now_ms = tat_millis(now);
+        let now_ms = u64::try_from(now.as_millis()).unwrap_or(u64::MAX);
         let last = self.last_sweep_ms.load(Ordering::Relaxed);
         if now_ms.saturating_sub(last) < SWEEP_INTERVAL_MS {
             return;
@@ -108,9 +108,11 @@ impl GcraStore {
     }
 }
 
-/// A `Duration` as whole milliseconds, saturating at `u64::MAX`.
-fn tat_millis(d: Duration) -> u64 {
-    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+/// A `Duration` as whole nanoseconds, saturating at `u64::MAX`. Nanosecond TATs
+/// preserve precision for sub-millisecond emission intervals (very high rates);
+/// `u64` nanoseconds span ~584 years, far beyond any process uptime.
+fn dur_nanos(d: Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
