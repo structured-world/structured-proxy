@@ -157,6 +157,11 @@ impl GlobalCounters {
             .entry(key.to_string())
             .or_insert_with(|| KeyState::new(ep, window_secs));
         if state.window_secs != window_secs {
+            // A window change is a different accounting unit, so the entry resets.
+            // Any unpushed admits from the old window are dropped rather than
+            // remapped (a different window can't share a counter); this is a rare,
+            // bounded under-count on a tier change, consistent with the fleet
+            // layer's best-effort, never-double contract.
             *state = KeyState::new(ep, window_secs);
         }
         state.roll_to(ep);
@@ -240,22 +245,25 @@ impl GlobalCounters {
             }
         }
 
+        // Claimed deltas are fire-and-forget: once claimed (zeroed), a push that
+        // fails or whose EXEC ack is lost simply drops them rather than restoring.
+        // Restoring risked publishing a committed-but-unacked batch twice (a false
+        // 429); dropping instead under-counts this instance's last interval, which
+        // is exactly the documented "store unreachable → degrade to per-instance"
+        // behaviour. It also means an unpushable delta never accumulates across
+        // window boundaries into a collapsed carryover.
         let mut conn = match self.connection().await {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!("rate-limit shared store unavailable, staying local: {e}");
-                self.restore_claims(&plans); // never pushed → give the claims back
                 return;
             }
         };
 
         // Push each claimed delta as an atomic INCRBY inside MULTI/EXEC (never a
-        // SET, so concurrent instances' increments accumulate). Because the push
-        // is all-or-nothing, a failure means nothing was applied, so restoring
-        // the claims for a clean retry cannot double-count.
+        // SET, so concurrent instances' increments accumulate).
         if let Err(e) = self.push_deltas(&mut conn, &plans).await {
-            tracing::warn!("rate-limit delta push failed: {e}");
-            self.restore_claims(&plans);
+            tracing::warn!("rate-limit delta push failed, dropping this interval: {e}");
             return;
         }
 
@@ -269,24 +277,6 @@ impl GlobalCounters {
             }
         };
         self.apply_estimates(now, &plans, &reads);
-    }
-
-    /// Return claimed deltas to the state when a push never reached the store, so
-    /// the next tick retries them. A delta whose epoch rolled meanwhile is owed
-    /// to the epoch it was accumulated in, so it goes back to `carryover`.
-    fn restore_claims(&self, plans: &[PushPlan]) {
-        for p in plans.iter().filter(|p| p.delta > 0) {
-            if let Some(mut s) = self.states.get_mut(&p.key) {
-                if !p.is_carryover && s.epoch == p.push_epoch {
-                    s.local_count += p.delta;
-                } else {
-                    if s.carryover == 0 {
-                        s.carryover_epoch = p.push_epoch;
-                    }
-                    s.carryover += p.delta;
-                }
-            }
-        }
     }
 
     /// Refresh each key's cached estimate of the fleet's consumption.
