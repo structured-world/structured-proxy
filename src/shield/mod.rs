@@ -296,20 +296,34 @@ async fn enforce(shield: &Shield, phase: Phase, request: Request, next: Next) ->
 }
 
 /// Set the `RateLimit-*` headers unless an inner limiter already advertised a
-/// tighter (smaller `remaining`) budget, which must reach the client intact.
+/// budget that binds at least as hard, which must reach the client intact.
+/// "Binds harder" is a smaller `remaining`, and on a `remaining` tie the larger
+/// `reset` wins: with both phases at `remaining=0`, a client pacing off the
+/// headers must see the longest wait (e.g. an hourly IP cap over a per-minute
+/// principal cap), or it retries early and immediately hits the outer limit.
 fn maybe_tighten_rate_headers(
     headers: &mut HeaderMap,
     limit: u64,
     remaining: u64,
     verdict: &Verdict,
 ) {
-    let existing = headers
-        .get("ratelimit-remaining")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok());
-    match existing {
-        Some(inner) if inner <= remaining => {} // inner budget is tighter (or equal): keep it
-        _ => attach_rate_headers(headers, limit, remaining, verdict),
+    let header_u64 = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+    };
+    let keep_inner = match header_u64("ratelimit-remaining") {
+        Some(inner) if inner < remaining => true,
+        // Tie on remaining: keep the inner headers only if their reset is at
+        // least as long as this phase's, so the longer-binding budget survives.
+        Some(inner) if inner == remaining => {
+            header_u64("ratelimit-reset").unwrap_or(0) >= secs_ceil(verdict.reset_after)
+        }
+        _ => false,
+    };
+    if !keep_inner {
+        attach_rate_headers(headers, limit, remaining, verdict);
     }
 }
 
