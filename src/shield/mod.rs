@@ -249,7 +249,13 @@ async fn enforce(shield: &Shield, phase: Phase, request: Request, next: Next) ->
     }
 
     let mut response = next.run(request).await;
-    attach_rate_headers(response.headers_mut(), profile.limit, &verdict);
+    // Don't overwrite rate-limit headers an inner limiter already set. With
+    // defense-in-depth (a pre-auth IP/header rule and a post-auth principal rule
+    // on the same path), the inner post-auth verdict is the more specific one and
+    // must reach the client intact, so the outer pre-auth phase leaves it alone.
+    if !response.headers().contains_key("ratelimit-limit") {
+        attach_rate_headers(response.headers_mut(), profile.limit, &verdict);
+    }
     response
 }
 

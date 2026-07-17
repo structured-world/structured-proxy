@@ -356,4 +356,52 @@ mod two_phase {
         // Bob is a different principal with his own budget.
         assert_eq!(get_with(&app, &bob).await, StatusCode::OK);
     }
+
+    #[tokio::test]
+    async fn inner_principal_headers_survive_outer_limiter() {
+        // Defense in depth: a generous pre-auth IP rule and a tight post-auth
+        // principal rule both match the path. When the principal limit rejects,
+        // the 429's RateLimit-* must reflect that tight rule, not be overwritten
+        // by the outer pre-auth verdict on the way out.
+        let (sk, pem) = keypair_pem();
+        let cfg = config(
+            vec![("wide", "100/min", Some(100)), ("tight", "60/min", Some(1))],
+            vec![
+                rule("/api/**", KeySourceConfig::Ip, Some("wide")),
+                rule(
+                    "/api/**",
+                    KeySourceConfig::JwtClaim {
+                        claim: "sub".to_string(),
+                    },
+                    Some("tight"),
+                ),
+            ],
+        );
+        let shield = Shield::build(&cfg).unwrap().unwrap();
+        let app = stack(shield, auth(pem));
+        let alice = token(&sk, "alice");
+
+        let send = |bearer: String| {
+            let app = app.clone();
+            async move {
+                let req = Request::builder()
+                    .uri("/api/x")
+                    .header("authorization", format!("Bearer {bearer}"))
+                    .body(Body::empty())
+                    .unwrap();
+                app.oneshot(req).await.unwrap()
+            }
+        };
+
+        assert_eq!(send(alice.clone()).await.status(), StatusCode::OK);
+        let rejected = send(alice).await;
+        assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+        // The tight principal rule (limit 100/min → 100? no, "tight" is 60/min)
+        // owns the rejection, so its limit shows, not the wide pre-auth rule's.
+        assert_eq!(
+            rejected.headers().get("ratelimit-limit").unwrap(),
+            "60",
+            "the rejecting inner rule's RateLimit-Limit must not be overwritten"
+        );
+    }
 }
