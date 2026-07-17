@@ -437,4 +437,52 @@ mod two_phase {
         // tight burst 2, one admitted → 1 remaining; wide would show 99.
         assert_eq!(resp.headers().get("ratelimit-remaining").unwrap(), "1");
     }
+
+    #[tokio::test]
+    async fn allowed_response_reports_longer_reset_on_remaining_tie() {
+        // Both phases exhaust their burst on the first admit, leaving the same
+        // remaining (0). The pre-auth IP rule (1/hour) binds far longer than the
+        // post-auth principal rule (1/min): the client must see the longer reset
+        // so it doesn't retry after ~60s and immediately hit the still-blocked
+        // hourly IP budget. On a remaining tie the longer-reset header wins.
+        let (sk, pem) = keypair_pem();
+        let cfg = config(
+            vec![
+                ("hourly", "1/hour", Some(1)),
+                ("minutely", "1/min", Some(1)),
+            ],
+            vec![
+                rule("/api/**", KeySourceConfig::Ip, Some("hourly")),
+                rule(
+                    "/api/**",
+                    KeySourceConfig::JwtClaim {
+                        claim: "sub".to_string(),
+                    },
+                    Some("minutely"),
+                ),
+            ],
+        );
+        let shield = Shield::build(&cfg).unwrap().unwrap();
+        let app = stack(shield, auth(pem));
+
+        let req = Request::builder()
+            .uri("/api/x")
+            .header("authorization", format!("Bearer {}", token(&sk, "alice")))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("ratelimit-remaining").unwrap(), "0");
+        // Longer reset (hourly IP ≈ 3600s) must win over the minutely 60s, so a
+        // paced client waits out the binding budget instead of retrying early.
+        let reset: u64 = resp
+            .headers()
+            .get("ratelimit-reset")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(reset > 120, "expected the hourly reset to win, got {reset}");
+    }
 }
