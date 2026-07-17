@@ -101,31 +101,39 @@ impl GlobalCounters {
     /// store and does not record the admit (call [`record`](Self::record) after
     /// the local check also passes).
     pub fn gate(&self, key: &str, budget: u64, window: Duration) -> bool {
-        let now = unix_now();
-        let ep = window::epoch(now, window);
-        let window_secs = window.as_secs().max(1);
-        let mut state = self
-            .states
-            .entry(key.to_string())
-            .or_insert_with(|| KeyState::new(ep, window_secs));
-        state.roll_to(ep);
-        state.last_seen = Instant::now();
+        let state = self.state_for(key, window);
         state.remote_estimate + state.local_count < budget
     }
 
     /// Record one admitted request for `key`, to be pushed to the store on the
     /// next background tick.
     pub fn record(&self, key: &str, window: Duration) {
+        let mut state = self.state_for(key, window);
+        state.local_count += 1;
+    }
+
+    /// Look up (or create) the per-key state, rolled to the current epoch and
+    /// stamped as seen. If the resolved `window` differs from the one the entry
+    /// was created with, the entry is reset: a different window is a different
+    /// accounting unit, so mixing counts across it would corrupt the estimate.
+    fn state_for(
+        &self,
+        key: &str,
+        window: Duration,
+    ) -> dashmap::mapref::one::RefMut<'_, String, KeyState> {
         let now = unix_now();
-        let ep = window::epoch(now, window);
         let window_secs = window.as_secs().max(1);
+        let ep = window::epoch(now, window);
         let mut state = self
             .states
             .entry(key.to_string())
             .or_insert_with(|| KeyState::new(ep, window_secs));
+        if state.window_secs != window_secs {
+            *state = KeyState::new(ep, window_secs);
+        }
         state.roll_to(ep);
-        state.local_count += 1;
         state.last_seen = Instant::now();
+        state
     }
 
     /// Spawn the background reconciliation loop. A no-op (with a warning) when
@@ -152,26 +160,31 @@ impl GlobalCounters {
             .cloned()
     }
 
-    /// One reconciliation pass: push this instance's deltas, pull the aggregate,
-    /// refresh each key's remote estimate, and evict stale keys.
+    /// One reconciliation pass at the current wall clock.
     async fn reconcile(&self) {
+        self.reconcile_at(unix_now()).await;
+    }
+
+    /// One reconciliation pass at instant `now` (parameterised for tests): push
+    /// this instance's deltas, pull the aggregate, refresh each key's remote
+    /// estimate, and evict stale keys.
+    async fn reconcile_at(&self, now: Duration) {
         self.evict_stale();
 
-        // Phase 1 (locked, brief): snapshot each active key's push delta and the
-        // epoch keys to read. No store I/O while holding a lock.
-        let now = unix_now();
+        // Phase 1 (locked, brief): snapshot each key's pending delta. The delta
+        // is pushed to the epoch it was accumulated in (`push_epoch`), while the
+        // estimate reads the current epoch (`read_epoch`); the two differ when a
+        // window boundary is crossed between a record and this tick.
         let mut plans: Vec<PushPlan> = Vec::new();
         for entry in self.states.iter() {
-            let key = entry.key().clone();
             let s = entry.value();
             let window = Duration::from_secs(s.window_secs);
-            let ep = window::epoch(now, window);
-            let delta = s.local_count.saturating_sub(s.pushed);
             plans.push(PushPlan {
-                key,
-                epoch: ep,
+                key: entry.key().clone(),
+                push_epoch: s.epoch,
+                read_epoch: window::epoch(now, window),
                 window,
-                delta,
+                delta: s.local_count.saturating_sub(s.pushed),
             });
         }
         if plans.is_empty() {
@@ -186,11 +199,16 @@ impl GlobalCounters {
             }
         };
 
-        // Phase 2 (no locks): push deltas, then read current+previous epochs.
+        // Push each pending delta as an atomic INCRBY (never a SET, so concurrent
+        // instances' increments accumulate rather than clobber). On success,
+        // commit `pushed` immediately so a later read failure cannot cause the
+        // same delta to be pushed a second time on the next tick.
         if let Err(e) = self.push_deltas(&mut conn, &plans).await {
             tracing::warn!("rate-limit delta push failed: {e}");
-            return;
+            return; // `pushed` not advanced → same delta retried next tick, no double count
         }
+        self.commit_pushed(&plans);
+
         let reads = match self.read_epochs(&mut conn, &plans).await {
             Ok(r) => r,
             Err(e) => {
@@ -198,18 +216,33 @@ impl GlobalCounters {
                 return;
             }
         };
+        self.apply_estimates(now, &plans, &reads);
+    }
 
-        // Phase 3 (locked, brief): commit pushed deltas and the fresh estimate.
-        for (plan, (cur, prev)) in plans.iter().zip(reads) {
-            if let Some(mut s) = self.states.get_mut(&plan.key) {
-                if s.epoch == plan.epoch {
-                    s.pushed += plan.delta;
+    /// Advance each key's `pushed` by the delta we just pushed, but only while
+    /// the state still holds the epoch the delta belonged to (a concurrent roll
+    /// resets the counts, so there is nothing to advance).
+    fn commit_pushed(&self, plans: &[PushPlan]) {
+        for p in plans.iter().filter(|p| p.delta > 0) {
+            if let Some(mut s) = self.states.get_mut(&p.key) {
+                if s.epoch == p.push_epoch {
+                    s.pushed += p.delta;
                 }
-                let elapsed = window::elapsed_in_window(now, plan.window);
-                let est = window::sliding_estimate(cur, prev, elapsed, plan.window);
-                // Exclude this instance's own current-epoch contribution: the
-                // gate adds `local_count` separately.
-                let others = (est.round() as i64 - s.pushed as i64).max(0);
+            }
+        }
+    }
+
+    /// Refresh each key's cached estimate of the rest of the fleet's consumption.
+    fn apply_estimates(&self, now: Duration, plans: &[PushPlan], reads: &[(u64, u64)]) {
+        for (p, (cur, prev)) in plans.iter().zip(reads) {
+            if let Some(mut s) = self.states.get_mut(&p.key) {
+                let elapsed = window::elapsed_in_window(now, p.window);
+                let est = window::sliding_estimate(*cur, *prev, elapsed, p.window);
+                // Subtract only our own contribution to the current epoch's count
+                // (the gate adds `local_count` back separately). If the key's
+                // pushes went to an earlier epoch, our current-epoch share is 0.
+                let my_current = if s.epoch == p.read_epoch { s.pushed } else { 0 };
+                let others = (est.round() as i64 - my_current as i64).max(0);
                 s.remote_estimate = others as u64;
             }
         }
@@ -225,7 +258,7 @@ impl GlobalCounters {
         let mut any = false;
         for p in plans.iter().filter(|p| p.delta > 0) {
             any = true;
-            let k = epoch_key(&p.key, p.epoch);
+            let k = epoch_key(&p.key, p.push_epoch);
             let ttl_ms = (p.window.as_millis() as u64).saturating_mul(2).max(1);
             pipe.cmd("INCRBY").arg(&k).arg(p.delta).ignore();
             pipe.cmd("PEXPIRE").arg(&k).arg(ttl_ms).ignore();
@@ -245,8 +278,8 @@ impl GlobalCounters {
     ) -> redis::RedisResult<Vec<(u64, u64)>> {
         let mut keys: Vec<String> = Vec::with_capacity(plans.len() * 2);
         for p in plans {
-            keys.push(epoch_key(&p.key, p.epoch));
-            keys.push(epoch_key(&p.key, p.epoch.saturating_sub(1)));
+            keys.push(epoch_key(&p.key, p.read_epoch));
+            keys.push(epoch_key(&p.key, p.read_epoch.saturating_sub(1)));
         }
         let vals: Vec<Option<i64>> = redis::cmd("MGET").arg(&keys).query_async(conn).await?;
         Ok(plans
@@ -271,7 +304,10 @@ impl GlobalCounters {
 /// A per-key push plan captured under lock, used without holding locks.
 struct PushPlan {
     key: String,
-    epoch: u64,
+    /// Epoch the pending delta was accumulated in (target of the `INCRBY`).
+    push_epoch: u64,
+    /// Current epoch, whose sliding window the estimate reads.
+    read_epoch: u64,
     window: Duration,
     delta: u64,
 }
@@ -364,6 +400,48 @@ mod tests {
         assert!(
             !b.gate(&key, 3, W),
             "B must reject once the combined budget is reached"
+        );
+    }
+
+    /// Repeated reconcile passes with no new admits must not re-push the same
+    /// delta: the shared counter reflects each admit exactly once, even if a
+    /// pass's aggregate read had failed on an earlier tick.
+    #[tokio::test]
+    async fn repeated_reconcile_does_not_double_push() {
+        let Ok(url) = std::env::var("SHIELD_REDIS_TEST_URL") else {
+            eprintln!(
+                "SKIP repeated_reconcile_does_not_double_push: SHIELD_REDIS_TEST_URL not set"
+            );
+            return;
+        };
+        // Hour-long window so no epoch boundary is crossed mid-test.
+        let win = Duration::from_secs(3600);
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let key = format!("it2:{}:{nonce}", std::process::id());
+
+        let a = GlobalCounters::build(&url, Duration::from_millis(200)).unwrap();
+        a.record(&key, win);
+        a.record(&key, win);
+        // Three passes: only the first has a non-zero delta to push.
+        a.reconcile().await;
+        a.reconcile().await;
+        a.reconcile().await;
+
+        let epoch = window::epoch(unix_now(), win);
+        let redis_key = epoch_key(&key, epoch);
+        let client = redis::Client::open(url).unwrap();
+        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+        let count: i64 = redis::cmd("GET")
+            .arg(&redis_key)
+            .query_async(&mut conn)
+            .await
+            .unwrap_or(0);
+        assert_eq!(
+            count, 2,
+            "shared counter must reflect the 2 admits exactly once"
         );
     }
 }
