@@ -64,8 +64,15 @@ impl Shield {
             return Ok(None);
         }
         if config.rules.is_empty() {
-            tracing::warn!("shield enabled but no rules configured");
-            return Ok(None);
+            // Fail loud rather than silently running unmetered: an upgrade that
+            // left an old `shield` schema (endpoint_classes / identifier_endpoints
+            // / redis_url) in place deserializes to zero rules, which would
+            // otherwise disable this security control while `enabled` is true.
+            return Err(
+                "shield.enabled is true but no rules are configured (note the schema: \
+                 profiles + rules + sync, not the older endpoint_classes/identifier_endpoints)"
+                    .to_string(),
+            );
         }
 
         let profiles = matcher::compile_profiles(&config.profiles)?;
@@ -225,10 +232,13 @@ async fn enforce(shield: &Shield, phase: Phase, request: Request, next: Next) ->
     // Fleet gate first (read-only, cached), so the local shaper is not charged
     // for a request the fleet-wide budget will reject.
     #[cfg(feature = "redis")]
-    if let Some(global) = &shield.global {
-        if !global.gate(&key.store, profile.limit, profile.window) {
-            return global_reject(profile.limit, profile.window);
-        }
+    let fleet_remaining = shield
+        .global
+        .as_ref()
+        .map(|g| g.fleet_remaining(&key.store, profile.limit, profile.window));
+    #[cfg(feature = "redis")]
+    if fleet_remaining == Some(0) {
+        return global_reject(profile.limit, profile.window);
     }
 
     // The store key intentionally excludes the profile's numbers, so if a key's
@@ -239,14 +249,26 @@ async fn enforce(shield: &Shield, phase: Phase, request: Request, next: Next) ->
     // every tier flip, which a client could exploit to shed its own limit.
     let verdict = shield.store.check(&key.store, &profile.gcra);
     if !verdict.allowed {
-        return too_many_requests(profile.limit, &verdict);
+        return too_many_requests(profile.limit, verdict.remaining, &verdict);
     }
 
-    // Record the admit for the next reconciliation push.
+    // Report the tighter of the local and (when reconciled) fleet budgets, so a
+    // client near the fleet cap isn't told it has ample local room. This admit
+    // consumes one, hence the `- 1`.
+    #[cfg(not(feature = "redis"))]
+    let reported = verdict.remaining;
     #[cfg(feature = "redis")]
-    if let Some(global) = &shield.global {
-        global.record(&key.store, profile.window);
-    }
+    let reported = {
+        let mut r = verdict.remaining;
+        if let Some(fr) = fleet_remaining {
+            r = r.min(fr.saturating_sub(1));
+            // Record the admit for the next reconciliation push.
+            if let Some(global) = &shield.global {
+                global.record(&key.store, profile.window);
+            }
+        }
+        r
+    };
 
     let mut response = next.run(request).await;
     // Don't overwrite rate-limit headers an inner limiter already set. With
@@ -254,7 +276,7 @@ async fn enforce(shield: &Shield, phase: Phase, request: Request, next: Next) ->
     // on the same path), the inner post-auth verdict is the more specific one and
     // must reach the client intact, so the outer pre-auth phase leaves it alone.
     if !response.headers().contains_key("ratelimit-limit") {
-        attach_rate_headers(response.headers_mut(), profile.limit, &verdict);
+        attach_rate_headers(response.headers_mut(), profile.limit, reported, &verdict);
     }
     response
 }
@@ -275,7 +297,7 @@ fn global_reject(limit: u64, window: Duration) -> Response {
         retry_after: remaining,
         reset_after: remaining,
     };
-    too_many_requests(limit, &verdict)
+    too_many_requests(limit, 0, &verdict)
 }
 
 /// The keys a matched rule derives for one request.
@@ -404,11 +426,13 @@ fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
 }
 
 /// Attach the draft-ietf `RateLimit-*` headers describing the remaining budget.
-fn attach_rate_headers(headers: &mut HeaderMap, limit: u64, verdict: &Verdict) {
+/// `remaining` is passed explicitly (rather than read from the verdict) so the
+/// caller can report the tighter of the local and fleet budgets.
+fn attach_rate_headers(headers: &mut HeaderMap, limit: u64, remaining: u64, verdict: &Verdict) {
     if let Ok(v) = limit.to_string().parse() {
         headers.insert("ratelimit-limit", v);
     }
-    if let Ok(v) = verdict.remaining.to_string().parse() {
+    if let Ok(v) = remaining.to_string().parse() {
         headers.insert("ratelimit-remaining", v);
     }
     if let Ok(v) = secs_ceil(verdict.reset_after).to_string().parse() {
@@ -417,7 +441,7 @@ fn attach_rate_headers(headers: &mut HeaderMap, limit: u64, verdict: &Verdict) {
 }
 
 /// A `429` response carrying the rate-limit headers plus `Retry-After`.
-fn too_many_requests(limit: u64, verdict: &Verdict) -> Response {
+fn too_many_requests(limit: u64, remaining: u64, verdict: &Verdict) -> Response {
     let mut response = (
         StatusCode::TOO_MANY_REQUESTS,
         Json(serde_json::json!({
@@ -427,7 +451,7 @@ fn too_many_requests(limit: u64, verdict: &Verdict) -> Response {
     )
         .into_response();
     let headers = response.headers_mut();
-    attach_rate_headers(headers, limit, verdict);
+    attach_rate_headers(headers, limit, remaining, verdict);
     if let Ok(v) = secs_ceil(verdict.retry_after).to_string().parse() {
         headers.insert("retry-after", v);
     }
