@@ -226,6 +226,18 @@ fn store_key_namespaced_by_fingerprint_and_value() {
 }
 
 #[test]
+fn secs_ceil_rounds_sub_second_waits_up() {
+    use std::time::Duration;
+    // A sub-millisecond wait must report at least 1 second, never 0.
+    assert_eq!(secs_ceil(Duration::from_micros(500)), 1);
+    assert_eq!(secs_ceil(Duration::from_millis(1)), 1);
+    assert_eq!(secs_ceil(Duration::from_millis(1500)), 2);
+    assert_eq!(secs_ceil(Duration::from_secs(3)), 3);
+    // Genuinely zero stays zero.
+    assert_eq!(secs_ceil(Duration::ZERO), 0);
+}
+
+#[test]
 fn build_rejects_unknown_default_profile() {
     let mut cfg = config(vec![("t", "1/min", None)], Vec::new());
     cfg.rules = vec![rule("/x", KeySourceConfig::Ip, Some("t"))];
