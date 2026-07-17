@@ -187,19 +187,34 @@ lets legitimate bursts through up to a configured `burst` while throttling
 sustained abuse to the `rate`, with no fixed-window boundary burst.
 
 **Keying and phases.** A rule keys on the client IP, a header value (API key),
-or a validated JWT claim. IP/header rules run *before* auth so anonymous floods
-are shed before any signature verification; claim-keyed rules run *after* auth so
-they use the verified, un-forgeable principal. The phase is derived from the key;
-there is no phase setting to misconfigure. Every key falls back to the client IP
-when its value is absent, so a limit can't be dodged by omitting a header or
-staying anonymous.
+or a validated JWT claim. The phase is derived from the key, not configured: an
+IP/header rule needs no verified identity so it runs *before* auth (a fast,
+purely local check that sheds anonymous floods before any signature verification,
+and short-circuits so blocked clients never reach the auth layer); a `jwt_claim`
+rule needs the verified principal so it runs *after* auth. A key falls back to
+the client IP when its value is absent within its own phase, so a limit can't be
+dodged by omitting a header. Note the fallback is phase-local: an anonymous
+request under a `jwt_claim` rule keys by IP in the post-auth phase, but is *not*
+shed pre-auth. For anonymous flood protection, add a separate pre-auth IP (or
+header) rule covering the same paths; a path may match one rule per phase and
+each is enforced independently (defense in depth).
 
 **Limit sources.** A key's `{rate, burst}` resolves in order: the JWT itself
 (a `ratelimit_tier` claim naming a profile, or explicit `ratelimit_rpm` /
 `ratelimit_burst`), then an external service (cached and refreshed in the
 background, never blocking), then the rule's pinned profile, then the default.
-Tier-name indirection lets you retune the numbers in config without re-issuing
-tokens or changing the service.
+JWT-based resolution only applies to `jwt_claim` rules, since only they run with
+verified claims available. Tier-name indirection lets you retune the numbers in
+config without re-issuing tokens or changing the service.
+
+**Response headers.** Every metered response carries the
+[draft-ietf-httpapi-ratelimit-headers](https://datatracker.ietf.org/doc/draft-ietf-httpapi-ratelimit-headers/)
+fields: `RateLimit-Limit` (the tier's per-window quota), `RateLimit-Remaining`
+(requests still admissible now), and `RateLimit-Reset` (whole seconds until the
+limiter drains toward full). A rejected request returns `429` with `Retry-After`
+(whole seconds until a retry would conform). Clients should back off for
+`Retry-After` seconds on a `429`, and may pace themselves using `RateLimit-*` on
+allowed responses. Behind a browser, these are exposed via CORS.
 
 **Deployment modes.**
 
@@ -214,9 +229,12 @@ tokens or changing the service.
   unreachable, instances degrade to local limiting rather than failing requests.
 
 **Sizing the overshoot.** In reconciled mode the aggregate lags by up to one
-`sync.interval_ms`, so the fleet can briefly overshoot the budget by about
-`(N - 1) × rate × interval`. Shorter intervals tighten the bound at the cost of
-more store traffic; the default (500 ms) suits per-minute limits. The global
+`sync.interval_ms`, so within that lag each of the other instances can admit up
+to a `rate` fraction of the window. With the interval expressed in the same time
+unit as the window, the worst-case fleet overshoot is about
+`(N - 1) × rate × (interval / window)` requests. For example, `rate = 1000/min`,
+`interval = 500 ms`, `N = 4` gives `3 × 1000 × (0.5 / 60) ≈ 25` extra requests.
+Shorter intervals tighten the bound at the cost of more store traffic. The global
 view uses a sliding-window counter, so there is no boundary burst on top of this
 lag.
 

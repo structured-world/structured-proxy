@@ -8,8 +8,10 @@
 //! failing requests.
 //!
 //! Counts are held in a sliding window (see [`super::window`]) so the fleet gate
-//! has no boundary burst. The worst-case overshoot is bounded by one sync
-//! interval of the other instances' traffic: `(N-1) × rate × interval`.
+//! has no boundary burst. The worst-case fleet overshoot is bounded by one sync
+//! interval of the other instances' traffic, about
+//! `(N-1) * rate * (interval / window)` requests (interval and window in the
+//! same unit).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
