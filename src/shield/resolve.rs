@@ -120,7 +120,12 @@ struct LimitResponse {
 #[derive(Clone, Copy)]
 struct Cached {
     profile: Option<CompiledProfile>,
+    /// When the value was last fetched (drives staleness / refresh age).
     at: Instant,
+    /// When the entry was last read (drives idle eviction). Advances on every
+    /// access, including stale hits, so an actively-used key is not evicted
+    /// during a service outage that keeps `at` from advancing.
+    last_access: Instant,
 }
 
 /// Sweep the cache of long-idle keys at most once per this interval.
@@ -191,10 +196,12 @@ impl LimitService {
         }
     }
 
-    /// Drop entries idle longer than `evict_after`.
+    /// Drop entries not accessed within `evict_after` (idle keys), keyed on last
+    /// access rather than last fetch so an active-but-unrefreshable key survives.
     fn sweep(&self) {
         let evict_after = self.evict_after;
-        self.cache.retain(|_, c| c.at.elapsed() < evict_after);
+        self.cache
+            .retain(|_, c| c.last_access.elapsed() < evict_after);
     }
 
     /// Resolve `key`'s limit from the cache, serving a stale value while a
@@ -202,7 +209,12 @@ impl LimitService {
     /// profile) only when nothing is cached yet. Never blocks the request.
     pub fn resolve(self: &Arc<Self>, key: &str) -> Option<CompiledProfile> {
         self.maybe_sweep();
-        let cached = self.cache.get(key).map(|c| *c);
+        // Bump last-access (even for a stale hit) so an actively-used key is kept
+        // through an outage, then read the cached value.
+        let cached = self.cache.get_mut(key).map(|mut c| {
+            c.last_access = Instant::now();
+            *c
+        });
         match cached {
             Some(c) if c.at.elapsed() < self.ttl => c.profile,
             Some(c) => {
@@ -228,11 +240,13 @@ impl LimitService {
         let this = self.clone();
         tokio::spawn(async move {
             if let Ok(resolved) = this.fetch(&key).await {
+                let now = Instant::now();
                 this.cache.insert(
                     key.clone(),
                     Cached {
                         profile: resolved,
-                        at: Instant::now(),
+                        at: now,
+                        last_access: now,
                     },
                 );
             }
@@ -357,6 +371,7 @@ mod tests {
             Cached {
                 profile: Some(profile_from_numbers(10, 10)),
                 at: old,
+                last_access: old,
             },
         );
         let _ = svc.resolve("k");
