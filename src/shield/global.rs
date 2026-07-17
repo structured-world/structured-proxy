@@ -111,7 +111,7 @@ impl KeyState {
 /// Cross-instance counter reconciliation over a shared Redis-protocol store.
 pub struct GlobalCounters {
     client: redis::Client,
-    conn: tokio::sync::OnceCell<redis::aio::MultiplexedConnection>,
+    conn: tokio::sync::OnceCell<redis::aio::ConnectionManager>,
     interval: Duration,
     states: dashmap::DashMap<String, KeyState>,
 }
@@ -188,8 +188,11 @@ impl GlobalCounters {
         if state.window_secs != window_secs {
             // A window change is a different accounting unit, so the entry resets.
             // Any unpushed admits from the old window are dropped rather than
-            // remapped (a different window can't share a counter); this is a rare,
-            // bounded under-count on a tier change, consistent with the fleet
+            // remapped (a different window can't share a counter). The window only
+            // changes when the resolved tier does, and the tier comes from the
+            // signed JWT, the limit service, or config, never from client input,
+            // so this is not client-triggerable: it is a rare, bounded one-window
+            // under-count on a legitimate tier change, consistent with the fleet
             // layer's best-effort, never-double contract.
             *state = KeyState::new(ep, window_secs);
         }
@@ -215,9 +218,12 @@ impl GlobalCounters {
         });
     }
 
-    async fn connection(&self) -> redis::RedisResult<redis::aio::MultiplexedConnection> {
+    /// A cloneable, self-reconnecting handle to the shared store. `ConnectionManager`
+    /// re-establishes the underlying connection internally after a drop (e.g. a
+    /// Redis restart), so reconciled mode recovers without a proxy restart.
+    async fn connection(&self) -> redis::RedisResult<redis::aio::ConnectionManager> {
         self.conn
-            .get_or_try_init(|| self.client.get_multiplexed_async_connection())
+            .get_or_try_init(|| redis::aio::ConnectionManager::new(self.client.clone()))
             .await
             .cloned()
     }
@@ -341,7 +347,7 @@ impl GlobalCounters {
     /// restores the claims and re-pushes the same deltas next tick.
     async fn push_deltas(
         &self,
-        conn: &mut redis::aio::MultiplexedConnection,
+        conn: &mut redis::aio::ConnectionManager,
         plans: &[PushPlan],
     ) -> redis::RedisResult<()> {
         let mut pipe = redis::pipe();
@@ -364,7 +370,7 @@ impl GlobalCounters {
     /// `(cur, prev)` per plan in order.
     async fn read_epochs(
         &self,
-        conn: &mut redis::aio::MultiplexedConnection,
+        conn: &mut redis::aio::ConnectionManager,
         plans: &[PushPlan],
     ) -> redis::RedisResult<Vec<(u64, u64)>> {
         let mut keys: Vec<String> = Vec::with_capacity(plans.len() * 2);
