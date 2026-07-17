@@ -228,6 +228,21 @@ mod tests {
         assert_eq!(last_reset, Duration::from_secs(5));
     }
 
+    /// After a key has fully drained (idle far past its TAT), the next request's
+    /// reported `remaining` must not exceed the bucket: `burst - 1`, never an
+    /// inflated count derived from the long idle gap.
+    #[test]
+    fn idle_key_remaining_capped_to_burst() {
+        let g = Gcra::from_profile(profile(60, 60, 3)); // 1/s, burst 3
+        let first = g.check(None, Duration::from_secs(100));
+        assert!(first.allowed);
+        // Idle for a long time, then one request: remaining is burst-1, not the
+        // huge slack-derived value.
+        let v = g.check(Some(first.new_tat), Duration::from_secs(1000));
+        assert!(v.allowed);
+        assert_eq!(v.remaining, 2, "remaining must be capped to burst-1");
+    }
+
     /// A bare-rate profile (burst 1) admits one request per emission interval
     /// with no instantaneous burst.
     #[test]
