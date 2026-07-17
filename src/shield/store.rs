@@ -19,14 +19,21 @@ use super::gcra::{Gcra, Verdict};
 /// Run eviction of drained entries at most once per this interval.
 const SWEEP_INTERVAL_MS: u64 = 60_000;
 
-/// When the map grows past this, run a drained-key eviction immediately instead
-/// of waiting for the timer, bounding peak memory during a burst of distinct
-/// keys. This only reclaims *drained* keys (TAT in the past), never active
-/// (rate-limited) ones: dropping a limited key would reset its GCRA budget and
-/// hand a flooding attacker a fresh burst, so the store deliberately holds
-/// active limiter state. An all-active flood is shed by the fleet gate and
-/// upstream, not by discarding the very state that enforces the limit.
+/// When the map grows past this, run a drained-key eviction sooner than the
+/// normal timer (throttled to [`HW_SWEEP_MIN_MS`]), bounding peak memory during
+/// a burst of distinct keys. This only reclaims *drained* keys (TAT in the
+/// past), never active (rate-limited) ones: dropping a limited key would reset
+/// its GCRA budget and hand a flooding attacker a fresh burst, so the store
+/// deliberately holds active limiter state. An all-active flood is shed by the
+/// fleet gate and upstream, not by discarding the very state that enforces the
+/// limit.
 const SWEEP_HIGH_WATER: usize = 200_000;
+
+/// Minimum spacing between high-water sweeps. The high-water path can't reclaim
+/// active TATs, so under an all-active flood the map stays over the mark and,
+/// without this floor, every request would run a full O(n) `retain` (a CPU
+/// DoS). Throttling to one scan per second bounds that cost.
+const HW_SWEEP_MIN_MS: u64 = 1_000;
 
 /// In-process per-instance GCRA store.
 // no-std: caller-provided Clock + spin/hashbrown map.
@@ -98,9 +105,14 @@ impl GcraStore {
     fn maybe_sweep(&self, now: Duration) {
         let now_ms = u64::try_from(now.as_millis()).unwrap_or(u64::MAX);
         let last = self.last_sweep_ms.load(Ordering::Relaxed);
-        // Time-based cadence, unless the map is already over the high-water mark,
-        // in which case sweep now regardless of when the last one ran.
-        if now_ms.saturating_sub(last) < SWEEP_INTERVAL_MS && self.tats.len() <= SWEEP_HIGH_WATER {
+        let elapsed = now_ms.saturating_sub(last);
+        // Normal cadence is SWEEP_INTERVAL_MS. Over the high-water mark we sweep
+        // sooner, but still throttled to HW_SWEEP_MIN_MS so an all-active flood
+        // (whose entries can't be reclaimed) can't trigger a full O(n) retain on
+        // every request.
+        let due = elapsed >= SWEEP_INTERVAL_MS
+            || (elapsed >= HW_SWEEP_MIN_MS && self.tats.len() > SWEEP_HIGH_WATER);
+        if !due {
             return;
         }
         if self
