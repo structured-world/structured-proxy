@@ -102,6 +102,14 @@ impl GlobalCounters {
     /// the cached remote estimate plus this instance's count. Does not touch the
     /// store and does not record the admit (call [`record`](Self::record) after
     /// the local check also passes).
+    ///
+    /// This is deliberately a read then a separate record, not an atomic
+    /// reserve/rollback. The per-instance [`GcraStore`](super::store::GcraStore)
+    /// is the hard local cap and is atomic per key; this fleet gate is only an
+    /// approximate cross-instance cap. A race where concurrent requests all pass
+    /// the gate before any records is bounded by the local burst plus the
+    /// documented one-interval overshoot, which is the accepted trade-off for
+    /// keeping the hot path lock-free and non-blocking.
     pub fn gate(&self, key: &str, budget: u64, window: Duration) -> bool {
         let state = self.state_for(key, window);
         state.remote_estimate + state.local_count < budget

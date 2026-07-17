@@ -204,8 +204,10 @@ each is enforced independently (defense in depth).
 `ratelimit_burst`), then an external service (cached and refreshed in the
 background, never blocking), then the rule's pinned profile, then the default.
 JWT-based resolution only applies to `jwt_claim` rules, since only they run with
-verified claims available. Tier-name indirection lets you retune the numbers in
-config without re-issuing tokens or changing the service.
+verified claims available; setting `jwt_limits` has no effect on an IP/header
+rule, which runs pre-auth (use a `jwt_claim` key if you want the token's tier to
+drive the limit). Tier-name indirection lets you retune the numbers in config
+without re-issuing tokens or changing the service.
 
 **Response headers.** Every metered response carries the
 [draft-ietf-httpapi-ratelimit-headers](https://datatracker.ietf.org/doc/draft-ietf-httpapi-ratelimit-headers/)
