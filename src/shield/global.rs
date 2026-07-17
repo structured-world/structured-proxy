@@ -36,22 +36,25 @@ fn unix_now() -> Duration {
 const KEY_TTL: Duration = Duration::from_secs(600);
 
 /// Per-key reconciliation state.
+///
+/// Admit accounting uses a claim model: `local_count` holds only admits *not yet
+/// claimed* by a reconcile pass. A pass claims the count (zeroes it under the
+/// lock) before the async push, so a concurrent epoch roll or a push failure
+/// can't double-publish or drop it.
 #[derive(Debug, Clone)]
 struct KeyState {
     epoch: u64,
     /// Window length in seconds (from the resolved profile).
     window_secs: u64,
-    /// Requests this instance admitted in the current epoch.
+    /// Admits in the current epoch not yet claimed for a push.
     local_count: u64,
-    /// How much of `local_count` has already been pushed to the store.
-    pushed: u64,
-    /// Admits from the previous epoch that were never pushed before the epoch
-    /// rolled, still owed to `carryover_epoch`'s counter. Carried so a boundary
-    /// crossing between the last push and a roll does not silently drop them.
+    /// Unclaimed admits owed to a prior epoch (`carryover_epoch`) that rolled
+    /// before they were claimed, so a boundary crossing doesn't drop them.
     carryover: u64,
     /// The epoch `carryover` is owed to.
     carryover_epoch: u64,
-    /// The rest of the fleet's sliding consumption, from the last pull.
+    /// The fleet's sliding consumption (including this instance's own claimed
+    /// admits, which now live in the shared counter), from the last pull.
     remote_estimate: u64,
     last_seen: Instant,
 }
@@ -62,7 +65,6 @@ impl KeyState {
             epoch,
             window_secs,
             local_count: 0,
-            pushed: 0,
             carryover: 0,
             carryover_epoch: 0,
             remote_estimate: 0,
@@ -70,25 +72,22 @@ impl KeyState {
         }
     }
 
-    /// Advance to `epoch`, resetting the per-epoch counts. Any admits not yet
-    /// pushed are stashed as `carryover` owed to the epoch being left, so the
-    /// reconciler still publishes them to that epoch's counter. The remote
-    /// estimate is kept (the background task refreshes it) so a fresh epoch does
-    /// not briefly open the full budget fleet-wide.
+    /// Advance to `epoch`, moving any unclaimed admits to `carryover` owed to the
+    /// epoch being left so the reconciler still publishes them to that epoch's
+    /// counter. The remote estimate is kept (the background task refreshes it) so
+    /// a fresh epoch does not briefly open the full budget fleet-wide.
     ///
     /// A single carryover slot assumes the reconcile interval is much shorter
-    /// than the window (the default 500ms vs seconds+), so at most one unpushed
-    /// epoch exists between reconciles.
+    /// than the window (the default 500ms vs seconds+), so at most one unclaimed
+    /// prior epoch exists between reconciles.
     fn roll_to(&mut self, epoch: u64) {
         if self.epoch != epoch {
-            let unpushed = self.local_count.saturating_sub(self.pushed);
-            if unpushed > 0 {
-                self.carryover += unpushed;
+            if self.local_count > 0 {
+                self.carryover += self.local_count;
                 self.carryover_epoch = self.epoch;
             }
             self.epoch = epoch;
             self.local_count = 0;
-            self.pushed = 0;
         }
     }
 }
@@ -117,10 +116,10 @@ impl GlobalCounters {
         }))
     }
 
-    /// Whether a request for `key` is within the fleet budget. Read-only: reads
-    /// the cached remote estimate plus this instance's count. Does not touch the
-    /// store and does not record the admit (call [`record`](Self::record) after
-    /// the local check also passes).
+    /// Fleet budget still available for `key` (0 = over budget). Read-only: the
+    /// cached remote estimate plus this instance's unclaimed count, subtracted
+    /// from `budget`. Does not touch the store and does not record the admit
+    /// (call [`record`](Self::record) after the local check also passes).
     ///
     /// This is deliberately a read then a separate record, not an atomic
     /// reserve/rollback. The per-instance [`GcraStore`](super::store::GcraStore)
@@ -129,9 +128,9 @@ impl GlobalCounters {
     /// the gate before any records is bounded by the local burst plus the
     /// documented one-interval overshoot, which is the accepted trade-off for
     /// keeping the hot path lock-free and non-blocking.
-    pub fn gate(&self, key: &str, budget: u64, window: Duration) -> bool {
+    pub fn fleet_remaining(&self, key: &str, budget: u64, window: Duration) -> u64 {
         let state = self.state_for(key, window);
-        state.remote_estimate + state.local_count < budget
+        budget.saturating_sub(state.remote_estimate + state.local_count)
     }
 
     /// Record one admitted request for `key`, to be pushed to the store on the
@@ -200,57 +199,68 @@ impl GlobalCounters {
     async fn reconcile_at(&self, now: Duration) {
         self.evict_stale();
 
-        // Phase 1 (locked, brief): snapshot each key's pending delta. The delta
-        // is pushed to the epoch it was accumulated in (`push_epoch`), while the
-        // estimate reads the current epoch (`read_epoch`); the two differ when a
-        // window boundary is crossed between a record and this tick.
+        // Phase 1 (locked per key, brief): CLAIM each key's unclaimed admits by
+        // zeroing them now, so a concurrent epoch roll or a push failure can't
+        // double-publish or drop them. Emit a plan for every active key (delta
+        // may be 0) so its estimate is refreshed even when the key is only being
+        // rejected on a stale remote estimate. The delta is pushed to the epoch
+        // it was accumulated in (`push_epoch`); the estimate reads the current
+        // epoch (`read_epoch`).
+        let keys: Vec<String> = self.states.iter().map(|e| e.key().clone()).collect();
+        if keys.is_empty() {
+            return;
+        }
         let mut plans: Vec<PushPlan> = Vec::new();
-        for entry in self.states.iter() {
-            let s = entry.value();
-            let window = Duration::from_secs(s.window_secs);
-            let read_epoch = window::epoch(now, window);
-            plans.push(PushPlan {
-                key: entry.key().clone(),
-                push_epoch: s.epoch,
-                read_epoch,
-                window,
-                delta: s.local_count.saturating_sub(s.pushed),
-                is_carryover: false,
-            });
-            // Deltas from a prior epoch that rolled before they were pushed.
-            if s.carryover > 0 {
+        for key in keys {
+            if let Some(mut s) = self.states.get_mut(&key) {
+                let window = Duration::from_secs(s.window_secs);
+                let read_epoch = window::epoch(now, window);
+                let claim = s.local_count;
+                s.local_count = 0;
                 plans.push(PushPlan {
-                    key: entry.key().clone(),
-                    push_epoch: s.carryover_epoch,
+                    key: key.clone(),
+                    push_epoch: s.epoch,
                     read_epoch,
                     window,
-                    delta: s.carryover,
-                    is_carryover: true,
+                    delta: claim,
+                    is_carryover: false,
                 });
+                if s.carryover > 0 {
+                    let carry = s.carryover;
+                    s.carryover = 0;
+                    plans.push(PushPlan {
+                        key: key.clone(),
+                        push_epoch: s.carryover_epoch,
+                        read_epoch,
+                        window,
+                        delta: carry,
+                        is_carryover: true,
+                    });
+                }
             }
-        }
-        if plans.iter().all(|p| p.delta == 0) {
-            return;
         }
 
         let mut conn = match self.connection().await {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!("rate-limit shared store unavailable, staying local: {e}");
+                self.restore_claims(&plans); // never pushed → give the claims back
                 return;
             }
         };
 
-        // Push each pending delta as an atomic INCRBY (never a SET, so concurrent
-        // instances' increments accumulate rather than clobber). On success,
-        // commit `pushed` immediately so a later read failure cannot cause the
-        // same delta to be pushed a second time on the next tick.
+        // Push each claimed delta as an atomic INCRBY inside MULTI/EXEC (never a
+        // SET, so concurrent instances' increments accumulate). Because the push
+        // is all-or-nothing, a failure means nothing was applied, so restoring
+        // the claims for a clean retry cannot double-count.
         if let Err(e) = self.push_deltas(&mut conn, &plans).await {
             tracing::warn!("rate-limit delta push failed: {e}");
-            return; // `pushed` not advanced → same delta retried next tick, no double count
+            self.restore_claims(&plans);
+            return;
         }
-        self.commit_pushed(&plans);
 
+        // Claimed admits are now in the shared counter; there is nothing to
+        // commit. A read failure below just skips this tick's estimate refresh.
         let reads = match self.read_epochs(&mut conn, &plans).await {
             Ok(r) => r,
             Err(e) => {
@@ -261,25 +271,25 @@ impl GlobalCounters {
         self.apply_estimates(now, &plans, &reads);
     }
 
-    /// Advance each key's `pushed` by the delta we just pushed, but only while
-    /// the state still holds the epoch the delta belonged to (a concurrent roll
-    /// resets the counts, so there is nothing to advance).
-    fn commit_pushed(&self, plans: &[PushPlan]) {
+    /// Return claimed deltas to the state when a push never reached the store, so
+    /// the next tick retries them. A delta whose epoch rolled meanwhile is owed
+    /// to the epoch it was accumulated in, so it goes back to `carryover`.
+    fn restore_claims(&self, plans: &[PushPlan]) {
         for p in plans.iter().filter(|p| p.delta > 0) {
             if let Some(mut s) = self.states.get_mut(&p.key) {
-                if p.is_carryover {
-                    // Clear the carried-over amount now that its epoch counter has it.
-                    if s.carryover_epoch == p.push_epoch {
-                        s.carryover = s.carryover.saturating_sub(p.delta);
+                if !p.is_carryover && s.epoch == p.push_epoch {
+                    s.local_count += p.delta;
+                } else {
+                    if s.carryover == 0 {
+                        s.carryover_epoch = p.push_epoch;
                     }
-                } else if s.epoch == p.push_epoch {
-                    s.pushed += p.delta;
+                    s.carryover += p.delta;
                 }
             }
         }
     }
 
-    /// Refresh each key's cached estimate of the rest of the fleet's consumption.
+    /// Refresh each key's cached estimate of the fleet's consumption.
     fn apply_estimates(&self, now: Duration, plans: &[PushPlan], reads: &[(u64, u64)]) {
         for (p, (cur, prev)) in plans.iter().zip(reads) {
             // Carryover plans only publish a past epoch's delta; the estimate is
@@ -296,21 +306,19 @@ impl GlobalCounters {
                     continue;
                 }
                 let elapsed = window::elapsed_in_window(now, p.window);
+                // The counter already includes this instance's claimed admits;
+                // the gate adds only the still-unclaimed `local_count` on top, so
+                // the full sliding estimate is used with no self-subtraction.
                 let est = window::sliding_estimate(*cur, *prev, elapsed, p.window);
-                // Subtract only our own contribution to the current epoch's count
-                // (the gate adds `local_count` back separately). If the key's
-                // pushes went to an earlier epoch, our current-epoch share is 0.
-                let my_current = if s.epoch == p.read_epoch { s.pushed } else { 0 };
-                let others = (est.round() as i64 - my_current as i64).max(0);
-                s.remote_estimate = others as u64;
+                s.remote_estimate = est.round().max(0.0) as u64;
             }
         }
     }
 
-    /// `INCRBY` each key with a pending delta and re-arm its TTL. Wrapped in a
+    /// `INCRBY` each key with a claimed delta and re-arm its TTL. Wrapped in a
     /// `MULTI`/`EXEC` transaction so the batch applies all-or-nothing: a
     /// mid-pipeline failure can't leave some `INCRBY`s applied while the caller
-    /// skips `commit_pushed` and re-pushes the same deltas next tick.
+    /// restores the claims and re-pushes the same deltas next tick.
     async fn push_deltas(
         &self,
         conn: &mut redis::aio::MultiplexedConnection,
@@ -356,11 +364,19 @@ impl GlobalCounters {
             .collect())
     }
 
-    /// Drop per-key state not seen within [`KEY_TTL`].
+    /// Drop per-key state that is idle and carries no unpublished admits. The
+    /// idle threshold is at least two windows, so a key on a long window (e.g.
+    /// `100/hour`) is not evicted mid-window; a key with pending `local_count` or
+    /// `carryover` is always kept so a store outage can't lose fleet counts.
     fn evict_stale(&self) {
         let now = Instant::now();
-        self.states
-            .retain(|_, s| now.duration_since(s.last_seen) < KEY_TTL);
+        self.states.retain(|_, s| {
+            if s.local_count > 0 || s.carryover > 0 {
+                return true;
+            }
+            let threshold = KEY_TTL.max(Duration::from_secs(s.window_secs.saturating_mul(2)));
+            now.duration_since(s.last_seen) < threshold
+        });
     }
 }
 
@@ -390,18 +406,18 @@ mod tests {
     }
 
     #[test]
-    fn gate_admits_until_local_count_reaches_budget() {
+    fn budget_admits_until_local_count_reaches_it() {
         let g = counters();
-        // Budget 3: three admits pass, the fourth is over budget.
+        // Budget 3: three admits leave room, the fourth is over budget.
         for _ in 0..3 {
-            assert!(g.gate("k", 3, W));
+            assert!(g.fleet_remaining("k", 3, W) > 0);
             g.record("k", W);
         }
-        assert!(!g.gate("k", 3, W));
+        assert_eq!(g.fleet_remaining("k", 3, W), 0);
     }
 
     #[test]
-    fn gate_accounts_for_remote_estimate() {
+    fn budget_accounts_for_remote_estimate() {
         let g = counters();
         // Simulate the background task having observed 2 requests elsewhere.
         let now = unix_now();
@@ -410,24 +426,21 @@ mod tests {
         state.remote_estimate = 2;
         g.states.insert("k".to_string(), state);
         // Budget 3, remote 2 → one local admit fits, the next is over budget.
-        assert!(g.gate("k", 3, W));
+        assert!(g.fleet_remaining("k", 3, W) > 0);
         g.record("k", W);
-        assert!(!g.gate("k", 3, W));
+        assert_eq!(g.fleet_remaining("k", 3, W), 0);
     }
 
     #[test]
-    fn roll_preserves_unpushed_deltas_as_carryover() {
-        // 5 admits in an epoch, 2 already pushed, then the epoch rolls before the
-        // remaining 3 are pushed: they must survive as carryover owed to the old
-        // epoch, not be silently dropped.
+    fn roll_preserves_unclaimed_deltas_as_carryover() {
+        // Admits accumulated in an epoch that rolls before a reconcile claims
+        // them must survive as carryover owed to the old epoch, not be dropped.
         let mut s = KeyState::new(10, 60);
         s.local_count = 5;
-        s.pushed = 2;
         s.roll_to(11);
-        assert_eq!(s.carryover, 3);
+        assert_eq!(s.carryover, 5);
         assert_eq!(s.carryover_epoch, 10);
         assert_eq!(s.local_count, 0);
-        assert_eq!(s.pushed, 0);
         assert_eq!(s.epoch, 11);
     }
 
@@ -462,11 +475,11 @@ mod tests {
     #[test]
     fn independent_keys_have_independent_budgets() {
         let g = counters();
-        assert!(g.gate("a", 1, W));
+        assert!(g.fleet_remaining("a", 1, W) > 0);
         g.record("a", W);
-        assert!(!g.gate("a", 1, W));
+        assert_eq!(g.fleet_remaining("a", 1, W), 0);
         // A different key is unaffected.
-        assert!(g.gate("b", 1, W));
+        assert!(g.fleet_remaining("b", 1, W) > 0);
     }
 
     /// End-to-end reconciliation against a live Redis-protocol store: one
@@ -499,15 +512,19 @@ mod tests {
 
         // B's first contact with the key: it has not reconciled this key yet, so
         // it admits once (the documented one-interval lag / bounded overshoot).
-        assert!(b.gate(&key, 3, W), "B admits its first request for the key");
+        assert!(
+            b.fleet_remaining(&key, 3, W) > 0,
+            "B admits its first request for the key"
+        );
         b.record(&key, W);
 
         // After a reconcile pass B has pushed its own admit and pulled the
         // aggregate: the combined view is 3 (A's 2 + B's 1) = the budget, so B
         // rejects the next request. The two instances enforce one combined limit.
         b.reconcile().await;
-        assert!(
-            !b.gate(&key, 3, W),
+        assert_eq!(
+            b.fleet_remaining(&key, 3, W),
+            0,
             "B must reject once the combined budget is reached"
         );
     }
@@ -548,6 +565,42 @@ mod tests {
             g.states.get(&key).unwrap().carryover,
             0,
             "carryover must be cleared once published"
+        );
+    }
+
+    /// A key with no local admits (only being rejected on a stale remote
+    /// estimate) must still have its estimate refreshed by a reconcile pass, so
+    /// it can recover once the fleet stops spending the budget.
+    #[tokio::test]
+    async fn estimate_refreshes_without_local_deltas() {
+        let Ok(url) = std::env::var("SHIELD_REDIS_TEST_URL") else {
+            eprintln!(
+                "SKIP estimate_refreshes_without_local_deltas: SHIELD_REDIS_TEST_URL not set"
+            );
+            return;
+        };
+        let win = Duration::from_secs(3600);
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let key = format!("it4:{}:{nonce}", std::process::id());
+
+        let g = GlobalCounters::build(&url, Duration::from_millis(200)).unwrap();
+        // Seed a stale-high remote estimate with no local admits (delta 0). The
+        // shared counter for this fresh key is empty, so a reconcile must pull it
+        // and decay the estimate to 0 rather than leaving the key stuck.
+        let cur = window::epoch(unix_now(), win);
+        let mut st = KeyState::new(cur, win.as_secs());
+        st.remote_estimate = 99;
+        g.states.insert(key.clone(), st);
+
+        g.reconcile().await;
+
+        assert_eq!(
+            g.states.get(&key).unwrap().remote_estimate,
+            0,
+            "estimate must be refreshed even with no local deltas"
         );
     }
 
