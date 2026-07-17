@@ -271,31 +271,48 @@ async fn enforce(shield: &Shield, phase: Phase, request: Request, next: Next) ->
     };
 
     let mut response = next.run(request).await;
-    // Don't overwrite rate-limit headers an inner limiter already set. With
-    // defense-in-depth (a pre-auth IP/header rule and a post-auth principal rule
-    // on the same path), the inner post-auth verdict is the more specific one and
-    // must reach the client intact, so the outer pre-auth phase leaves it alone.
-    if !response.headers().contains_key("ratelimit-limit") {
-        attach_rate_headers(response.headers_mut(), profile.limit, reported, &verdict);
-    }
+    // Report the tightest budget across phases. With defense-in-depth (a pre-auth
+    // and a post-auth rule on the same path), an inner limiter may already have
+    // set headers on the way out; overwrite them only when this (outer) phase's
+    // remaining is smaller, so the client always sees the budget that will bite
+    // first. An inner rejection carries remaining 0, so it is never overwritten.
+    maybe_tighten_rate_headers(response.headers_mut(), profile.limit, reported, &verdict);
     response
 }
 
-/// A `429` for a request rejected by the fleet-wide gate. `Retry-After` /
-/// `RateLimit-Reset` point at the end of the current window, when the sliding
-/// estimate will have decayed.
+/// Set the `RateLimit-*` headers unless an inner limiter already advertised a
+/// tighter (smaller `remaining`) budget, which must reach the client intact.
+fn maybe_tighten_rate_headers(
+    headers: &mut HeaderMap,
+    limit: u64,
+    remaining: u64,
+    verdict: &Verdict,
+) {
+    let existing = headers
+        .get("ratelimit-remaining")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    match existing {
+        Some(inner) if inner <= remaining => {} // inner budget is tighter (or equal): keep it
+        _ => attach_rate_headers(headers, limit, remaining, verdict),
+    }
+}
+
+/// A `429` for a request rejected by the fleet-wide gate. The sliding-window
+/// estimate decays continuously (it does not free capacity at the epoch
+/// boundary), so `Retry-After` is a modest poll interval rather than the time to
+/// the boundary, which a client could wait out and still be rejected.
 #[cfg(feature = "redis")]
 fn global_reject(limit: u64, window: Duration) -> Response {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO);
-    let remaining = window.saturating_sub(window::elapsed_in_window(now, window));
+    // A tenth of the window (at least 1s): long enough not to hammer, short
+    // enough to retry as the window decays or other instances free budget.
+    let backoff = (window / 10).max(Duration::from_secs(1));
     let verdict = Verdict {
         allowed: false,
         new_tat: Duration::ZERO,
         remaining: 0,
-        retry_after: remaining,
-        reset_after: remaining,
+        retry_after: backoff,
+        reset_after: backoff,
     };
     too_many_requests(limit, 0, &verdict)
 }
