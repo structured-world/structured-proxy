@@ -425,8 +425,10 @@ fn too_many_requests(limit: u64, verdict: &Verdict) -> Response {
 /// Whole seconds, rounded up, for `Retry-After` / `RateLimit-Reset` (never report
 /// `0` for a non-zero wait).
 fn secs_ceil(d: Duration) -> u64 {
-    let millis = d.as_millis();
-    u64::try_from(millis.div_ceil(1000)).unwrap_or(u64::MAX)
+    // Round up from nanoseconds, not truncated millis: a sub-millisecond wait
+    // must still report at least one second, never zero.
+    let nanos = d.as_nanos();
+    u64::try_from(nanos.div_ceil(1_000_000_000)).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
