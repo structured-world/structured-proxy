@@ -50,19 +50,25 @@ fn claim_at<'a>(claims: &'a Value, path: &str) -> Option<&'a Value> {
     Some(cur)
 }
 
-/// Build a limit tier from explicit per-minute numbers.
-fn profile_from_numbers(rpm: u64, burst: u64) -> CompiledProfile {
-    let rate = rpm.max(1);
+/// Build a limit tier from explicit per-minute numbers. Returns `None` for a
+/// zero rate: like a static profile, a dynamic `0` is not a usable limit (it
+/// would otherwise clamp to 1 and silently grant a request per minute), so the
+/// caller falls through to the next resolver. Blocking a principal outright is
+/// an authorization concern, not a rate limit.
+fn profile_from_numbers(rpm: u64, burst: u64) -> Option<CompiledProfile> {
+    if rpm == 0 {
+        return None;
+    }
     let gcra = Gcra::from_profile(Profile {
-        rate,
+        rate: rpm,
         window: PER_MINUTE,
         burst: burst.max(1),
     });
-    CompiledProfile {
+    Some(CompiledProfile {
         gcra,
-        limit: rate,
+        limit: rpm,
         window: PER_MINUTE,
-    }
+    })
 }
 
 /// Compiled JWT-based limit resolution: the claim names to read from the token.
@@ -98,7 +104,7 @@ impl JwtLimits {
         }
         if let Some(rpm) = claim_u64(claims, &self.rpm_claim) {
             let burst = claim_u64(claims, &self.burst_claim).unwrap_or(rpm);
-            return Some(profile_from_numbers(rpm, burst));
+            return profile_from_numbers(rpm, burst);
         }
         None
     }
@@ -239,18 +245,36 @@ impl LimitService {
         }
         let this = self.clone();
         tokio::spawn(async move {
-            if let Ok(resolved) = this.fetch(&key).await {
-                let now = Instant::now();
-                this.cache.insert(
-                    key.clone(),
-                    Cached {
-                        profile: resolved,
-                        at: now,
-                        last_access: now,
-                    },
-                );
+            match this.fetch(&key).await {
+                Ok(resolved) => {
+                    let now = Instant::now();
+                    this.cache.insert(
+                        key.clone(),
+                        Cached {
+                            profile: resolved,
+                            at: now,
+                            last_access: now,
+                        },
+                    );
+                }
+                Err(()) => {
+                    // Leave an existing (stale) entry in place (fail-static). For a
+                    // brand-new key, negative-cache the failure so a client rotating
+                    // key values during an outage can't spawn unbounded fetch tasks;
+                    // it is retried after the TTL like any stale entry.
+                    if !this.cache.contains_key(&key) {
+                        let now = Instant::now();
+                        this.cache.insert(
+                            key.clone(),
+                            Cached {
+                                profile: None,
+                                at: now,
+                                last_access: now,
+                            },
+                        );
+                    }
+                }
             }
-            // On error, leave any stale entry in place (fail-static, not fail-open).
             this.inflight.remove(&key);
         });
     }
@@ -289,7 +313,7 @@ impl LimitService {
             return self.profiles.get(&tier).copied();
         }
         body.rate_per_min
-            .map(|rpm| profile_from_numbers(rpm, body.burst.unwrap_or(rpm)))
+            .and_then(|rpm| profile_from_numbers(rpm, body.burst.unwrap_or(rpm)))
     }
 }
 
@@ -301,7 +325,7 @@ mod tests {
         let mut m = HashMap::new();
         m.insert(
             "premium".to_string(),
-            profile_from_numbers(1000, 100), // limit 1000
+            profile_from_numbers(1000, 100).unwrap(), // limit 1000
         );
         m
     }
@@ -369,7 +393,7 @@ mod tests {
         svc.cache.insert(
             "k".to_string(),
             Cached {
-                profile: Some(profile_from_numbers(10, 10)),
+                profile: Some(profile_from_numbers(10, 10).unwrap()),
                 at: old,
                 last_access: old,
             },
@@ -380,6 +404,14 @@ mod tests {
             svc.cache.contains_key("k"),
             "an actively-used stale entry must not be evicted during an outage"
         );
+    }
+
+    #[test]
+    fn jwt_zero_rate_is_not_a_usable_limit() {
+        // A dynamic rate of 0 must not clamp to 1; it yields no limit so the
+        // caller falls through to the next resolver.
+        let claims = serde_json::json!({ "ratelimit_rpm": 0 });
+        assert!(jwt_limits().resolve(&claims, &profiles()).is_none());
     }
 
     #[test]
