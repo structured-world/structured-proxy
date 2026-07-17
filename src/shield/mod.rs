@@ -237,6 +237,15 @@ async fn enforce(shield: &Shield, phase: Phase, request: Request, next: Next) ->
     // smoothing allowance, not a fleet-wide entitlement (honouring it fleet-wide
     // would multiply the effective limit by N). A single instance's burst is
     // therefore capped by the shared budget when the fleet is near it.
+    //
+    // Consequence for a `burst > limit` profile (e.g. `rate: "1/min", burst: 5`):
+    // under reconciliation the shared counter caps the key at the sustained
+    // `limit`, so the extra burst headroom that a local-only deployment would
+    // allow is not granted fleet-wide. This is intentional, not an oversight:
+    // gating on `burst` instead would let the fleet sustain `burst`-per-window,
+    // loosening the sustained cap by the burst factor. The conservative choice
+    // (never over-admit the fleet's sustained budget) wins; the local GCRA still
+    // smooths per-instance traffic.
     #[cfg(feature = "redis")]
     let fleet_remaining = shield
         .global
