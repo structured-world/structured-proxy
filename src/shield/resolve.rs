@@ -263,20 +263,26 @@ impl LimitService {
                     );
                 }
                 Err(()) => {
-                    // Leave an existing (stale) entry in place (fail-static). For a
-                    // brand-new key, negative-cache the failure so a client rotating
-                    // key values during an outage can't spawn unbounded fetch tasks;
-                    // it is retried after the TTL like any stale entry.
-                    if !this.cache.contains_key(&key) {
-                        let now = Instant::now();
-                        this.cache.insert(
-                            key.clone(),
-                            Cached {
-                                profile: None,
-                                at: now,
-                                last_access: now,
-                            },
-                        );
+                    // Throttle retries during an outage. Reset the fetch timestamp
+                    // (`at`) so the entry is treated as fresh for another TTL and
+                    // the next request serves it without immediately re-fetching;
+                    // otherwise a hot stale key would spawn one outbound call per
+                    // request. Keep the last-good profile for an existing entry
+                    // (fail-static); negative-cache a brand-new key so a client
+                    // rotating key values can't spawn unbounded fetch tasks.
+                    let now = Instant::now();
+                    match this.cache.get_mut(&key) {
+                        Some(mut c) => c.at = now,
+                        None => {
+                            this.cache.insert(
+                                key.clone(),
+                                Cached {
+                                    profile: None,
+                                    at: now,
+                                    last_access: now,
+                                },
+                            );
+                        }
                     }
                 }
             }
