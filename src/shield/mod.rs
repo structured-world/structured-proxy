@@ -127,14 +127,13 @@ impl Shield {
         })))
     }
 
-    /// The first rule in `phase` whose glob matches `path`, with its index (the
-    /// index keys the store so distinct rules keep independent budgets). A path
-    /// may match one rule per phase; each phase enforces independently.
-    fn match_rule(&self, path: &str, phase: Phase) -> Option<(usize, &CompiledRule)> {
+    /// The first rule in `phase` whose glob matches `path`. A path may match one
+    /// rule per phase; each phase enforces independently (two-phase by design:
+    /// a pre-auth IP/header rule and a post-auth claim rule can both apply).
+    fn match_rule(&self, path: &str, phase: Phase) -> Option<&CompiledRule> {
         self.rules
             .iter()
-            .enumerate()
-            .find(|(_, r)| r.phase == phase && r.matcher.is_match(path))
+            .find(|r| r.phase == phase && r.matcher.is_match(path))
     }
 
     /// Resolve the limit tier for a matched rule, in priority order: the JWT
@@ -145,7 +144,7 @@ impl Shield {
         &self,
         rule: &CompiledRule,
         claims: Option<&serde_json::Value>,
-        key: &str,
+        identity: &str,
     ) -> Option<CompiledProfile> {
         if let (Some(jwt), Some(claims)) = (&self.jwt_limits, claims) {
             if let Some(profile) = jwt.resolve(claims, &self.profiles) {
@@ -153,7 +152,7 @@ impl Shield {
             }
         }
         if let Some(service) = &self.limit_service {
-            if let Some(profile) = service.resolve(key) {
+            if let Some(profile) = service.resolve(identity) {
                 return Some(profile);
             }
         }
@@ -194,7 +193,7 @@ pub async fn post_auth_middleware(
 /// Match a phase's rule for the request, apply its limit, and attach headers.
 async fn enforce(shield: &Shield, phase: Phase, request: Request, next: Next) -> Response {
     let path = request.uri().path();
-    let Some((idx, rule)) = shield.match_rule(path, phase) else {
+    let Some(rule) = shield.match_rule(path, phase) else {
         return next.run(request).await;
     };
 
@@ -207,9 +206,17 @@ async fn enforce(shield: &Shield, phase: Phase, request: Request, next: Next) ->
         .extensions()
         .get::<crate::auth::ValidatedClaims>()
         .map(|c| c.0.as_ref());
-    let key = rule_key(idx, &rule.key, &client, request.headers(), claims);
+    let key = rule_key(
+        &rule.fingerprint,
+        &rule.key,
+        &client,
+        request.headers(),
+        claims,
+    );
 
-    let Some(profile) = shield.resolve_limit(rule, claims, &key) else {
+    // The limit service resolves per-principal, so it needs the real identity;
+    // the store / shared counter only need the de-identified `store` key.
+    let Some(profile) = shield.resolve_limit(rule, claims, &key.identity) else {
         // No limit resolves for this rule (JWT/service/profile/default all
         // absent): allow the request unmetered.
         return next.run(request).await;
@@ -219,12 +226,12 @@ async fn enforce(shield: &Shield, phase: Phase, request: Request, next: Next) ->
     // for a request the fleet-wide budget will reject.
     #[cfg(feature = "redis")]
     if let Some(global) = &shield.global {
-        if !global.gate(&key, profile.limit, profile.window) {
+        if !global.gate(&key.store, profile.limit, profile.window) {
             return global_reject(profile.limit, profile.window);
         }
     }
 
-    let verdict = shield.store.check(&key, &profile.gcra);
+    let verdict = shield.store.check(&key.store, &profile.gcra);
     if !verdict.allowed {
         return too_many_requests(profile.limit, &verdict);
     }
@@ -232,7 +239,7 @@ async fn enforce(shield: &Shield, phase: Phase, request: Request, next: Next) ->
     // Record the admit for the next reconciliation push.
     #[cfg(feature = "redis")]
     if let Some(global) = &shield.global {
-        global.record(&key, profile.window);
+        global.record(&key.store, profile.window);
     }
 
     let mut response = next.run(request).await;
@@ -259,28 +266,43 @@ fn global_reject(limit: u64, window: Duration) -> Response {
     too_many_requests(limit, &verdict)
 }
 
-/// Build the store key for a matched rule. The rule index namespaces the key so
-/// two rules that happen to see the same client keep independent budgets. Every
-/// source falls back to the client IP when its value is absent, so a limit can't
-/// be dodged by omitting a header or authenticating anonymously.
+/// The keys a matched rule derives for one request.
+struct RuleKey {
+    /// De-identified key for the local store and shared counter: the rule's
+    /// stable fingerprint, the source tag, and a hash of the value. Raw client
+    /// values (API keys, principals, IPs) never reach the shared store or its
+    /// logs. Deterministic across instances so reconciliation keys agree.
+    store: String,
+    /// The raw identity for per-principal limit-service resolution (the service
+    /// must see the real principal to resolve its tier). Not persisted.
+    identity: String,
+}
+
+/// Derive the store key and resolution identity for a matched rule. Every source
+/// falls back to the client IP when its value is absent, so a limit can't be
+/// dodged by omitting a header or authenticating anonymously (subject to the
+/// rule's phase: a `jwt_claim` rule only runs post-auth).
 fn rule_key(
-    idx: usize,
+    fingerprint: &str,
     key: &KeySource,
     client: &str,
     headers: &HeaderMap,
     claims: Option<&serde_json::Value>,
-) -> String {
-    let by_ip = || format!("{idx}:ip:{client}");
-    match key {
-        KeySource::Ip => by_ip(),
+) -> RuleKey {
+    let (tag, identity) = match key {
+        KeySource::Ip => ("ip", client.to_string()),
         KeySource::Header(name) => match header_str(headers, name) {
-            Some(v) => format!("{idx}:hdr:{v}"),
-            None => by_ip(),
+            Some(v) => ("hdr", v),
+            None => ("ip", client.to_string()),
         },
         KeySource::JwtClaim(claim) => match claims.and_then(|c| resolve::claim_str(c, claim)) {
-            Some(v) => format!("{idx}:jwt:{v}"),
-            None => by_ip(),
+            Some(v) => ("jwt", v),
+            None => ("ip", client.to_string()),
         },
+    };
+    RuleKey {
+        store: format!("{fingerprint}:{tag}:{}", matcher::short_hash(&identity)),
+        identity,
     }
 }
 

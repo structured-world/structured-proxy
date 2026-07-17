@@ -50,6 +50,19 @@ pub struct CompiledRule {
     /// Static profile name, if the rule pins one.
     pub profile: Option<String>,
     pub phase: Phase,
+    /// Stable identifier for this rule, derived from its shape (pattern + key +
+    /// profile) rather than its position. Namespaces store keys so reordering
+    /// rules or a rolling deploy does not reset budgets.
+    pub fingerprint: String,
+}
+
+/// A short, stable, non-reversible hash (128-bit hex) of `input`. Used both to
+/// fingerprint rules and to de-identify key values before they reach the shared
+/// store, and deterministic across instances so reconciliation keys agree.
+pub fn short_hash(input: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(input.as_bytes());
+    digest[..16].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Build a glob matcher where `*` stays within a path segment and `**` spans
@@ -116,11 +129,23 @@ pub fn compile_rules(
                 KeySource::JwtClaim(_) => Phase::PostAuth,
                 KeySource::Ip | KeySource::Header(_) => Phase::PreAuth,
             };
+            let key_repr = match &key {
+                KeySource::Ip => "ip".to_string(),
+                KeySource::Header(name) => format!("hdr:{name}"),
+                KeySource::JwtClaim(claim) => format!("jwt:{claim}"),
+            };
+            let fingerprint = short_hash(&format!(
+                "{}\u{1f}{}\u{1f}{}",
+                c.pattern,
+                key_repr,
+                c.profile.as_deref().unwrap_or("")
+            ));
             Ok(CompiledRule {
                 matcher: path_glob(&c.pattern)?,
                 key,
                 profile: c.profile.clone(),
                 phase,
+                fingerprint,
             })
         })
         .collect()

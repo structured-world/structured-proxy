@@ -179,42 +179,50 @@ async fn rule_without_resolvable_profile_passes() {
 fn jwt_claim_key_uses_claim_then_falls_back_to_ip() {
     let claims = serde_json::json!({ "sub": "alice", "org": { "id": "acme" } });
     let key = KeySource::JwtClaim("sub".to_string());
-    // Present claim keys by its value.
-    assert_eq!(
-        rule_key(0, &key, "1.1.1.1", &HeaderMap::new(), Some(&claims)),
-        "0:jwt:alice"
+    // Present claim: identity is the raw claim value (for service resolution);
+    // the store key is de-identified (no raw value) and tagged `jwt`.
+    let k = rule_key("fp", &key, "1.1.1.1", &HeaderMap::new(), Some(&claims));
+    assert_eq!(k.identity, "alice");
+    assert!(k.store.starts_with("fp:jwt:"));
+    assert!(
+        !k.store.contains("alice"),
+        "raw value must not appear in store key"
     );
     // Dotted path into a nested claim.
     let nested = KeySource::JwtClaim("org.id".to_string());
     assert_eq!(
-        rule_key(0, &nested, "1.1.1.1", &HeaderMap::new(), Some(&claims)),
-        "0:jwt:acme"
+        rule_key("fp", &nested, "1.1.1.1", &HeaderMap::new(), Some(&claims)).identity,
+        "acme"
     );
     // No claims (anonymous) → IP fallback, so the limit can't be dodged.
-    assert_eq!(
-        rule_key(0, &key, "1.1.1.1", &HeaderMap::new(), None),
-        "0:ip:1.1.1.1"
-    );
+    let anon = rule_key("fp", &key, "1.1.1.1", &HeaderMap::new(), None);
+    assert_eq!(anon.identity, "1.1.1.1");
+    assert!(anon.store.starts_with("fp:ip:"));
     // Claim present but missing the requested field → IP fallback.
-    assert_eq!(
-        rule_key(
-            0,
-            &KeySource::JwtClaim("missing".to_string()),
-            "1.1.1.1",
-            &HeaderMap::new(),
-            Some(&claims)
-        ),
-        "0:ip:1.1.1.1"
+    let missing = rule_key(
+        "fp",
+        &KeySource::JwtClaim("missing".to_string()),
+        "1.1.1.1",
+        &HeaderMap::new(),
+        Some(&claims),
     );
+    assert_eq!(missing.identity, "1.1.1.1");
+    assert!(missing.store.starts_with("fp:ip:"));
 }
 
 #[test]
-fn rule_index_namespaces_identical_keys() {
-    // The same client under two different rules keeps independent budgets.
+fn store_key_namespaced_by_fingerprint_and_value() {
     let key = KeySource::Ip;
-    let a = rule_key(0, &key, "1.1.1.1", &HeaderMap::new(), None);
-    let b = rule_key(1, &key, "1.1.1.1", &HeaderMap::new(), None);
-    assert_ne!(a, b);
+    // Same client under two different rules (fingerprints) → independent budgets.
+    let a = rule_key("fpA", &key, "1.1.1.1", &HeaderMap::new(), None);
+    let b = rule_key("fpB", &key, "1.1.1.1", &HeaderMap::new(), None);
+    assert_ne!(a.store, b.store);
+    // Same rule + same value → identical store key (stable across instances).
+    let a2 = rule_key("fpA", &key, "1.1.1.1", &HeaderMap::new(), None);
+    assert_eq!(a.store, a2.store);
+    // Different value → different store key.
+    let c = rule_key("fpA", &key, "2.2.2.2", &HeaderMap::new(), None);
+    assert_ne!(a.store, c.store);
 }
 
 #[test]
