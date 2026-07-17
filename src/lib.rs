@@ -511,8 +511,10 @@ impl ProxyServer {
             .merge(openapi_routes)
             .merge(oidc_routes)
             .merge(embed::extra_routes_router(&self.extra_routes))
-            .merge(transcode_routes)
-            .layer(cors);
+            .merge(transcode_routes);
+        // CORS is applied as the outermost layer below, so it wraps the auth and
+        // rate-limit enforcement: a short-circuited 401/429/503 still carries CORS
+        // headers, and preflight OPTIONS is answered before auth can reject it.
 
         // Forward-auth verification endpoint, sharing the built Auth. Mounted
         // after the auth layer below so the endpoint itself is not gated by the
@@ -576,6 +578,9 @@ impl ProxyServer {
                 maintenance_middleware,
             ))
             .layer(TraceLayer::new_for_http())
+            // Outermost: wraps every enforcement layer so short-circuited
+            // responses keep CORS headers, and answers preflight before auth.
+            .layer(cors)
             .with_state(state);
 
         Ok(router)
@@ -646,6 +651,11 @@ impl ProxyServer {
                 .expose_headers([
                     "grpc-status".parse().unwrap(),
                     "grpc-message".parse().unwrap(),
+                    // Let browser clients read the rate-limit budget and back off.
+                    "ratelimit-limit".parse().unwrap(),
+                    "ratelimit-remaining".parse().unwrap(),
+                    "ratelimit-reset".parse().unwrap(),
+                    "retry-after".parse().unwrap(),
                 ])
         }
     }
