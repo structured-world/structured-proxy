@@ -78,8 +78,19 @@ fn path_glob(pattern: &str) -> Result<GlobMatcher, String> {
 /// Compile a single limit profile from its config.
 pub fn compile_profile(cfg: &LimitProfileConfig) -> Result<CompiledProfile, String> {
     let rate = super::rate::Rate::parse(&cfg.rate, BARE_COUNT_WINDOW)?;
+    // Reject non-positive limits explicitly rather than silently clamping them
+    // to 1, which would hide a misconfigured (effectively unlimited or dead) tier.
+    if rate.limit == 0 {
+        return Err(format!(
+            "profile rate must be greater than 0, got {:?}",
+            cfg.rate
+        ));
+    }
+    if cfg.burst == Some(0) {
+        return Err("profile burst must be greater than 0".to_string());
+    }
     // Default burst = one full window of the sustained rate.
-    let burst = cfg.burst.unwrap_or(rate.limit).max(1);
+    let burst = cfg.burst.unwrap_or(rate.limit);
     let gcra = Gcra::from_profile(Profile {
         rate: rate.limit,
         window: rate.window,
@@ -175,6 +186,20 @@ mod tests {
         })
         .unwrap();
         assert_eq!(p.limit, 100);
+    }
+
+    #[test]
+    fn zero_rate_or_burst_is_rejected() {
+        assert!(compile_profile(&LimitProfileConfig {
+            rate: "0/min".to_string(),
+            burst: None,
+        })
+        .is_err());
+        assert!(compile_profile(&LimitProfileConfig {
+            rate: "100/min".to_string(),
+            burst: Some(0),
+        })
+        .is_err());
     }
 
     #[test]
