@@ -56,11 +56,16 @@ struct KeyState {
     /// The fleet's sliding consumption (including this instance's own claimed
     /// admits, which now live in the shared counter), from the last pull.
     remote_estimate: u64,
+    /// When `remote_estimate` was last refreshed from the store. If it goes
+    /// stale (the store is unreachable for several intervals), the gate stops
+    /// trusting it and degrades to per-instance limiting.
+    estimate_at: Instant,
     last_seen: Instant,
 }
 
 impl KeyState {
     fn new(epoch: u64, window_secs: u64) -> Self {
+        let now = Instant::now();
         Self {
             epoch,
             window_secs,
@@ -68,7 +73,8 @@ impl KeyState {
             carryover: 0,
             carryover_epoch: 0,
             remote_estimate: 0,
-            last_seen: Instant::now(),
+            estimate_at: now,
+            last_seen: now,
         }
     }
 
@@ -83,7 +89,17 @@ impl KeyState {
     fn roll_to(&mut self, epoch: u64) {
         if self.epoch != epoch {
             if self.local_count > 0 {
-                self.carryover += self.local_count;
+                if self.carryover > 0 && self.carryover_epoch != self.epoch {
+                    // An unclaimed carryover from an earlier epoch still exists:
+                    // reconcile has not run across two boundaries (interval
+                    // misconfigured longer than the window). Keep only the most
+                    // recent window rather than collapsing two epochs' counts
+                    // under one label, which would corrupt both. Dropping the
+                    // older is a bounded under-count consistent with best-effort.
+                    self.carryover = self.local_count;
+                } else {
+                    self.carryover += self.local_count;
+                }
                 self.carryover_epoch = self.epoch;
             }
             self.epoch = epoch;
@@ -130,7 +146,20 @@ impl GlobalCounters {
     /// keeping the hot path lock-free and non-blocking.
     pub fn fleet_remaining(&self, key: &str, budget: u64, window: Duration) -> u64 {
         let state = self.state_for(key, window);
-        budget.saturating_sub(state.remote_estimate + state.local_count)
+        // Ignore the remote estimate once it is stale (store unreachable for
+        // several intervals): keep gating on this instance's own counts only,
+        // which is the documented degrade-to-per-instance behaviour, instead of
+        // subtracting a frozen estimate forever.
+        let stale_after = (self.interval * 4).max(Duration::from_secs(2));
+        let remote = if state.estimate_at.elapsed() < stale_after {
+            state.remote_estimate
+        } else {
+            0
+        };
+        // Subtract carryover too: unpushed previous-window admits still count in
+        // the sliding window until the next tick publishes them.
+        let used = remote + state.local_count + state.carryover;
+        budget.saturating_sub(used)
     }
 
     /// Record one admitted request for `key`, to be pushed to the store on the
@@ -301,6 +330,7 @@ impl GlobalCounters {
                 // the full sliding estimate is used with no self-subtraction.
                 let est = window::sliding_estimate(*cur, *prev, elapsed, p.window);
                 s.remote_estimate = est.round().max(0.0) as u64;
+                s.estimate_at = Instant::now();
             }
         }
     }
