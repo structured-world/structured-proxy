@@ -435,6 +435,25 @@ mod tests {
     }
 
     #[test]
+    fn consecutive_rolls_do_not_collapse_epochs() {
+        // If reconcile does not run between two boundary crossings (interval
+        // misconfigured longer than the window), a second roll must not add a new
+        // epoch's count onto the previous carryover under one epoch label. It
+        // keeps the most recent window (dropping the older) rather than corrupting
+        // both with a collapsed count.
+        let mut s = KeyState::new(10, 60);
+        s.local_count = 3;
+        s.roll_to(11); // carryover = 3 owed to epoch 10
+        s.local_count = 4;
+        s.roll_to(12); // second roll before any reconcile claimed the carryover
+        assert_eq!(
+            s.carryover, 4,
+            "keeps the latest window, not 3 + 4 collapsed"
+        );
+        assert_eq!(s.carryover_epoch, 11);
+    }
+
+    #[test]
     fn stale_estimate_not_applied_after_window_reset() {
         let g = counters();
         let key = "k";
