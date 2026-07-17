@@ -16,6 +16,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use dashmap::mapref::entry::Entry;
+
 use super::window;
 
 /// Redis key namespace for a rate-limit key at a given epoch.
@@ -34,6 +36,15 @@ fn unix_now() -> Duration {
 /// Drop per-key state untouched for this long (bounds memory under churning
 /// key cardinality).
 const KEY_TTL: Duration = Duration::from_secs(600);
+
+/// Hard cap on tracked keys. [`evict_stale`](GlobalCounters::evict_stale) bounds
+/// retention *time*, but only runs once per reconcile tick; a burst of distinct
+/// keys between ticks could still grow the map. Past this cap, a *new* key is not
+/// fleet-tracked and simply degrades to per-instance limiting (the local
+/// [`GcraStore`](super::store::GcraStore) still caps it) rather than being fleet
+/// under-counted; this is the same best-effort tolerance as a dropped push.
+/// Already-tracked keys are unaffected, so a real principal's budget is kept.
+const MAX_KEYS: usize = 500_000;
 
 /// Per-key reconciliation state.
 ///
@@ -145,7 +156,12 @@ impl GlobalCounters {
     /// documented one-interval overshoot, which is the accepted trade-off for
     /// keeping the hot path lock-free and non-blocking.
     pub fn fleet_remaining(&self, key: &str, budget: u64, window: Duration) -> u64 {
-        let state = self.state_for(key, window);
+        // When the map is full and this key is new, don't fleet-gate it: report
+        // the full budget so the local limiter alone decides (degrade-to-
+        // per-instance). Tracking it would breach the memory cap under a flood.
+        let Some(state) = self.state_for(key, window) else {
+            return budget;
+        };
         // Ignore the remote estimate once it is stale (store unreachable for
         // several intervals): keep gating on this instance's own counts only,
         // which is the documented degrade-to-per-instance behaviour, instead of
@@ -165,8 +181,12 @@ impl GlobalCounters {
     /// Record one admitted request for `key`, to be pushed to the store on the
     /// next background tick.
     pub fn record(&self, key: &str, window: Duration) {
-        let mut state = self.state_for(key, window);
-        state.local_count += 1;
+        // If the map is full and this key is untracked, skip: the admit is
+        // enforced locally and simply isn't published to the fleet (bounded
+        // under-count), which is preferable to breaching the memory cap.
+        if let Some(mut state) = self.state_for(key, window) {
+            state.local_count += 1;
+        }
     }
 
     /// Look up (or create) the per-key state, rolled to the current epoch and
@@ -177,14 +197,19 @@ impl GlobalCounters {
         &self,
         key: &str,
         window: Duration,
-    ) -> dashmap::mapref::one::RefMut<'_, String, KeyState> {
+    ) -> Option<dashmap::mapref::one::RefMut<'_, String, KeyState>> {
         let now = unix_now();
         let window_secs = window.as_secs().max(1);
         let ep = window::epoch(now, window);
-        let mut state = self
-            .states
-            .entry(key.to_string())
-            .or_insert_with(|| KeyState::new(ep, window_secs));
+        // Soft cap check before the entry: a new key past the cap is not tracked.
+        // The `len()` read races with concurrent inserts, but the cap is a memory
+        // guard, not an exact limit, so a few entries of overshoot are harmless.
+        let over_cap = self.states.len() >= MAX_KEYS;
+        let mut state = match self.states.entry(key.to_string()) {
+            Entry::Occupied(o) => o.into_ref(),
+            Entry::Vacant(_) if over_cap => return None,
+            Entry::Vacant(v) => v.insert(KeyState::new(ep, window_secs)),
+        };
         if state.window_secs != window_secs {
             // A window change is a different accounting unit, so the entry resets.
             // Any unpushed admits from the old window are dropped rather than
@@ -198,15 +223,18 @@ impl GlobalCounters {
         }
         state.roll_to(ep);
         state.last_seen = Instant::now();
-        state
+        Some(state)
     }
 
-    /// Spawn the background reconciliation loop. A no-op (with a warning) when
-    /// called outside a Tokio runtime, so the local shaper still works.
-    pub fn spawn(self: &Arc<Self>) {
+    /// Spawn the background reconciliation loop. Returns `false` (without
+    /// spawning) when called outside a Tokio runtime, so the caller can drop the
+    /// fleet gate and fall back to per-instance limiting rather than gating on a
+    /// view that would never be reconciled.
+    #[must_use]
+    pub fn spawn(self: &Arc<Self>) -> bool {
         if tokio::runtime::Handle::try_current().is_err() {
             tracing::warn!("rate-limit reconciler not started: no Tokio runtime in this context");
-            return;
+            return false;
         }
         let this = self.clone();
         tokio::spawn(async move {
@@ -216,6 +244,7 @@ impl GlobalCounters {
                 this.reconcile().await;
             }
         });
+        true
     }
 
     /// A cloneable, self-reconnecting handle to the shared store. `ConnectionManager`
@@ -281,12 +310,16 @@ impl GlobalCounters {
         }
 
         // Claimed deltas are fire-and-forget: once claimed (zeroed), a push that
-        // fails or whose EXEC ack is lost simply drops them rather than restoring.
-        // Restoring risked publishing a committed-but-unacked batch twice (a false
-        // 429); dropping instead under-counts this instance's last interval, which
-        // is exactly the documented "store unreachable → degrade to per-instance"
-        // behaviour. It also means an unpushable delta never accumulates across
-        // window boundaries into a collapsed carryover.
+        // fails (connection or transaction) simply drops them rather than
+        // restoring. This is deliberate, not a leak:
+        //   * Restoring risks publishing a committed-but-unacked batch twice (a
+        //     false 429), and across a sustained outage it would accumulate
+        //     unbounded local_count and then dump a huge spike on recovery.
+        //   * Dropping instead under-counts only this instance's last interval,
+        //     which is exactly the documented "store unreachable → degrade to
+        //     per-instance limiting" behaviour, and never over-counts.
+        // So the failure mode is a bounded, self-correcting under-count (slight
+        // over-admit), never a false rejection or a recovery spike.
         let mut conn = match self.connection().await {
             Ok(c) => c,
             Err(e) => {
@@ -335,7 +368,10 @@ impl GlobalCounters {
                 // the gate adds only the still-unclaimed `local_count` on top, so
                 // the full sliding estimate is used with no self-subtraction.
                 let est = window::sliding_estimate(*cur, *prev, elapsed, p.window);
-                s.remote_estimate = est.round().max(0.0) as u64;
+                // Round the fractional sliding estimate UP: under-counting the
+                // fleet would let the gate admit past the budget, so bias to the
+                // conservative side.
+                s.remote_estimate = est.ceil().max(0.0) as u64;
                 s.estimate_at = Instant::now();
             }
         }

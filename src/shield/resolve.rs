@@ -137,6 +137,16 @@ struct Cached {
 /// Sweep the cache of long-idle keys at most once per this interval.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Hard cap on cached resolutions, bounding peak memory under rapid key rotation
+/// (idle eviction bounds retention time, not peak cardinality). When full, the
+/// least-recently-accessed entries are dropped: an attacker's one-shot keys are
+/// the oldest and get evicted, while an actively-reused key stays warm.
+const MAX_CACHE_ENTRIES: usize = 100_000;
+
+/// Cap on concurrent background limit-service fetches, bounding outbound calls
+/// and tasks when many distinct keys miss at once.
+const MAX_CONCURRENT_FETCHES: usize = 32;
+
 /// External limit-resolution service with an async, non-blocking cache.
 pub struct LimitService {
     endpoint: String,
@@ -151,6 +161,8 @@ pub struct LimitService {
     cache: dashmap::DashMap<String, Cached>,
     /// Keys with a background fetch already in flight (dedupes refreshes).
     inflight: dashmap::DashMap<String, ()>,
+    /// Global cap on concurrent background fetches (in addition to per-key dedup).
+    fetch_slots: Arc<tokio::sync::Semaphore>,
     base: Instant,
     last_sweep_ms: std::sync::atomic::AtomicU64,
 }
@@ -190,6 +202,7 @@ impl LimitService {
             profiles,
             cache: dashmap::DashMap::new(),
             inflight: dashmap::DashMap::new(),
+            fetch_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_FETCHES)),
             base: Instant::now(),
             last_sweep_ms: std::sync::atomic::AtomicU64::new(0),
         }))
@@ -215,10 +228,24 @@ impl LimitService {
 
     /// Drop entries not accessed within `evict_after` (idle keys), keyed on last
     /// access rather than last fetch so an active-but-unrefreshable key survives.
+    /// Then enforce the hard capacity, evicting the least-recently-accessed
+    /// entries so rapid key rotation cannot grow the cache without bound.
     fn sweep(&self) {
         let evict_after = self.evict_after;
         self.cache
             .retain(|_, c| c.last_access.elapsed() < evict_after);
+        if self.cache.len() > MAX_CACHE_ENTRIES {
+            let mut ages: Vec<(String, Instant)> = self
+                .cache
+                .iter()
+                .map(|e| (e.key().clone(), e.value().last_access))
+                .collect();
+            // Oldest first; drop everything past the cap.
+            ages.sort_by_key(|(_, t)| *t);
+            for (key, _) in ages.into_iter().take(self.cache.len() - MAX_CACHE_ENTRIES) {
+                self.cache.remove(&key);
+            }
+        }
     }
 
     /// Resolve `key`'s limit from the cache, serving a stale value while a
@@ -246,7 +273,10 @@ impl LimitService {
         }
     }
 
-    /// Spawn a single background fetch for `key` (deduped by `inflight`).
+    /// Spawn a single background fetch for `key` (deduped by `inflight`, and
+    /// globally bounded by `fetch_slots`). When no fetch slot is free, skip the
+    /// refresh and serve the existing stale/static result rather than piling up
+    /// outbound calls under a burst of distinct keys.
     fn trigger_refresh(self: &Arc<Self>, key: String) {
         match self.inflight.entry(key.clone()) {
             Entry::Occupied(_) => return,
@@ -254,8 +284,16 @@ impl LimitService {
                 v.insert(());
             }
         }
+        let permit = match self.fetch_slots.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                self.inflight.remove(&key);
+                return;
+            }
+        };
         let this = self.clone();
         tokio::spawn(async move {
+            let _permit = permit; // released when the fetch task ends
             match this.fetch(&key).await {
                 Ok(resolved) => {
                     let now = Instant::now();
