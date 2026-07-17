@@ -187,9 +187,14 @@ impl LimitService {
             .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
         {
-            let evict_after = self.evict_after;
-            self.cache.retain(|_, c| c.at.elapsed() < evict_after);
+            self.sweep();
         }
+    }
+
+    /// Drop entries idle longer than `evict_after`.
+    fn sweep(&self) {
+        let evict_after = self.evict_after;
+        self.cache.retain(|_, c| c.at.elapsed() < evict_after);
     }
 
     /// Resolve `key`'s limit from the cache, serving a stale value while a
@@ -326,6 +331,39 @@ mod tests {
         assert_eq!(
             jwt_limits().resolve(&claims, &profiles()).unwrap().limit,
             42
+        );
+    }
+
+    #[tokio::test]
+    async fn actively_used_stale_entry_survives_eviction() {
+        use crate::config::LimitServiceConfig;
+        let svc = LimitService::build(
+            &LimitServiceConfig {
+                endpoint: "http://127.0.0.1:0/".to_string(),
+                ttl_secs: 1,
+                timeout_ms: 50,
+            },
+            profiles(),
+        )
+        .unwrap();
+        // Simulate a service outage: the last successful fetch was long ago, so
+        // `at` is stale and well past evict_after, but the key is still in active
+        // use right now.
+        let old = Instant::now()
+            .checked_sub(Duration::from_secs(600))
+            .expect("clock supports the offset");
+        svc.cache.insert(
+            "k".to_string(),
+            Cached {
+                profile: Some(profile_from_numbers(10, 10)),
+                at: old,
+            },
+        );
+        let _ = svc.resolve("k");
+        svc.sweep();
+        assert!(
+            svc.cache.contains_key("k"),
+            "an actively-used stale entry must not be evicted during an outage"
         );
     }
 
