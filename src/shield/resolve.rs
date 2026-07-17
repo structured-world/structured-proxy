@@ -164,11 +164,17 @@ impl LimitService {
         cfg: &LimitServiceConfig,
         profiles: HashMap<String, CompiledProfile>,
     ) -> Result<Arc<Self>, String> {
-        // Validate the endpoint at build time: a malformed URL is a config error
-        // for a security control, so fail startup rather than silently disabling
-        // dynamic limits when the first background fetch fails to parse it.
-        reqwest::Url::parse(&cfg.endpoint)
+        // Validate the endpoint at build time: a malformed or non-HTTP URL is a
+        // config error for a security control, so fail startup rather than
+        // silently disabling dynamic limits when the background fetch later fails.
+        let url = reqwest::Url::parse(&cfg.endpoint)
             .map_err(|e| format!("invalid limit_service.endpoint {:?}: {e}", cfg.endpoint))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(format!(
+                "limit_service.endpoint must be http/https, got scheme {:?}",
+                url.scheme()
+            ));
+        }
         let client = reqwest::Client::builder()
             .timeout(Duration::from_millis(cfg.timeout_ms.max(1)))
             .tls_backend_preconfigured(crate::auth::jwks::build_tls_config())
@@ -445,6 +451,22 @@ mod tests {
             })
             .unwrap();
         assert_eq!(p.limit, 50);
+    }
+
+    #[test]
+    fn build_rejects_non_http_endpoint() {
+        // Syntactically valid URLs that reqwest GET can't use must be rejected.
+        for ep in ["redis://127.0.0.1/", "file:///etc/passwd", "ftp://h/x"] {
+            let r = LimitService::build(
+                &LimitServiceConfig {
+                    endpoint: ep.to_string(),
+                    ttl_secs: 60,
+                    timeout_ms: 50,
+                },
+                profiles(),
+            );
+            assert!(r.is_err(), "expected {ep} to be rejected");
+        }
     }
 
     #[test]
