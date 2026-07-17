@@ -228,8 +228,10 @@ impl LimitService {
 
     /// Drop entries not accessed within `evict_after` (idle keys), keyed on last
     /// access rather than last fetch so an active-but-unrefreshable key survives.
-    /// Then enforce the hard capacity, evicting the least-recently-accessed
-    /// entries so rapid key rotation cannot grow the cache without bound.
+    /// Then enforce the hard capacity as a backstop, evicting the
+    /// least-recently-accessed entries. Growth is primarily bounded at insertion
+    /// (see [`insert_capped`](Self::insert_capped)); this trim only reclaims the
+    /// rare overshoot from concurrent inserts racing the soft cap check.
     fn sweep(&self) {
         let evict_after = self.evict_after;
         self.cache
@@ -277,6 +279,28 @@ impl LimitService {
     /// globally bounded by `fetch_slots`). When no fetch slot is free, skip the
     /// refresh and serve the existing stale/static result rather than piling up
     /// outbound calls under a burst of distinct keys.
+    /// Insert or refresh a cache entry, refusing to create a *new* entry once the
+    /// cache is at capacity. A completed fetch inserts from a background task, so
+    /// without this a fast service plus rotating identities could push the map
+    /// far past [`MAX_CACHE_ENTRIES`] between the 60s sweeps; refusing new entries
+    /// at the cap degrades those keys to the static profile (the same tolerance as
+    /// a skipped refresh). An existing key is always updated.
+    fn insert_capped(&self, key: String, cached: Cached) {
+        // Read len() before taking the entry: DashMap::len() read-locks every
+        // shard, and holding a shard write-lock (via entry) while doing so would
+        // deadlock. The cap is a soft memory guard, so the race is harmless.
+        let over_cap = self.cache.len() >= MAX_CACHE_ENTRIES;
+        match self.cache.entry(key) {
+            Entry::Occupied(mut o) => {
+                o.insert(cached);
+            }
+            Entry::Vacant(_) if over_cap => {} // at capacity: drop the new entry
+            Entry::Vacant(v) => {
+                v.insert(cached);
+            }
+        }
+    }
+
     fn trigger_refresh(self: &Arc<Self>, key: String) {
         match self.inflight.entry(key.clone()) {
             Entry::Occupied(_) => return,
@@ -297,7 +321,7 @@ impl LimitService {
             match this.fetch(&key).await {
                 Ok(resolved) => {
                     let now = Instant::now();
-                    this.cache.insert(
+                    this.insert_capped(
                         key.clone(),
                         Cached {
                             profile: resolved,
@@ -318,7 +342,7 @@ impl LimitService {
                     match this.cache.get_mut(&key) {
                         Some(mut c) => c.at = now,
                         None => {
-                            this.cache.insert(
+                            this.insert_capped(
                                 key.clone(),
                                 Cached {
                                     profile: None,
