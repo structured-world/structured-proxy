@@ -164,6 +164,11 @@ impl LimitService {
         cfg: &LimitServiceConfig,
         profiles: HashMap<String, CompiledProfile>,
     ) -> Result<Arc<Self>, String> {
+        // Validate the endpoint at build time: a malformed URL is a config error
+        // for a security control, so fail startup rather than silently disabling
+        // dynamic limits when the first background fetch fails to parse it.
+        reqwest::Url::parse(&cfg.endpoint)
+            .map_err(|e| format!("invalid limit_service.endpoint {:?}: {e}", cfg.endpoint))?;
         let client = reqwest::Client::builder()
             .timeout(Duration::from_millis(cfg.timeout_ms.max(1)))
             .tls_backend_preconfigured(crate::auth::jwks::build_tls_config())
@@ -309,8 +314,12 @@ impl LimitService {
     /// Map a service response to a compiled limit: a tier name resolves against
     /// the configured profiles; otherwise explicit numbers apply.
     fn map_response(&self, body: LimitResponse) -> Option<CompiledProfile> {
-        if let Some(tier) = body.tier {
-            return self.profiles.get(&tier).copied();
+        if let Some(tier) = &body.tier {
+            if let Some(profile) = self.profiles.get(tier) {
+                return Some(*profile);
+            }
+            // Unknown tier (e.g. mid rollout): fall through to explicit numbers if
+            // the response also carried them, matching JWT resolution.
         }
         body.rate_per_min
             .and_then(|rpm| profile_from_numbers(rpm, body.burst.unwrap_or(rpm)))
@@ -404,6 +413,45 @@ mod tests {
             svc.cache.contains_key("k"),
             "an actively-used stale entry must not be evicted during an outage"
         );
+    }
+
+    fn service(endpoint: &str) -> Arc<LimitService> {
+        LimitService::build(
+            &LimitServiceConfig {
+                endpoint: endpoint.to_string(),
+                ttl_secs: 60,
+                timeout_ms: 50,
+            },
+            profiles(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn service_unknown_tier_falls_through_to_numbers() {
+        let svc = service("http://127.0.0.1:9/");
+        // Unknown tier but explicit numbers present → numbers win (like JWT).
+        let p = svc
+            .map_response(LimitResponse {
+                tier: Some("gold".to_string()),
+                rate_per_min: Some(50),
+                burst: None,
+            })
+            .unwrap();
+        assert_eq!(p.limit, 50);
+    }
+
+    #[test]
+    fn build_rejects_malformed_endpoint() {
+        let bad = LimitService::build(
+            &LimitServiceConfig {
+                endpoint: "not a url".to_string(),
+                ttl_secs: 60,
+                timeout_ms: 50,
+            },
+            profiles(),
+        );
+        assert!(bad.is_err());
     }
 
     #[test]
