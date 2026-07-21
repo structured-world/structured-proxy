@@ -306,12 +306,32 @@ fn reconciled_headers(
     fleet_remaining: Option<u64>,
     window: Duration,
 ) -> (u64, Verdict) {
-    let _ = window; // used once the fleet-bound reset lands
     let mut reported = verdict.remaining;
+    let mut hv = verdict;
     if let Some(fr) = fleet_remaining {
-        reported = reported.min(fr.saturating_sub(1));
+        let fleet_r = fr.saturating_sub(1);
+        if fleet_r <= reported {
+            // The fleet budget binds. Advertise the fleet-derived reset (the
+            // shared sliding-window estimate can stay saturated far longer than
+            // this instance's local GCRA), so a client pacing off the allowed
+            // response does not retry before the window decays and immediately
+            // hit the fleet gate. Widen, never shrink: keep the local reset if it
+            // is already the longer wait.
+            reported = fleet_r;
+            let backoff = fleet_backoff(window);
+            hv.reset_after = hv.reset_after.max(backoff);
+            hv.retry_after = hv.retry_after.max(backoff);
+        }
     }
-    (reported, verdict)
+    (reported, hv)
+}
+
+/// Poll interval for a client blocked (or nearly blocked) by the fleet gate: a
+/// tenth of the window, at least 1s. The fleet's sliding-window estimate decays
+/// continuously rather than freeing at an epoch boundary, so this is a retry
+/// cadence, not a wait-to-boundary.
+fn fleet_backoff(window: Duration) -> Duration {
+    (window / 10).max(Duration::from_secs(1))
 }
 
 /// Set the `RateLimit-*` headers unless an inner limiter already advertised a
@@ -352,9 +372,7 @@ fn maybe_tighten_rate_headers(
 /// the boundary, which a client could wait out and still be rejected.
 #[cfg(feature = "redis")]
 fn global_reject(limit: u64, window: Duration) -> Response {
-    // A tenth of the window (at least 1s): long enough not to hammer, short
-    // enough to retry as the window decays or other instances free budget.
-    let backoff = (window / 10).max(Duration::from_secs(1));
+    let backoff = fleet_backoff(window);
     let verdict = Verdict {
         allowed: false,
         new_tat: Duration::ZERO,
