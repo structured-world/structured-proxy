@@ -268,21 +268,19 @@ async fn enforce(shield: &Shield, phase: Phase, request: Request, next: Next) ->
     }
 
     // Report the tighter of the local and (when reconciled) fleet budgets, so a
-    // client near the fleet cap isn't told it has ample local room. This admit
-    // consumes one, hence the `- 1`.
+    // client near the fleet cap isn't told it has ample local room.
     #[cfg(not(feature = "redis"))]
-    let reported = verdict.remaining;
+    let (reported, header_verdict) = reconciled_headers(verdict, None);
     #[cfg(feature = "redis")]
-    let reported = {
-        let mut r = verdict.remaining;
-        if let Some(fr) = fleet_remaining {
-            r = r.min(fr.saturating_sub(1));
-            // Record the admit for the next reconciliation push.
+    let (reported, header_verdict) = {
+        // Record the admit for the next reconciliation push (whenever the fleet
+        // gate is active, i.e. `fleet_remaining` was computed).
+        if fleet_remaining.is_some() {
             if let Some(global) = &shield.global {
                 global.record(&key.store, profile.window);
             }
         }
-        r
+        reconciled_headers(verdict, fleet_remaining)
     };
 
     let mut response = next.run(request).await;
@@ -291,8 +289,24 @@ async fn enforce(shield: &Shield, phase: Phase, request: Request, next: Next) ->
     // set headers on the way out; overwrite them only when this (outer) phase's
     // remaining is smaller, so the client always sees the budget that will bite
     // first. An inner rejection carries remaining 0, so it is never overwritten.
-    maybe_tighten_rate_headers(response.headers_mut(), profile.limit, reported, &verdict);
+    maybe_tighten_rate_headers(
+        response.headers_mut(),
+        profile.limit,
+        reported,
+        &header_verdict,
+    );
     response
+}
+
+/// Combine the local GCRA `verdict` with the optional fleet remaining into the
+/// reported remaining and the verdict whose reset drives the headers. The count
+/// is the tighter of local and fleet, minus this admit (`fr - 1`).
+fn reconciled_headers(verdict: Verdict, fleet_remaining: Option<u64>) -> (u64, Verdict) {
+    let mut reported = verdict.remaining;
+    if let Some(fr) = fleet_remaining {
+        reported = reported.min(fr.saturating_sub(1));
+    }
+    (reported, verdict)
 }
 
 /// Set the `RateLimit-*` headers unless an inner limiter already advertised a
