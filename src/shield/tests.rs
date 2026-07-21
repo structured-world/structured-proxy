@@ -238,6 +238,48 @@ fn secs_ceil_rounds_sub_second_waits_up() {
 }
 
 #[test]
+fn reconciled_headers_widen_reset_when_fleet_binds() {
+    use crate::shield::gcra::Verdict;
+    use std::time::Duration;
+    // Fresh high-rate local key: ample local room, tiny local reset (100ms).
+    let verdict = Verdict {
+        allowed: true,
+        new_tat: Duration::from_millis(100),
+        remaining: 599,
+        retry_after: Duration::ZERO,
+        reset_after: Duration::from_millis(100),
+    };
+    let window = Duration::from_secs(60);
+    // Fleet has one slot left → it binds; reported collapses to 0. The reset must
+    // reflect the fleet's sliding-window decay (window/10 = 6s), not the 100ms
+    // local reset, or a paced client retries early into the fleet gate.
+    let (reported, hv) = reconciled_headers(verdict, Some(1), window);
+    assert_eq!(reported, 0, "fleet budget must bind the reported remaining");
+    assert!(
+        hv.reset_after >= Duration::from_secs(6),
+        "expected fleet-derived reset, got {:?}",
+        hv.reset_after
+    );
+}
+
+#[test]
+fn reconciled_headers_keep_local_reset_when_local_binds() {
+    use crate::shield::gcra::Verdict;
+    use std::time::Duration;
+    let verdict = Verdict {
+        allowed: true,
+        new_tat: Duration::from_secs(30),
+        remaining: 0,
+        retry_after: Duration::ZERO,
+        reset_after: Duration::from_secs(30),
+    };
+    // Fleet has ample room → local binds; the local 30s reset is left intact.
+    let (reported, hv) = reconciled_headers(verdict, Some(100), Duration::from_secs(60));
+    assert_eq!(reported, 0);
+    assert_eq!(hv.reset_after, Duration::from_secs(30));
+}
+
+#[test]
 fn build_rejects_unknown_default_profile() {
     let mut cfg = config(vec![("t", "1/min", None)], Vec::new());
     cfg.rules = vec![rule("/x", KeySourceConfig::Ip, Some("t"))];

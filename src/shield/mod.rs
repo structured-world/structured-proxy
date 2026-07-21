@@ -270,7 +270,7 @@ async fn enforce(shield: &Shield, phase: Phase, request: Request, next: Next) ->
     // Report the tighter of the local and (when reconciled) fleet budgets, so a
     // client near the fleet cap isn't told it has ample local room.
     #[cfg(not(feature = "redis"))]
-    let (reported, header_verdict) = reconciled_headers(verdict, None);
+    let (reported, header_verdict) = reconciled_headers(verdict, None, profile.window);
     #[cfg(feature = "redis")]
     let (reported, header_verdict) = {
         // Record the admit for the next reconciliation push (whenever the fleet
@@ -280,7 +280,7 @@ async fn enforce(shield: &Shield, phase: Phase, request: Request, next: Next) ->
                 global.record(&key.store, profile.window);
             }
         }
-        reconciled_headers(verdict, fleet_remaining)
+        reconciled_headers(verdict, fleet_remaining, profile.window)
     };
 
     let mut response = next.run(request).await;
@@ -301,7 +301,12 @@ async fn enforce(shield: &Shield, phase: Phase, request: Request, next: Next) ->
 /// Combine the local GCRA `verdict` with the optional fleet remaining into the
 /// reported remaining and the verdict whose reset drives the headers. The count
 /// is the tighter of local and fleet, minus this admit (`fr - 1`).
-fn reconciled_headers(verdict: Verdict, fleet_remaining: Option<u64>) -> (u64, Verdict) {
+fn reconciled_headers(
+    verdict: Verdict,
+    fleet_remaining: Option<u64>,
+    window: Duration,
+) -> (u64, Verdict) {
+    let _ = window; // used once the fleet-bound reset lands
     let mut reported = verdict.remaining;
     if let Some(fr) = fleet_remaining {
         reported = reported.min(fr.saturating_sub(1));
