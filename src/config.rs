@@ -1104,6 +1104,27 @@ shield:
     }
 
     #[test]
+    fn shield_rejects_unknown_field_in_rule_key() {
+        // A stray field inside a rule key (here `name` on an `ip` key, a copy-edit
+        // leftover) must be a hard error. Silently ignoring it would keep the rule
+        // IP-keyed instead of the intended per-header limit, weakening the control.
+        let yaml = r#"
+upstream:
+  default: "grpc://localhost:4180"
+shield:
+  enabled: true
+  profiles:
+    auth: { rate: "20/min", burst: 5 }
+  rules:
+    - pattern: "/v1/**"
+      key: { type: ip, name: x-api-key }
+      profile: "auth"
+"#;
+        let err = serde_yaml::from_str::<ProxyConfig>(yaml);
+        assert!(err.is_err(), "unknown field in a rule key must be rejected");
+    }
+
+    #[test]
     fn test_openapi_config_deserialize() {
         let yaml = r#"
 upstream:
