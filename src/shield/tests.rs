@@ -280,6 +280,31 @@ fn reconciled_headers_keep_local_reset_when_local_binds() {
 }
 
 #[test]
+fn tighten_headers_widen_retry_after_when_outer_reset_wins() {
+    use crate::shield::gcra::Verdict;
+    use axum::http::HeaderMap;
+    use std::time::Duration;
+    // An inner 429 left exhausted headers with a short reset and Retry-After.
+    let mut headers = HeaderMap::new();
+    headers.insert("ratelimit-remaining", "0".parse().unwrap());
+    headers.insert("ratelimit-reset", "60".parse().unwrap());
+    headers.insert("retry-after", "60".parse().unwrap());
+    // The outer phase is also exhausted but binds far longer (1 hour).
+    let outer = Verdict {
+        allowed: false,
+        new_tat: Duration::ZERO,
+        remaining: 0,
+        retry_after: Duration::from_secs(3600),
+        reset_after: Duration::from_secs(3600),
+    };
+    maybe_tighten_rate_headers(&mut headers, 1, 0, &outer);
+    // The longer outer reset wins; Retry-After must be widened to match it, or
+    // the client retries after 60s and immediately hits the outer gate.
+    assert_eq!(headers.get("ratelimit-reset").unwrap(), "3600");
+    assert_eq!(headers.get("retry-after").unwrap(), "3600");
+}
+
+#[test]
 fn build_rejects_unknown_default_profile() {
     let mut cfg = config(vec![("t", "1/min", None)], Vec::new());
     cfg.rules = vec![rule("/x", KeySourceConfig::Ip, Some("t"))];
