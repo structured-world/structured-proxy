@@ -363,6 +363,24 @@ fn maybe_tighten_rate_headers(
     };
     if !keep_inner {
         attach_rate_headers(headers, limit, remaining, verdict);
+        // On an error response the rejecting layer already set `Retry-After`. We
+        // just replaced the budget with a longer-binding one, so widen
+        // `Retry-After` to that reset too; otherwise the client retries after the
+        // overwritten (shorter) wait and immediately hits this binding budget.
+        // Only ever widen: a 200 has no `Retry-After` to touch, and an already
+        // longer wait is left intact.
+        if let Some(current) = headers
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            let reset = secs_ceil(verdict.reset_after);
+            if reset > current {
+                if let Ok(v) = reset.to_string().parse() {
+                    headers.insert("retry-after", v);
+                }
+            }
+        }
     }
 }
 
