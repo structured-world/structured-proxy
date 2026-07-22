@@ -499,6 +499,39 @@ mod tests {
     }
 
     #[test]
+    fn idle_zero_delta_keys_are_not_refreshed_each_tick() {
+        use std::collections::HashSet;
+        let g = counters();
+        let now = unix_now();
+        // Three keys become tracked: one with a delta, one only gated (read), one
+        // that goes idle after the first tick.
+        g.record("delta", W);
+        let _ = g.fleet_remaining("gated", 100, W);
+        g.record("idle", W);
+        // First tick claims everything and clears the per-tick activity.
+        let _ = g.claim_plans(now);
+        // Between ticks, only `delta` and `gated` see activity; `idle` is untouched.
+        g.record("delta", W);
+        let _ = g.fleet_remaining("gated", 100, W);
+        let plans = g.claim_plans(now);
+        let keys: HashSet<&str> = plans.iter().map(|p| p.key.as_str()).collect();
+        assert!(
+            keys.contains("delta"),
+            "a key with a pending delta must be pushed"
+        );
+        assert!(
+            keys.contains("gated"),
+            "an actively-gated key must be refreshed"
+        );
+        // An idle key with no delta must not be MGET'd every tick, or a one-shot
+        // key-cardinality burst becomes sustained load for the whole KEY_TTL.
+        assert!(
+            !keys.contains("idle"),
+            "an idle zero-delta key must not be refreshed every tick"
+        );
+    }
+
+    #[test]
     fn roll_preserves_unclaimed_deltas_as_carryover() {
         // Admits accumulated in an epoch that rolls before a reconcile claims
         // them must survive as carryover owed to the old epoch, not be dropped.
