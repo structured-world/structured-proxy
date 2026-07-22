@@ -454,8 +454,7 @@ pub struct RateRuleConfig {
 /// their value is absent, so a limit can't be bypassed by omitting a header or
 /// authenticating anonymously. Written as a tagged map, e.g.
 /// `key: { type: jwt_claim, claim: sub }`; omitting `key` defaults to `ip`.
-#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum KeySourceConfig {
     /// Client IP (trusted-proxy `X-Forwarded-For` aware). `{ type: ip }`.
@@ -473,6 +472,63 @@ pub enum KeySourceConfig {
         /// Claim whose value identifies the principal.
         claim: String,
     },
+}
+
+/// Flat wire form of a rule key. `deny_unknown_fields` rejects any field outside
+/// this set, and the manual [`KeySourceConfig`] deserializer additionally rejects
+/// a field that belongs to a *different* variant (e.g. `name` on an `ip` key), so
+/// a copy-edit leftover can't silently downgrade the intended key source. serde
+/// does not honour `deny_unknown_fields` on internally-tagged enums directly,
+/// hence this intermediate.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+struct KeySourceRaw {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    claim: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for KeySourceConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+        let raw = KeySourceRaw::deserialize(deserializer)?;
+        match raw.kind.as_str() {
+            "ip" => {
+                if raw.name.is_some() || raw.claim.is_some() {
+                    return Err(D::Error::custom("key type 'ip' takes no other fields"));
+                }
+                Ok(Self::Ip)
+            }
+            "header" => {
+                if raw.claim.is_some() {
+                    return Err(D::Error::custom(
+                        "key type 'header' takes 'name', not 'claim'",
+                    ));
+                }
+                let name = raw.name.ok_or_else(|| D::Error::missing_field("name"))?;
+                Ok(Self::Header { name })
+            }
+            "jwt_claim" => {
+                if raw.name.is_some() {
+                    return Err(D::Error::custom(
+                        "key type 'jwt_claim' takes 'claim', not 'name'",
+                    ));
+                }
+                let claim = raw.claim.ok_or_else(|| D::Error::missing_field("claim"))?;
+                Ok(Self::JwtClaim { claim })
+            }
+            other => Err(D::Error::unknown_variant(
+                other,
+                &["ip", "header", "jwt_claim"],
+            )),
+        }
+    }
 }
 
 /// Claims that carry a key's limit inside the JWT itself. A tier-name claim maps
