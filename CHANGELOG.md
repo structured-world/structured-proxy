@@ -7,6 +7,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.0](https://github.com/structured-world/structured-proxy/compare/v2.2.2...v3.0.0) - 2026-07-22
+
+### Added
+
+- *(shield)* [**breaking**] GCRA rate limiting with pluggable keys and limits
+- [**breaking**] embedding hooks + configurable edge routes
+
+### Fixed
+
+- *(shield)* skip idle zero-delta keys in fleet reconciliation
+- *(shield)* reject unknown and mismatched fields in rule keys
+- *(shield)* reject rule patterns without a leading slash
+- *(shield)* widen Retry-After when the outer budget wins a header tie
+- *(shield)* report fleet-derived reset when the fleet budget binds
+- *(shield)* enforce limit-service cache cap at insertion
+- *(shield)* throttle high-water GCRA sweeps to bound CPU
+- *(shield)* break RateLimit-Reset ties toward the longer-binding phase
+- *(shield)* fail closed on unknown client IP and unstarted fleet gate
+- *(shield)* bound rate-limit state under key-cardinality floods
+- *(shield)* normalize header key names before fingerprinting
+- *(shield)* require an http/https limit-service endpoint
+- *(shield)* auto-reconnect the shared store; note window-reset is not client-driven
+- *(shield)* report tightest phase budget and a decaying global Retry-After
+- *(shield)* throttle limit-service retries for stale keys during an outage
+- *(shield)* reject invalid header key names at startup
+- *(shield)* degrade on stale estimate, gate on carryover, no epoch collapse
+- *(shield)* validate limit-service endpoint and honor unknown-tier numbers
+- *(shield)* drop unpushable deltas instead of restoring (never double)
+- *(shield)* reject dynamic zero rates and bound fetch storms
+- *(shield)* fail closed on empty rules and report fleet remaining
+- *(shield)* race-free reconcile via claim model, refresh, and eviction
+- *(shield)* carry unpushed deltas across an epoch roll
+- *(shield)* preserve inner limiter's rate-limit headers
+- *(shield)* make delta push atomic and guard stale estimate writes
+- *(shield)* evict limit cache by last access, not last fetch
+- *(shield)* store GCRA theoretical arrival times in nanoseconds
+- *(shield)* bound the limit-service resolution cache
+- *(proxy)* apply CORS outside the auth and rate-limit layers
+- *(shield)* reject non-positive profile rate and burst
+- *(shield)* round Retry-After / RateLimit-Reset up from nanoseconds
+- *(shield)* de-identify store keys and namespace by rule fingerprint
+- *(shield)* correct cross-instance counter accounting
+- *(shield)* cap GCRA admissible count at bucket capacity
+- normalize route shape for collisions; unify transcode route enumeration
+- key route-collision detection on (method, path), not path alone
+- validate every mounted path shape, not just verify
+- guard and exempt the verify path that is actually mounted
+- reject duplicate edge routes before building the router
+- make verify-path collision guard cover all mounted routes
+- cover all built-in routes in verify guard; order authz before decider
+- short-circuit userinfo without token; guard forward-auth path collision
+- *(config)* dedupe edge paths, keep relocated paths exempt and collision-free
+- *(embed)* harden extra-route body read, userinfo challenge, bearer scheme
+
+### Other
+
+- *(shield)* add regression test for idle fleet-key refresh
+- *(shield)* extract claim_plans from reconcile_at
+- *(shield)* add regression test for unknown fields in rule keys
+- *(shield)* add regression test for relative rule patterns
+- *(shield)* add regression test for Retry-After on tie-break overwrite
+- *(deps)* bump EmbarkStudios/cargo-deny-action from 2.0.20 to 2.1.1
+- *(shield)* note reconciliation needs the redis feature and a sync block
+- *(shield)* add regression test for fleet-bound RateLimit-Reset
+- *(shield)* extract reconciled_headers helper
+- *(shield)* add regression test for reset tie-break on equal remaining
+- *(shield)* document burst>limit behaviour under fleet reconciliation
+- *(shield)* reject unknown config fields and assert outer budget headers
+- *(shield)* add regression test for carryover epoch collapse
+- *(shield)* match phase on borrowed key
+- *(shield)* clarify JWT-limit scope and the fleet gate approximation
+- *(shield)* add regression test for evicting an active stale limit entry
+- *(shield)* explain TAT reuse across a resolved-tier change
+- *(shield)* clarify phase-local fallback, header contract, and overshoot
+- *(shield)* add regression test for sub-second Retry-After rounding
+- *(shield)* add regression test for GCRA idle-key remaining cap
+- *(deps)* update ed25519-dalek requirement from 2 to 3
+- *(readme)* note async-trait is required for embedding hooks
+
 ## [2.2.2](https://github.com/structured-world/structured-proxy/compare/v2.2.1...v2.2.2) - 2026-06-27
 
 ### Fixed
