@@ -268,45 +268,9 @@ impl GlobalCounters {
     async fn reconcile_at(&self, now: Duration) {
         self.evict_stale();
 
-        // Phase 1 (locked per key, brief): CLAIM each key's unclaimed admits by
-        // zeroing them now, so a concurrent epoch roll or a push failure can't
-        // double-publish or drop them. Emit a plan for every active key (delta
-        // may be 0) so its estimate is refreshed even when the key is only being
-        // rejected on a stale remote estimate. The delta is pushed to the epoch
-        // it was accumulated in (`push_epoch`); the estimate reads the current
-        // epoch (`read_epoch`).
-        let keys: Vec<String> = self.states.iter().map(|e| e.key().clone()).collect();
-        if keys.is_empty() {
+        let plans = self.claim_plans(now);
+        if plans.is_empty() {
             return;
-        }
-        let mut plans: Vec<PushPlan> = Vec::new();
-        for key in keys {
-            if let Some(mut s) = self.states.get_mut(&key) {
-                let window = Duration::from_secs(s.window_secs);
-                let read_epoch = window::epoch(now, window);
-                let claim = s.local_count;
-                s.local_count = 0;
-                plans.push(PushPlan {
-                    key: key.clone(),
-                    push_epoch: s.epoch,
-                    read_epoch,
-                    window,
-                    delta: claim,
-                    is_carryover: false,
-                });
-                if s.carryover > 0 {
-                    let carry = s.carryover;
-                    s.carryover = 0;
-                    plans.push(PushPlan {
-                        key: key.clone(),
-                        push_epoch: s.carryover_epoch,
-                        read_epoch,
-                        window,
-                        delta: carry,
-                        is_carryover: true,
-                    });
-                }
-            }
         }
 
         // Claimed deltas are fire-and-forget: once claimed (zeroed), a push that
@@ -345,6 +309,47 @@ impl GlobalCounters {
             }
         };
         self.apply_estimates(now, &plans, &reads);
+    }
+
+    /// Phase 1 (locked per key, brief): CLAIM each key's unclaimed admits by
+    /// zeroing them now, so a concurrent epoch roll or a push failure can't
+    /// double-publish or drop them. Emit a plan for every tracked key (delta may
+    /// be 0) so its estimate is refreshed even when the key is only being rejected
+    /// on a stale remote estimate. The delta is pushed to the epoch it was
+    /// accumulated in (`push_epoch`); the estimate reads the current epoch
+    /// (`read_epoch`).
+    fn claim_plans(&self, now: Duration) -> Vec<PushPlan> {
+        let keys: Vec<String> = self.states.iter().map(|e| e.key().clone()).collect();
+        let mut plans: Vec<PushPlan> = Vec::new();
+        for key in keys {
+            if let Some(mut s) = self.states.get_mut(&key) {
+                let window = Duration::from_secs(s.window_secs);
+                let read_epoch = window::epoch(now, window);
+                let claim = s.local_count;
+                s.local_count = 0;
+                plans.push(PushPlan {
+                    key: key.clone(),
+                    push_epoch: s.epoch,
+                    read_epoch,
+                    window,
+                    delta: claim,
+                    is_carryover: false,
+                });
+                if s.carryover > 0 {
+                    let carry = s.carryover;
+                    s.carryover = 0;
+                    plans.push(PushPlan {
+                        key: key.clone(),
+                        push_epoch: s.carryover_epoch,
+                        read_epoch,
+                        window,
+                        delta: carry,
+                        is_carryover: true,
+                    });
+                }
+            }
+        }
+        plans
     }
 
     /// Refresh each key's cached estimate of the fleet's consumption.
