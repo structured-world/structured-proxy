@@ -123,6 +123,16 @@ pub fn compile_rules(
     configs
         .iter()
         .map(|c| {
+            // Patterns are matched against the request path, which always starts
+            // with `/`. Reject a relative pattern (a missing-slash typo) rather
+            // than compiling a matcher that silently never fires, leaving the
+            // route unmetered.
+            if !c.pattern.starts_with('/') {
+                return Err(format!(
+                    "rule pattern {:?} must start with '/' (matched against the request path)",
+                    c.pattern
+                ));
+            }
             if let Some(name) = &c.profile {
                 if !profiles.contains_key(name) {
                     return Err(format!(
