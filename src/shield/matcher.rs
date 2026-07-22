@@ -314,4 +314,20 @@ mod tests {
         );
         assert!(err.is_err());
     }
+
+    #[test]
+    fn relative_pattern_is_rejected() {
+        // A pattern without a leading slash (a missing-slash typo like `api/**`)
+        // can never match `request.uri().path()`, which always starts with `/`,
+        // so the route would silently run unmetered. Reject it at build time.
+        let err = compile_rules(
+            &[RateRuleConfig {
+                pattern: "api/**".to_string(),
+                key: KeySourceConfig::Ip,
+                profile: Some("auth".to_string()),
+            }],
+            &profiles(),
+        );
+        assert!(err.is_err());
+    }
 }
