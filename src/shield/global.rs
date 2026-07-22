@@ -72,6 +72,12 @@ struct KeyState {
     /// trusting it and degrades to per-instance limiting.
     estimate_at: Instant,
     last_seen: Instant,
+    /// Set when the key is touched (recorded or gated) and cleared by each
+    /// reconcile pass. Gates whether an idle, zero-delta key still needs its
+    /// estimate refreshed: an untouched key's estimate isn't being read, so
+    /// re-reading it every tick is pure load. A later request marks it again and
+    /// the next tick refreshes.
+    seen_since_tick: bool,
 }
 
 impl KeyState {
@@ -86,6 +92,7 @@ impl KeyState {
             remote_estimate: 0,
             estimate_at: now,
             last_seen: now,
+            seen_since_tick: true,
         }
     }
 
@@ -223,6 +230,7 @@ impl GlobalCounters {
         }
         state.roll_to(ep);
         state.last_seen = Instant::now();
+        state.seen_since_tick = true;
         Some(state)
     }
 
@@ -323,6 +331,16 @@ impl GlobalCounters {
         let mut plans: Vec<PushPlan> = Vec::new();
         for key in keys {
             if let Some(mut s) = self.states.get_mut(&key) {
+                // Skip a key that is idle (untouched since the last tick) and has
+                // nothing pending: its estimate isn't being read, so refreshing it
+                // is wasted store load. Always clear the flag so the next tick sees
+                // only keys touched since. A key with a delta/carryover is active
+                // by definition and always processed.
+                let active = s.local_count > 0 || s.carryover > 0 || s.seen_since_tick;
+                s.seen_since_tick = false;
+                if !active {
+                    continue;
+                }
                 let window = Duration::from_secs(s.window_secs);
                 let read_epoch = window::epoch(now, window);
                 let claim = s.local_count;
