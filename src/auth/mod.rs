@@ -120,13 +120,22 @@ impl Auth {
 
 /// The outcome of an auth check for a request.
 pub(crate) enum AuthDecision {
-    /// Allowed; forward these (verified) claim headers to the upstream.
-    Allow(HeaderMap),
+    /// Allowed; forward these (verified) claim headers to the upstream, and the
+    /// verified claims themselves (`None` for anonymous access) for downstream
+    /// consumers such as per-principal rate limiting.
+    Allow(HeaderMap, Option<Value>),
     /// Rejected: no/invalid credentials (HTTP 401).
     Unauthenticated(&'static str),
     /// Rejected: authenticated but lacking a required role (HTTP 403).
     Forbidden(&'static str),
 }
+
+/// Verified JWT claims attached to the request by the auth middleware. Present
+/// only when a valid token was supplied, and set exclusively from a verified
+/// token (never from client input), so downstream consumers may safely key
+/// security decisions (e.g. rate limits) on it.
+#[derive(Clone)]
+pub(crate) struct ValidatedClaims(pub(crate) std::sync::Arc<Value>);
 
 impl Auth {
     /// Evaluate auth for a request: validate the bearer token, apply the route
@@ -168,7 +177,7 @@ impl Auth {
         if let Some(claims) = &claims {
             inject_claim_headers(&mut claim_headers, claims, &self.claims_headers);
         }
-        AuthDecision::Allow(claim_headers)
+        AuthDecision::Allow(claim_headers, claims)
     }
 }
 
@@ -189,10 +198,17 @@ pub async fn middleware(
     match auth.decide(request.headers(), &path, &method).await {
         AuthDecision::Unauthenticated(msg) => unauthorized(msg),
         AuthDecision::Forbidden(msg) => forbidden(msg),
-        AuthDecision::Allow(claim_headers) => {
+        AuthDecision::Allow(claim_headers, claims) => {
             let dst = request.headers_mut();
             for (name, value) in &claim_headers {
                 dst.insert(name.clone(), value.clone());
+            }
+            // Expose the verified claims to inner layers (e.g. per-principal rate
+            // limiting) as a typed extension a client cannot forge.
+            if let Some(claims) = claims {
+                request
+                    .extensions_mut()
+                    .insert(ValidatedClaims(std::sync::Arc::new(claims)));
             }
             next.run(request).await
         }

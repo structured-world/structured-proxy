@@ -511,8 +511,10 @@ impl ProxyServer {
             .merge(openapi_routes)
             .merge(oidc_routes)
             .merge(embed::extra_routes_router(&self.extra_routes))
-            .merge(transcode_routes)
-            .layer(cors);
+            .merge(transcode_routes);
+        // CORS is applied as the outermost layer below, so it wraps the auth and
+        // rate-limit enforcement: a short-circuited 401/429/503 still carries CORS
+        // headers, and preflight OPTIONS is answered before auth can reject it.
 
         // Forward-auth verification endpoint, sharing the built Auth. Mounted
         // after the auth layer below so the endpoint itself is not gated by the
@@ -524,8 +526,18 @@ impl ProxyServer {
         // Duplicate-route collisions (including the verify path) were already
         // rejected up front, before any router was built.
 
-        // Auth runs inside Shield (added first = inner): rate limiting sheds
-        // load before any signature verification work.
+        // Two-phase rate limiting around auth. The post-auth phase (rules keyed
+        // by a validated JWT claim) is layered first so it sits *inside* auth and
+        // sees the verified claims; the pre-auth phase (IP / header keys) is
+        // layered after auth below so it runs *first* and sheds anonymous floods
+        // before any signature verification.
+        if let Some(shield) = &shield {
+            router = router.layer(axum::middleware::from_fn_with_state(
+                shield.clone(),
+                shield::post_auth_middleware,
+            ));
+        }
+
         if let Some(auth) = auth {
             router = router.layer(axum::middleware::from_fn_with_state(auth, auth::middleware));
         }
@@ -548,13 +560,15 @@ impl ProxyServer {
             router = router.merge(forward_auth.routes());
         }
 
-        // Shield is added before maintenance so maintenance wraps it (outer
-        // layers run first): a request rejected by the maintenance gate must
-        // not be charged against its rate-limit budget.
-        if let Some(shield) = shield {
+        // Pre-auth phase, added before maintenance so maintenance wraps it (outer
+        // layers run first): a request rejected by the maintenance gate must not
+        // be charged against its rate-limit budget. Placed after the auth layer
+        // so it runs before auth, and after the verify route so that endpoint is
+        // rate-limited too (but not JWT-gated).
+        if let Some(shield) = &shield {
             router = router.layer(axum::middleware::from_fn_with_state(
-                shield,
-                shield::middleware,
+                shield.clone(),
+                shield::pre_auth_middleware,
             ));
         }
 
@@ -564,6 +578,9 @@ impl ProxyServer {
                 maintenance_middleware,
             ))
             .layer(TraceLayer::new_for_http())
+            // Outermost: wraps every enforcement layer so short-circuited
+            // responses keep CORS headers, and answers preflight before auth.
+            .layer(cors)
             .with_state(state);
 
         Ok(router)
@@ -634,6 +651,11 @@ impl ProxyServer {
                 .expose_headers([
                     "grpc-status".parse().unwrap(),
                     "grpc-message".parse().unwrap(),
+                    // Let browser clients read the rate-limit budget and back off.
+                    "ratelimit-limit".parse().unwrap(),
+                    "ratelimit-remaining".parse().unwrap(),
+                    "ratelimit-reset".parse().unwrap(),
+                    "retry-after".parse().unwrap(),
                 ])
         }
     }

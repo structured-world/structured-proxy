@@ -73,7 +73,7 @@ dashmap = "6"
 async-trait = "0.1"
 ipnet = "2"
 # Optional shared rate-limit store for multi-instance deployments.
-redis = { version = "1.2", features = ["tokio-comp"], optional = true }
+redis = { version = "1.2", features = ["tokio-comp", "connection-manager"], optional = true }
 
 # Auth (JWT validation, route policies).
 # Crypto backend is selected via this crate's `rust_crypto` / `aws_lc_rs`

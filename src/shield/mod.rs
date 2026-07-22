@@ -1,37 +1,54 @@
 //! Shield: request rate limiting.
 //!
-//! Enforces the `shield` config as an axum middleware. Two rule kinds are
-//! supported: endpoint *classes* (glob path → per-client limit) and per
-//! *identifier* endpoints (limit by a value read from the request body). The
-//! counter backend is pluggable via [`RateLimitStore`]; the default is an
-//! in-process store, with an optional Redis store for multi-instance setups.
+//! The proxy runs embedded on each service instance, so every decision is made
+//! locally with a per-instance GCRA shaper ([`store::GcraStore`]) that adds no
+//! blocking latency to the request path. When a shared store is configured, a
+//! background task reconciles counters across instances asynchronously to
+//! approximate a fleet-wide limit; the request path never blocks on it.
+//!
+//! A request is limited by the first [rule](matcher::CompiledRule) whose glob
+//! matches its path. The rule's key selects *who* is limited (client IP, a
+//! header value, or a validated JWT claim) and its profile selects *how much*.
 
+pub mod gcra;
+#[cfg(feature = "redis")]
+pub mod global;
 pub mod matcher;
 pub mod rate;
+pub mod resolve;
 pub mod store;
+pub mod window;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::body::Body;
-use axum::extract::State;
+use axum::extract::Request;
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
 use crate::config::ShieldConfig;
-use matcher::{EndpointClass, IdentifierEndpoint};
-use store::{Decision, MemoryStore, RateLimitStore};
+use gcra::Verdict;
+use matcher::{CompiledProfile, CompiledRule, KeySource, Phase};
+use store::GcraStore;
 
-/// Maximum request body buffered to read an identifier field (256 KiB).
-const MAX_IDENTIFIER_BODY: usize = 256 * 1024;
-
-/// Compiled Shield rules plus the counter store.
+/// Compiled Shield rules, limit tiers, and the local GCRA store.
 pub struct Shield {
-    store: Arc<dyn RateLimitStore>,
-    classes: Vec<EndpointClass>,
-    identifiers: Vec<IdentifierEndpoint>,
+    rules: Vec<CompiledRule>,
+    profiles: HashMap<String, CompiledProfile>,
+    /// Applied when a matched rule resolves no other limit.
+    default_profile: Option<CompiledProfile>,
+    /// Resolve a key's limit from validated JWT claims, when configured.
+    jwt_limits: Option<resolve::JwtLimits>,
+    /// Resolve a key's limit from an external service (cached, async).
+    limit_service: Option<Arc<resolve::LimitService>>,
+    /// Cross-instance reconciliation of the fleet-wide view (async, off the hot
+    /// path). Present only when a shared store is configured and compiled in.
+    #[cfg(feature = "redis")]
+    global: Option<Arc<global::GlobalCounters>>,
+    store: GcraStore,
     /// CIDR ranges whose `X-Forwarded-For` / `X-Real-IP` headers we trust.
     trusted_proxies: Vec<ipnet::IpNet>,
 }
@@ -39,25 +56,35 @@ pub struct Shield {
 impl Shield {
     /// Build a Shield from config, or `None` when disabled / has no rules.
     ///
-    /// Uses a Redis store when `redis_url` is set and the `redis` feature is
-    /// compiled in; otherwise an in-process [`MemoryStore`].
-    ///
     /// # Errors
-    /// Returns an error string when a glob pattern or rate fails to compile, or
-    /// when the configured Redis backend cannot be reached.
+    /// Returns an error string when a glob pattern, rate, profile reference, or
+    /// trusted-proxy CIDR fails to compile.
     pub fn build(config: &ShieldConfig) -> Result<Option<Arc<Self>>, String> {
         if !config.enabled {
             return Ok(None);
         }
-        if config.endpoint_classes.is_empty() && config.identifier_endpoints.is_empty() {
-            tracing::warn!("shield enabled but no endpoint_classes or identifier_endpoints set");
-            return Ok(None);
+        if config.rules.is_empty() {
+            // Fail loud rather than silently running unmetered: an upgrade that
+            // left an old `shield` schema (endpoint_classes / identifier_endpoints
+            // / redis_url) in place deserializes to zero rules, which would
+            // otherwise disable this security control while `enabled` is true.
+            return Err(
+                "shield.enabled is true but no rules are configured (note the schema: \
+                 profiles + rules + sync, not the older endpoint_classes/identifier_endpoints)"
+                    .to_string(),
+            );
         }
 
-        let default_window = Duration::from_secs(config.window_secs.max(1));
-        let classes = matcher::compile_endpoint_classes(&config.endpoint_classes, default_window)?;
-        let identifiers =
-            matcher::compile_identifier_endpoints(&config.identifier_endpoints, default_window)?;
+        let profiles = matcher::compile_profiles(&config.profiles)?;
+        let rules = matcher::compile_rules(&config.rules, &profiles)?;
+
+        let default_profile =
+            match &config.default_profile {
+                Some(name) => Some(*profiles.get(name).ok_or_else(|| {
+                    format!("default_profile references unknown profile {name:?}")
+                })?),
+                None => None,
+            };
 
         let trusted_proxies = config
             .trusted_proxies
@@ -65,107 +92,354 @@ impl Shield {
             .map(|s| parse_cidr(s))
             .collect::<Result<Vec<_>, _>>()?;
 
-        let store = build_store(config)?;
+        let jwt_limits = config
+            .jwt_limits
+            .as_ref()
+            .map(resolve::JwtLimits::from_config);
+        let limit_service = match &config.limit_service {
+            Some(cfg) => Some(resolve::LimitService::build(cfg, profiles.clone())?),
+            None => None,
+        };
+
+        #[cfg(feature = "redis")]
+        let global = match &config.sync {
+            Some(sync) => {
+                let g = global::GlobalCounters::build(
+                    &sync.redis_url,
+                    Duration::from_millis(sync.interval_ms),
+                )?;
+                // Keep the fleet gate only if reconciliation actually started;
+                // otherwise fall back to per-instance limiting rather than gating
+                // on an estimate that would never be refreshed.
+                g.spawn().then_some(g)
+            }
+            None => None,
+        };
+        #[cfg(not(feature = "redis"))]
+        if config.sync.is_some() {
+            tracing::warn!(
+                "shield.sync is set but the `redis` feature is not compiled in; \
+                 staying local-only (per-instance limits)"
+            );
+        }
+
         Ok(Some(Arc::new(Self {
-            store,
-            classes,
-            identifiers,
+            rules,
+            profiles,
+            default_profile,
+            jwt_limits,
+            limit_service,
+            #[cfg(feature = "redis")]
+            global,
+            store: GcraStore::new(),
             trusted_proxies,
         })))
     }
 
-    fn match_class(&self, path: &str) -> Option<&EndpointClass> {
-        self.classes.iter().find(|c| c.matcher.is_match(path))
+    /// The first rule in `phase` whose glob matches `path`. A path may match one
+    /// rule per phase; each phase enforces independently (two-phase by design:
+    /// a pre-auth IP/header rule and a post-auth claim rule can both apply).
+    fn match_rule(&self, path: &str, phase: Phase) -> Option<&CompiledRule> {
+        self.rules
+            .iter()
+            .find(|r| r.phase == phase && r.matcher.is_match(path))
     }
 
-    fn match_identifier(&self, path: &str) -> Option<&IdentifierEndpoint> {
-        self.identifiers.iter().find(|i| i.matcher.is_match(path))
+    /// Resolve the limit tier for a matched rule, in priority order: the JWT
+    /// itself (validated claims), then the external service (cached), then the
+    /// rule's pinned profile, then the default profile. `None` means no limit
+    /// applies and the request passes unmetered.
+    fn resolve_limit(
+        &self,
+        rule: &CompiledRule,
+        claims: Option<&serde_json::Value>,
+        identity: &str,
+    ) -> Option<CompiledProfile> {
+        if let (Some(jwt), Some(claims)) = (&self.jwt_limits, claims) {
+            if let Some(profile) = jwt.resolve(claims, &self.profiles) {
+                return Some(profile);
+            }
+        }
+        if let Some(service) = &self.limit_service {
+            if let Some(profile) = service.resolve(identity) {
+                return Some(profile);
+            }
+        }
+        self.static_profile(rule)
+    }
+
+    /// The rule's pinned profile, else the default profile.
+    fn static_profile(&self, rule: &CompiledRule) -> Option<CompiledProfile> {
+        rule.profile
+            .as_ref()
+            .and_then(|name| self.profiles.get(name))
+            .or(self.default_profile.as_ref())
+            .copied()
     }
 }
 
-/// Select the counter store from config.
-fn build_store(config: &ShieldConfig) -> Result<Arc<dyn RateLimitStore>, String> {
-    match &config.redis_url {
-        Some(url) => open_redis(url),
-        None => Ok(Arc::new(MemoryStore::new())),
-    }
-}
-
-#[cfg(feature = "redis")]
-fn open_redis(url: &str) -> Result<Arc<dyn RateLimitStore>, String> {
-    store::RedisStore::open(url)
-        .map(|s| Arc::new(s) as Arc<dyn RateLimitStore>)
-        .map_err(|e| format!("invalid Redis URL for rate-limit store: {e}"))
-}
-
-#[cfg(not(feature = "redis"))]
-fn open_redis(_url: &str) -> Result<Arc<dyn RateLimitStore>, String> {
-    tracing::warn!(
-        "shield.redis_url is set but the `redis` feature is not compiled in; \
-         falling back to the in-process store (per-replica limits only)"
-    );
-    Ok(Arc::new(MemoryStore::new()))
-}
-
-/// Axum middleware enforcing the compiled Shield rules.
-pub async fn middleware(
-    State(shield): State<Arc<Shield>>,
+/// Pre-auth middleware: enforces rules that need no validated claims (IP /
+/// header keys). Layered outside auth so anonymous floods are shed before any
+/// signature verification.
+pub async fn pre_auth_middleware(
+    axum::extract::State(shield): axum::extract::State<Arc<Shield>>,
     request: Request,
     next: Next,
 ) -> Response {
-    let path = request.uri().path().to_string();
+    enforce(&shield, Phase::PreAuth, request, next).await
+}
+
+/// Post-auth middleware: enforces rules keyed by a validated JWT claim. Layered
+/// inside auth so the verified claims are available on the request.
+pub async fn post_auth_middleware(
+    axum::extract::State(shield): axum::extract::State<Arc<Shield>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    enforce(&shield, Phase::PostAuth, request, next).await
+}
+
+/// Match a phase's rule for the request, apply its limit, and attach headers.
+async fn enforce(shield: &Shield, phase: Phase, request: Request, next: Next) -> Response {
+    let path = request.uri().path();
+    let Some(rule) = shield.match_rule(path, phase) else {
+        return next.run(request).await;
+    };
+
     let peer = request
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
         .map(|ci| ci.0.ip());
     let client = client_ip(peer, request.headers(), &shield.trusted_proxies);
+    let claims = request
+        .extensions()
+        .get::<crate::auth::ValidatedClaims>()
+        .map(|c| c.0.as_ref());
+    let key = rule_key(
+        &rule.fingerprint,
+        &rule.key,
+        &client,
+        request.headers(),
+        claims,
+    );
 
-    // The decision whose budget we surface to the client via headers.
-    let mut report = None;
+    // The limit service resolves per-principal, so it needs the real identity;
+    // the store / shared counter only need the de-identified `store` key.
+    let Some(profile) = shield.resolve_limit(rule, claims, &key.identity) else {
+        // No limit resolves for this rule (JWT/service/profile/default all
+        // absent): allow the request unmetered.
+        return next.run(request).await;
+    };
 
-    // Endpoint-class limit (per client IP), no body needed.
-    if let Some(class) = shield.match_class(&path) {
-        let key = format!("class:{}:{client}", class.class);
-        let decision = shield.store.hit(&key, &class.rate).await;
-        if !decision.allowed {
-            return too_many_requests(decision);
-        }
-        report = Some(decision);
+    // Fleet gate first (read-only, cached), so the local shaper is not charged
+    // for a request the fleet-wide budget will reject. The fleet budget is the
+    // sustained rate (`profile.limit`); `burst` is deliberately a per-instance
+    // smoothing allowance, not a fleet-wide entitlement (honouring it fleet-wide
+    // would multiply the effective limit by N). A single instance's burst is
+    // therefore capped by the shared budget when the fleet is near it.
+    //
+    // Consequence for a `burst > limit` profile (e.g. `rate: "1/min", burst: 5`):
+    // under reconciliation the shared counter caps the key at the sustained
+    // `limit`, so the extra burst headroom that a local-only deployment would
+    // allow is not granted fleet-wide. This is intentional, not an oversight:
+    // gating on `burst` instead would let the fleet sustain `burst`-per-window,
+    // loosening the sustained cap by the burst factor. The conservative choice
+    // (never over-admit the fleet's sustained budget) wins; the local GCRA still
+    // smooths per-instance traffic.
+    #[cfg(feature = "redis")]
+    let fleet_remaining = shield
+        .global
+        .as_ref()
+        .map(|g| g.fleet_remaining(&key.store, profile.limit, profile.window));
+    #[cfg(feature = "redis")]
+    if fleet_remaining == Some(0) {
+        return global_reject(profile.limit, profile.window);
     }
 
-    // Per-identifier limit: buffer the body, read the field, then restore it.
-    let request = if let Some(id_ep) = shield.match_identifier(&path) {
-        let (parts, body) = request.into_parts();
-        let bytes = match axum::body::to_bytes(body, MAX_IDENTIFIER_BODY).await {
-            Ok(b) => b,
-            Err(_) => return payload_too_large(),
-        };
-        // Key by the identifier value, or fall back to the client IP when the
-        // field is absent so the limit can't be bypassed by omitting it.
-        let key = match extract_body_field(&bytes, &id_ep.body_field) {
-            Some(ident) => format!("id:{path}:{}:{ident}", id_ep.body_field),
-            None => format!("id:{path}:{}:ip:{client}", id_ep.body_field),
-        };
-        let decision = shield.store.hit(&key, &id_ep.rate).await;
-        if !decision.allowed {
-            return too_many_requests(decision);
+    // The store key intentionally excludes the profile's numbers, so if a key's
+    // resolved tier changes (a JWT/service tier upgrade), the existing TAT is
+    // reused with the new emission interval. The TAT is an absolute time, so this
+    // only causes a brief transient at the change and self-corrects within one
+    // window. Keying by the tier's numbers instead would reset the budget on
+    // every tier flip, which a client could exploit to shed its own limit.
+    let verdict = shield.store.check(&key.store, &profile.gcra);
+    if !verdict.allowed {
+        return too_many_requests(profile.limit, verdict.remaining, &verdict);
+    }
+
+    // Report the tighter of the local and (when reconciled) fleet budgets, so a
+    // client near the fleet cap isn't told it has ample local room.
+    #[cfg(not(feature = "redis"))]
+    let (reported, header_verdict) = reconciled_headers(verdict, None, profile.window);
+    #[cfg(feature = "redis")]
+    let (reported, header_verdict) = {
+        // Record the admit for the next reconciliation push (whenever the fleet
+        // gate is active, i.e. `fleet_remaining` was computed).
+        if fleet_remaining.is_some() {
+            if let Some(global) = &shield.global {
+                global.record(&key.store, profile.window);
+            }
         }
-        // The identifier rule is more specific than a class rule, so report it.
-        report = Some(decision);
-        Request::from_parts(parts, Body::from(bytes))
-    } else {
-        request
+        reconciled_headers(verdict, fleet_remaining, profile.window)
     };
 
     let mut response = next.run(request).await;
-    if let Some(decision) = report {
-        attach_rate_headers(response.headers_mut(), &decision);
-    }
+    // Report the tightest budget across phases. With defense-in-depth (a pre-auth
+    // and a post-auth rule on the same path), an inner limiter may already have
+    // set headers on the way out; overwrite them only when this (outer) phase's
+    // remaining is smaller, so the client always sees the budget that will bite
+    // first. An inner rejection carries remaining 0, so it is never overwritten.
+    maybe_tighten_rate_headers(
+        response.headers_mut(),
+        profile.limit,
+        reported,
+        &header_verdict,
+    );
     response
 }
 
-/// Convenience alias for the axum request type used by the middleware.
-type Request = axum::extract::Request;
+/// Combine the local GCRA `verdict` with the optional fleet remaining into the
+/// reported remaining and the verdict whose reset drives the headers. The count
+/// is the tighter of local and fleet, minus this admit (`fr - 1`).
+fn reconciled_headers(
+    verdict: Verdict,
+    fleet_remaining: Option<u64>,
+    window: Duration,
+) -> (u64, Verdict) {
+    let mut reported = verdict.remaining;
+    let mut hv = verdict;
+    if let Some(fr) = fleet_remaining {
+        let fleet_r = fr.saturating_sub(1);
+        if fleet_r <= reported {
+            // The fleet budget binds. Advertise the fleet-derived reset (the
+            // shared sliding-window estimate can stay saturated far longer than
+            // this instance's local GCRA), so a client pacing off the allowed
+            // response does not retry before the window decays and immediately
+            // hit the fleet gate. Widen, never shrink: keep the local reset if it
+            // is already the longer wait.
+            reported = fleet_r;
+            let backoff = fleet_backoff(window);
+            hv.reset_after = hv.reset_after.max(backoff);
+            hv.retry_after = hv.retry_after.max(backoff);
+        }
+    }
+    (reported, hv)
+}
+
+/// Poll interval for a client blocked (or nearly blocked) by the fleet gate: a
+/// tenth of the window, at least 1s. The fleet's sliding-window estimate decays
+/// continuously rather than freeing at an epoch boundary, so this is a retry
+/// cadence, not a wait-to-boundary.
+fn fleet_backoff(window: Duration) -> Duration {
+    (window / 10).max(Duration::from_secs(1))
+}
+
+/// Set the `RateLimit-*` headers unless an inner limiter already advertised a
+/// budget that binds at least as hard, which must reach the client intact.
+/// "Binds harder" is a smaller `remaining`, and on a `remaining` tie the larger
+/// `reset` wins: with both phases at `remaining=0`, a client pacing off the
+/// headers must see the longest wait (e.g. an hourly IP cap over a per-minute
+/// principal cap), or it retries early and immediately hits the outer limit.
+fn maybe_tighten_rate_headers(
+    headers: &mut HeaderMap,
+    limit: u64,
+    remaining: u64,
+    verdict: &Verdict,
+) {
+    let header_u64 = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+    };
+    let keep_inner = match header_u64("ratelimit-remaining") {
+        Some(inner) if inner < remaining => true,
+        // Tie on remaining: keep the inner headers only if their reset is at
+        // least as long as this phase's, so the longer-binding budget survives.
+        Some(inner) if inner == remaining => {
+            header_u64("ratelimit-reset").unwrap_or(0) >= secs_ceil(verdict.reset_after)
+        }
+        _ => false,
+    };
+    if !keep_inner {
+        attach_rate_headers(headers, limit, remaining, verdict);
+        // On an error response the rejecting layer already set `Retry-After`. We
+        // just replaced the budget with a longer-binding one, so widen
+        // `Retry-After` to that reset too; otherwise the client retries after the
+        // overwritten (shorter) wait and immediately hits this binding budget.
+        // Only ever widen: a 200 has no `Retry-After` to touch, and an already
+        // longer wait is left intact.
+        if let Some(current) = headers
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            let reset = secs_ceil(verdict.reset_after);
+            if reset > current {
+                if let Ok(v) = reset.to_string().parse() {
+                    headers.insert("retry-after", v);
+                }
+            }
+        }
+    }
+}
+
+/// A `429` for a request rejected by the fleet-wide gate. The sliding-window
+/// estimate decays continuously (it does not free capacity at the epoch
+/// boundary), so `Retry-After` is a modest poll interval rather than the time to
+/// the boundary, which a client could wait out and still be rejected.
+#[cfg(feature = "redis")]
+fn global_reject(limit: u64, window: Duration) -> Response {
+    let backoff = fleet_backoff(window);
+    let verdict = Verdict {
+        allowed: false,
+        new_tat: Duration::ZERO,
+        remaining: 0,
+        retry_after: backoff,
+        reset_after: backoff,
+    };
+    too_many_requests(limit, 0, &verdict)
+}
+
+/// The keys a matched rule derives for one request.
+struct RuleKey {
+    /// De-identified key for the local store and shared counter: the rule's
+    /// stable fingerprint, the source tag, and a hash of the value. Raw client
+    /// values (API keys, principals, IPs) never reach the shared store or its
+    /// logs. Deterministic across instances so reconciliation keys agree.
+    store: String,
+    /// The raw identity for per-principal limit-service resolution (the service
+    /// must see the real principal to resolve its tier). Not persisted.
+    identity: String,
+}
+
+/// Derive the store key and resolution identity for a matched rule. Every source
+/// falls back to the client IP when its value is absent, so a limit can't be
+/// dodged by omitting a header or authenticating anonymously (subject to the
+/// rule's phase: a `jwt_claim` rule only runs post-auth).
+fn rule_key(
+    fingerprint: &str,
+    key: &KeySource,
+    client: &str,
+    headers: &HeaderMap,
+    claims: Option<&serde_json::Value>,
+) -> RuleKey {
+    let (tag, identity) = match key {
+        KeySource::Ip => ("ip", client.to_string()),
+        KeySource::Header(name) => match header_str(headers, name) {
+            Some(v) => ("hdr", v),
+            None => ("ip", client.to_string()),
+        },
+        KeySource::JwtClaim(claim) => match claims.and_then(|c| resolve::claim_str(c, claim)) {
+            Some(v) => ("jwt", v),
+            None => ("ip", client.to_string()),
+        },
+    };
+    RuleKey {
+        store: format!("{fingerprint}:{tag}:{}", matcher::short_hash(&identity)),
+        identity,
+    }
+}
 
 /// Parse a trusted-proxy entry as a CIDR range, accepting a bare IP as a /32
 /// or /128 host range.
@@ -186,9 +460,10 @@ fn parse_cidr(s: &str) -> Result<ipnet::IpNet, String> {
 /// `X-Forwarded-For` is trusted only when the direct `peer` is a configured
 /// trusted proxy, and even then the *rightmost* hop outside the trusted ranges
 /// is used: appending load balancers (nginx, ALB, GCP) add the connecting IP on
-/// the right, so the leftmost entries are attacker-controlled. Without
-/// connection info (e.g. a custom server that does not provide it) the headers
-/// are taken as a best effort.
+/// the right, so the leftmost entries are attacker-controlled. Without connection
+/// info (a server not wired with `ConnectInfo`) we fail closed to a single
+/// `"unknown"` bucket rather than trusting client-supplied forwarding headers,
+/// which an attacker could otherwise rotate to dodge the limit.
 fn client_ip(
     peer: Option<std::net::IpAddr>,
     headers: &HeaderMap,
@@ -203,8 +478,7 @@ fn client_ip(
             }
             ip.to_string()
         }
-        // No connection info: fall back to the headers as a best effort.
-        None => best_effort_forwarded(headers).unwrap_or_else(|| "unknown".to_string()),
+        None => "unknown".to_string(),
     }
 }
 
@@ -229,19 +503,6 @@ fn rightmost_untrusted(headers: &HeaderMap, trusted: &[ipnet::IpNet]) -> Option<
     header_str(headers, "x-real-ip")
 }
 
-/// Best-effort client from forwarding headers when no peer is known: leftmost
-/// `X-Forwarded-For`, then `X-Real-IP`.
-fn best_effort_forwarded(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .or_else(|| header_str(headers, "x-real-ip"))
-}
-
 /// Trimmed, non-empty value of a header.
 fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
@@ -252,33 +513,23 @@ fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Read a (possibly dotted) field from a JSON body as a string identifier.
-fn extract_body_field(bytes: &[u8], field: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-    let mut cur = &value;
-    for seg in field.split('.') {
-        cur = cur.get(seg)?;
+/// Attach the draft-ietf `RateLimit-*` headers describing the remaining budget.
+/// `remaining` is passed explicitly (rather than read from the verdict) so the
+/// caller can report the tighter of the local and fleet budgets.
+fn attach_rate_headers(headers: &mut HeaderMap, limit: u64, remaining: u64, verdict: &Verdict) {
+    if let Ok(v) = limit.to_string().parse() {
+        headers.insert("ratelimit-limit", v);
     }
-    match cur {
-        serde_json::Value::String(s) => Some(s.clone()),
-        serde_json::Value::Number(n) => Some(n.to_string()),
-        serde_json::Value::Bool(b) => Some(b.to_string()),
-        _ => None,
+    if let Ok(v) = remaining.to_string().parse() {
+        headers.insert("ratelimit-remaining", v);
     }
-}
-
-/// Add `X-RateLimit-*` headers describing the remaining budget.
-fn attach_rate_headers(headers: &mut HeaderMap, decision: &Decision) {
-    if let Ok(v) = decision.limit.to_string().parse() {
-        headers.insert("x-ratelimit-limit", v);
-    }
-    if let Ok(v) = decision.remaining.to_string().parse() {
-        headers.insert("x-ratelimit-remaining", v);
+    if let Ok(v) = secs_ceil(verdict.reset_after).to_string().parse() {
+        headers.insert("ratelimit-reset", v);
     }
 }
 
-fn too_many_requests(decision: Decision) -> Response {
-    let retry = decision.retry_after.unwrap_or(Duration::ZERO).as_secs();
+/// A `429` response carrying the rate-limit headers plus `Retry-After`.
+fn too_many_requests(limit: u64, remaining: u64, verdict: &Verdict) -> Response {
     let mut response = (
         StatusCode::TOO_MANY_REQUESTS,
         Json(serde_json::json!({
@@ -288,251 +539,21 @@ fn too_many_requests(decision: Decision) -> Response {
     )
         .into_response();
     let headers = response.headers_mut();
-    attach_rate_headers(headers, &decision);
-    if let Ok(v) = retry.to_string().parse() {
+    attach_rate_headers(headers, limit, remaining, verdict);
+    if let Ok(v) = secs_ceil(verdict.retry_after).to_string().parse() {
         headers.insert("retry-after", v);
     }
     response
 }
 
-fn payload_too_large() -> Response {
-    (
-        StatusCode::PAYLOAD_TOO_LARGE,
-        Json(serde_json::json!({
-            "error": "INVALID_ARGUMENT",
-            "message": "request body too large for rate-limit identifier extraction",
-        })),
-    )
-        .into_response()
+/// Whole seconds, rounded up, for `Retry-After` / `RateLimit-Reset` (never report
+/// `0` for a non-zero wait).
+fn secs_ceil(d: Duration) -> u64 {
+    // Round up from nanoseconds, not truncated millis: a sub-millisecond wait
+    // must still report at least one second, never zero.
+    let nanos = d.as_nanos();
+    u64::try_from(nanos.div_ceil(1_000_000_000)).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn client_ip_trusts_headers_only_from_trusted_peer() {
-        let mut h = HeaderMap::new();
-        h.insert("x-forwarded-for", "203.0.113.7, 10.0.0.1".parse().unwrap());
-        let trusted = vec![parse_cidr("10.0.0.0/8").unwrap()];
-        let lb: std::net::IpAddr = "10.0.0.1".parse().unwrap();
-        let direct: std::net::IpAddr = "198.51.100.9".parse().unwrap();
-
-        // From a trusted proxy: trust the forwarded first hop.
-        assert_eq!(client_ip(Some(lb), &h, &trusted), "203.0.113.7");
-        // From an untrusted direct client: ignore the spoofable header, key by peer.
-        assert_eq!(client_ip(Some(direct), &h, &trusted), "198.51.100.9");
-    }
-
-    #[test]
-    fn client_ip_uses_rightmost_untrusted_hop() {
-        // Appending LBs (nginx proxy_add_x_forwarded_for, AWS ALB, GCP LB) add
-        // the connecting IP on the RIGHT, so the leftmost entry is attacker
-        // controlled. The real client is the rightmost hop outside trusted ranges.
-        let mut h = HeaderMap::new();
-        h.insert("x-forwarded-for", "1.1.1.1, 203.0.113.7".parse().unwrap());
-        let trusted = vec![parse_cidr("10.0.0.0/8").unwrap()];
-        let lb: std::net::IpAddr = "10.0.0.5".parse().unwrap();
-        assert_eq!(client_ip(Some(lb), &h, &trusted), "203.0.113.7");
-    }
-
-    #[test]
-    fn client_ip_without_peer_info_uses_headers_then_unknown() {
-        let mut h = HeaderMap::new();
-        h.insert("x-real-ip", "198.51.100.2".parse().unwrap());
-        assert_eq!(client_ip(None, &h, &[]), "198.51.100.2");
-        assert_eq!(client_ip(None, &HeaderMap::new(), &[]), "unknown");
-    }
-
-    #[test]
-    fn extract_body_field_reads_string_and_dotted() {
-        let body = br#"{"email":"a@b.com","nested":{"id":42}}"#;
-        assert_eq!(
-            extract_body_field(body, "email"),
-            Some("a@b.com".to_string())
-        );
-        assert_eq!(
-            extract_body_field(body, "nested.id"),
-            Some("42".to_string())
-        );
-        assert_eq!(extract_body_field(body, "missing"), None);
-        assert_eq!(extract_body_field(b"not json", "email"), None);
-    }
-
-    // --- middleware enforcement (real router) ---
-
-    use crate::config::{EndpointClassConfig, IdentifierEndpointConfig, ShieldConfig};
-    use axum::http::Request as HttpRequest;
-    use tower::ServiceExt;
-
-    fn shield_config(
-        classes: Vec<EndpointClassConfig>,
-        ids: Vec<IdentifierEndpointConfig>,
-    ) -> ShieldConfig {
-        ShieldConfig {
-            enabled: true,
-            endpoint_classes: classes,
-            identifier_endpoints: ids,
-            window_secs: 60,
-            redis_url: None,
-            trusted_proxies: Vec::new(),
-        }
-    }
-
-    fn app(shield: Arc<Shield>) -> axum::Router {
-        axum::Router::new()
-            .route("/limited", axum::routing::get(|| async { "ok" }))
-            .route("/login", axum::routing::post(|| async { "ok" }))
-            .layer(axum::middleware::from_fn_with_state(shield, middleware))
-    }
-
-    #[tokio::test]
-    async fn middleware_blocks_after_endpoint_class_limit() {
-        let shield = Shield::build(&shield_config(
-            vec![EndpointClassConfig {
-                pattern: "/limited".into(),
-                class: "t".into(),
-                rate: "2/min".into(),
-            }],
-            vec![],
-        ))
-        .unwrap()
-        .unwrap();
-        let app = app(shield);
-
-        let get = || HttpRequest::get("/limited").body(Body::empty()).unwrap();
-        // Two allowed (no client IP header → all share the "unknown" bucket).
-        assert_eq!(app.clone().oneshot(get()).await.unwrap().status(), 200);
-        let second = app.clone().oneshot(get()).await.unwrap();
-        assert_eq!(second.status(), 200);
-        assert_eq!(second.headers()["x-ratelimit-remaining"], "0");
-        // Third over the limit → 429 with Retry-After.
-        let third = app.clone().oneshot(get()).await.unwrap();
-        assert_eq!(third.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert!(third.headers().contains_key("retry-after"));
-    }
-
-    #[tokio::test]
-    async fn middleware_limits_per_identifier_value() {
-        let shield = Shield::build(&shield_config(
-            vec![],
-            vec![IdentifierEndpointConfig {
-                path: "/login".into(),
-                body_field: "email".into(),
-                rate: "1/min".into(),
-            }],
-        ))
-        .unwrap()
-        .unwrap();
-        let app = app(shield);
-
-        let post = |email: &str| {
-            HttpRequest::post("/login")
-                .header("content-type", "application/json")
-                .body(Body::from(format!(r#"{{"email":"{email}"}}"#)))
-                .unwrap()
-        };
-
-        // First request for alice is allowed, second is blocked.
-        assert_eq!(
-            app.clone().oneshot(post("alice")).await.unwrap().status(),
-            200
-        );
-        assert_eq!(
-            app.clone().oneshot(post("alice")).await.unwrap().status(),
-            StatusCode::TOO_MANY_REQUESTS
-        );
-        // A different identifier has its own budget.
-        assert_eq!(
-            app.clone().oneshot(post("bob")).await.unwrap().status(),
-            200
-        );
-    }
-
-    #[tokio::test]
-    async fn identifier_response_carries_ratelimit_headers() {
-        let shield = Shield::build(&shield_config(
-            vec![],
-            vec![IdentifierEndpointConfig {
-                path: "/login".into(),
-                body_field: "email".into(),
-                rate: "5/min".into(),
-            }],
-        ))
-        .unwrap()
-        .unwrap();
-        let app = app(shield);
-
-        let resp = app
-            .oneshot(
-                HttpRequest::post("/login")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"email":"a"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        // Headers come from the identifier decision, not just class decisions.
-        assert_eq!(resp.headers()["x-ratelimit-limit"], "5");
-        assert_eq!(resp.headers()["x-ratelimit-remaining"], "4");
-    }
-
-    #[tokio::test]
-    async fn identifier_limit_not_bypassed_when_field_absent() {
-        // Omitting the identifier field must not skip the limit: requests with
-        // no extractable identifier fall back to a client-keyed counter.
-        let shield = Shield::build(&shield_config(
-            vec![],
-            vec![IdentifierEndpointConfig {
-                path: "/login".into(),
-                body_field: "email".into(),
-                rate: "1/min".into(),
-            }],
-        ))
-        .unwrap()
-        .unwrap();
-        let app = app(shield);
-
-        let post_no_email = || {
-            HttpRequest::post("/login")
-                .header("content-type", "application/json")
-                .body(Body::from("{}"))
-                .unwrap()
-        };
-        assert_eq!(
-            app.clone().oneshot(post_no_email()).await.unwrap().status(),
-            200
-        );
-        // Second request without the field is still counted → blocked.
-        assert_eq!(
-            app.clone().oneshot(post_no_email()).await.unwrap().status(),
-            StatusCode::TOO_MANY_REQUESTS
-        );
-    }
-
-    #[tokio::test]
-    async fn middleware_ignores_unmatched_paths() {
-        let shield = Shield::build(&shield_config(
-            vec![EndpointClassConfig {
-                pattern: "/limited".into(),
-                class: "t".into(),
-                rate: "1/min".into(),
-            }],
-            vec![],
-        ))
-        .unwrap()
-        .unwrap();
-        let app = app(shield);
-
-        // /login is not covered by any rule → never limited.
-        for _ in 0..5 {
-            let resp = app
-                .clone()
-                .oneshot(HttpRequest::post("/login").body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(resp.status(), 200);
-        }
-    }
-}
+mod tests;

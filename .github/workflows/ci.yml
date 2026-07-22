@@ -18,6 +18,17 @@ jobs:
   quality-checks:
     name: Quality Checks (${{ matrix.backend.name }})
     runs-on: ubuntu-latest
+    services:
+      # Shared store for the rate-limit cross-instance reconciliation test.
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     strategy:
       fail-fast: false
       matrix:
@@ -53,6 +64,9 @@ jobs:
         run: cargo build --release ${{ matrix.backend.flags }}
 
       - name: Test
+        env:
+          # Exercises the rate-limit reconciliation against the Redis service.
+          SHIELD_REDIS_TEST_URL: redis://127.0.0.1:6379/
         run: cargo test ${{ matrix.backend.flags }}
 
       - name: Publish dry-run
@@ -69,6 +83,6 @@ jobs:
       # Scans Cargo.lock for RustSec advisories; honors the ignore list in
       # deny.toml. Third-party action: pinned to a commit SHA (dependabot
       # keeps it fresh).
-      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check advisories
