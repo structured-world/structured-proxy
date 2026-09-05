@@ -154,6 +154,9 @@ fn algorithm_for(jwk: &Jwk) -> Option<Algorithm> {
         },
         AlgorithmParameters::OctetKeyPair(_) => Some(Algorithm::EdDSA),
         AlgorithmParameters::OctetKey(_) => None,
+        // The enum is non-exhaustive: key types added upstream are not
+        // verifiable here until they are mapped explicitly.
+        _ => None,
     }
 }
 

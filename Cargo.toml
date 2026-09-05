@@ -79,7 +79,7 @@ redis = { version = "1.2", features = ["tokio-comp", "connection-manager"], opti
 # Crypto backend is selected via this crate's `rust_crypto` / `aws_lc_rs`
 # features (see [features] below); `use_pem` is always required for PEM key
 # parsing and is therefore enabled unconditionally.
-jsonwebtoken = { version = "10", default-features = false, features = ["use_pem"] }
+jsonwebtoken = { version = "11", default-features = false, features = ["use_pem"] }
 # reqwest 0.13's `rustls` feature hardwires the aws-lc-rs provider (C FFI, awkward
 # for the musl static build). We keep the pure-Rust `ring` provider instead:
 # `rustls-no-provider` builds rustls without a bundled provider, and auth/jwks.rs
