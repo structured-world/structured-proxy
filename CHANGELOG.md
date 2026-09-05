@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.2](https://github.com/structured-world/structured-proxy/compare/v3.0.1...v3.0.2) - 2026-09-05
+
+### Other
+
+- name the copyright holder in the licence appendix ([#80](https://github.com/structured-world/structured-proxy/pull/80))
+- *(deps)* update jsonwebtoken requirement from 10 to 11 ([#75](https://github.com/structured-world/structured-proxy/pull/75))
+
 ## [3.0.1](https://github.com/structured-world/structured-proxy/compare/v3.0.0...v3.0.1) - 2026-09-05
 
 ### Other
