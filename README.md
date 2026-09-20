@@ -26,7 +26,7 @@ Works with **any** gRPC service via proto descriptor files. No code generation, 
 - **Prometheus metrics** at `/metrics`
 - **CORS** with a configurable origin allow-list
 - **Rate limiting (Shield)**: local GCRA shaper (no blocking latency) keyed by client IP, header, or validated JWT claim; named limit tiers as config data; optional async cross-instance reconciliation for an approximate fleet-wide limit (requires both the `redis` feature and a configured `sync` block)
-- **JWT auth**: validate `Bearer` tokens via an Ed25519 PEM key or JWKS auto-discovery, enforce per-route `require_auth` / `required_roles`, and forward claims as headers
+- **JWT auth**: validate `Bearer` tokens via an Ed25519 PEM key or JWKS auto-discovery, enforce per-route `require_auth` / `required_roles`, and forward claims as headers — or hand the signature check to your own verifier (a validated / FIPS module, an HSM) without changing anything else
 - **OIDC discovery**: serve `/.well-known/openid-configuration` and a JWKS endpoint (Ed25519) built from config, to front an identity provider
 - **Forward-auth**: a verification endpoint (`/auth/verify`) for a fronting proxy (nginx `auth_request`, Traefik `forwardAuth`) to delegate auth, returning the verified identity as headers
 - **External AuthZ**: gate proxied requests through an Envoy ext_authz gRPC server (`envoy.service.auth.v3.Authorization/Check`), interoperating with OPA and any ext_authz server, with fail-open/closed control
@@ -316,11 +316,80 @@ The hooks are:
 - **`with_auth_decider`** — an in-process forward-auth / PDP decision, run inline
   on every proxied request and exposed at `/verify` (path configurable via
   `with_verify_path`).
+- **`with_token_verifier`** — replaces the built-in JWT signature check
+  (see [JWT verification](#jwt-verification)) while keeping the route policies,
+  the roles claim, and the claim→header forwarding.
 - **`with_oidc_backend`** — backs the stateless OIDC surface (discovery, JWKS,
   userinfo) with your key/client metadata; supersedes the config-driven static
   discovery.
 - **`with_extra_routes`** — registers extra stateless routes through a
   framework-agnostic adapter (request parts in, response parts out).
+
+## JWT verification
+
+The bearer-token check sits behind the `TokenVerifier` hook. A build gets one of
+two implementations.
+
+**The built-in verifier** is what a plain config-driven deployment uses: keys
+from `auth.jwt` (an Ed25519 PEM file or a JWKS endpoint), verified with
+`jsonwebtoken`. Its crypto backend is a Cargo feature:
+
+| Feature | Backend | Notes |
+|---------|---------|-------|
+| `rust_crypto` (default) | RustCrypto | Pure Rust. Pulls in `rsa`, which carries [RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071); the Marvin attack targets private-key timing, and this path only verifies with public keys (see `deny.toml`). |
+| `aws_lc_rs` | aws-lc | Constant-time / FIPS-capable, advisory-free, links aws-lc through C FFI. |
+
+They are mutually exclusive, and enabling both is a compile error rather than a
+runtime panic. Do **not** build with `--all-features`.
+
+**An injected verifier** is what you supply when neither of those is the right
+answer for your binary: a validated / FIPS crypto module, an HSM, or a verifier
+your service already owns.
+
+```rust
+use std::sync::Arc;
+use structured_proxy::hooks::TokenVerifier;
+use structured_proxy::{config::ProxyConfig, ProxyServer};
+
+struct MyVerifier; // your signature + claim check
+
+#[async_trait::async_trait]
+impl TokenVerifier for MyVerifier {
+    async fn verify(&self, token: &str) -> Option<serde_json::Value> {
+        // claims out, or None to reject the request with 401
+        # let _ = token;
+        None
+    }
+}
+
+# async fn run(config: ProxyConfig) -> anyhow::Result<()> {
+ProxyServer::from_config(config)
+    .with_token_verifier(Arc::new(MyVerifier))
+    .serve()
+    .await
+# }
+```
+
+Injection also resolves a problem the features cannot: Cargo unifies features
+across the whole dependency graph, so `rust_crypto` / `aws_lc_rs` is a property
+of the *resolution*, not of a binary. Two crates in one workspace that link this
+one and want different backends cannot both get their way — and if both features
+end up enabled, `jsonwebtoken` refuses the combination. A consumer that injects
+its own verifier is not in that argument at all: it takes
+
+```toml
+[dependencies]
+structured-proxy = { version = "3", default-features = false }
+# What the verifier above is written with: the trait is `#[async_trait]`, and
+# claims cross it as `serde_json::Value`. Neither is re-exported.
+async-trait = "0.1"
+serde_json = "1"
+```
+
+which links no JWT crypto (and therefore no `rsa`), and supplies the backend
+from its own binary. With no verifier injected and no backend feature, an
+`auth.mode: "jwt"` config is rejected at startup with that instruction, rather
+than silently accepting tokens.
 
 ## How It Works
 

@@ -74,6 +74,39 @@ pub trait AuthDecider: Send + Sync {
     async fn decide(&self, req: &RequestParts<'_>) -> Decision;
 }
 
+/// Verifies a bearer token and yields its claims.
+///
+/// This is the seam the JWT middleware validates through. The built-in
+/// implementation (`jsonwebtoken`, keys from `auth.jwt`) is what a plain
+/// config-driven deployment gets; an embedder injects its own through
+/// [`ProxyServer::with_token_verifier`](crate::ProxyServer::with_token_verifier)
+/// when it needs a different signature backend — a validated / FIPS module, an
+/// HSM, a shared verifier it already owns.
+///
+/// Injecting one is what makes the crypto backend a property of the *binary*
+/// rather than of the dependency graph: Cargo unifies features across the whole
+/// resolution, so two consumers of this crate that want different built-in
+/// backends cannot coexist, while two consumers that inject their own verifiers
+/// can. A build that injects one needs no crypto backend feature at all
+/// (`default-features = false`), and then links no JWT crypto.
+///
+/// Everything around verification stays with the proxy: route policies
+/// (`require_auth` / `required_roles`), the roles claim, and the claim→header
+/// forwarding all operate on the returned claims.
+#[async_trait]
+pub trait TokenVerifier: Send + Sync {
+    /// Verify `token` and return its claims, or `None` to reject the request
+    /// with `401`.
+    ///
+    /// `token` is the raw JWT from the `Authorization: Bearer` header, already
+    /// stripped of the prefix and guaranteed non-empty. The implementation owns
+    /// the whole check — signature, `exp`/`nbf`, issuer, audience — since only
+    /// it knows which of those its keys and policy imply. Returning claims for
+    /// a token whose signature was not verified would hand a forged identity to
+    /// the upstream.
+    async fn verify(&self, token: &str) -> Option<serde_json::Value>;
+}
+
 /// A static JSON document served at a fixed path (an OIDC metadata document or a
 /// JWKS document).
 #[derive(Debug, Clone)]

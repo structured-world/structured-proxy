@@ -42,6 +42,13 @@ jobs:
           - name: aws_lc_rs
             # Opt-in constant-time backend (aws-lc, C FFI); disables the default.
             flags: "--no-default-features --features aws_lc_rs,redis"
+          - name: injected_verifier
+            # No built-in verifier at all: the build a consumer takes when it
+            # injects its own `hooks::TokenVerifier`. Links no JWT crypto (and
+            # so no `rsa`), which is only true as long as nothing outside the
+            # `builtin_jwt` gate reaches for jsonwebtoken — this leg is what
+            # keeps that honest.
+            flags: "--no-default-features --features redis"
     steps:
       - uses: actions/checkout@v7
         with:

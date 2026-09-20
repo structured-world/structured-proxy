@@ -298,7 +298,9 @@ pub struct JwtConfig {
     pub roles_claim: String,
 }
 
-fn default_roles_claim() -> String {
+/// Default for [`JwtConfig::roles_claim`]. Also applied by the auth builder when
+/// an injected verifier makes the whole `auth.jwt` block optional.
+pub(crate) fn default_roles_claim() -> String {
     "roles".into()
 }
 

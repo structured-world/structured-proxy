@@ -189,7 +189,7 @@ impl LimitService {
         }
         let client = reqwest::Client::builder()
             .timeout(Duration::from_millis(cfg.timeout_ms.max(1)))
-            .tls_backend_preconfigured(crate::auth::jwks::build_tls_config())
+            .tls_backend_preconfigured(crate::tls::client_config())
             .build()
             .map_err(|e| format!("invalid limit_service client: {e}"))?;
         let ttl = Duration::from_secs(cfg.ttl_secs.max(1));

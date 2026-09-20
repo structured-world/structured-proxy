@@ -10,20 +10,37 @@
 //! structured-proxy --config sflow-proxy.yaml
 //! ```
 //!
-//! ## JWT crypto backend
+//! ## JWT verification
 //!
-//! Exactly one crypto backend feature must be enabled (they are mutually
-//! exclusive): `rust_crypto` (default, pure Rust) or `aws_lc_rs` (opt-in,
-//! constant-time / FIPS-capable, links aws-lc via C FFI). Enabling both or
-//! neither is rejected at compile time by the guards below.
+//! The bearer-token check sits behind [`hooks::TokenVerifier`]. A build gets one
+//! of two:
+//!
+//! - the **built-in** verifier (keys from `auth.jwt`), whose crypto backend is
+//!   picked by a feature: `rust_crypto` (default, pure Rust) or `aws_lc_rs`
+//!   (opt-in, constant-time / FIPS-capable, links aws-lc via C FFI). They are
+//!   mutually exclusive; enabling both is rejected at compile time below.
+//! - an **injected** one, supplied by the embedder through
+//!   [`ProxyServer::with_token_verifier`]. Since Cargo unifies features across a
+//!   whole dependency graph, a backend feature cannot be chosen per binary —
+//!   injection is how a consumer that needs a different one gets it without
+//!   deciding for everyone else who links this crate. Such a build takes
+//!   `default-features = false` and links no JWT crypto at all.
 
 // jsonwebtoken selects its provider from these features and would otherwise
 // panic at runtime on an invalid combination; turn that into a build error.
 #[cfg(all(feature = "rust_crypto", feature = "aws_lc_rs"))]
-compile_error!("features `rust_crypto` and `aws_lc_rs` are mutually exclusive; enable exactly one");
+compile_error!("features `rust_crypto` and `aws_lc_rs` are mutually exclusive; enable at most one");
 
-#[cfg(not(any(feature = "rust_crypto", feature = "aws_lc_rs")))]
-compile_error!("exactly one JWT crypto backend must be enabled: `rust_crypto` or `aws_lc_rs`");
+// `builtin_jwt` is implied by each backend and never meant to stand alone: on
+// its own it would link jsonwebtoken with no provider, which panics at runtime.
+#[cfg(all(
+    feature = "builtin_jwt",
+    not(any(feature = "rust_crypto", feature = "aws_lc_rs"))
+))]
+compile_error!(
+    "feature `builtin_jwt` needs a crypto backend: enable `rust_crypto` or `aws_lc_rs` \
+     (or neither, and inject a verifier with `ProxyServer::with_token_verifier`)"
+);
 
 pub mod auth;
 pub mod config;
@@ -32,6 +49,7 @@ pub mod hooks;
 pub mod oidc;
 pub mod openapi;
 pub mod shield;
+mod tls;
 pub mod transcode;
 
 use axum::extract::State;
@@ -48,7 +66,7 @@ use tower_http::trace::TraceLayer;
 use std::sync::Arc;
 
 use config::{DescriptorSource, ProxyConfig};
-use hooks::{AuthDecider, ExtraRoute, OidcBackend};
+use hooks::{AuthDecider, ExtraRoute, OidcBackend, TokenVerifier};
 
 /// Shared state for all proxy handlers.
 #[derive(Clone, Debug)]
@@ -88,6 +106,8 @@ pub struct ProxyServer {
     extra_routes: Vec<ExtraRoute>,
     /// Override for the `/verify` forward-auth path of an injected AuthDecider.
     verify_path: Option<String>,
+    /// Embedder-supplied JWT verifier, replacing the built-in one.
+    token_verifier: Option<Arc<dyn TokenVerifier>>,
 }
 
 impl ProxyServer {
@@ -100,6 +120,7 @@ impl ProxyServer {
             oidc_backend: None,
             extra_routes: Vec::new(),
             verify_path: None,
+            token_verifier: None,
         }
     }
 
@@ -144,6 +165,25 @@ impl ProxyServer {
     /// `auth.forward_auth.path` from config, then the default `/auth/verify`.
     pub fn with_verify_path(mut self, path: impl Into<String>) -> Self {
         self.verify_path = Some(path.into());
+        self
+    }
+
+    /// Verify bearer tokens with the embedder's own verifier instead of the
+    /// built-in one (embedded Tier-2 hook).
+    ///
+    /// The JWT middleware keeps everything around the signature check — route
+    /// policies, the roles claim, claim→header forwarding — and takes the
+    /// verdict from [`hooks::TokenVerifier`]. Use this when the built-in crypto
+    /// backend is not the one this binary needs: a validated / FIPS module, an
+    /// HSM, or a verifier the embedder already owns. It is also the way out of
+    /// Cargo's feature unification, which makes `rust_crypto` / `aws_lc_rs` a
+    /// property of the whole dependency graph rather than of one binary.
+    ///
+    /// `auth.mode` must still be `"jwt"` for the middleware to run; `auth.jwt`
+    /// then only configures claim forwarding, and any key source in it is
+    /// ignored (with a warning), since the verifier owns its own keys.
+    pub fn with_token_verifier(mut self, verifier: Arc<dyn TokenVerifier>) -> Self {
+        self.token_verifier = Some(verifier);
         self
     }
 
@@ -499,9 +539,8 @@ impl ProxyServer {
 
         // JWT auth, if configured (auth.mode == "jwt").
         let auth = match &self.config.auth {
-            Some(cfg) => {
-                auth::Auth::build(cfg).map_err(|e| anyhow::anyhow!("invalid auth config: {e}"))?
-            }
+            Some(cfg) => auth::Auth::build(cfg, self.token_verifier.clone())
+                .map_err(|e| anyhow::anyhow!("invalid auth config: {e}"))?,
             None => None,
         };
 
