@@ -471,4 +471,28 @@ mod builtin {
         };
         assert!(err.contains("jwks_uri"), "unexpected error: {err}");
     }
+
+    /// A build with both crypto backends linked (feature unification, or
+    /// `--all-features`) must verify tokens like any other. `jsonwebtoken` can
+    /// then not pick a provider from its own features and installs one that
+    /// panics on first use, so the verifier has to select one itself.
+    #[cfg(all(feature = "rust_crypto", feature = "aws_lc_rs"))]
+    #[tokio::test]
+    async fn verifies_with_both_crypto_backends_linked() {
+        let app = app(auth_with_policy(&["admin"]));
+        let token = sign(serde_json::json!({
+            "iss": "test-iss", "aud": "test-aud", "exp": future_exp(),
+            "sub": "user-42", "roles": ["admin"]
+        }));
+        let resp = app
+            .oneshot(
+                HttpRequest::get("/secure")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
 }

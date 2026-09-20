@@ -1,5 +1,10 @@
 [[package]]
 name = "structured-proxy"
+# cargo-semver-checks builds the baseline from the registry, and every version
+# published so far rejects the feature set it uses (both JWT backends at once).
+# The published artefacts cannot be changed, so the check stays off until a
+# release carrying that fix becomes the baseline; see issue #84.
+semver_check = false
 # Preserve the existing tag scheme (v1.0.0, v1.0.1, ...) instead of the
 # release-plz default of "{package}-v{version}", so tag history stays continuous.
 git_tag_name = "v{{ version }}"

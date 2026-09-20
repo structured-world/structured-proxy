@@ -17,19 +17,17 @@
 //!
 //! - the **built-in** verifier (keys from `auth.jwt`), whose crypto backend is
 //!   picked by a feature: `rust_crypto` (default, pure Rust) or `aws_lc_rs`
-//!   (opt-in, constant-time / FIPS-capable, links aws-lc via C FFI). They are
-//!   mutually exclusive; enabling both is rejected at compile time below.
+//!   (opt-in, constant-time / FIPS-capable, links aws-lc via C FFI). Both may be
+//!   compiled in at once — Cargo features are additive, so a dependency graph
+//!   with two dependents asking for different backends unifies into exactly that
+//!   build. `aws_lc_rs` then wins: it is constant-time and free of the `rsa`
+//!   advisory `rust_crypto` carries.
 //! - an **injected** one, supplied by the embedder through
 //!   [`ProxyServer::with_token_verifier`]. Since Cargo unifies features across a
 //!   whole dependency graph, a backend feature cannot be chosen per binary —
 //!   injection is how a consumer that needs a different one gets it without
 //!   deciding for everyone else who links this crate. Such a build takes
 //!   `default-features = false` and links no JWT crypto at all.
-
-// jsonwebtoken selects its provider from these features and would otherwise
-// panic at runtime on an invalid combination; turn that into a build error.
-#[cfg(all(feature = "rust_crypto", feature = "aws_lc_rs"))]
-compile_error!("features `rust_crypto` and `aws_lc_rs` are mutually exclusive; enable at most one");
 
 // `builtin_jwt` is implied by each backend and never meant to stand alone: on
 // its own it would link jsonwebtoken with no provider, which panics at runtime.

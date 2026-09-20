@@ -339,8 +339,10 @@ from `auth.jwt` (an Ed25519 PEM file or a JWKS endpoint), verified with
 | `rust_crypto` (default) | RustCrypto | Pure Rust. Pulls in `rsa`, which carries [RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071); the Marvin attack targets private-key timing, and this path only verifies with public keys (see `deny.toml`). |
 | `aws_lc_rs` | aws-lc | Constant-time / FIPS-capable, advisory-free, links aws-lc through C FFI. |
 
-They are mutually exclusive, and enabling both is a compile error rather than a
-runtime panic. Do **not** build with `--all-features`.
+Both can be linked at once, as with any pair of Cargo features. `jsonwebtoken`
+cannot infer a provider then, so the built-in verifier installs `aws_lc_rs` for
+the process: it is constant-time and carries no advisory. A build that wants
+RustCrypto regardless drops the `aws_lc_rs` feature.
 
 **An injected verifier** is what you supply when neither of those is the right
 answer for your binary: a validated / FIPS crypto module, an HSM, or a verifier
@@ -373,9 +375,9 @@ ProxyServer::from_config(config)
 Injection also resolves a problem the features cannot: Cargo unifies features
 across the whole dependency graph, so `rust_crypto` / `aws_lc_rs` is a property
 of the *resolution*, not of a binary. Two crates in one workspace that link this
-one and want different backends cannot both get their way — and if both features
-end up enabled, `jsonwebtoken` refuses the combination. A consumer that injects
-its own verifier is not in that argument at all: it takes
+one and want different backends cannot both get their way: the resolution enables
+both features, and the tie-break above picks `aws_lc_rs` for everyone. A consumer
+that injects its own verifier is not in that argument at all: it takes
 
 ```toml
 [dependencies]
