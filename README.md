@@ -397,7 +397,7 @@ that injects its own verifier is not in that argument at all: it takes
 
 ```toml
 [dependencies]
-structured-proxy = { version = "3", default-features = false }
+structured-proxy = { version = "4", default-features = false }
 # What the verifier above is written with: the trait is `#[async_trait]`, and
 # claims cross it as `serde_json::Value`. Neither is re-exported.
 async-trait = "0.1"
