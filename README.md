@@ -378,7 +378,12 @@ end up enabled, `jsonwebtoken` refuses the combination. A consumer that injects
 its own verifier is not in that argument at all: it takes
 
 ```toml
+[dependencies]
 structured-proxy = { version = "3", default-features = false }
+# What the verifier above is written with: the trait is `#[async_trait]`, and
+# claims cross it as `serde_json::Value`. Neither is re-exported.
+async-trait = "0.1"
+serde_json = "1"
 ```
 
 which links no JWT crypto (and therefore no `rsa`), and supplies the backend

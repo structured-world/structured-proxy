@@ -9,8 +9,10 @@
 # Chain: rsa -> jsonwebtoken (rust_crypto backend) -> structured-proxy.
 #
 # Ignored deliberately. See https://github.com/structured-world/structured-proxy/issues/48
-#   1. No fix exists: latest `rsa` is 0.10.0-rc and the advisory has patched:[] /
-#      unaffected:[] in the RustSec DB. Nothing to upgrade to.
+#   1. No fix exists: the advisory has patched:[] / unaffected:[] in the RustSec
+#      DB, and it names both the latest stable `rsa` (0.9.10) and the latest
+#      pre-release (0.10.0-rc.18) as affected. There is nothing to upgrade to,
+#      release candidates included.
 #   2. We keep jsonwebtoken's pure-Rust `rust_crypto` backend over `aws_lc_rs`
 #      (C FFI), required by no-FFI consumers (e.g. CoordiNode ADR-013).
 #   3. RSA here is used for JWT *verification* (public key) only. Marvin targets
@@ -24,5 +26,5 @@
 # injects its own `hooks::TokenVerifier`: no jsonwebtoken, no `rsa`, nothing to
 # ignore. The `injected_verifier` CI leg builds exactly that.
 ignore = [
-  { id = "RUSTSEC-2023-0071", reason = "No fixed `rsa` release exists (latest 0.10.0-rc; advisory patched:[]). We deliberately keep jsonwebtoken's pure-Rust `rust_crypto` backend over `aws_lc_rs` (C FFI). RSA is used for JWT verification (public key) only; Marvin targets private-key timing, not exploitable on the verify path. A build that must not link `rsa` at all takes default-features = false and injects its own TokenVerifier. Revisit when RustCrypto ships a constant-time `rsa` stable. Tracking: structured-world/structured-proxy#48" },
+  { id = "RUSTSEC-2023-0071", reason = "No fixed `rsa` release exists: the advisory is patched:[] and names both the latest stable (0.9.10) and the latest pre-release (0.10.0-rc.18) as affected. We deliberately keep jsonwebtoken's pure-Rust `rust_crypto` backend over `aws_lc_rs` (C FFI). RSA is used for JWT verification (public key) only; Marvin targets private-key timing, not exploitable on the verify path. A build that must not link `rsa` at all takes default-features = false and injects its own TokenVerifier. Revisit when RustCrypto ships a constant-time `rsa` stable. Tracking: structured-world/structured-proxy#48" },
 ]
