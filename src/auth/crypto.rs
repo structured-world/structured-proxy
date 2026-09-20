@@ -7,23 +7,41 @@
 //! its own features then, and falls back to one that panics on first use, so the
 //! choice has to be made here.
 
-/// Select the crypto provider for this process when both backends are linked.
+#[cfg(test)]
+mod tests;
+
+/// The provider this crate picks when both backends are linked.
 ///
-/// Call before any `jsonwebtoken` operation. Idempotent, and a no-op unless both
-/// backend features are on: with a single backend `jsonwebtoken` infers it.
-///
-/// `aws_lc_rs` wins the tie because it is constant-time and advisory-free, while
-/// `rust_crypto` pulls in `rsa` (RUSTSEC-2023-0071). A build that wants the
-/// other one regardless installs its own provider first, or drops the
-/// `aws_lc_rs` feature.
+/// `aws_lc_rs` wins the tie because it is constant-time and advisory-free,
+/// while `rust_crypto` pulls in `rsa` (RUSTSEC-2023-0071).
 #[cfg(all(feature = "rust_crypto", feature = "aws_lc_rs"))]
-pub(crate) fn install_default_provider() {
-    if jsonwebtoken::crypto::aws_lc::DEFAULT_PROVIDER
-        .install_default()
-        .is_err()
-    {
+pub(crate) fn preferred_provider() -> &'static jsonwebtoken::crypto::CryptoProvider {
+    &jsonwebtoken::crypto::aws_lc::DEFAULT_PROVIDER
+}
+
+/// Select the `jsonwebtoken` crypto provider for this process.
+///
+/// Call it once at startup, before anything in the process signs or verifies a
+/// JWT. It is idempotent, and a no-op unless both backend features are on: with
+/// a single backend `jsonwebtoken` infers the provider from its own features.
+///
+/// A plain [`ProxyServer`](crate::ProxyServer) deployment needs no call: the
+/// server does this while it is being built. It is public for the case the
+/// server cannot cover, which is the same one that makes both backends end up
+/// linked: another crate in the graph uses `jsonwebtoken` too and may reach it
+/// first. Call this at the top of `main` and every consumer is covered,
+/// whichever runs first.
+///
+/// With both backends linked the choice is `aws_lc_rs`: constant-time, and free
+/// of the `rsa` advisory `rust_crypto` carries. A process that wants the other
+/// one installs it through
+/// [`CryptoProvider::install_default`](jsonwebtoken::crypto::CryptoProvider::install_default)
+/// before calling this, and the earlier choice stands.
+#[cfg(all(feature = "rust_crypto", feature = "aws_lc_rs"))]
+pub fn install_default_crypto_provider() {
+    if preferred_provider().install_default().is_err() {
         // Something installed a provider before us: an embedder that made its
-        // own choice, or an earlier call here. Either way it stands — the
+        // own choice, or an earlier call here. Either way it stands: the
         // process gets one provider, and the first explicit choice is the one
         // the caller meant.
         tracing::debug!("jsonwebtoken crypto provider already installed; keeping it");
@@ -31,6 +49,6 @@ pub(crate) fn install_default_provider() {
 }
 
 /// No-op: with a single backend `jsonwebtoken` picks the provider from its own
-/// features.
+/// features. Kept callable so embedders need no feature-dependent code.
 #[cfg(not(all(feature = "rust_crypto", feature = "aws_lc_rs")))]
-pub(crate) fn install_default_provider() {}
+pub fn install_default_crypto_provider() {}

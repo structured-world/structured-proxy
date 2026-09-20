@@ -340,9 +340,23 @@ from `auth.jwt` (an Ed25519 PEM file or a JWKS endpoint), verified with
 | `aws_lc_rs` | aws-lc | Constant-time / FIPS-capable, advisory-free, links aws-lc through C FFI. |
 
 Both can be linked at once, as with any pair of Cargo features. `jsonwebtoken`
-cannot infer a provider then, so the built-in verifier installs `aws_lc_rs` for
-the process: it is constant-time and carries no advisory. A build that wants
+cannot infer a provider then, so `ProxyServer::from_config` installs `aws_lc_rs`
+for the process: it is constant-time and carries no advisory. A build that wants
 RustCrypto regardless drops the `aws_lc_rs` feature.
+
+If another crate in your process uses `jsonwebtoken` too, it may reach it before
+any proxy server is built, and would hit the same ambiguity. Settle it once at
+the top of `main`:
+
+```rust
+# fn main() {
+structured_proxy::install_default_crypto_provider();
+# }
+```
+
+The call is idempotent, and a no-op in a single-backend build. It exists
+wherever the built-in verifier does, so a `default-features = false` build with
+an injected verifier neither has it nor needs it.
 
 **An injected verifier** is what you supply when neither of those is the right
 answer for your binary: a validated / FIPS crypto module, an HSM, or a verifier

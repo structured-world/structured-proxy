@@ -13,7 +13,7 @@
 
 pub mod authz;
 #[cfg(feature = "builtin_jwt")]
-pub(crate) mod crypto;
+pub mod crypto;
 pub mod forward;
 #[cfg(feature = "builtin_jwt")]
 pub mod jwks;
