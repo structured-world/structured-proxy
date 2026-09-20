@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.0.1](https://github.com/structured-world/structured-proxy/compare/v4.0.0...v4.0.1) - 2026-09-20
+
+### Other
+
+- re-enable the semver check and pin the readme example ([#88](https://github.com/structured-world/structured-proxy/pull/88))
+
 ## [4.0.0](https://github.com/structured-world/structured-proxy/compare/v3.0.2...v4.0.0) - 2026-09-20
 
 ### Added
