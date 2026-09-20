@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.0.0](https://github.com/structured-world/structured-proxy/compare/v3.0.2...v4.0.0) - 2026-09-20
+
+### Added
+
+- *(auth)* [**breaking**] verify tokens through an injectable TokenVerifier ([#82](https://github.com/structured-world/structured-proxy/pull/82))
+
+### Fixed
+
+- *(auth)* make the JWT crypto backends additive ([#85](https://github.com/structured-world/structured-proxy/pull/85))
+
 ## [3.0.2](https://github.com/structured-world/structured-proxy/compare/v3.0.1...v3.0.2) - 2026-09-05
 
 ### Other
