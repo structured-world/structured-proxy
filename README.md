@@ -345,8 +345,10 @@ for the process: it is constant-time and carries no advisory. A build that wants
 RustCrypto regardless drops the `aws_lc_rs` feature.
 
 If another crate in your process uses `jsonwebtoken` too, it may reach it before
-any proxy server is built, and would hit the same ambiguity. Settle it once at
-the top of `main`:
+any proxy server is built, and would hit the same ambiguity. It can also turn on
+the other backend for `jsonwebtoken` directly, which leaves this crate looking
+single-backend while `jsonwebtoken` sees two. Settle it once at the top of
+`main`:
 
 ```rust
 # fn main() {
@@ -354,9 +356,9 @@ structured_proxy::install_default_crypto_provider();
 # }
 ```
 
-The call is idempotent, and a no-op in a single-backend build. It exists
-wherever the built-in verifier does, so a `default-features = false` build with
-an injected verifier neither has it nor needs it.
+The call is idempotent, and installs the backend this crate was built with. It
+exists wherever the built-in verifier does, so a `default-features = false`
+build with an injected verifier neither has it nor needs it.
 
 **An injected verifier** is what you supply when neither of those is the right
 answer for your binary: a validated / FIPS crypto module, an HSM, or a verifier
