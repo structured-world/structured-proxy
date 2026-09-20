@@ -14,7 +14,7 @@ use http::{HeaderMap, Method, StatusCode};
 use structured_proxy::config::ProxyConfig;
 use structured_proxy::hooks::{
     AuthDecider, Decision, ExtraRoute, ExtraRouteHandler, MetadataDocument, OidcBackend,
-    RequestParts, RouteRequest, RouteResponse,
+    RequestParts, RouteRequest, RouteResponse, TokenVerifier,
 };
 use structured_proxy::ProxyServer;
 
@@ -66,6 +66,19 @@ impl OidcBackend for DemoOidc {
     }
     async fn userinfo(&self, bearer: &str) -> Option<serde_json::Value> {
         (bearer == "token-123").then(|| serde_json::json!({ "sub": "user-1", "email": "u@x" }))
+    }
+}
+
+/// Stands in for an embedder's own JWT verification (a validated crypto module,
+/// an HSM, a verifier it already owns): the proxy never sees a key, only the
+/// verdict and the claims.
+struct EmbedderVerifier;
+
+#[async_trait]
+impl TokenVerifier for EmbedderVerifier {
+    async fn verify(&self, token: &str) -> Option<serde_json::Value> {
+        (token == "embedder-token")
+            .then(|| serde_json::json!({ "sub": "embedded-user", "roles": ["admin"] }))
     }
 }
 
@@ -596,6 +609,65 @@ metrics:
         .await
         .unwrap();
     assert_eq!(blocked.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// The JWT surface backed by an injected verifier, exercised through the
+/// forward-auth endpoint. The config names no key source at all, which the
+/// built-in verifier would reject: the verifier is the key source now, and the
+/// build links no JWT crypto of its own when no backend feature is enabled.
+#[tokio::test]
+async fn injected_token_verifier_backs_the_jwt_surface() {
+    let config = ProxyConfig::from_yaml_str(
+        r#"
+upstream:
+  default: "http://127.0.0.1:50051"
+service:
+  name: "verifier-test"
+auth:
+  mode: "jwt"
+  jwt:
+    claims_headers:
+      sub: "x-user-id"
+  forward_auth:
+    enabled: true
+    path: "/auth/verify"
+    policies:
+      - path: "/v1/admin/**"
+        methods: ["*"]
+        require_auth: true
+        required_roles: ["admin"]
+"#,
+    )
+    .unwrap();
+
+    let app = ProxyServer::from_config(config)
+        .with_token_verifier(Arc::new(EmbedderVerifier))
+        .router()
+        .unwrap();
+
+    let verify = |token: Option<&str>| {
+        let mut req = axum::http::Request::get("/auth/verify")
+            .header("x-forwarded-method", "GET")
+            .header("x-forwarded-uri", "/v1/admin/things");
+        if let Some(t) = token {
+            req = req.header("authorization", format!("Bearer {t}"));
+        }
+        app.clone().oneshot(req.body(Body::empty()).unwrap())
+    };
+
+    // The token the embedder's verifier accepts passes, and the claims it
+    // returned drive both the role policy and the forwarded identity header.
+    let ok = verify(Some("embedder-token")).await.unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+    assert_eq!(ok.headers()["x-user-id"], "embedded-user");
+
+    // A token it rejects is a 401, not a pass-through.
+    let bad = verify(Some("forged-token")).await.unwrap();
+    assert_eq!(bad.status(), StatusCode::UNAUTHORIZED);
+
+    // And the policy still requires authentication when no token is presented.
+    let anon = verify(None).await.unwrap();
+    assert_eq!(anon.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

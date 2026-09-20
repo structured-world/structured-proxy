@@ -76,10 +76,14 @@ ipnet = "2"
 redis = { version = "1.2", features = ["tokio-comp", "connection-manager"], optional = true }
 
 # Auth (JWT validation, route policies).
-# Crypto backend is selected via this crate's `rust_crypto` / `aws_lc_rs`
-# features (see [features] below); `use_pem` is always required for PEM key
-# parsing and is therefore enabled unconditionally.
-jsonwebtoken = { version = "11", default-features = false, features = ["use_pem"] }
+# Optional: it backs the BUILT-IN verifier only. A consumer that injects its own
+# `hooks::TokenVerifier` builds with `default-features = false` and links no JWT
+# crypto at all. Crypto backend is selected via this crate's `rust_crypto` /
+# `aws_lc_rs` features (see [features] below); `use_pem` is always required for
+# PEM key parsing and is therefore enabled unconditionally.
+jsonwebtoken = { version = "11", default-features = false, features = [
+  "use_pem",
+], optional = true }
 # reqwest 0.13's `rustls` feature hardwires the aws-lc-rs provider (C FFI, awkward
 # for the musl static build). We keep the pure-Rust `ring` provider instead:
 # `rustls-no-provider` builds rustls without a bundled provider, and auth/jwks.rs
@@ -103,18 +107,27 @@ envoy-types = "0.7"
 [features]
 default = ["rust_crypto"]
 
-# JWT crypto backend. Mutually exclusive: enable exactly one. jsonwebtoken
-# picks its provider from these features and panics at runtime if both (or
-# neither) are on, so do NOT build with `--all-features`.
+# The built-in JWT verifier (config-driven keys: PEM file or JWKS endpoint),
+# implemented with `jsonwebtoken`. Implied by both crypto backends below, so it
+# is never enabled on its own. With neither backend the crate links no JWT
+# crypto: `auth.mode: "jwt"` then requires a verifier injected through
+# `ProxyServer::with_token_verifier`.
+builtin_jwt = ["dep:jsonwebtoken"]
+
+# Crypto backend for the BUILT-IN verifier. Mutually exclusive: enable at most
+# one. jsonwebtoken picks its provider from these features and panics at runtime
+# if both are on, so do NOT build with `--all-features`. They no longer decide
+# for the whole dependency graph: a consumer that cannot accept this crate's
+# choice supplies its own verifier instead (see `builtin_jwt` above).
 #
 # `rust_crypto` (default): pure-Rust RustCrypto backend. Pulls in `rsa`, which
 # carries RUSTSEC-2023-0071 (Marvin Attack). Not exploitable on our verify-only
 # path (public key, no private-key ops); see deny.toml / issue #48.
-rust_crypto = ["jsonwebtoken/rust_crypto"]
+rust_crypto = ["builtin_jwt", "jsonwebtoken/rust_crypto"]
 # `aws_lc_rs`: constant-time / FIPS-capable backend via aws-lc (C FFI),
 # advisory-free. Opt-in for consumers that allow FFI; enable with
 # `default-features = false, features = ["aws_lc_rs"]`.
-aws_lc_rs = ["jsonwebtoken/aws_lc_rs"]
+aws_lc_rs = ["builtin_jwt", "jsonwebtoken/aws_lc_rs"]
 
 # Shared Redis-backed rate-limit store for multi-instance deployments.
 redis = ["dep:redis"]

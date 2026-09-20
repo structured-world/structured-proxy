@@ -109,7 +109,9 @@ fn forwarded(headers: &HeaderMap, names: &[&str]) -> Option<String> {
         .map(str::to_string)
 }
 
-#[cfg(test)]
+// The endpoint is exercised end to end against the built-in verifier, so these
+// tests need a crypto backend; the `Auth` seam itself is covered in `tests.rs`.
+#[cfg(all(test, feature = "builtin_jwt"))]
 mod tests {
     use super::*;
     use crate::config::{AuthConfig, ForwardAuthConfig, JwtConfig, RoutePolicyConfig};
@@ -182,7 +184,7 @@ mod tests {
             }),
             authz: None,
         };
-        let auth = Auth::build(&config).unwrap().unwrap();
+        let auth = Auth::build(&config, None).unwrap().unwrap();
         ForwardAuth::build(&config, auth).unwrap()
     }
 

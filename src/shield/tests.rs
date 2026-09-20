@@ -315,6 +315,10 @@ fn build_rejects_unknown_default_profile() {
 /// End-to-end two-phase test: a rule keyed by a validated JWT claim, layered in
 /// the same order as the server (pre-auth → auth → post-auth), limits per
 /// principal using the claims the auth middleware verifies and attaches.
+///
+/// Drives the built-in verifier (a PEM key from config), so it needs a crypto
+/// backend; the post-auth phase itself is verifier-agnostic.
+#[cfg(feature = "builtin_jwt")]
 mod two_phase {
     use super::*;
     use crate::auth::Auth;
@@ -368,7 +372,7 @@ mod two_phase {
             forward_auth: None,
             authz: None,
         };
-        Auth::build(&cfg).unwrap().unwrap()
+        Auth::build(&cfg, None).unwrap().unwrap()
     }
 
     fn stack(shield: std::sync::Arc<Shield>, auth: std::sync::Arc<Auth>) -> Router {

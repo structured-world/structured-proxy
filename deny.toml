@@ -16,6 +16,13 @@
 #   3. RSA here is used for JWT *verification* (public key) only. Marvin targets
 #      private-key timing (decrypt/sign), which never runs on the verify path.
 #      Revisit when RustCrypto ships a constant-time `rsa` stable release.
+#
+# The ignore covers the DEFAULT build only. `rsa` arrives with jsonwebtoken's
+# whole `rust_crypto` bundle (it has no per-algorithm features), so it cannot be
+# dropped by a feature of ours while that backend is in use. A deployment that
+# will not carry the advisory at all builds with `default-features = false` and
+# injects its own `hooks::TokenVerifier`: no jsonwebtoken, no `rsa`, nothing to
+# ignore. The `injected_verifier` CI leg builds exactly that.
 ignore = [
-  { id = "RUSTSEC-2023-0071", reason = "No fixed `rsa` release exists (latest 0.10.0-rc; advisory patched:[]). We deliberately keep jsonwebtoken's pure-Rust `rust_crypto` backend over `aws_lc_rs` (C FFI). RSA is used for JWT verification (public key) only; Marvin targets private-key timing, not exploitable on the verify path. Revisit when RustCrypto ships a constant-time `rsa` stable. Tracking: structured-world/structured-proxy#48" },
+  { id = "RUSTSEC-2023-0071", reason = "No fixed `rsa` release exists (latest 0.10.0-rc; advisory patched:[]). We deliberately keep jsonwebtoken's pure-Rust `rust_crypto` backend over `aws_lc_rs` (C FFI). RSA is used for JWT verification (public key) only; Marvin targets private-key timing, not exploitable on the verify path. A build that must not link `rsa` at all takes default-features = false and injects its own TokenVerifier. Revisit when RustCrypto ships a constant-time `rsa` stable. Tracking: structured-world/structured-proxy#48" },
 ]
