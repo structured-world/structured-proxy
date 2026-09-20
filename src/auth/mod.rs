@@ -12,6 +12,8 @@
 //! which one verified the token.
 
 pub mod authz;
+#[cfg(feature = "builtin_jwt")]
+pub mod crypto;
 pub mod forward;
 #[cfg(feature = "builtin_jwt")]
 pub mod jwks;

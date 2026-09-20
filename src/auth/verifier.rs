@@ -36,6 +36,11 @@ impl ConfigVerifier {
     /// Returns an error string when no key source is configured, the PEM file
     /// cannot be read, or it is not a valid Ed25519 public key.
     pub(crate) fn build(jwt: &JwtConfig) -> Result<Self, String> {
+        // Normally settled in `ProxyServer::from_config` already; repeated here
+        // because a verifier can also be built without going through the
+        // server, and the call costs one atomic once the provider is in place.
+        super::crypto::install_default_crypto_provider();
+
         let keys = if let Some(uri) = &jwt.jwks_uri {
             KeySource::Jwks(JwksCache::new(uri.clone()))
         } else if let Some(pem_path) = &jwt.public_key_pem_file {

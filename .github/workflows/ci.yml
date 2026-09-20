@@ -33,9 +33,10 @@ jobs:
       fail-fast: false
       matrix:
         backend:
-          # The jsonwebtoken crypto backends are mutually exclusive (enabling
-          # both panics at runtime), so each is exercised on its own leg instead
-          # of via `--all-features`.
+          # One leg per crypto backend, plus the build that links both: Cargo
+          # features are additive, so feature unification (and every tool that
+          # reaches for `--all-features`, docs.rs and cargo-semver-checks
+          # included) can produce that combination.
           - name: rust_crypto
             # Pure-Rust default backend (RustCrypto / rsa).
             flags: "--features redis"
@@ -49,6 +50,10 @@ jobs:
             # `builtin_jwt` gate reaches for jsonwebtoken — this leg is what
             # keeps that honest.
             flags: "--no-default-features --features redis"
+          - name: all_features
+            # Both backends at once, the build cargo-semver-checks and docs.rs
+            # take. `aws_lc_rs` wins the tie; this leg keeps that wiring honest.
+            flags: "--all-features"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -59,6 +64,12 @@ jobs:
           components: clippy, rustfmt
       # Third-party action: pinned to a commit SHA (dependabot keeps it fresh).
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # Runs each test in its own process, so a hang names the test that hung
+      # instead of timing the whole job out. Third-party action: pinned to a
+      # commit SHA (dependabot keeps it fresh).
+      - uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
+        with:
+          tool: cargo-nextest
 
       - name: Format
         if: matrix.backend.name == 'rust_crypto'
@@ -74,7 +85,11 @@ jobs:
         env:
           # Exercises the rate-limit reconciliation against the Redis service.
           SHIELD_REDIS_TEST_URL: redis://127.0.0.1:6379/
-        run: cargo test ${{ matrix.backend.flags }}
+        run: cargo nextest run ${{ matrix.backend.flags }}
+
+      # nextest does not run doctests; cargo does.
+      - name: Doc tests
+        run: cargo test --doc ${{ matrix.backend.flags }}
 
       - name: Publish dry-run
         if: matrix.backend.name == 'rust_crypto'

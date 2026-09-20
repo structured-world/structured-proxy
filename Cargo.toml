@@ -114,11 +114,11 @@ default = ["rust_crypto"]
 # `ProxyServer::with_token_verifier`.
 builtin_jwt = ["dep:jsonwebtoken"]
 
-# Crypto backend for the BUILT-IN verifier. Mutually exclusive: enable at most
-# one. jsonwebtoken picks its provider from these features and panics at runtime
-# if both are on, so do NOT build with `--all-features`. They no longer decide
-# for the whole dependency graph: a consumer that cannot accept this crate's
-# choice supplies its own verifier instead (see `builtin_jwt` above).
+# Crypto backend for the BUILT-IN verifier. Additive, like every Cargo feature:
+# with both on, jsonwebtoken cannot infer a provider, so the built-in verifier
+# installs `aws_lc_rs` (constant-time, advisory-free) for the process. They no
+# longer decide for the whole dependency graph: a consumer that cannot accept
+# this crate's choice supplies its own verifier instead (see `builtin_jwt`).
 #
 # `rust_crypto` (default): pure-Rust RustCrypto backend. Pulls in `rsa`, which
 # carries RUSTSEC-2023-0071 (Marvin Attack). Not exploitable on our verify-only
