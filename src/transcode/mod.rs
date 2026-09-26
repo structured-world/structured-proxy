@@ -420,36 +420,28 @@ const STATUS_TYPE_URL: &str = "type.googleapis.com/google.rpc.Status";
 /// Both a gRPC `Status` (rendered by `render_error`) and a per-message
 /// serialization failure become a terminal [`StreamFrame::Error`]; downstream
 /// messages the upstream might still emit are dropped rather than streamed past
-/// the error.
+/// the error. The terminal frame drops the upstream along with the stream
+/// state, so the body ends at once instead of polling an upstream that may
+/// stay open.
 fn json_frames<St, R>(
     stream: St,
     render_error: R,
 ) -> impl futures::Stream<Item = StreamFrame> + Send + 'static
 where
-    St: futures::Stream<Item = Result<DynamicMessage, tonic::Status>> + Send + 'static,
+    St: futures::Stream<Item = Result<DynamicMessage, tonic::Status>> + Send + Unpin + 'static,
     R: Fn(&tonic::Status) -> serde_json::Value + Send + 'static,
 {
-    let opts = response_serialize_options();
-    stream.scan(false, move |stopped, result| {
-        if *stopped {
-            return futures::future::ready(None);
-        }
-        let frame = match result {
+    let state = Some((stream, render_error, response_serialize_options()));
+    futures::stream::unfold(state, |state| async move {
+        let (mut stream, render_error, opts) = state?;
+        let error = match stream.next().await? {
             Ok(msg) => match message_to_json_string(&msg, &opts) {
-                Ok(s) => StreamFrame::Data(s),
-                Err(e) => {
-                    *stopped = true;
-                    StreamFrame::Error(render_error(&tonic::Status::internal(format!(
-                        "serialization error: {e}"
-                    ))))
-                }
+                Ok(s) => return Some((StreamFrame::Data(s), Some((stream, render_error, opts)))),
+                Err(e) => tonic::Status::internal(format!("serialization error: {e}")),
             },
-            Err(status) => {
-                *stopped = true;
-                StreamFrame::Error(render_error(&status))
-            }
+            Err(status) => status,
         };
-        futures::future::ready(Some(frame))
+        Some((StreamFrame::Error(render_error(&error)), None))
     })
 }
 
@@ -461,7 +453,7 @@ where
 /// `@type: google.rpc.Status` marker (see [`STATUS_TYPE_URL`]).
 fn ndjson_response<St, R>(stream: St, render_error: R, envelope: bool) -> Response
 where
-    St: futures::Stream<Item = Result<DynamicMessage, tonic::Status>> + Send + 'static,
+    St: futures::Stream<Item = Result<DynamicMessage, tonic::Status>> + Send + Unpin + 'static,
     R: Fn(&tonic::Status) -> serde_json::Value + Send + 'static,
 {
     let byte_stream = json_frames(stream, render_error).map(move |frame| {
@@ -504,7 +496,7 @@ where
 /// Build a Server-Sent Events (`text/event-stream`) streaming response.
 fn sse_response<St, R>(stream: St, render_error: R, keep_alive_secs: u64) -> Response
 where
-    St: futures::Stream<Item = Result<DynamicMessage, tonic::Status>> + Send + 'static,
+    St: futures::Stream<Item = Result<DynamicMessage, tonic::Status>> + Send + Unpin + 'static,
     R: Fn(&tonic::Status) -> serde_json::Value + Send + 'static,
 {
     // Terminal errors use the `stream-error` event type, not the reserved

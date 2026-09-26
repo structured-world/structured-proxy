@@ -383,6 +383,28 @@ async fn serialization_failure_ends_the_stream_with_the_shared_error_body() {
 }
 
 #[tokio::test]
+async fn terminal_frame_ends_the_body_while_the_upstream_stays_open() {
+    // After the terminal frame the body ends at once, without polling the
+    // upstream again: an upstream that stays open (neither a message nor a
+    // close) must not keep the response open, whichever failure ended it.
+    let serialization_failure = futures::stream::iter(vec![Ok(unserializable_message())]);
+    let upstream_error = futures::stream::iter(vec![Err(tonic::Status::internal("boom"))]);
+    for (name, items) in [
+        ("serialization failure", serialization_failure),
+        ("upstream error", upstream_error),
+    ] {
+        let open_upstream = items.chain(futures::stream::pending());
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            collect_body(ndjson_response(open_upstream, no_details, false)),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{name}: body stayed open after the terminal frame"));
+        assert_eq!(body.lines().count(), 1, "{name}: {body}");
+    }
+}
+
+#[tokio::test]
 async fn sse_error_payload_is_the_unary_body_without_the_ndjson_marker() {
     // SSE frames the error by its event type, so the payload is exactly the
     // body a unary error gets: no `@type` marker.
