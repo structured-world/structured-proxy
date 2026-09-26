@@ -369,8 +369,27 @@ maintenence:
   enabled: true
 "#;
     assert_eq!(
-        unknown_top_level_keys(yaml),
+        unknown_config_keys(yaml),
         vec!["error_detail".to_string(), "maintenence".to_string()]
+    );
+}
+
+#[test]
+fn misspelled_streaming_key_is_reported() {
+    // `streaming:` is read by two structs that must accept each other's keys,
+    // so neither rejects a typo such as `ndjson_envelop:`, which would leave
+    // unenveloped framing silently in force; it is reported by its path.
+    let yaml = r#"
+upstream:
+  default: "grpc://x:1"
+streaming:
+  sse_keep_alive_secs: 5
+  ndjson_envelope: true
+  ndjson_envelop: true
+"#;
+    assert_eq!(
+        unknown_config_keys(yaml),
+        vec!["streaming.ndjson_envelop".to_string()]
     );
 }
 
@@ -422,6 +441,20 @@ fn known_top_level_keys_cover_every_proxy_config_field() {
         assert!(KNOWN_TOP_LEVEL_KEYS.contains(&key), "{key}");
     }
     assert_eq!(KNOWN_TOP_LEVEL_KEYS.len(), 18);
+}
+
+#[test]
+fn known_streaming_keys_cover_both_streaming_structs() {
+    // Exhaustive destructuring: a new field in either struct reading
+    // `streaming:` fails to compile here until it is listed as known.
+    let StreamingConfig {
+        sse_keep_alive_secs: _,
+    } = StreamingConfig::default();
+    let StreamingFileConfig { ndjson_envelope: _ } = StreamingFileConfig::default();
+    assert_eq!(
+        KNOWN_STREAMING_KEYS,
+        &["sse_keep_alive_secs", "ndjson_envelope"]
+    );
 }
 
 /// The transcoding options a YAML document compiles to.

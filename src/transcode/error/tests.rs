@@ -807,6 +807,31 @@ fn detail_with_required_debug_info_field_is_withheld() {
     assert!(!body.to_string().contains("hunter2"), "{body}");
 }
 
+#[test]
+fn detail_missing_a_required_field_is_malformed() {
+    // A proto2 detail whose payload lacks a `required` field decodes, but
+    // has no valid ProtoJSON form; directly or nested, it makes the status
+    // malformed instead of being forwarded without the field.
+    let pool = product_pool(
+        "acme/required.proto",
+        "syntax = \"proto2\"; package acme; \
+         message Strict { required string id = 1; optional string note = 2; } \
+         message Holder { optional Strict strict = 1; }",
+    );
+    let mut strict = DynamicMessage::new(pool.get_message_by_name("acme.Strict").unwrap());
+    strict.set_field_by_name("note", prost_reflect::Value::String("no id".into()));
+    let mut holder = DynamicMessage::new(pool.get_message_by_name("acme.Holder").unwrap());
+    holder.set_field_by_name("strict", prost_reflect::Value::Message(strict.clone()));
+    for (type_url, bytes) in [
+        ("type.googleapis.com/acme.Strict", strict.encode_to_vec()),
+        ("type.googleapis.com/acme.Holder", holder.encode_to_vec()),
+    ] {
+        let status = status_with_raw_details(&[(type_url, bytes)]);
+        let body = error_body(&status, Some(&StatusDetails::new(&pool)));
+        assert_eq!(body, malformed_upstream_status_body(), "{type_url}");
+    }
+}
+
 /// Unwraps the message out of a reflected value built by [`packed`].
 struct DynamicMessageValue(DynamicMessage);
 

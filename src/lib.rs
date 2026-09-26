@@ -143,8 +143,8 @@ impl ProxyServer {
     /// Create from a YAML document: the [`ProxyConfig`] plus the transcoding
     /// settings it does not hold (`error_details:` and
     /// `streaming.ndjson_envelope`), applied as [`with_error_details`] and
-    /// [`with_ndjson_envelope`] would. A top-level key no setting reads is
-    /// logged as a warning.
+    /// [`with_ndjson_envelope`] would. A top-level or `streaming:` key no
+    /// setting reads is logged as a warning.
     ///
     /// # Errors
     ///
@@ -156,8 +156,8 @@ impl ProxyServer {
     /// [`with_ndjson_envelope`]: Self::with_ndjson_envelope
     pub fn from_yaml_str(yaml: &str) -> anyhow::Result<Self> {
         let config = ProxyConfig::from_yaml_str(yaml)?;
-        for key in config::unknown_top_level_keys(yaml) {
-            tracing::warn!(%key, "unknown top-level config key is ignored");
+        for key in config::unknown_config_keys(yaml) {
+            tracing::warn!(%key, "unknown config key is ignored");
         }
         let settings: config::TranscodeFileConfig = serde_yaml::from_str(yaml)?;
         let options = settings

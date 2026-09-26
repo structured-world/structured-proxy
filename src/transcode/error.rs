@@ -577,7 +577,9 @@ impl StatusDetails {
     /// value. Only the message types decide, so data such as a `Struct` key
     /// named `@type` is never mistaken for one. Returns `None` when `msg` is
     /// itself a DebugInfo or an `Any` packing one (the caller drops it),
-    /// otherwise whether anything changed.
+    /// otherwise whether anything changed. A message missing a proto2
+    /// `required` field is [`MalformedStatus`]: decoding accepts it, but it has
+    /// no valid ProtoJSON form.
     fn scrub(&self, msg: &mut DynamicMessage) -> Result<Option<bool>, MalformedStatus> {
         let desc = msg.descriptor();
         if desc.full_name() == ANY {
@@ -585,6 +587,16 @@ impl StatusDetails {
         }
         if desc.full_name() == DEBUG_INFO {
             return Ok(None);
+        }
+        for field in desc.fields() {
+            if field.cardinality() == Cardinality::Required && !msg.has_field(&field) {
+                tracing::error!(
+                    message = %desc.full_name(),
+                    field = %field.name(),
+                    "error detail lacks a required field"
+                );
+                return Err(MalformedStatus);
+            }
         }
         let mut changed = false;
         let mut dropped_fields = Vec::new();

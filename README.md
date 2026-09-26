@@ -380,8 +380,9 @@ format, and it is not an OAuth 2.0 token endpoint error body (RFC 6749 §5.2).
 [Configuration](#configuration)) is read by the standalone binary and by
 `ProxyServer::from_yaml_str` / `ProxyServer::from_file`; it is not part of
 `ProxyConfig`, so `ProxyConfig::from_yaml_str` alone ignores it. Both log a
-warning for a top-level key no setting reads, so a misspelled `error_detail:`
-shows up at startup instead of silently leaving details on. An embedding
+warning for a top-level or `streaming:` key no setting reads, so a misspelled
+`error_detail:` or `ndjson_envelop:` shows up at startup instead of silently
+leaving the default in force. An embedding
 service can choose in code with `ProxyServer::with_error_details`. Overrides are
 checked in the order they are added and the first whose pattern matches the
 mounted route decides; `*` stays within one path segment (a path parameter

@@ -168,7 +168,8 @@ struct ErrorDetailsRouteFileConfig {
 }
 
 /// The `streaming:` keys [`StreamingConfig`] does not hold. Both read the same
-/// section, so neither can reject the other's keys.
+/// section, so neither can reject the other's keys; [`unknown_config_keys`]
+/// reports the keys neither reads.
 #[derive(Debug, Default, Deserialize)]
 struct StreamingFileConfig {
     #[serde(default)]
@@ -198,19 +199,36 @@ pub(crate) const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "error_details",
 ];
 
-/// The top-level keys of `yaml` that no setting reads, typically typos
-/// (`error_detail:` for `error_details:`) that would otherwise leave a default
-/// silently in force. They are reported, not rejected, so a file that loaded
-/// before keeps loading.
-pub(crate) fn unknown_top_level_keys(yaml: &str) -> Vec<String> {
+/// Every `streaming:` key: the [`StreamingConfig`] fields plus the ones
+/// [`StreamingFileConfig`] reads.
+pub(crate) const KNOWN_STREAMING_KEYS: &[&str] = &["sse_keep_alive_secs", "ndjson_envelope"];
+
+/// The keys of `yaml` that no setting reads, typically typos (`error_detail:`
+/// for `error_details:`) that would otherwise leave a default silently in
+/// force. They are reported, not rejected, so a file that loaded before keeps
+/// loading.
+pub(crate) fn unknown_config_keys(yaml: &str) -> Vec<String> {
     let Ok(serde_yaml::Value::Mapping(map)) = serde_yaml::from_str(yaml) else {
         return Vec::new();
     };
-    map.keys()
+    let mut unknown: Vec<String> = map
+        .keys()
         .filter_map(|key| key.as_str())
         .filter(|key| !KNOWN_TOP_LEVEL_KEYS.contains(key))
         .map(str::to_owned)
-        .collect()
+        .collect();
+    // `streaming:` is split between StreamingConfig and StreamingFileConfig,
+    // so neither can deny unknown fields; its keys are checked here instead.
+    if let Some(serde_yaml::Value::Mapping(streaming)) = map.get("streaming") {
+        unknown.extend(
+            streaming
+                .keys()
+                .filter_map(|key| key.as_str())
+                .filter(|key| !KNOWN_STREAMING_KEYS.contains(key))
+                .map(|key| format!("streaming.{key}")),
+        );
+    }
+    unknown
 }
 
 impl TranscodeFileConfig {
