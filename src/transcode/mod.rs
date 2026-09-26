@@ -123,8 +123,12 @@ pub fn routes<S: TranscodeState>(
         let method = binding.entry.http_method;
         let entry = Arc::new(binding.entry);
         let method_router: MethodRouter<S> = if binding.streaming {
-            let handler = move |proxy_state: State<S>, headers: HeaderMap| {
-                streaming_handler(proxy_state, headers, entry)
+            let handler = move |proxy_state: State<S>,
+                                headers: HeaderMap,
+                                path_params: Path<std::collections::HashMap<String, String>>,
+                                raw_query: RawQuery,
+                                body: axum::body::Bytes| {
+                streaming_handler(proxy_state, headers, path_params, raw_query, body, entry)
             };
             match method {
                 HttpMethod::Get => get(handler),
@@ -275,12 +279,23 @@ fn accept_range_selects_sse(range: &str) -> bool {
 async fn streaming_handler<S: TranscodeState>(
     State(proxy_state): State<S>,
     headers: HeaderMap,
+    Path(path_params): Path<std::collections::HashMap<String, String>>,
+    RawQuery(raw_query): RawQuery,
+    body_bytes: axum::body::Bytes,
     entry: std::sync::Arc<RouteEntry>,
 ) -> Response {
     let channel = proxy_state.grpc_channel();
 
-    let input_desc = entry.method.input();
-    let request_msg = DynamicMessage::new(input_desc);
+    let request_msg = match decode_request(
+        &entry,
+        &headers,
+        &path_params,
+        raw_query.as_deref(),
+        &body_bytes,
+    ) {
+        Ok(msg) => msg,
+        Err(message) => return bad_request(message),
+    };
 
     let grpc_metadata =
         metadata::http_headers_to_grpc_metadata(&headers, proxy_state.forwarded_headers());
@@ -430,6 +445,54 @@ where
         .into_response()
 }
 
+/// Map the HTTP request onto the RPC's input message: path parameters, query
+/// parameters and the route's `body` rule. Unary and server-streaming routes
+/// share it, so both bind a request the same way. The error is the message of
+/// the 400 the caller answers with, before the upstream is called.
+fn decode_request(
+    entry: &RouteEntry,
+    headers: &HeaderMap,
+    path_params: &std::collections::HashMap<String, String>,
+    raw_query: Option<&str>,
+    body_bytes: &[u8],
+) -> Result<DynamicMessage, String> {
+    // Only read the body when the rule maps it onto the message.
+    let json_body = match entry.body {
+        request::BodyMapping::None => serde_json::Value::Null,
+        _ => body::parse_body(body::content_type(headers), body_bytes)
+            .map_err(|e| format!("failed to parse request body: {e}"))?,
+    };
+
+    // Query string → field bindings (fields not bound by path or body).
+    // A malformed query is a client error: reject it rather than silently
+    // dropping every query-bound field.
+    let query_pairs = request::parse_query(raw_query)?;
+
+    let input_desc = entry.method.input();
+    let request_json = request::build_request_json(
+        &input_desc,
+        &entry.body,
+        json_body,
+        path_params,
+        &query_pairs,
+    )?;
+
+    DynamicMessage::deserialize(input_desc, request_json)
+        .map_err(|e| format!("failed to decode request: {e}"))
+}
+
+/// The 400 answer to a request [`decode_request`] could not map.
+fn bad_request(message: String) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": "INVALID_ARGUMENT",
+            "message": message,
+        })),
+    )
+        .into_response()
+}
+
 /// Generic transcoding handler.
 async fn transcode_handler<S: TranscodeState>(
     State(proxy_state): State<S>,
@@ -441,77 +504,15 @@ async fn transcode_handler<S: TranscodeState>(
 ) -> Response {
     let channel = proxy_state.grpc_channel();
 
-    // Only read the body when the rule maps it onto the message.
-    let json_body = match entry.body {
-        request::BodyMapping::None => serde_json::Value::Null,
-        _ => {
-            let ct = body::content_type(&headers);
-            match body::parse_body(ct, &body_bytes) {
-                Ok(v) => v,
-                Err(e) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({
-                            "error": "INVALID_ARGUMENT",
-                            "message": format!("failed to parse request body: {e}"),
-                        })),
-                    )
-                        .into_response();
-                }
-            }
-        }
-    };
-
-    // Query string → field bindings (fields not bound by path or body).
-    // A malformed query is a client error: reject it rather than silently
-    // dropping every query-bound field.
-    let query_pairs = match request::parse_query(raw_query.as_deref()) {
-        Ok(pairs) => pairs,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "INVALID_ARGUMENT",
-                    "message": e,
-                })),
-            )
-                .into_response();
-        }
-    };
-
-    let input_desc = entry.method.input();
-    let request_json = match request::build_request_json(
-        &input_desc,
-        &entry.body,
-        json_body,
+    let request_msg = match decode_request(
+        &entry,
+        &headers,
         &path_params,
-        &query_pairs,
+        raw_query.as_deref(),
+        &body_bytes,
     ) {
-        Ok(v) => v,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "INVALID_ARGUMENT",
-                    "message": e,
-                })),
-            )
-                .into_response();
-        }
-    };
-
-    let request_msg = match DynamicMessage::deserialize(input_desc, request_json) {
         Ok(msg) => msg,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "INVALID_ARGUMENT",
-                    "message": format!("failed to decode request: {e}"),
-                })),
-            )
-                .into_response();
-        }
+        Err(message) => return bad_request(message),
     };
 
     let grpc_metadata =
