@@ -1,0 +1,814 @@
+use super::*;
+
+use serde_json::json;
+use tonic_types::{BadRequest, DebugInfo, ErrorDetail, ErrorInfo, FieldViolation, StatusExt};
+
+#[test]
+fn test_grpc_to_http_mapping() {
+    assert_eq!(grpc_to_http_status(tonic::Code::Ok), StatusCode::OK);
+    assert_eq!(
+        grpc_to_http_status(tonic::Code::InvalidArgument),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        grpc_to_http_status(tonic::Code::NotFound),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        grpc_to_http_status(tonic::Code::AlreadyExists),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        grpc_to_http_status(tonic::Code::PermissionDenied),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        grpc_to_http_status(tonic::Code::Unauthenticated),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        grpc_to_http_status(tonic::Code::ResourceExhausted),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        grpc_to_http_status(tonic::Code::Unimplemented),
+        StatusCode::NOT_IMPLEMENTED
+    );
+    assert_eq!(
+        grpc_to_http_status(tonic::Code::Internal),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        grpc_to_http_status(tonic::Code::Unavailable),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        grpc_to_http_status(tonic::Code::DeadlineExceeded),
+        StatusCode::GATEWAY_TIMEOUT
+    );
+}
+
+#[test]
+fn test_grpc_code_name() {
+    assert_eq!(grpc_code_name(tonic::Code::Ok), "OK");
+    assert_eq!(grpc_code_name(tonic::Code::NotFound), "NOT_FOUND");
+    assert_eq!(
+        grpc_code_name(tonic::Code::Unauthenticated),
+        "UNAUTHENTICATED"
+    );
+}
+
+#[test]
+fn test_status_to_response() {
+    let status = tonic::Status::not_found("user not found");
+    let response = status_to_response(status);
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+// --- fixtures -------------------------------------------------------------
+
+/// A renderer over an empty product pool: only the canonical google.rpc
+/// descriptors resolve.
+fn canonical_only() -> StatusDetails {
+    StatusDetails::new(&DescriptorPool::new())
+}
+
+/// An `INVALID_ARGUMENT` status carrying `ErrorInfo` + `BadRequest`, the shape
+/// the issue's acceptance criterion names.
+fn rich_status() -> tonic::Status {
+    tonic::Status::with_error_details_vec(
+        tonic::Code::InvalidArgument,
+        "invalid email",
+        [
+            ErrorDetail::from(ErrorInfo::new(
+                "EMAIL_TAKEN",
+                "identity.example.com",
+                [("email".to_string(), "a@b.c".to_string())]
+                    .into_iter()
+                    .collect::<std::collections::HashMap<_, _>>(),
+            )),
+            ErrorDetail::from(BadRequest::new(vec![FieldViolation::new(
+                "email",
+                "already registered",
+            )])),
+        ],
+    )
+}
+
+/// A status whose trailer holds the given raw `(type_url, value)` details,
+/// for types tonic-types has no builder for.
+fn status_with_raw_details(details: &[(&str, Vec<u8>)]) -> tonic::Status {
+    let mut rpc = tonic_types::pb::Status {
+        code: tonic::Code::FailedPrecondition as i32,
+        message: "raw".into(),
+        ..Default::default()
+    };
+    for (type_url, value) in details {
+        rpc.details.push(Default::default());
+        let any = rpc.details.last_mut().expect("just pushed");
+        any.type_url = (*type_url).to_string();
+        any.value = value.clone();
+    }
+    tonic::Status::with_details(
+        tonic::Code::FailedPrecondition,
+        "raw",
+        bytes::Bytes::from(rpc.encode_to_vec()),
+    )
+}
+
+/// A product pool compiled from one in-memory `.proto` source.
+fn product_pool(name: &str, source: &str) -> DescriptorPool {
+    struct OneFile {
+        name: String,
+        source: String,
+    }
+    impl protox::file::FileResolver for OneFile {
+        fn open_file(&self, name: &str) -> Result<protox::file::File, protox::Error> {
+            if name == self.name {
+                protox::file::File::from_source(name, &self.source)
+            } else {
+                // google/protobuf/*.proto for imports such as any.proto.
+                protox::file::GoogleFileResolver::new().open_file(name)
+            }
+        }
+    }
+    protox::Compiler::with_file_resolver(OneFile {
+        name: name.to_owned(),
+        source: source.to_owned(),
+    })
+    .open_file(name)
+    .expect("test proto compiles")
+    .descriptor_pool()
+}
+
+// --- body shape -------------------------------------------------------------
+
+#[test]
+fn body_without_renderer_keeps_the_details_key_absent() {
+    // A route with details switched off must answer with exactly the
+    // pre-existing shape: no `details` key at all, not an empty array, so the
+    // off switch is observable and nothing about the upstream leaks.
+    let body = error_body(&rich_status(), None);
+    assert_eq!(
+        body,
+        json!({"error": "INVALID_ARGUMENT", "message": "invalid email", "code": 3})
+    );
+}
+
+#[test]
+fn body_without_trailer_has_empty_details() {
+    // No `grpc-status-details-bin` from the upstream: the enabled shape still
+    // carries `details`, as an empty array, so clients never branch on presence.
+    let status = tonic::Status::not_found("user not found");
+    let body = error_body(&status, Some(&canonical_only()));
+    assert_eq!(
+        body,
+        json!({"error": "NOT_FOUND", "message": "user not found", "code": 5, "details": []})
+    );
+}
+
+#[test]
+fn error_info_and_bad_request_render_as_canonical_json() {
+    // The two most common details come out in the ProtoJSON form of `Any`:
+    // `@type` plus the message fields in lowerCamelCase, unset fields omitted.
+    let body = error_body(&rich_status(), Some(&canonical_only()));
+    assert_eq!(
+        body,
+        json!({
+            "error": "INVALID_ARGUMENT",
+            "message": "invalid email",
+            "code": 3,
+            "details": [
+                {
+                    "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                    "reason": "EMAIL_TAKEN",
+                    "domain": "identity.example.com",
+                    "metadata": {"email": "a@b.c"}
+                },
+                {
+                    "@type": "type.googleapis.com/google.rpc.BadRequest",
+                    "fieldViolations": [
+                        {"field": "email", "description": "already registered"}
+                    ]
+                }
+            ]
+        })
+    );
+}
+
+#[test]
+fn status_to_response_keeps_http_mapping_with_details() {
+    // Rendering details must not change the HTTP status chosen by the
+    // gRPC → HTTP mapping.
+    let resp = status_to_response_with_details(&rich_status(), Some(&canonical_only()));
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[test]
+fn debug_info_is_never_rendered() {
+    // DebugInfo carries stack traces for operators; it is dropped while the
+    // details around it still render, in their original order.
+    let status = tonic::Status::with_error_details_vec(
+        tonic::Code::Internal,
+        "boom",
+        [
+            ErrorDetail::from(ErrorInfo::new(
+                "DB_DOWN",
+                "store.example.com",
+                std::collections::HashMap::new(),
+            )),
+            ErrorDetail::from(DebugInfo::new(
+                vec!["at store::write (store.rs:42)".to_string()],
+                "connection refused to 10.0.0.7:5432",
+            )),
+        ],
+    );
+    let details = canonical_only().render(&status).unwrap().details;
+    assert_eq!(
+        details,
+        vec![json!({
+            "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+            "reason": "DB_DOWN",
+            "domain": "store.example.com"
+        })]
+    );
+    let text = serde_json::to_string(&details).unwrap();
+    assert!(!text.contains("store.rs:42") && !text.contains("10.0.0.7"));
+}
+
+#[test]
+fn debug_info_is_dropped_under_any_type_url_prefix() {
+    // The type is identified by the last URL segment, so a non-default prefix
+    // cannot smuggle DebugInfo past the filter.
+    let debug = tonic_types::pb::DebugInfo {
+        stack_entries: vec!["secret frame".into()],
+        detail: "secret".into(),
+    };
+    let status = status_with_raw_details(&[(
+        "example.com/types/google.rpc.DebugInfo",
+        debug.encode_to_vec(),
+    )]);
+    let rendered = canonical_only().render(&status).unwrap();
+    assert!(rendered.details.is_empty() && rendered.opaque.is_empty());
+}
+
+#[test]
+fn unknown_detail_type_goes_to_opaque_details() {
+    // A type neither pool knows has no ProtoJSON form. It is kept, with its
+    // original type URL and bytes, in `opaqueDetails` next to `details`, never
+    // inside `details` and never under `@type`, so no client can take it for a
+    // message of that type.
+    let status = status_with_raw_details(&[(
+        "type.googleapis.com/acme.v1.Unknown",
+        vec![0x08, 0x96, 0x01],
+    )]);
+    assert_eq!(
+        error_body(&status, Some(&canonical_only())),
+        json!({
+            "error": "FAILED_PRECONDITION",
+            "message": "raw",
+            "code": 9,
+            "details": [],
+            "opaqueDetails": [{
+                "index": 0,
+                "typeUrl": "type.googleapis.com/acme.v1.Unknown",
+                "bytes": "CJYB"
+            }]
+        })
+    );
+}
+
+#[test]
+fn opaque_index_is_the_position_among_forwarded_details() {
+    // Upstream order: ErrorInfo, DebugInfo, unknown, ErrorInfo. DebugInfo is
+    // not forwarded and leaves no gap, so merging `details` and
+    // `opaqueDetails` by `index` restores the order the client may see:
+    // ErrorInfo (0), unknown (1), ErrorInfo (2).
+    let info = |reason: &str| {
+        tonic_types::pb::ErrorInfo {
+            reason: reason.into(),
+            ..Default::default()
+        }
+        .encode_to_vec()
+    };
+    let debug = tonic_types::pb::DebugInfo {
+        detail: "secret".into(),
+        ..Default::default()
+    };
+    let status = status_with_raw_details(&[
+        ("type.googleapis.com/google.rpc.ErrorInfo", info("FIRST")),
+        (
+            "type.googleapis.com/google.rpc.DebugInfo",
+            debug.encode_to_vec(),
+        ),
+        ("type.googleapis.com/acme.v1.Unknown", vec![0x08, 0x01]),
+        ("type.googleapis.com/google.rpc.ErrorInfo", info("LAST")),
+    ]);
+    let body = error_body(&status, Some(&canonical_only()));
+    assert_eq!(
+        body["details"],
+        json!([
+            {"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "FIRST"},
+            {"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "LAST"}
+        ])
+    );
+    assert_eq!(
+        body["opaqueDetails"],
+        json!([{"index": 1, "typeUrl": "type.googleapis.com/acme.v1.Unknown", "bytes": "CAE="}])
+    );
+}
+
+#[test]
+fn object_valued_well_known_details_go_under_value() {
+    // ProtoJSON wraps every well-known type with a special JSON representation
+    // under `value`, decided by the type, not by the shape of its JSON: a
+    // Struct is a JSON object yet still goes under `value`, and its own
+    // `@type` key cannot overwrite the detail's.
+    use prost_reflect::prost_types::{value::Kind, Struct, Value as PbValue};
+    let mut fields = std::collections::BTreeMap::new();
+    fields.insert(
+        "@type".to_string(),
+        PbValue {
+            kind: Some(Kind::StringValue("forged".into())),
+        },
+    );
+    fields.insert(
+        "retry".to_string(),
+        PbValue {
+            kind: Some(Kind::BoolValue(true)),
+        },
+    );
+    let status = status_with_raw_details(&[
+        (
+            "type.googleapis.com/google.protobuf.Struct",
+            Struct { fields }.encode_to_vec(),
+        ),
+        ("type.googleapis.com/google.protobuf.Empty", Vec::new()),
+    ]);
+    assert_eq!(
+        canonical_only().render(&status).unwrap().details,
+        vec![
+            json!({
+                "@type": "type.googleapis.com/google.protobuf.Struct",
+                "value": {"@type": "forged", "retry": true}
+            }),
+            json!({"@type": "type.googleapis.com/google.protobuf.Empty", "value": {}}),
+        ]
+    );
+}
+
+#[test]
+fn debug_info_behind_a_malformed_type_url_is_not_forwarded() {
+    // A type URL whose name part is empty or not a protobuf full name cannot
+    // be told apart from a disguised DebugInfo, so it fails the error safely
+    // instead of shipping its bytes as an opaque detail.
+    let debug = tonic_types::pb::DebugInfo {
+        detail: "connection refused to 10.0.0.7:5432".into(),
+        ..Default::default()
+    };
+    for type_url in [
+        "type.googleapis.com/google.rpc.DebugInfo/",
+        "type.googleapis.com/google.rpc.DebugInfo?v=1",
+        "",
+        "type.googleapis.com/google..rpc.DebugInfo",
+    ] {
+        let status = status_with_raw_details(&[(type_url, debug.encode_to_vec())]);
+        let body = error_body(&status, Some(&canonical_only()));
+        assert_eq!(body, malformed_upstream_status_body(), "{type_url:?}");
+    }
+}
+
+#[test]
+fn trailer_code_or_message_disagreeing_with_the_status_fails_safely() {
+    // The rich status in the trailer must describe the same error as
+    // grpc-status / grpc-message; otherwise its details would be attached to
+    // an error they were not written for.
+    let details = canonical_only();
+    for (code, message) in [
+        (tonic::Code::NotFound, "raw"),
+        (tonic::Code::FailedPrecondition, "something else"),
+    ] {
+        let rpc = tonic_types::pb::Status {
+            code: code as i32,
+            message: message.into(),
+            ..Default::default()
+        };
+        let status = tonic::Status::with_details(
+            tonic::Code::FailedPrecondition,
+            "raw",
+            bytes::Bytes::from(rpc.encode_to_vec()),
+        );
+        assert_eq!(
+            error_body(&status, Some(&details)),
+            malformed_upstream_status_body(),
+            "{code:?} {message:?}"
+        );
+    }
+}
+
+/// `acme.v1.Wrapper { Any cause = 1; repeated Any causes = 2; }`, a product
+/// detail that imports any.proto but not google/rpc.
+fn wrapper_pool() -> DescriptorPool {
+    product_pool(
+        "acme.proto",
+        "syntax = \"proto3\"; package acme.v1; import \"google/protobuf/any.proto\"; \
+         message Wrapper { google.protobuf.Any cause = 1; repeated google.protobuf.Any causes = 2; }",
+    )
+}
+
+/// An `Any` packing `message` under `type_url`, as a reflected value.
+fn packed(pool: &DescriptorPool, type_url: &str, message: Vec<u8>) -> prost_reflect::Value {
+    let mut any = DynamicMessage::new(pool.get_message_by_name("google.protobuf.Any").unwrap());
+    any.set_field_by_name("type_url", prost_reflect::Value::String(type_url.into()));
+    any.set_field_by_name("value", prost_reflect::Value::Bytes(message.into()));
+    prost_reflect::Value::Message(any)
+}
+
+fn secret_debug_info() -> Vec<u8> {
+    tonic_types::pb::DebugInfo {
+        stack_entries: vec!["at db::write (db.rs:7)".into()],
+        detail: "password=hunter2".into(),
+    }
+    .encode_to_vec()
+}
+
+fn error_info(reason: &str) -> Vec<u8> {
+    tonic_types::pb::ErrorInfo {
+        reason: reason.into(),
+        ..Default::default()
+    }
+    .encode_to_vec()
+}
+
+#[test]
+fn nested_canonical_type_resolves_inside_a_product_detail() {
+    // The product descriptors know Wrapper but not google.rpc.ErrorInfo; the
+    // ErrorInfo packed inside it must still render from the canonical
+    // descriptors instead of failing the whole error.
+    let pool = wrapper_pool();
+    let mut wrapper = DynamicMessage::new(pool.get_message_by_name("acme.v1.Wrapper").unwrap());
+    wrapper.set_field_by_name(
+        "cause",
+        packed(
+            &pool,
+            "type.googleapis.com/google.rpc.ErrorInfo",
+            error_info("NESTED"),
+        ),
+    );
+    let status = status_with_raw_details(&[(
+        "type.googleapis.com/acme.v1.Wrapper",
+        wrapper.encode_to_vec(),
+    )]);
+    assert_eq!(
+        StatusDetails::new(&pool).render(&status).unwrap().details,
+        vec![json!({
+            "@type": "type.googleapis.com/acme.v1.Wrapper",
+            "cause": {"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "NESTED"}
+        })]
+    );
+}
+
+#[test]
+fn debug_info_nested_in_a_product_detail_is_removed() {
+    // DebugInfo packed in an Any field, singular or repeated, is withheld at
+    // any depth, while the rest of the detail stays.
+    let pool = wrapper_pool();
+    let mut wrapper = DynamicMessage::new(pool.get_message_by_name("acme.v1.Wrapper").unwrap());
+    wrapper.set_field_by_name(
+        "cause",
+        packed(
+            &pool,
+            "type.googleapis.com/google.rpc.DebugInfo",
+            secret_debug_info(),
+        ),
+    );
+    wrapper.set_field_by_name(
+        "causes",
+        prost_reflect::Value::List(vec![
+            packed(
+                &pool,
+                "type.googleapis.com/google.rpc.ErrorInfo",
+                error_info("KEPT"),
+            ),
+            packed(
+                &pool,
+                "type.googleapis.com/google.rpc.DebugInfo",
+                secret_debug_info(),
+            ),
+        ]),
+    );
+    let status = status_with_raw_details(&[(
+        "type.googleapis.com/acme.v1.Wrapper",
+        wrapper.encode_to_vec(),
+    )]);
+    let body = error_body(&status, Some(&StatusDetails::new(&pool)));
+    assert_eq!(
+        body["details"],
+        json!([{
+            "@type": "type.googleapis.com/acme.v1.Wrapper",
+            "causes": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "KEPT"}]
+        }])
+    );
+    let text = body.to_string();
+    assert!(
+        !text.contains("hunter2") && !text.contains("db.rs"),
+        "{text}"
+    );
+}
+
+#[test]
+fn debug_info_packed_in_an_any_detail_is_dropped() {
+    // A detail that is itself an Any wrapping DebugInfo is dropped like a
+    // direct DebugInfo and takes no index.
+    let pool = wrapper_pool();
+    let DynamicMessageValue(any) = DynamicMessageValue::from(packed(
+        &pool,
+        "type.googleapis.com/google.rpc.DebugInfo",
+        secret_debug_info(),
+    ));
+    let status = status_with_raw_details(&[
+        (
+            "type.googleapis.com/google.protobuf.Any",
+            any.encode_to_vec(),
+        ),
+        ("type.googleapis.com/acme.v1.Unknown", vec![0x08, 0x01]),
+    ]);
+    let body = error_body(&status, Some(&StatusDetails::new(&pool)));
+    assert_eq!(body["details"], json!([]));
+    assert_eq!(body["opaqueDetails"][0]["index"], 0);
+    let text = body.to_string();
+    assert!(
+        !text.contains("hunter2") && !text.contains("db.rs"),
+        "{text}"
+    );
+}
+
+/// Unwraps the message out of a reflected value built by [`packed`].
+struct DynamicMessageValue(DynamicMessage);
+
+impl From<prost_reflect::Value> for DynamicMessageValue {
+    fn from(value: prost_reflect::Value) -> Self {
+        match value {
+            prost_reflect::Value::Message(message) => Self(message),
+            other => panic!("expected a message, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn opaque_details_key_is_absent_when_every_type_resolves() {
+    let body = error_body(&rich_status(), Some(&canonical_only()));
+    assert!(body.get("opaqueDetails").is_none(), "{body}");
+}
+
+/// The body a failed call gets when the upstream's error status itself cannot
+/// be rendered faithfully: a generic INTERNAL, with no decoder diagnostics.
+fn malformed_upstream_status_body() -> Value {
+    json!({
+        "error": "INTERNAL",
+        "message": "upstream returned a malformed error status",
+        "code": 13,
+        "details": []
+    })
+}
+
+#[test]
+fn corrupt_known_detail_fails_the_error_safely() {
+    // The type resolves but its bytes do not decode (a truncated
+    // length-delimited field). That is a broken upstream response, not an
+    // unknown type: the whole error becomes a safe INTERNAL instead of the
+    // detail being passed on as opaque bytes, dropped, or half-rendered next
+    // to the valid one.
+    let valid = tonic_types::pb::ErrorInfo {
+        reason: "OK_ONE".into(),
+        ..Default::default()
+    };
+    let status = status_with_raw_details(&[
+        (
+            "type.googleapis.com/google.rpc.ErrorInfo",
+            valid.encode_to_vec(),
+        ),
+        (
+            "type.googleapis.com/google.rpc.ErrorInfo",
+            vec![0x0a, 0x05, b'a'],
+        ),
+    ]);
+    let details = canonical_only();
+    assert_eq!(
+        error_body(&status, Some(&details)),
+        malformed_upstream_status_body()
+    );
+    let resp = status_to_response_with_details(&status, Some(&details));
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[test]
+fn corrupt_well_known_detail_is_not_rendered_as_that_type() {
+    // A Duration whose bytes are truncated must not come out as a Duration
+    // (nor as base64 under the same `value` key a real Duration uses).
+    let status =
+        status_with_raw_details(&[("type.googleapis.com/google.protobuf.Duration", vec![0x08])]);
+    assert_eq!(
+        error_body(&status, Some(&canonical_only())),
+        malformed_upstream_status_body()
+    );
+}
+
+#[test]
+fn out_of_range_well_known_value_fails_the_error_safely() {
+    // Well-formed bytes carrying a value the type forbids: Duration is limited
+    // to ±315,576,000,000 seconds, so this one has no valid JSON form.
+    let duration = prost_reflect::prost_types::Duration {
+        seconds: 400_000_000_000,
+        nanos: 0,
+    };
+    let status = status_with_raw_details(&[(
+        "type.googleapis.com/google.protobuf.Duration",
+        duration.encode_to_vec(),
+    )]);
+    assert_eq!(
+        error_body(&status, Some(&canonical_only())),
+        malformed_upstream_status_body()
+    );
+}
+
+#[test]
+fn well_known_type_detail_goes_under_value() {
+    // A well-known type with a special JSON representation (Duration is
+    // "1.500s") sits under `value`, which is ProtoJSON for `Any`; unlike the
+    // opaque extension, `value` here holds that JSON, not base64 bytes.
+    let duration = prost_reflect::prost_types::Duration {
+        seconds: 1,
+        nanos: 500_000_000,
+    };
+    let status = status_with_raw_details(&[(
+        "type.googleapis.com/google.protobuf.Duration",
+        duration.encode_to_vec(),
+    )]);
+    assert_eq!(
+        canonical_only().render(&status).unwrap().details,
+        vec![json!({"@type": "type.googleapis.com/google.protobuf.Duration", "value": "1.500s"})]
+    );
+}
+
+#[test]
+fn product_defined_detail_type_renders_its_fields() {
+    // A service's own detail message resolves through the product descriptors.
+    let pool = product_pool(
+        "acme.proto",
+        "syntax = \"proto3\"; package acme.v1; message QuotaTicket { string ticket = 1; int64 wait_ms = 2; }",
+    );
+    let ticket = pool.get_message_by_name("acme.v1.QuotaTicket").unwrap();
+    let mut msg = DynamicMessage::new(ticket);
+    msg.set_field_by_name("ticket", prost_reflect::Value::String("T-1".into()));
+    msg.set_field_by_name("wait_ms", prost_reflect::Value::I64(1500));
+    let status = status_with_raw_details(&[(
+        "type.googleapis.com/acme.v1.QuotaTicket",
+        msg.encode_to_vec(),
+    )]);
+    assert_eq!(
+        StatusDetails::new(&pool).render(&status).unwrap().details,
+        vec![json!({
+            "@type": "type.googleapis.com/acme.v1.QuotaTicket",
+            "ticket": "T-1",
+            "waitMs": "1500"
+        })]
+    );
+}
+
+#[test]
+fn product_revision_of_a_canonical_type_wins() {
+    // When the product ships its own google.rpc revision, that definition is
+    // used: a field it adds (number 9 here) renders by its name instead of
+    // being lost as an unknown field of the canonical revision.
+    let pool = product_pool(
+        "google/rpc/error_details.proto",
+        "syntax = \"proto3\"; package google.rpc; message ErrorInfo { string reason = 1; string domain = 2; string tenant = 9; }",
+    );
+    let desc = pool.get_message_by_name("google.rpc.ErrorInfo").unwrap();
+    let mut msg = DynamicMessage::new(desc);
+    msg.set_field_by_name("reason", prost_reflect::Value::String("R".into()));
+    msg.set_field_by_name("tenant", prost_reflect::Value::String("t-7".into()));
+    let status = status_with_raw_details(&[(
+        "type.googleapis.com/google.rpc.ErrorInfo",
+        msg.encode_to_vec(),
+    )]);
+    assert_eq!(
+        StatusDetails::new(&pool).render(&status).unwrap().details,
+        vec![json!({
+            "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+            "reason": "R",
+            "tenant": "t-7"
+        })]
+    );
+}
+
+#[test]
+fn malformed_trailer_fails_the_error_safely() {
+    // A trailer that is not a google.rpc.Status is a broken upstream
+    // response; answering with the original code and an empty `details` would
+    // claim the upstream sent no details.
+    let status = tonic::Status::with_details(
+        tonic::Code::NotFound,
+        "boom",
+        bytes::Bytes::from_static(&[0x1a, 0xff]),
+    );
+    let details = canonical_only();
+    assert_eq!(
+        error_body(&status, Some(&details)),
+        malformed_upstream_status_body()
+    );
+    let resp = status_to_response_with_details(&status, Some(&details));
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[test]
+fn details_off_leaves_a_malformed_trailer_unread() {
+    // With details switched off the trailer is never decoded, so it cannot
+    // fail the error: the upstream's own code and message pass through.
+    let status = tonic::Status::with_details(
+        tonic::Code::NotFound,
+        "boom",
+        bytes::Bytes::from_static(&[0x1a, 0xff]),
+    );
+    assert_eq!(
+        error_body(&status, None),
+        json!({"error": "NOT_FOUND", "message": "boom", "code": 5})
+    );
+    assert_eq!(
+        status_to_response_with_details(&status, None).status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+// --- policy -----------------------------------------------------------------
+
+fn policy(enabled: bool, routes: &[(&str, bool)]) -> Result<ErrorDetailsPolicy, String> {
+    let base = if enabled {
+        ErrorDetailsPolicy::default()
+    } else {
+        ErrorDetailsPolicy::disabled()
+    };
+    routes.iter().try_fold(base, |policy, (pattern, enabled)| {
+        policy.route(pattern, *enabled)
+    })
+}
+
+#[test]
+fn policy_defaults_to_enabled_everywhere() {
+    let p = ErrorDetailsPolicy::default();
+    assert!(p.enabled_for("/v1/users/{id}"));
+    assert!(p.enabled_for("/anything"));
+}
+
+#[test]
+fn policy_global_off_disables_every_route() {
+    let p = policy(false, &[]).unwrap();
+    assert!(!p.enabled_for("/v1/users/{id}"));
+}
+
+#[test]
+fn policy_route_rule_overrides_global_in_both_directions() {
+    // Global off with a sub-route switched back on, and a nested route inside
+    // that sub-route switched off again by an earlier rule.
+    let p = policy(
+        false,
+        &[("/v1/public/internal/*", false), ("/v1/public/**", true)],
+    )
+    .unwrap();
+    assert!(p.enabled_for("/v1/public/items/{id}"));
+    assert!(!p.enabled_for("/v1/public/internal/{id}"));
+    assert!(!p.enabled_for("/v1/admin/items"));
+}
+
+#[test]
+fn policy_first_matching_rule_wins() {
+    // Order is the contract: a broad rule listed first shadows a narrower
+    // one listed after it.
+    let p = policy(true, &[("/v1/**", false), ("/v1/public/**", true)]).unwrap();
+    assert!(!p.enabled_for("/v1/public/items"));
+}
+
+#[test]
+fn policy_star_matches_one_parameter_segment_only() {
+    // A path parameter is one segment: `*` matches `{id}` but not a deeper
+    // route under it, while `**` also matches an axum catch-all.
+    let p = policy(true, &[("/v1/users/*", false), ("/v1/files/**", false)]).unwrap();
+    assert!(!p.enabled_for("/v1/users/{id}"));
+    assert!(p.enabled_for("/v1/users/{id}/keys"));
+    assert!(!p.enabled_for("/v1/files/{*path}"));
+}
+
+#[test]
+fn policy_rejects_relative_pattern() {
+    // `v1/admin/**` can never match a route path; a silent no-op would leave
+    // details on where the operator meant to turn them off.
+    let err = policy(true, &[("v1/admin/**", false)]).unwrap_err();
+    assert!(err.contains("must start with '/'"), "{err}");
+}
+
+#[test]
+fn policy_rejects_invalid_glob() {
+    let err = policy(true, &[("/v1/[admin", false)]).unwrap_err();
+    assert!(err.contains("invalid glob pattern"), "{err}");
+}

@@ -114,6 +114,8 @@ pub struct ProxyServer {
     verify_path: Option<String>,
     /// Embedder-supplied JWT verifier, replacing the built-in one.
     token_verifier: Option<Arc<dyn TokenVerifier>>,
+    /// How the transcoded routes render errors and frame NDJSON streams.
+    transcode: transcode::TranscodeOptions,
 }
 
 impl ProxyServer {
@@ -134,7 +136,47 @@ impl ProxyServer {
             extra_routes: Vec::new(),
             verify_path: None,
             token_verifier: None,
+            transcode: transcode::TranscodeOptions::default(),
         }
+    }
+
+    /// Create from a YAML document: the [`ProxyConfig`] plus the transcoding
+    /// settings it does not hold (`error_details:` and
+    /// `streaming.ndjson_envelope`), applied as [`with_error_details`] and
+    /// [`with_ndjson_envelope`] would.
+    ///
+    /// # Errors
+    ///
+    /// Invalid YAML, a [`ProxyConfig`] that fails
+    /// [`validate`](ProxyConfig::validate), or an `error_details` route pattern
+    /// that is relative or not a valid glob.
+    ///
+    /// [`with_error_details`]: Self::with_error_details
+    /// [`with_ndjson_envelope`]: Self::with_ndjson_envelope
+    pub fn from_yaml_str(yaml: &str) -> anyhow::Result<Self> {
+        let config = ProxyConfig::from_yaml_str(yaml)?;
+        let settings: config::TranscodeFileConfig = serde_yaml::from_str(yaml)?;
+        let options = settings
+            .options()
+            .map_err(|e| anyhow::anyhow!("invalid error_details config: {e}"))?;
+        let mut server = Self::from_config(config);
+        server.transcode = options;
+        Ok(server)
+    }
+
+    /// [`from_yaml_str`](Self::from_yaml_str) on the contents of a file.
+    ///
+    /// # Errors
+    ///
+    /// The file cannot be read, or its contents are rejected by
+    /// [`from_yaml_str`](Self::from_yaml_str).
+    pub fn from_file(path: &std::path::Path) -> anyhow::Result<Self> {
+        Self::from_yaml_str(&std::fs::read_to_string(path)?)
+    }
+
+    /// The configuration this server was created with.
+    pub fn config(&self) -> &ProxyConfig {
+        &self.config
     }
 
     /// Create with an embedded descriptor pool (for sid-proxy backward compat).
@@ -197,6 +239,22 @@ impl ProxyServer {
     /// ignored (with a warning), since the verifier owns its own keys.
     pub fn with_token_verifier(mut self, verifier: Arc<dyn TokenVerifier>) -> Self {
         self.token_verifier = Some(verifier);
+        self
+    }
+
+    /// Choose which transcoded routes return the upstream's
+    /// `google.rpc.Status` details in their error bodies. Every route does by
+    /// default; see [`transcode::error::ErrorDetailsPolicy`] to switch them
+    /// off globally or per route.
+    pub fn with_error_details(mut self, policy: transcode::error::ErrorDetailsPolicy) -> Self {
+        self.transcode = self.transcode.with_error_details(policy);
+        self
+    }
+
+    /// Wrap NDJSON stream lines in `{"result"}` / `{"error"}` envelopes; see
+    /// [`transcode::TranscodeOptions::with_ndjson_envelope`].
+    pub fn with_ndjson_envelope(mut self, enabled: bool) -> Self {
+        self.transcode = self.transcode.with_ndjson_envelope(enabled);
         self
     }
 
@@ -422,7 +480,8 @@ impl ProxyServer {
         let cors = self.build_cors();
 
         // Build transcoding routes from descriptor pool.
-        let mut transcode_routes = transcode::routes(&pool, &self.config.aliases);
+        let mut transcode_routes =
+            transcode::routes_with_options(&pool, &self.config.aliases, &self.transcode);
 
         // External authorization (Envoy ext_authz) gates only the proxied API
         // routes, never health / metrics / discovery. It runs inside the auth

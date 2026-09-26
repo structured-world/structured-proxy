@@ -19,9 +19,11 @@ use axum::routing::{delete, get, patch, post, put, MethodRouter};
 use axum::{Json, Router};
 use futures::StreamExt;
 use prost_reflect::{DescriptorPool, DynamicMessage, MethodDescriptor, SerializeOptions};
+use std::sync::Arc;
 use tonic::client::Grpc;
 
 use crate::config::AliasConfig;
+use error::{ErrorDetailsPolicy, StatusDetails};
 
 /// Trait for state types that support REST→gRPC transcoding.
 ///
@@ -64,6 +66,51 @@ struct RouteEntry {
     body: request::BodyMapping,
     /// Optional response subfield to return as the HTTP body (`response_body`).
     response_body: Option<String>,
+    /// Renderer for the status details of this route's errors; `None` when the
+    /// error-details policy switches them off for the route.
+    error_details: Option<Arc<StatusDetails>>,
+    /// Wrap NDJSON stream lines in `{"result"}` / `{"error"}` envelopes.
+    ndjson_envelope: bool,
+}
+
+/// How [`routes_with_options`] builds the transcoded routes.
+///
+/// # Examples
+///
+/// ```
+/// use structured_proxy::transcode::error::ErrorDetailsPolicy;
+/// use structured_proxy::transcode::TranscodeOptions;
+///
+/// let options = TranscodeOptions::default()
+///     .with_error_details(ErrorDetailsPolicy::default().route("/v1/admin/**", false).unwrap())
+///     .with_ndjson_envelope(true);
+/// # let _ = options;
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct TranscodeOptions {
+    pub(crate) error_details: ErrorDetailsPolicy,
+    pub(crate) ndjson_envelope: bool,
+}
+
+impl TranscodeOptions {
+    /// Which routes return `google.rpc.Status` details in their error bodies
+    /// (all of them by default).
+    pub fn with_error_details(mut self, policy: ErrorDetailsPolicy) -> Self {
+        self.error_details = policy;
+        self
+    }
+
+    /// Wrap every NDJSON line of a server-streaming response in an envelope:
+    /// `{"result": <message>}` for data, `{"error": <error body>}` for the
+    /// terminal error (the grpc-gateway stream shape). Off by default, when a
+    /// data line is the bare message and the error line carries an
+    /// `@type: google.rpc.Status` marker instead. Only the envelope keeps the
+    /// two apart for RPCs that stream `google.protobuf.Any`, `Struct`, `Value`
+    /// or `ListValue`, whose messages can carry any keys. SSE is unaffected.
+    pub fn with_ndjson_envelope(mut self, enabled: bool) -> Self {
+        self.ndjson_envelope = enabled;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -91,8 +138,19 @@ impl HttpMethod {
 /// Build transcoded REST→gRPC routes from a descriptor pool.
 ///
 /// Takes a `DescriptorPool` and optional path aliases from config.
-/// Returns an axum Router that transcodes REST requests to gRPC calls.
+/// Returns an axum Router that transcodes REST requests to gRPC calls. Error
+/// bodies carry `google.rpc.Status` details on every route; use
+/// [`routes_with_options`] to choose per route or to frame NDJSON streams.
 pub fn routes<S: TranscodeState>(pool: &DescriptorPool, aliases: &[AliasConfig]) -> Router<S> {
+    routes_with_options(pool, aliases, &TranscodeOptions::default())
+}
+
+/// [`routes`], built as `options` describe.
+pub fn routes_with_options<S: TranscodeState>(
+    pool: &DescriptorPool,
+    aliases: &[AliasConfig],
+    options: &TranscodeOptions,
+) -> Router<S> {
     let bindings = route_bindings(pool, aliases);
     if bindings.is_empty() {
         tracing::warn!("No HTTP-annotated RPCs found in proto descriptors");
@@ -101,13 +159,25 @@ pub fn routes<S: TranscodeState>(pool: &DescriptorPool, aliases: &[AliasConfig])
 
     tracing::info!("Registering {} transcoded REST→gRPC routes", bindings.len());
 
+    // One renderer shared by every route that returns details, built only if
+    // at least one does.
+    let mut status_details: Option<Arc<StatusDetails>> = None;
     let mut router: Router<S> = Router::new();
-    for binding in bindings {
+    for mut binding in bindings {
+        if options.error_details.enabled_for(&binding.axum_path) {
+            let renderer = status_details.get_or_insert_with(|| Arc::new(StatusDetails::new(pool)));
+            binding.entry.error_details = Some(Arc::clone(renderer));
+        }
+        binding.entry.ndjson_envelope = options.ndjson_envelope;
         let method = binding.entry.http_method;
-        let entry = std::sync::Arc::new(binding.entry);
+        let entry = Arc::new(binding.entry);
         let method_router: MethodRouter<S> = if binding.streaming {
-            let handler = move |proxy_state: State<S>, headers: HeaderMap| {
-                streaming_handler(proxy_state, headers, entry)
+            let handler = move |proxy_state: State<S>,
+                                headers: HeaderMap,
+                                path_params: Path<std::collections::HashMap<String, String>>,
+                                raw_query: RawQuery,
+                                body: axum::body::Bytes| {
+                streaming_handler(proxy_state, headers, path_params, raw_query, body, entry)
             };
             match method {
                 HttpMethod::Get => get(handler),
@@ -213,16 +283,6 @@ fn message_to_json_string(msg: &DynamicMessage, opts: &SerializeOptions) -> Resu
     serde_json::to_string(&value).map_err(|e| e.to_string())
 }
 
-/// Terminal error frame for a stream that failed mid-flight. Shared by the
-/// NDJSON and SSE paths so a client sees the same shape in either format.
-fn stream_error_json(status: &tonic::Status) -> serde_json::Value {
-    serde_json::json!({
-        "error": error::grpc_code_name(status.code()),
-        "message": status.message(),
-        "code": status.code() as i32,
-    })
-}
-
 /// Whether the client negotiated a Server-Sent Events response via `Accept`.
 ///
 /// Considers every `Accept` header line (a client may send more than one) and
@@ -268,12 +328,23 @@ fn accept_range_selects_sse(range: &str) -> bool {
 async fn streaming_handler<S: TranscodeState>(
     State(proxy_state): State<S>,
     headers: HeaderMap,
+    Path(path_params): Path<std::collections::HashMap<String, String>>,
+    RawQuery(raw_query): RawQuery,
+    body_bytes: axum::body::Bytes,
     entry: std::sync::Arc<RouteEntry>,
 ) -> Response {
     let channel = proxy_state.grpc_channel();
 
-    let input_desc = entry.method.input();
-    let request_msg = DynamicMessage::new(input_desc);
+    let request_msg = match decode_request(
+        &entry,
+        &headers,
+        &path_params,
+        raw_query.as_deref(),
+        &body_bytes,
+    ) {
+        Ok(msg) => msg,
+        Err(message) => return bad_request(&entry, message),
+    };
 
     let grpc_metadata =
         metadata::http_headers_to_grpc_metadata(&headers, proxy_state.forwarded_headers());
@@ -287,14 +358,8 @@ async fn streaming_handler<S: TranscodeState>(
 
     let mut grpc_client = Grpc::new(channel);
     if let Err(e) = grpc_client.ready().await {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": "UNAVAILABLE",
-                "message": format!("gRPC upstream not ready: {e}"),
-            })),
-        )
-            .into_response();
+        let status = tonic::Status::unavailable(format!("gRPC upstream not ready: {e}"));
+        return error::status_to_response_with_details(&status, entry.error_details.as_deref());
     }
 
     let use_sse = wants_sse(&headers);
@@ -305,35 +370,60 @@ async fn streaming_handler<S: TranscodeState>(
     {
         Ok(response) => {
             let stream = response.into_inner();
+            // The terminal frame renders like the unary error body. The
+            // closure takes over this request's route handle, so the stream
+            // keeps it alive without another refcount.
+            let envelope = entry.ndjson_envelope;
+            let render_error = move |status: &tonic::Status| {
+                error::error_body(status, entry.error_details.as_deref())
+            };
             if use_sse {
-                sse_response(stream, proxy_state.sse_keep_alive_secs())
+                sse_response(stream, render_error, proxy_state.sse_keep_alive_secs())
             } else {
-                ndjson_response(stream)
+                ndjson_response(stream, render_error, envelope)
             }
         }
-        Err(status) => error::status_to_response(status),
+        Err(status) => {
+            error::status_to_response_with_details(&status, entry.error_details.as_deref())
+        }
     }
 }
 
-/// One JSON frame of a streaming response, already serialized.
+/// One frame of a streaming response: a serialized message, or the error body
+/// (see [`error::error_body`]) that ends the stream.
 ///
 /// `Error` is terminal: [`json_frames`] stops the stream right after yielding
 /// it, so an error frame is always the last thing a client sees regardless of
-/// whether it came from a gRPC status or a serialization failure.
+/// whether it came from a gRPC status or a serialization failure. It stays a
+/// JSON value so each format can add its own framing before serializing it.
 enum StreamFrame {
     Data(String),
-    Error(String),
+    Error(serde_json::Value),
 }
+
+/// Type URL marking the terminal error line of an unenveloped NDJSON stream. A
+/// data line is the ProtoJSON of a response message, which carries a top-level
+/// `@type` only when the RPC streams `google.protobuf.Any`; `Struct`, `Value`
+/// and `ListValue` can carry any key at all. For those RPCs no in-band marker
+/// is collision-free, which is what the opt-in envelope
+/// ([`TranscodeOptions::with_ndjson_envelope`]) is for; the unenveloped shape
+/// stays the default so existing NDJSON readers keep working.
+const STATUS_TYPE_URL: &str = "type.googleapis.com/google.rpc.Status";
 
 /// Turn a gRPC message stream into a stream of serialized JSON frames, stopping
 /// after the first error so error frames are unambiguously terminal.
 ///
-/// Both a gRPC `Status` and a per-message serialization failure become a
-/// terminal [`StreamFrame::Error`]; downstream messages the upstream might
-/// still emit are dropped rather than streamed past the error.
-fn json_frames<St>(stream: St) -> impl futures::Stream<Item = StreamFrame> + Send + 'static
+/// Both a gRPC `Status` (rendered by `render_error`) and a per-message
+/// serialization failure become a terminal [`StreamFrame::Error`]; downstream
+/// messages the upstream might still emit are dropped rather than streamed past
+/// the error.
+fn json_frames<St, R>(
+    stream: St,
+    render_error: R,
+) -> impl futures::Stream<Item = StreamFrame> + Send + 'static
 where
     St: futures::Stream<Item = Result<DynamicMessage, tonic::Status>> + Send + 'static,
+    R: Fn(&tonic::Status) -> serde_json::Value + Send + 'static,
 {
     let opts = response_serialize_options();
     stream.scan(false, move |stopped, result| {
@@ -345,18 +435,14 @@ where
                 Ok(s) => StreamFrame::Data(s),
                 Err(e) => {
                     *stopped = true;
-                    StreamFrame::Error(
-                        serde_json::json!({
-                            "error": "INTERNAL",
-                            "message": format!("serialization error: {e}"),
-                        })
-                        .to_string(),
-                    )
+                    StreamFrame::Error(render_error(&tonic::Status::internal(format!(
+                        "serialization error: {e}"
+                    ))))
                 }
             },
             Err(status) => {
                 *stopped = true;
-                StreamFrame::Error(stream_error_json(&status).to_string())
+                StreamFrame::Error(render_error(&status))
             }
         };
         futures::future::ready(Some(frame))
@@ -364,15 +450,37 @@ where
 }
 
 /// Build an NDJSON (`application/x-ndjson`) streaming response.
-fn ndjson_response<St>(stream: St) -> Response
+///
+/// With `envelope`, every line is wrapped: `{"result": <message>}` for data and
+/// `{"error": <error body>}` for the terminal error. Without it, a data line is
+/// the bare message and the error line is the error body plus an
+/// `@type: google.rpc.Status` marker (see [`STATUS_TYPE_URL`]).
+fn ndjson_response<St, R>(stream: St, render_error: R, envelope: bool) -> Response
 where
     St: futures::Stream<Item = Result<DynamicMessage, tonic::Status>> + Send + 'static,
+    R: Fn(&tonic::Status) -> serde_json::Value + Send + 'static,
 {
-    // Data and error frames are both JSON lines; an error is distinguished by
-    // its `error` field and by being the final line (see `json_frames`).
-    let byte_stream = json_frames(stream).map(|frame| {
+    let byte_stream = json_frames(stream, render_error).map(move |frame| {
         let mut line = match frame {
-            StreamFrame::Data(s) | StreamFrame::Error(s) => s,
+            // The message is already serialized; wrap the text instead of
+            // parsing it back into a value.
+            StreamFrame::Data(s) if envelope => {
+                let mut wrapped = String::with_capacity(s.len() + 12);
+                wrapped.push_str("{\"result\":");
+                wrapped.push_str(&s);
+                wrapped.push('}');
+                wrapped
+            }
+            StreamFrame::Data(s) => s,
+            StreamFrame::Error(body) if envelope => {
+                serde_json::json!({ "error": body }).to_string()
+            }
+            StreamFrame::Error(mut body) => {
+                if let Some(fields) = body.as_object_mut() {
+                    fields.insert("@type".into(), STATUS_TYPE_URL.into());
+                }
+                body.to_string()
+            }
         };
         line.push('\n');
         Ok::<axum::body::Bytes, std::io::Error>(axum::body::Bytes::from(line))
@@ -390,17 +498,20 @@ where
 }
 
 /// Build a Server-Sent Events (`text/event-stream`) streaming response.
-fn sse_response<St>(stream: St, keep_alive_secs: u64) -> Response
+fn sse_response<St, R>(stream: St, render_error: R, keep_alive_secs: u64) -> Response
 where
     St: futures::Stream<Item = Result<DynamicMessage, tonic::Status>> + Send + 'static,
+    R: Fn(&tonic::Status) -> serde_json::Value + Send + 'static,
 {
     // Terminal errors use the `stream-error` event type, not the reserved
     // `error` type that the browser EventSource dispatches for transport
     // failures — clients listen for it via addEventListener("stream-error").
-    let event_stream = json_frames(stream).map(|frame| {
+    let event_stream = json_frames(stream, render_error).map(|frame| {
         let event = match frame {
             StreamFrame::Data(s) => Event::default().data(s),
-            StreamFrame::Error(s) => Event::default().event("stream-error").data(s),
+            StreamFrame::Error(body) => Event::default()
+                .event("stream-error")
+                .data(body.to_string()),
         };
         Ok::<Event, std::convert::Infallible>(event)
     });
@@ -408,6 +519,51 @@ where
     Sse::new(event_stream)
         .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(keep_alive_secs)))
         .into_response()
+}
+
+/// Map the HTTP request onto the RPC's input message: path parameters, query
+/// parameters and the route's `body` rule. Unary and server-streaming routes
+/// share it, so both bind a request the same way. The error is the message of
+/// the 400 the caller answers with, before the upstream is called.
+fn decode_request(
+    entry: &RouteEntry,
+    headers: &HeaderMap,
+    path_params: &std::collections::HashMap<String, String>,
+    raw_query: Option<&str>,
+    body_bytes: &[u8],
+) -> Result<DynamicMessage, String> {
+    // Only read the body when the rule maps it onto the message.
+    let json_body = match entry.body {
+        request::BodyMapping::None => serde_json::Value::Null,
+        _ => body::parse_body(body::content_type(headers), body_bytes)
+            .map_err(|e| format!("failed to parse request body: {e}"))?,
+    };
+
+    // Query string → field bindings (fields not bound by path or body).
+    // A malformed query is a client error: reject it rather than silently
+    // dropping every query-bound field.
+    let query_pairs = request::parse_query(raw_query)?;
+
+    let input_desc = entry.method.input();
+    let request_json = request::build_request_json(
+        &input_desc,
+        &entry.body,
+        json_body,
+        path_params,
+        &query_pairs,
+    )?;
+
+    DynamicMessage::deserialize(input_desc, request_json)
+        .map_err(|e| format!("failed to decode request: {e}"))
+}
+
+/// The 400 answer to a request [`decode_request`] could not map, in the same
+/// error body the upstream's own errors get on this route.
+fn bad_request(entry: &RouteEntry, message: String) -> Response {
+    error::status_to_response_with_details(
+        &tonic::Status::invalid_argument(message),
+        entry.error_details.as_deref(),
+    )
 }
 
 /// Generic transcoding handler.
@@ -421,77 +577,15 @@ async fn transcode_handler<S: TranscodeState>(
 ) -> Response {
     let channel = proxy_state.grpc_channel();
 
-    // Only read the body when the rule maps it onto the message.
-    let json_body = match entry.body {
-        request::BodyMapping::None => serde_json::Value::Null,
-        _ => {
-            let ct = body::content_type(&headers);
-            match body::parse_body(ct, &body_bytes) {
-                Ok(v) => v,
-                Err(e) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({
-                            "error": "INVALID_ARGUMENT",
-                            "message": format!("failed to parse request body: {e}"),
-                        })),
-                    )
-                        .into_response();
-                }
-            }
-        }
-    };
-
-    // Query string → field bindings (fields not bound by path or body).
-    // A malformed query is a client error: reject it rather than silently
-    // dropping every query-bound field.
-    let query_pairs = match request::parse_query(raw_query.as_deref()) {
-        Ok(pairs) => pairs,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "INVALID_ARGUMENT",
-                    "message": e,
-                })),
-            )
-                .into_response();
-        }
-    };
-
-    let input_desc = entry.method.input();
-    let request_json = match request::build_request_json(
-        &input_desc,
-        &entry.body,
-        json_body,
+    let request_msg = match decode_request(
+        &entry,
+        &headers,
         &path_params,
-        &query_pairs,
+        raw_query.as_deref(),
+        &body_bytes,
     ) {
-        Ok(v) => v,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "INVALID_ARGUMENT",
-                    "message": e,
-                })),
-            )
-                .into_response();
-        }
-    };
-
-    let request_msg = match DynamicMessage::deserialize(input_desc, request_json) {
         Ok(msg) => msg,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "INVALID_ARGUMENT",
-                    "message": format!("failed to decode request: {e}"),
-                })),
-            )
-                .into_response();
-        }
+        Err(message) => return bad_request(&entry, message),
     };
 
     let grpc_metadata =
@@ -506,14 +600,8 @@ async fn transcode_handler<S: TranscodeState>(
 
     let mut grpc_client = Grpc::new(channel);
     if let Err(e) = grpc_client.ready().await {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": "UNAVAILABLE",
-                "message": format!("gRPC upstream not ready: {e}"),
-            })),
-        )
-            .into_response();
+        let status = tonic::Status::unavailable(format!("gRPC upstream not ready: {e}"));
+        return error::status_to_response_with_details(&status, entry.error_details.as_deref());
     }
 
     match grpc_client.unary(grpc_request, grpc_path, grpc_codec).await {
@@ -541,18 +629,16 @@ async fn transcode_handler<S: TranscodeState>(
                 }
                 Err(e) => {
                     tracing::error!("Failed to serialize gRPC response: {e}");
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({
-                            "error": "INTERNAL",
-                            "message": "failed to serialize response",
-                        })),
+                    error::status_to_response_with_details(
+                        &tonic::Status::internal("failed to serialize response"),
+                        entry.error_details.as_deref(),
                     )
-                        .into_response()
                 }
             }
         }
-        Err(status) => error::status_to_response(status),
+        Err(status) => {
+            error::status_to_response_with_details(&status, entry.error_details.as_deref())
+        }
     }
 }
 
@@ -591,6 +677,9 @@ fn extract_routes(pool: &DescriptorPool) -> Vec<RouteEntry> {
                     method: method.clone(),
                     body: binding.body,
                     response_body: binding.response_body,
+                    // Decided per mounted path in `routes_with_options`.
+                    error_details: None,
+                    ndjson_envelope: false,
                 });
             }
         }
@@ -641,6 +730,9 @@ fn extract_streaming_routes(pool: &DescriptorPool) -> Vec<RouteEntry> {
                     method: method.clone(),
                     body: binding.body,
                     response_body: binding.response_body,
+                    // Decided per mounted path in `routes_with_options`.
+                    error_details: None,
+                    ndjson_envelope: false,
                 });
             }
         }
@@ -856,348 +948,4 @@ fn catch_all(name: &str, is_last: bool) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Build a standalone `HttpRule`-shaped descriptor (self-referential
-    /// `additional_bindings`) so the binding parser can be tested without the
-    /// google.api extension wiring.
-    fn http_rule_descriptor() -> prost_reflect::MessageDescriptor {
-        use prost_reflect::prost::Message;
-        use prost_reflect::prost_types::{
-            field_descriptor_proto::{Label, Type},
-            DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
-        };
-
-        let str_field = |name: &str, num: i32| FieldDescriptorProto {
-            name: Some(name.to_string()),
-            number: Some(num),
-            label: Some(Label::Optional as i32),
-            r#type: Some(Type::String as i32),
-            ..Default::default()
-        };
-        let rule = DescriptorProto {
-            name: Some("HttpRule".to_string()),
-            field: vec![
-                str_field("get", 2),
-                str_field("put", 3),
-                str_field("post", 4),
-                str_field("delete", 5),
-                str_field("patch", 6),
-                str_field("body", 7),
-                str_field("response_body", 12),
-                FieldDescriptorProto {
-                    name: Some("additional_bindings".to_string()),
-                    number: Some(11),
-                    label: Some(Label::Repeated as i32),
-                    r#type: Some(Type::Message as i32),
-                    type_name: Some(".gapi.HttpRule".to_string()),
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
-        let file = FileDescriptorProto {
-            name: Some("http.proto".to_string()),
-            package: Some("gapi".to_string()),
-            message_type: vec![rule],
-            syntax: Some("proto3".to_string()),
-            ..Default::default()
-        };
-        let fds = FileDescriptorSet { file: vec![file] };
-        let pool = DescriptorPool::decode(fds.encode_to_vec().as_slice()).unwrap();
-        pool.get_message_by_name("gapi.HttpRule").unwrap()
-    }
-
-    #[test]
-    fn collect_bindings_reads_body_response_and_additional() {
-        let desc = http_rule_descriptor();
-
-        // additional_bindings entry: POST /v1/items with whole-body mapping.
-        let mut extra = DynamicMessage::new(desc.clone());
-        extra.set_field_by_name("post", prost_reflect::Value::String("/v1/items".into()));
-        extra.set_field_by_name("body", prost_reflect::Value::String("*".into()));
-
-        // primary rule: GET /v1/items/{id}, returns only the `result` subfield.
-        let mut rule = DynamicMessage::new(desc);
-        rule.set_field_by_name("get", prost_reflect::Value::String("/v1/items/{id}".into()));
-        rule.set_field_by_name(
-            "response_body",
-            prost_reflect::Value::String("result".into()),
-        );
-        rule.set_field_by_name(
-            "additional_bindings",
-            prost_reflect::Value::List(vec![prost_reflect::Value::Message(extra)]),
-        );
-
-        let bindings = collect_bindings(&rule);
-        assert_eq!(bindings.len(), 2);
-
-        // Primary: GET, no body, response_body = result.
-        assert!(matches!(bindings[0].http_method, HttpMethod::Get));
-        assert_eq!(bindings[0].http_path, "/v1/items/{id}");
-        assert_eq!(bindings[0].body, request::BodyMapping::None);
-        assert_eq!(bindings[0].response_body.as_deref(), Some("result"));
-
-        // Additional: POST, whole-body mapping, no response_body.
-        assert!(matches!(bindings[1].http_method, HttpMethod::Post));
-        assert_eq!(bindings[1].http_path, "/v1/items");
-        assert_eq!(bindings[1].body, request::BodyMapping::Root);
-        assert_eq!(bindings[1].response_body, None);
-    }
-
-    #[test]
-    fn test_proto_path_to_axum() {
-        // axum 0.8: proto `{param}` IS the native capture syntax, pass through verbatim.
-        assert_eq!(proto_path_to_axum("/v1/profiles/{id}"), "/v1/profiles/{id}");
-        assert_eq!(
-            proto_path_to_axum("/v1/admin/profiles/{profile_id}/metadata/{key}"),
-            "/v1/admin/profiles/{profile_id}/metadata/{key}"
-        );
-        assert_eq!(proto_path_to_axum("/v1/auth/login"), "/v1/auth/login");
-    }
-
-    #[test]
-    fn test_proto_path_to_axum_wildcards() {
-        // `{name=*}` single-segment field path collapses to a plain capture.
-        assert_eq!(proto_path_to_axum("/v1/{name=*}"), "/v1/{name}");
-        // `{name=**}` multi-segment catch-all maps to axum's `{*name}`.
-        assert_eq!(
-            proto_path_to_axum("/v1/files/{path=**}"),
-            "/v1/files/{*path}"
-        );
-        // Bare wildcards get position-named captures so they never collide.
-        // Index is the segment position after splitting on `/` (leading "" = 0).
-        assert_eq!(proto_path_to_axum("/v1/*/items"), "/v1/{wildcard2}/items");
-        assert_eq!(proto_path_to_axum("/v1/files/**"), "/v1/files/{*wildcard3}");
-    }
-
-    #[test]
-    fn non_terminal_catch_all_degrades_to_single_capture() {
-        // A catch-all `{*name}` is only valid in axum's LAST path segment.
-        // An unsupported/multi-segment field template in a NON-terminal position
-        // (`/v1/{name=projects/*}/topics`) must NOT emit a mid-path catch-all —
-        // axum rejects `/v1/{*name}/topics` at `Router::route()`. It degrades to
-        // a single-segment capture instead.
-        assert_eq!(
-            proto_path_to_axum("/v1/{name=projects/*}/topics"),
-            "/v1/{name}/topics"
-        );
-        let path = proto_path_to_axum("/v1/{name=projects/*}/topics");
-        let _router: Router<()> = Router::new().route(&path, get(|| async { "ok" }));
-
-        // The same guard applies to an explicit `**` template in non-terminal
-        // position and a terminal one still yields a real catch-all.
-        assert_eq!(proto_path_to_axum("/v1/{rest=**}/tail"), "/v1/{rest}/tail");
-        assert_eq!(
-            proto_path_to_axum("/v1/files/{rest=**}"),
-            "/v1/files/{*rest}"
-        );
-    }
-
-    #[test]
-    fn multi_segment_field_template_does_not_fracture() {
-        // google.api.http resource-name templates (AIP-127) embed slashes
-        // inside a SINGLE brace span: `{name=shelves/*/books/*}`. Splitting on
-        // `/` before brace parsing fractured this into invalid fragments and
-        // produced a mangled axum path that panicked at `Router::route()`.
-        // It must collapse to a single catch-all capture instead.
-        assert_eq!(
-            proto_path_to_axum("/v1/{name=shelves/*/books/*}"),
-            "/v1/{*name}"
-        );
-        // And the produced path must actually register on axum 0.8.
-        let path = proto_path_to_axum("/v1/{name=shelves/*/books/*}");
-        let _router: Router<()> = Router::new().route(&path, get(|| async { "ok" }));
-    }
-
-    /// Regression for the axum 0.7→0.8 migration bug: `proto_path_to_axum`
-    /// emitted `:id` syntax, which axum 0.8 rejects at `Router::route()` with
-    /// a startup panic ("Path segments must not start with `:`"). Building the
-    /// router over a brace-param path must NOT panic. Pre-fix this panicked.
-    #[test]
-    fn router_builds_with_brace_path_params_on_axum_0_8() {
-        let axum_path = proto_path_to_axum("/v1/profiles/{id}");
-        let _router: Router<()> = Router::new().route(&axum_path, get(|| async { "ok" }));
-
-        // Deeper nesting and a catch-all also route without panicking.
-        let nested = proto_path_to_axum("/v1/admin/profiles/{profile_id}/metadata/{key}");
-        let catch_all = proto_path_to_axum("/v1/files/{path=**}");
-        let _router: Router<()> = Router::new()
-            .route(&nested, get(|| async { "ok" }))
-            .route(&catch_all, get(|| async { "ok" }));
-    }
-
-    /// `Item { name: "alice", count: 42 }` — default fixture for the
-    /// serialization helpers.
-    fn item_message() -> DynamicMessage {
-        item_message_named("alice", 42)
-    }
-
-    /// Build an `Item { name, count }` message from a freshly-decoded
-    /// descriptor pool, used to exercise the streaming serialization helpers.
-    fn item_message_named(name: &str, count: i64) -> DynamicMessage {
-        use prost_reflect::prost::Message;
-        use prost_reflect::prost_types::{
-            field_descriptor_proto::{Label, Type},
-            DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
-        };
-
-        let item = DescriptorProto {
-            name: Some("Item".to_string()),
-            field: vec![
-                FieldDescriptorProto {
-                    name: Some("name".to_string()),
-                    number: Some(1),
-                    label: Some(Label::Optional as i32),
-                    r#type: Some(Type::String as i32),
-                    ..Default::default()
-                },
-                FieldDescriptorProto {
-                    name: Some("count".to_string()),
-                    number: Some(2),
-                    label: Some(Label::Optional as i32),
-                    r#type: Some(Type::Int64 as i32),
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
-        let file = FileDescriptorProto {
-            name: Some("item.proto".to_string()),
-            package: Some("test.v1".to_string()),
-            message_type: vec![item],
-            syntax: Some("proto3".to_string()),
-            ..Default::default()
-        };
-        let mut bytes = Vec::new();
-        FileDescriptorSet { file: vec![file] }
-            .encode(&mut bytes)
-            .unwrap();
-        let pool = DescriptorPool::decode(bytes.as_slice()).unwrap();
-        let desc = pool.get_message_by_name("test.v1.Item").unwrap();
-
-        let mut msg = DynamicMessage::new(desc);
-        msg.set_field_by_name("name", prost_reflect::Value::String(name.to_string()));
-        msg.set_field_by_name("count", prost_reflect::Value::I64(count));
-        msg
-    }
-
-    /// Collect a streaming response body into a single UTF-8 string.
-    async fn collect_body(resp: Response) -> String {
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        String::from_utf8(bytes.to_vec()).unwrap()
-    }
-
-    #[tokio::test]
-    async fn ndjson_error_frame_is_terminal() {
-        // A gRPC error mid-stream must be the LAST frame: messages the upstream
-        // would yield after the error are dropped, so the error line is an
-        // unambiguous end-of-stream signal rather than a mid-stream marker.
-        let items = vec![
-            Ok(item_message_named("alice", 1)),
-            Err(tonic::Status::internal("boom")),
-            Ok(item_message_named("bob", 2)),
-        ];
-        let body = collect_body(ndjson_response(futures::stream::iter(items))).await;
-        let lines: Vec<&str> = body.lines().collect();
-        assert_eq!(lines.len(), 2, "stream must stop after the error frame");
-        assert!(lines[0].contains("alice"));
-        assert!(lines[1].contains("INTERNAL") && lines[1].contains("boom"));
-        assert!(!body.contains("bob"), "post-error message must be dropped");
-    }
-
-    #[tokio::test]
-    async fn sse_error_uses_distinct_event_name() {
-        // The terminal error is sent as `event: stream-error`, not the reserved
-        // `error` type that collides with the browser EventSource onerror.
-        let items = vec![
-            Ok(item_message_named("alice", 1)),
-            Err(tonic::Status::permission_denied("nope")),
-            Ok(item_message_named("bob", 2)),
-        ];
-        let body = collect_body(sse_response(futures::stream::iter(items), 15)).await;
-        assert!(body.contains("stream-error"));
-        assert!(body.contains("PERMISSION_DENIED"));
-        assert!(!body.contains("bob"), "post-error message must be dropped");
-    }
-
-    #[test]
-    fn wants_sse_detects_event_stream_accept() {
-        let mut headers = HeaderMap::new();
-        headers.insert("accept", "text/event-stream".parse().unwrap());
-        assert!(wants_sse(&headers));
-    }
-
-    #[test]
-    fn wants_sse_matches_within_list_and_ignores_params() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "accept",
-            "application/json, text/event-stream;q=0.9".parse().unwrap(),
-        );
-        assert!(wants_sse(&headers));
-    }
-
-    #[test]
-    fn wants_sse_false_for_json_and_missing() {
-        let mut headers = HeaderMap::new();
-        headers.insert("accept", "application/json".parse().unwrap());
-        assert!(!wants_sse(&headers));
-        assert!(!wants_sse(&HeaderMap::new()));
-    }
-
-    #[test]
-    fn wants_sse_rejects_explicit_q_zero() {
-        // RFC 7231 §5.3.1: `q=0` means the media type is explicitly NOT
-        // acceptable, so it must not select the SSE path.
-        let mut headers = HeaderMap::new();
-        headers.insert("accept", "text/event-stream;q=0".parse().unwrap());
-        assert!(!wants_sse(&headers));
-    }
-
-    #[test]
-    fn wants_sse_honors_second_accept_header_line() {
-        // A client may send multiple `Accept` header lines; the negotiation
-        // must consider all of them, not just the first.
-        let mut headers = HeaderMap::new();
-        headers.append("accept", "application/json".parse().unwrap());
-        headers.append("accept", "text/event-stream".parse().unwrap());
-        assert!(wants_sse(&headers));
-    }
-
-    #[test]
-    fn message_to_json_string_stringifies_64bit() {
-        let opts = response_serialize_options();
-        let json = message_to_json_string(&item_message(), &opts).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(value["name"], "alice");
-        // 64-bit integers are stringified to survive JS number precision limits.
-        assert_eq!(value["count"], "42");
-    }
-
-    #[test]
-    fn ndjson_response_omits_manual_transfer_encoding() {
-        // hyper picks the framing per protocol version; a hand-set
-        // transfer-encoding would be illegal on HTTP/2.
-        let resp = ndjson_response(futures::stream::empty::<
-            Result<DynamicMessage, tonic::Status>,
-        >());
-        assert_eq!(
-            resp.headers().get("content-type").unwrap(),
-            "application/x-ndjson"
-        );
-        assert!(resp.headers().get("transfer-encoding").is_none());
-    }
-
-    #[test]
-    fn stream_error_json_carries_grpc_code_name() {
-        let status = tonic::Status::permission_denied("nope");
-        let value = stream_error_json(&status);
-        assert_eq!(value["error"], "PERMISSION_DENIED");
-        assert_eq!(value["message"], "nope");
-        assert_eq!(value["code"], tonic::Code::PermissionDenied as i32);
-    }
-}
+mod tests;

@@ -18,6 +18,7 @@ Works with **any** gRPC service via proto descriptor files. No code generation, 
 - **Auto-generated OpenAPI** documentation from proto messages, served at `/openapi.json`
 - **Server-streaming** RPC → NDJSON by default, or Server-Sent Events via `Accept: text/event-stream` negotiation
 - **gRPC → HTTP status mapping** following the standard `google.rpc.Code` table
+- **Typed error details**: the upstream's `google.rpc.Status` details (`ErrorInfo`, `BadRequest`, `RetryInfo`, ...) reach the HTTP client as ProtoJSON, switchable globally and per route (see [Error responses](#error-responses))
 - **Header forwarding** from HTTP requests to gRPC metadata (configurable allow-list)
 - **Context propagation**: W3C trace-context (`traceparent` forwarded or synthesized) and client deadlines (`grpc-timeout`) carried across the REST↔gRPC boundary
 - **Path aliasing** for route remapping (e.g. `/oauth2/*` → `/v1/oauth2/*`)
@@ -106,6 +107,19 @@ streaming:
   # SSE keep-alive interval (seconds). Comment frames keep idle streams alive
   # through load balancers / nginx read timeouts. Default: 15.
   sse_keep_alive_secs: 15
+  # Wrap every NDJSON line as {"result": ...} / {"error": ...} (see "Error
+  # responses"). Default: false.
+  ndjson_envelope: false
+
+# Optional: google.rpc.Status details in error bodies (see "Error responses").
+# On everywhere by default. Rules are checked in order and the first whose
+# pattern matches the mounted route decides; `*` stays within one path segment
+# (a path parameter counts as one), `**` spans segments.
+error_details:
+  enabled: true
+  routes:
+    - pattern: "/v1/internal/**"
+      enabled: false
 
 # Rate limiting (Shield)
 #
@@ -245,18 +259,154 @@ there is no boundary burst on top of this lag.
 See the `shield:` block under [Configuration](#configuration) for the full
 schema.
 
+## Error responses
+
+A failed gRPC call becomes a JSON body with the status of the gRPC → HTTP
+mapping (`INVALID_ARGUMENT` → 400, `NOT_FOUND` → 404, ...):
+
+```json
+{
+  "error": "INVALID_ARGUMENT",
+  "code": 3,
+  "message": "invalid email",
+  "details": [
+    {
+      "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+      "reason": "EMAIL_TAKEN",
+      "domain": "identity.example.com",
+      "metadata": { "email": "a@b.c" }
+    },
+    {
+      "@type": "type.googleapis.com/google.rpc.BadRequest",
+      "fieldViolations": [{ "field": "email", "description": "already registered" }]
+    }
+  ]
+}
+```
+
+- `code`, `message` and `details` follow `google.rpc.Status`; `error` is the
+  code's name. A client that parses the body as `google.rpc.Status` with a
+  strict ProtoJSON parser must let it ignore unknown fields.
+- `details` is the upstream's `grpc-status-details-bin` trailer, one entry per
+  `Any`, in [ProtoJSON](https://protobuf.dev/programming-guides/json/#any)
+  form: `@type` plus the message fields, or `@type` plus `value` for a
+  well-known type with a special JSON representation (`google.protobuf.Duration`
+  as `"1.500s"`). Types resolve from the service's descriptors first, then from
+  the canonical `google/rpc/status.proto` and `error_details.proto`, which are
+  always available. An upstream that sends no trailer yields `"details": []`.
+- `google.rpc.DebugInfo` is never forwarded: it carries stack traces and server
+  internals meant for the service's operators.
+- Details are on for every route. They can be switched off globally or per
+  route (see below); on such a route the `details` and `opaqueDetails` keys are
+  absent and the body is `{"error", "code", "message"}`.
+- Errors the proxy raises itself on a transcoded route use the same body: a
+  request that cannot be mapped onto the RPC (`INVALID_ARGUMENT`, 400), an
+  upstream that is not reachable (`UNAVAILABLE`, 503), a response that cannot
+  be serialized (`INTERNAL`, 500). Their `details` is empty.
+- A broken upstream error status is never passed on in part or reinterpreted:
+  a trailer that is not a `google.rpc.Status`, or a detail of a known type whose
+  bytes do not decode or whose value has no valid JSON form (a `Duration`
+  beyond its range), turns the whole error into
+  `{"error": "INTERNAL", "code": 13, "message": "upstream returned a malformed error status", "details": []}`
+  (500, or the terminal frame of a started stream). The cause is logged by the
+  proxy and not sent to the client. With details switched off for a route the
+  trailer is not read, so this does not apply there.
+
+**Opaque-detail extension.** ProtoJSON cannot represent an `Any` whose type is
+unknown to the writer, so a detail whose type is in neither descriptor set has
+no place in `details`. Rather than drop it, structured-proxy keeps it in a
+separate `opaqueDetails` array, which is its own extension and **not** part of
+ProtoJSON or `google.rpc.Status`:
+
+```json
+{
+  "error": "FAILED_PRECONDITION",
+  "code": 9,
+  "message": "quota exhausted",
+  "details": [
+    { "@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "QUOTA", "domain": "acme.example.com" }
+  ],
+  "opaqueDetails": [
+    { "index": 1, "typeUrl": "type.googleapis.com/acme.v1.QuotaTicket", "bytes": "CgNULTE=" }
+  ]
+}
+```
+
+- `typeUrl` is the original type URL and `bytes` the standard base64 of the
+  original bytes. An entry has no `@type` and never appears in `details`, so
+  `details` stays an array of ProtoJSON `Any` and nothing in the extension can
+  be taken for a message of the named type.
+- `index` is the entry's position among the forwarded details: merging
+  `details` and `opaqueDetails` by position restores the upstream's order.
+- `opaqueDetails` appears only when at least one detail went there. A client
+  that knows the type base64-decodes `bytes` and parses the protobuf itself; a
+  client that does not handle the extension ignores the key.
+- Only an unknown type goes there. A detail of a known type that fails to
+  decode is a broken upstream status (see above), never an opaque entry.
+
+**Errors in server-streaming responses.** A stream that fails before its first
+message still owns the response: it gets the mapped HTTP status and the body
+above. Once the first message is sent, the `200` is already on the wire and
+cannot change, so the failure is delivered as a terminal frame whose payload is
+exactly that body, after which the stream ends and no further data follows:
+
+- **NDJSON**: the last line, framed by an extra
+  `"@type": "type.googleapis.com/google.rpc.Status"` next to the error body. A
+  data line is the ProtoJSON of a response message, which has a top-level
+  `@type` only when the RPC streams `google.protobuf.Any`, while `Struct`,
+  `Value` and `ListValue` messages can carry any key at all. For those RPCs no
+  in-band marker is collision-free: set `streaming.ndjson_envelope: true` (or
+  `ProxyServer::with_ndjson_envelope(true)`) and every line is wrapped instead,
+  `{"result": <message>}` for data and `{"error": <error body>}` for the
+  terminal error, the grpc-gateway stream shape. The envelope changes data
+  lines too, so it is off by default.
+- **SSE**: one event with type `stream-error` (listen with
+  `addEventListener("stream-error", ...)`), distinct from the `EventSource`
+  `onerror` that fires on transport failures. The event type is the framing,
+  so the event data is exactly the error body, without the NDJSON marker.
+
+The same applies to a message the proxy cannot serialize mid-stream: the
+stream ends with an `INTERNAL` terminal frame.
+
+This is the HTTP/JSON transcoding format. It is not the Connect protocol's error
+format, and it is not an OAuth 2.0 token endpoint error body (RFC 6749 §5.2).
+
+**Switching details off.** In the config file, `error_details:` (see
+[Configuration](#configuration)) is read by the standalone binary and by
+`ProxyServer::from_yaml_str` / `ProxyServer::from_file`; it is not part of
+`ProxyConfig`, so `ProxyConfig::from_yaml_str` alone ignores it. An embedding
+service can choose in code with `ProxyServer::with_error_details`. Overrides are
+checked in the order they are added and the first whose pattern matches the
+mounted route decides; `*` stays within one path segment (a path parameter
+counts as one) and `**` spans segments:
+
+```rust
+use structured_proxy::transcode::error::ErrorDetailsPolicy;
+use structured_proxy::{config::ProxyConfig, ProxyServer};
+
+# fn build(config: ProxyConfig) -> Result<ProxyServer, String> {
+// Details everywhere except the internal admin surface.
+let policy = ErrorDetailsPolicy::default().route("/v1/admin/**", false)?;
+// Or: off everywhere except a public sub-route.
+// let policy = ErrorDetailsPolicy::disabled().route("/v1/public/**", true)?;
+Ok(ProxyServer::from_config(config).with_error_details(policy))
+# }
+```
+
 ## Library Usage
 
 ```rust
 use std::path::Path;
-use structured_proxy::{config::ProxyConfig, ProxyServer};
+use structured_proxy::ProxyServer;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let config = ProxyConfig::from_file(Path::new("my-service.yaml"))?;
+    // Reads the whole config file, including `error_details` and
+    // `streaming.ndjson_envelope`, which live outside `ProxyConfig`.
+    let server = ProxyServer::from_file(Path::new("my-service.yaml"))?;
 
     // Run the proxy on the configured listen address.
-    ProxyServer::from_config(config).serve().await?;
+    server.serve().await?;
     Ok(())
 }
 ```
@@ -324,6 +474,8 @@ The hooks are:
   discovery.
 - **`with_extra_routes`** — registers extra stateless routes through a
   framework-agnostic adapter (request parts in, response parts out).
+- **`with_error_details`** — chooses which transcoded routes return the
+  upstream's `google.rpc.Status` details (see [Error responses](#error-responses)).
 
 ## JWT verification
 

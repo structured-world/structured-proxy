@@ -1,11 +1,23 @@
 //! gRPC → HTTP error mapping.
 //!
 //! Converts `tonic::Status` to appropriate HTTP status codes and JSON error bodies
-//! following the gRPC-HTTP status code mapping from the gRPC specification.
+//! following the gRPC-HTTP status code mapping from the gRPC specification, and
+//! renders the typed `google.rpc.Status` details the upstream attached in the
+//! `grpc-status-details-bin` trailer.
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use base64::Engine as _;
+use globset::GlobMatcher;
+use prost::Message as _;
+use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor, SerializeOptions};
+use serde_json::{Map, Value};
+
+/// Full name of `google.rpc.DebugInfo`. It carries stack traces and server
+/// internals meant for the service's operators, so it never reaches an HTTP
+/// client.
+const DEBUG_INFO: &str = "google.rpc.DebugInfo";
 
 /// Map a gRPC status code to the corresponding HTTP status code.
 ///
@@ -32,15 +44,89 @@ pub fn grpc_to_http_status(code: tonic::Code) -> StatusCode {
     }
 }
 
-/// Convert a `tonic::Status` into an axum HTTP response with JSON error body.
+/// Message of the `INTERNAL` a client gets instead of an upstream error whose
+/// details cannot be rendered faithfully. The cause stays in the proxy's log.
+const MALFORMED_STATUS_MESSAGE: &str = "upstream returned a malformed error status";
+
+/// An upstream error status whose details cannot be rendered faithfully: a
+/// trailer that is not a `google.rpc.Status`, or a detail of a known type whose
+/// bytes do not decode or whose value has no valid JSON form. Its cause is
+/// logged where it is detected.
+#[derive(Debug)]
+struct MalformedStatus;
+
+/// Convert a `tonic::Status` into an axum HTTP response with a JSON error body
+/// `{"error", "message", "code"}`, without status details.
+///
+/// Use [`status_to_response_with_details`] to also render the upstream's
+/// `google.rpc.Status` details.
 pub fn status_to_response(status: tonic::Status) -> Response {
-    let http_status = grpc_to_http_status(status.code());
-    let body = serde_json::json!({
-        "error": grpc_code_name(status.code()),
-        "message": status.message(),
-        "code": status.code() as i32,
-    });
-    (http_status, Json(body)).into_response()
+    status_to_response_with_details(&status, None)
+}
+
+/// Convert a `tonic::Status` into an axum HTTP response with a JSON error body.
+///
+/// The body is `{"error", "message", "code"}`, plus a `details` array when
+/// `details` is given (see [`error_body`]). The HTTP status follows the code the
+/// body reports, so a malformed upstream status answers 500.
+pub fn status_to_response_with_details(
+    status: &tonic::Status,
+    details: Option<&StatusDetails>,
+) -> Response {
+    let (code, body) = render(status, details);
+    (grpc_to_http_status(code), Json(body)).into_response()
+}
+
+/// The JSON error body for a failed call, shared by the unary response and the
+/// terminal frame of a stream so a client parses one shape everywhere.
+///
+/// `error` is the gRPC code name, `code` its number and `message` the status
+/// message. With `details`, the body also carries `details`: the upstream's
+/// `google.rpc.Status.details` in proto3 JSON form (empty when the upstream sent
+/// none), plus `opaqueDetails` for details whose type no descriptor describes;
+/// without it, both keys are absent and the trailer is not read. When the
+/// details cannot be rendered faithfully the whole body is a generic `INTERNAL`
+/// instead, never a partial or reinterpreted set of details.
+pub fn error_body(status: &tonic::Status, details: Option<&StatusDetails>) -> Value {
+    render(status, details).1
+}
+
+/// The error body and the gRPC code it reports: the upstream's own, or
+/// `INTERNAL` when its details cannot be rendered faithfully.
+fn render(status: &tonic::Status, details: Option<&StatusDetails>) -> (tonic::Code, Value) {
+    let Some(details) = details else {
+        return (status.code(), body(status.code(), status.message(), None));
+    };
+    match details.render(status) {
+        Ok(rendered) => (
+            status.code(),
+            body(status.code(), status.message(), Some(rendered)),
+        ),
+        Err(MalformedStatus) => (
+            tonic::Code::Internal,
+            body(
+                tonic::Code::Internal,
+                MALFORMED_STATUS_MESSAGE,
+                Some(RenderedDetails::default()),
+            ),
+        ),
+    }
+}
+
+/// `opaqueDetails` appears only when a detail went to the extension, so a
+/// client that does not handle it sees nothing new otherwise.
+fn body(code: tonic::Code, message: &str, details: Option<RenderedDetails>) -> Value {
+    let mut body = Map::with_capacity(5);
+    body.insert("error".into(), grpc_code_name(code).into());
+    body.insert("message".into(), message.into());
+    body.insert("code".into(), (code as i32).into());
+    if let Some(rendered) = details {
+        body.insert("details".into(), Value::Array(rendered.details));
+        if !rendered.opaque.is_empty() {
+            body.insert("opaqueDetails".into(), Value::Array(rendered.opaque));
+        }
+    }
+    Value::Object(body)
 }
 
 /// Human-readable gRPC code name for JSON error responses.
@@ -66,69 +152,357 @@ pub(crate) fn grpc_code_name(code: tonic::Code) -> &'static str {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Which routes return `details` in their error bodies.
+///
+/// A global switch plus per-route overrides, checked in the order they were
+/// added: the first whose pattern matches the route decides. A pattern is a
+/// glob over the mounted route path, where `*` stays within one segment and
+/// `**` spans segments; every path parameter counts as one segment, so
+/// `/v1/users/*` matches the route `/v1/users/{id}`. Decided once per route
+/// when the router is built, so a request pays nothing for it.
+///
+/// # Examples
+///
+/// ```
+/// use structured_proxy::transcode::error::ErrorDetailsPolicy;
+///
+/// // Details everywhere except the internal admin surface.
+/// let policy = ErrorDetailsPolicy::default()
+///     .route("/v1/admin/**", false)
+///     .unwrap();
+/// assert!(policy.enabled_for("/v1/users/{id}"));
+/// assert!(!policy.enabled_for("/v1/admin/users/{id}"));
+///
+/// // Off by default, back on for one sub-route.
+/// let policy = ErrorDetailsPolicy::disabled()
+///     .route("/v1/public/**", true)
+///     .unwrap();
+/// assert!(!policy.enabled_for("/v1/users/{id}"));
+/// assert!(policy.enabled_for("/v1/public/items"));
+/// ```
+#[derive(Debug, Clone)]
+pub struct ErrorDetailsPolicy {
+    enabled: bool,
+    routes: Vec<(GlobMatcher, bool)>,
+}
 
-    #[test]
-    fn test_grpc_to_http_mapping() {
-        assert_eq!(grpc_to_http_status(tonic::Code::Ok), StatusCode::OK);
-        assert_eq!(
-            grpc_to_http_status(tonic::Code::InvalidArgument),
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(
-            grpc_to_http_status(tonic::Code::NotFound),
-            StatusCode::NOT_FOUND
-        );
-        assert_eq!(
-            grpc_to_http_status(tonic::Code::AlreadyExists),
-            StatusCode::CONFLICT
-        );
-        assert_eq!(
-            grpc_to_http_status(tonic::Code::PermissionDenied),
-            StatusCode::FORBIDDEN
-        );
-        assert_eq!(
-            grpc_to_http_status(tonic::Code::Unauthenticated),
-            StatusCode::UNAUTHORIZED
-        );
-        assert_eq!(
-            grpc_to_http_status(tonic::Code::ResourceExhausted),
-            StatusCode::TOO_MANY_REQUESTS
-        );
-        assert_eq!(
-            grpc_to_http_status(tonic::Code::Unimplemented),
-            StatusCode::NOT_IMPLEMENTED
-        );
-        assert_eq!(
-            grpc_to_http_status(tonic::Code::Internal),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
-        assert_eq!(
-            grpc_to_http_status(tonic::Code::Unavailable),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
-        assert_eq!(
-            grpc_to_http_status(tonic::Code::DeadlineExceeded),
-            StatusCode::GATEWAY_TIMEOUT
-        );
+impl ErrorDetailsPolicy {
+    /// No details on any route, until a [`route`](Self::route) switches them on.
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            routes: Vec::new(),
+        }
     }
 
-    #[test]
-    fn test_grpc_code_name() {
-        assert_eq!(grpc_code_name(tonic::Code::Ok), "OK");
-        assert_eq!(grpc_code_name(tonic::Code::NotFound), "NOT_FOUND");
-        assert_eq!(
-            grpc_code_name(tonic::Code::Unauthenticated),
-            "UNAUTHENTICATED"
-        );
+    /// Add an override for the routes `pattern` matches, checked after the
+    /// ones added before it.
+    ///
+    /// # Errors
+    ///
+    /// A pattern that does not start with `/` (it could never match a route)
+    /// or is not a valid glob.
+    pub fn route(mut self, pattern: &str, enabled: bool) -> Result<Self, String> {
+        // Route paths always start with `/`; a relative pattern is a
+        // missing-slash typo that would silently never apply.
+        if !pattern.starts_with('/') {
+            return Err(format!(
+                "error details route pattern {pattern:?} must start with '/'"
+            ));
+        }
+        self.routes
+            .push((crate::shield::matcher::path_glob(pattern)?, enabled));
+        Ok(self)
     }
 
-    #[test]
-    fn test_status_to_response() {
-        let status = tonic::Status::not_found("user not found");
-        let response = status_to_response(status);
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    /// Whether the route mounted at `route_path` (axum form, e.g.
+    /// `/v1/users/{id}`) returns details: the first matching rule decides,
+    /// otherwise the global switch.
+    pub fn enabled_for(&self, route_path: &str) -> bool {
+        for (matcher, enabled) in &self.routes {
+            if matcher.is_match(route_path) {
+                return *enabled;
+            }
+        }
+        self.enabled
     }
 }
+
+impl Default for ErrorDetailsPolicy {
+    /// Details on every route.
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            routes: Vec::new(),
+        }
+    }
+}
+
+/// Whether `full_name` is a well-known type with a special ProtoJSON
+/// representation, which an `Any` carries under `value`
+/// (<https://protobuf.dev/programming-guides/json/#any>). The same set
+/// prost-reflect wraps when it serializes an `Any`.
+fn has_special_json(full_name: &str) -> bool {
+    matches!(
+        full_name,
+        "google.protobuf.Any"
+            | "google.protobuf.Timestamp"
+            | "google.protobuf.Duration"
+            | "google.protobuf.Struct"
+            | "google.protobuf.FloatValue"
+            | "google.protobuf.DoubleValue"
+            | "google.protobuf.Int32Value"
+            | "google.protobuf.Int64Value"
+            | "google.protobuf.UInt32Value"
+            | "google.protobuf.UInt64Value"
+            | "google.protobuf.BoolValue"
+            | "google.protobuf.StringValue"
+            | "google.protobuf.BytesValue"
+            | "google.protobuf.FieldMask"
+            | "google.protobuf.ListValue"
+            | "google.protobuf.Value"
+            | "google.protobuf.Empty"
+    )
+}
+
+/// Whether `value` is the ProtoJSON of a packed `google.rpc.DebugInfo`: an
+/// object whose `@type` names it, or an `Any` whose `value` is one.
+fn is_packed_debug_info(value: &Value) -> bool {
+    let Some(fields) = value.as_object() else {
+        return false;
+    };
+    let type_name = fields
+        .get("@type")
+        .and_then(Value::as_str)
+        .map(|url| url.rsplit_once('/').map_or(url, |(_, name)| name));
+    match type_name {
+        Some(DEBUG_INFO) => true,
+        Some("google.protobuf.Any") => fields.get("value").is_some_and(is_packed_debug_info),
+        _ => false,
+    }
+}
+
+/// Remove every packed `DebugInfo` below `value`, at any depth: an array
+/// element is dropped, an object field (a message field or map entry) is
+/// cleared, which ProtoJSON reads as unset. A `Struct` key that merely looks
+/// like a DebugInfo `@type` is removed as well; over-withholding is the safe
+/// side of that ambiguity.
+fn strip_debug_info(value: &mut Value) {
+    match value {
+        Value::Array(items) => {
+            items.retain(|item| !is_packed_debug_info(item));
+            items.iter_mut().for_each(strip_debug_info);
+        }
+        Value::Object(fields) => {
+            fields.retain(|_, field| !is_packed_debug_info(field));
+            fields.values_mut().for_each(strip_debug_info);
+        }
+        _ => {}
+    }
+}
+
+/// Whether `name` is a protobuf full name: dot-separated identifiers, each a
+/// letter or `_` followed by letters, digits or `_`.
+fn is_full_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.split('.').all(|part| {
+            let mut chars = part.chars();
+            matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+}
+
+/// The rendered details of one status.
+#[derive(Debug, Default)]
+struct RenderedDetails {
+    /// ProtoJSON `Any` entries, in upstream order.
+    details: Vec<Value>,
+    /// Opaque-detail extension entries, in upstream order.
+    opaque: Vec<Value>,
+}
+
+/// An entry of the structured-proxy opaque-detail extension, for a detail whose
+/// type no descriptor describes: `{"index", "typeUrl", "bytes"}`, where `index`
+/// is its position among the forwarded details (so merging `details` and
+/// `opaqueDetails` by position restores the upstream order), `typeUrl` the
+/// original type URL and `bytes` the standard base64 of the original bytes.
+/// It carries no `@type` and lives outside `details`, so it cannot be taken for
+/// a ProtoJSON `Any`.
+fn opaque_entry(index: usize, type_url: &str, value: &[u8]) -> Value {
+    let mut out = Map::with_capacity(3);
+    out.insert("index".into(), index.into());
+    out.insert("typeUrl".into(), type_url.into());
+    out.insert(
+        "bytes".into(),
+        base64::engine::general_purpose::STANDARD
+            .encode(value)
+            .into(),
+    );
+    Value::Object(out)
+}
+
+/// Renders the typed details of a gRPC status (`grpc-status-details-bin`) as
+/// proto3 JSON.
+///
+/// Detail types resolve in one pool: the product descriptors, completed with
+/// the well-known types and the canonical `google/rpc/status.proto` and
+/// `error_details.proto` for whatever the product does not define itself. A
+/// service's own detail messages (and its own `google.rpc` revision) render as
+/// it defines them, the canonical ones are always available even when the
+/// product descriptors do not import them, and a type packed inside another
+/// detail resolves from the same pool as the detail itself.
+///
+/// Details use the canonical proto3 JSON mapping (unset fields omitted, 64-bit
+/// integers as strings), the form clients of the `google.rpc` model expect.
+#[derive(Debug, Clone)]
+pub struct StatusDetails {
+    pool: DescriptorPool,
+}
+
+impl StatusDetails {
+    /// Build a renderer over `product`, completed with the canonical
+    /// descriptors it lacks.
+    pub fn new(product: &DescriptorPool) -> Self {
+        let mut canonical = DescriptorPool::global();
+        canonical
+            .decode_file_descriptor_set(tonic_types::pb::FILE_DESCRIPTOR_SET)
+            .expect("tonic-types ships a valid google.rpc descriptor set");
+        let mut pool = product.clone();
+        // `files()` lists dependencies before their dependents, so each
+        // canonical file finds its imports already present.
+        for file in canonical.files() {
+            if pool.get_file_by_name(file.name()).is_some() {
+                continue;
+            }
+            // A product that defines the same types under another file name
+            // keeps its own definitions: the conflicting canonical file is
+            // left out.
+            if let Err(e) = pool.add_file_descriptor_proto(file.file_descriptor_proto().clone()) {
+                tracing::debug!(file = %file.name(), "canonical descriptor not merged: {e}");
+            }
+        }
+        Self { pool }
+    }
+
+    /// The details of `status`, `google.rpc.DebugInfo` left out.
+    ///
+    /// A detail whose type resolves goes to `details` in its ProtoJSON `Any`
+    /// form: `@type` plus the message fields, or `@type` plus `value` for a
+    /// well-known type with a special JSON representation. A type no descriptor
+    /// describes has no ProtoJSON form (the mapping requires the type), so it
+    /// goes to the opaque-detail extension instead (see [`opaque_entry`]).
+    ///
+    /// # Errors
+    ///
+    /// [`MalformedStatus`] when the trailer is not a `google.rpc.Status`, or a
+    /// detail of a known type does not decode or has no valid JSON form. Such a
+    /// detail is never passed on as opaque bytes, since that would present a
+    /// broken value as an unknown one.
+    fn render(&self, status: &tonic::Status) -> Result<RenderedDetails, MalformedStatus> {
+        let mut rendered = RenderedDetails::default();
+        let raw = status.details();
+        if raw.is_empty() {
+            return Ok(rendered);
+        }
+        let decoded = tonic_types::pb::Status::decode(raw).map_err(|e| {
+            tracing::error!("malformed grpc-status-details-bin trailer: {e}");
+            MalformedStatus
+        })?;
+        // The trailer must describe the same error as grpc-status and
+        // grpc-message (gRPC richer error model); otherwise its details would
+        // be attached to an error they were not written for.
+        if decoded.code != status.code() as i32 || decoded.message != status.message() {
+            tracing::error!(
+                trailer_code = decoded.code,
+                status_code = status.code() as i32,
+                "grpc-status-details-bin disagrees with grpc-status / grpc-message"
+            );
+            return Err(MalformedStatus);
+        }
+        rendered.details.reserve(decoded.details.len());
+        // Position among the forwarded details: DebugInfo takes no index, so
+        // the numbering does not reveal that one was withheld.
+        let mut index = 0usize;
+        for any in &decoded.details {
+            // ProtoJSON identifies the type by the last `/`-segment of the URL
+            // (`type.googleapis.com/google.rpc.ErrorInfo`). A name that is not
+            // a protobuf full name (empty after a trailing `/`, a query suffix,
+            // an empty segment) could be a disguised DebugInfo, so the whole
+            // status is refused rather than its bytes passed on as opaque.
+            let type_url = any.type_url.as_str();
+            let type_name = type_url.rsplit_once('/').map_or(type_url, |(_, name)| name);
+            if !is_full_name(type_name) {
+                tracing::error!(%type_url, "error detail with a malformed type URL");
+                return Err(MalformedStatus);
+            }
+            if type_name == DEBUG_INFO {
+                continue;
+            }
+            match self.resolve(type_name) {
+                Some(desc) => {
+                    let mut entry = self.typed_entry(type_url, type_name, desc, &any.value)?;
+                    // An Any detail packing DebugInfo is withheld like a direct
+                    // one; DebugInfo packed deeper is cut out of the entry.
+                    if is_packed_debug_info(&entry) {
+                        continue;
+                    }
+                    strip_debug_info(&mut entry);
+                    rendered.details.push(entry);
+                }
+                None => rendered
+                    .opaque
+                    .push(opaque_entry(index, type_url, &any.value)),
+            }
+            index += 1;
+        }
+        Ok(rendered)
+    }
+
+    /// The ProtoJSON `Any` form of a detail whose type resolved.
+    fn typed_entry(
+        &self,
+        type_url: &str,
+        type_name: &str,
+        desc: MessageDescriptor,
+        value: &[u8],
+    ) -> Result<Value, MalformedStatus> {
+        // ProtoJSON puts a well-known type with a special JSON representation
+        // under `value` whatever that JSON looks like (a Struct is an object,
+        // yet still wrapped), so the choice follows the type, not the shape.
+        let wrapped = has_special_json(desc.full_name());
+        let json = self.to_json(type_name, desc, value)?;
+        let mut out = Map::new();
+        out.insert("@type".into(), type_url.into());
+        match json {
+            Value::Object(fields) if !wrapped => out.extend(fields),
+            other => {
+                out.insert("value".into(), other);
+            }
+        }
+        Ok(Value::Object(out))
+    }
+
+    fn resolve(&self, type_name: &str) -> Option<MessageDescriptor> {
+        self.pool.get_message_by_name(type_name)
+    }
+
+    fn to_json(
+        &self,
+        type_name: &str,
+        desc: MessageDescriptor,
+        value: &[u8],
+    ) -> Result<Value, MalformedStatus> {
+        let msg = DynamicMessage::decode(desc, value).map_err(|e| {
+            tracing::error!(detail = %type_name, "undecodable error detail: {e}");
+            MalformedStatus
+        })?;
+        msg.serialize_with_options(serde_json::value::Serializer, &SerializeOptions::new())
+            .map_err(|e| {
+                tracing::error!(detail = %type_name, "error detail has no valid JSON form: {e}");
+                MalformedStatus
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests;
