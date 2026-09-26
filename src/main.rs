@@ -25,8 +25,10 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let config =
-        structured_proxy::config::ProxyConfig::from_file(std::path::Path::new(&cli.config))?;
+    // Reads the ProxyConfig and the transcoding settings kept outside it
+    // (error_details, streaming.ndjson_envelope) from the same file.
+    let server = structured_proxy::ProxyServer::from_file(std::path::Path::new(&cli.config))?;
+    let config = server.config();
 
     tracing::info!(
         service = %config.service.name,
@@ -36,6 +38,5 @@ async fn main() -> anyhow::Result<()> {
         "Starting structured-proxy"
     );
 
-    let server = structured_proxy::ProxyServer::from_config(config);
     server.serve().await
 }

@@ -67,7 +67,7 @@ pub fn short_hash(input: &str) -> String {
 
 /// Build a glob matcher where `*` stays within a path segment and `**` spans
 /// segments, matching the `google.api.http` / maintenance path convention.
-fn path_glob(pattern: &str) -> Result<GlobMatcher, String> {
+pub(crate) fn path_glob(pattern: &str) -> Result<GlobMatcher, String> {
     globset::GlobBuilder::new(pattern)
         .literal_separator(true)
         .build()
