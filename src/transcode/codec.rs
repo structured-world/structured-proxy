@@ -3,7 +3,6 @@
 //! Allows sending/receiving protobuf messages without compile-time type information,
 //! using `MessageDescriptor` for runtime encoding/decoding.
 
-use prost::bytes::Buf;
 use prost::Message;
 use prost_reflect::{DynamicMessage, MessageDescriptor};
 use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
@@ -43,12 +42,11 @@ impl Decoder for DynamicDecoder {
     type Item = DynamicMessage;
     type Error = Status;
 
+    /// Decode one gRPC frame. tonic calls this once per complete frame, so an
+    /// empty buffer is a message whose fields all hold their defaults (e.g.
+    /// `google.protobuf.Empty`), not the absence of one.
     fn decode(&mut self, buf: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Status> {
-        let remaining = buf.remaining();
-        if remaining == 0 {
-            return Ok(None);
-        }
-        let msg = DynamicMessage::decode(self.desc.clone(), buf.copy_to_bytes(remaining))
+        let msg = DynamicMessage::decode(self.desc.clone(), buf)
             .map_err(|e| Status::internal(format!("decode error: {e}")))?;
         Ok(Some(msg))
     }
@@ -86,17 +84,4 @@ impl Codec for DynamicCodec {
 }
 
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn test_dynamic_codec_creation() {
-        // Use google.protobuf.Empty as a universal test message
-        let pool = prost_reflect::DescriptorPool::decode(
-            prost_reflect::DescriptorPool::global()
-                .encode_to_vec()
-                .as_slice(),
-        )
-        .unwrap_or_else(|_| prost_reflect::DescriptorPool::new());
-        // Basic smoke test — codec can be created with any message descriptor
-        let _ = pool;
-    }
-}
+mod tests;
