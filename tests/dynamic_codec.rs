@@ -21,12 +21,21 @@ use structured_proxy::transcode::codec::DynamicCodec;
 
 /// `test.v1.Item { string name = 1; }`.
 fn item_desc() -> MessageDescriptor {
+    item_desc_with("proto3", Label::Optional)
+}
+
+/// The proto2 `test.v1.Item { required string name = 1; }`.
+fn required_item_desc() -> MessageDescriptor {
+    item_desc_with("proto2", Label::Required)
+}
+
+fn item_desc_with(syntax: &str, label: Label) -> MessageDescriptor {
     let item = DescriptorProto {
         name: Some("Item".to_string()),
         field: vec![FieldDescriptorProto {
             name: Some("name".to_string()),
             number: Some(1),
-            label: Some(Label::Optional as i32),
+            label: Some(label as i32),
             r#type: Some(Type::String as i32),
             ..Default::default()
         }],
@@ -36,7 +45,7 @@ fn item_desc() -> MessageDescriptor {
         name: Some("item.proto".to_string()),
         package: Some("test.v1".to_string()),
         message_type: vec![item],
-        syntax: Some("proto3".to_string()),
+        syntax: Some(syntax.to_string()),
         ..Default::default()
     };
     let fds = FileDescriptorSet { file: vec![file] };
@@ -153,6 +162,17 @@ async fn client_decodes_an_all_default_response() {
     let desc = item_desc();
     let reply = call(item(&desc, "reply-empty")).await.unwrap();
     assert_eq!(reply, DynamicMessage::new(desc));
+}
+
+#[tokio::test]
+async fn empty_response_missing_a_required_field_is_rejected() {
+    // A zero-byte frame is a valid message only when no field is required: for
+    // a proto2 message with a `required` field it is an uninitialized one, and
+    // the client must fail with INTERNAL rather than hand it on as a reply.
+    let desc = required_item_desc();
+    let err = call(item(&desc, "reply-empty")).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Internal, "{err:?}");
+    assert!(err.message().contains("required"), "{err:?}");
 }
 
 #[tokio::test]

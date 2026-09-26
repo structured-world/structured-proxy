@@ -354,8 +354,14 @@ async fn product_unknown_and_well_known_details_are_told_apart() {
     // its fields and a well-known type with a special JSON form sits under
     // `value` as that JSON, both in `details`; the type no descriptor
     // describes goes to `opaqueDetails` (its position, original type URL and
-    // base64 of the original bytes), never into `details`.
-    let app = proxy(ErrorDetailsPolicy::default()).await;
+    // base64 of the original bytes), never into `details`, on the route that
+    // switches the extension on.
+    let app = proxy(
+        ErrorDetailsPolicy::default()
+            .opaque_route("/v1/things/*", true)
+            .unwrap(),
+    )
+    .await;
     let (status, body) = get_json(&app, "/v1/things/mixed").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(
@@ -369,6 +375,12 @@ async fn product_unknown_and_well_known_details_are_told_apart() {
         body["opaqueDetails"],
         json!([{"index": 1, "typeUrl": "type.googleapis.com/acme.v1.Missing", "bytes": "CJYB"}])
     );
+    // A route the rule does not match keeps the default: the unknown detail is
+    // withheld, since its bytes cannot be checked for a nested DebugInfo.
+    let (status, quiet) = get_json(&app, "/v1/quiet/mixed").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(quiet["details"], body["details"]);
+    assert!(quiet.get("opaqueDetails").is_none(), "{quiet}");
 }
 
 // --- per-route switch -------------------------------------------------------
@@ -525,6 +537,36 @@ async fn yaml_switches_route_details_off_and_envelopes_ndjson() {
                 "details": rich_details()
             }}),
         ]
+    );
+}
+
+#[tokio::test]
+async fn yaml_switches_opaque_details_globally_and_per_route() {
+    // `opaque: true` turns the extension on everywhere and a rule setting only
+    // `opaque: false` turns it back off for one route, leaving its details on.
+    let app = proxy_from_yaml(
+        "error_details:\n  opaque: true\n  routes:\n    - pattern: \"/v1/quiet/*\"\n      opaque: false\n",
+    )
+    .await;
+    let (_, things) = get_json(&app, "/v1/things/mixed").await;
+    assert_eq!(things["opaqueDetails"][0]["index"], 1, "{things}");
+    let (_, quiet) = get_json(&app, "/v1/quiet/mixed").await;
+    assert_eq!(quiet["details"], things["details"]);
+    assert!(quiet.get("opaqueDetails").is_none(), "{quiet}");
+}
+
+#[test]
+fn yaml_route_rule_without_a_switch_is_rejected() {
+    // A rule that sets neither `enabled` nor `opaque` would match routes and
+    // change nothing, which is a mistake rather than an intent.
+    let err = structured_proxy::ProxyServer::from_yaml_str(
+        "upstream:\n  default: \"http://127.0.0.1:1\"\nerror_details:\n  routes:\n    - pattern: \"/v1/**\"\n",
+    )
+    .err()
+    .expect("a rule without a switch must be rejected");
+    assert!(
+        err.to_string().contains("neither enabled nor opaque"),
+        "{err}"
     );
 }
 

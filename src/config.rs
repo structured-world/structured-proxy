@@ -130,9 +130,12 @@ impl Default for StreamingConfig {
 /// ```yaml
 /// error_details:
 ///   enabled: true
+///   opaque: false
 ///   routes:
 ///     - pattern: "/v1/admin/**"
 ///       enabled: false
+///     - pattern: "/v1/partner/**"
+///       opaque: true
 /// streaming:
 ///   ndjson_envelope: true
 /// ```
@@ -155,16 +158,25 @@ struct ErrorDetailsFileConfig {
     /// Default for routes no rule matches.
     #[serde(default = "default_true")]
     enabled: bool,
-    /// Per-route overrides, first match wins.
+    /// Default for routes no rule matches: whether details of types no
+    /// descriptor describes go to `opaqueDetails` instead of being withheld.
+    #[serde(default)]
+    opaque: bool,
+    /// Per-route overrides; for each switch, the first matching rule that
+    /// sets it wins.
     #[serde(default)]
     routes: Vec<ErrorDetailsRouteFileConfig>,
 }
 
+/// A rule sets `enabled`, `opaque` or both; one setting neither is rejected.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ErrorDetailsRouteFileConfig {
     pattern: String,
-    enabled: bool,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    opaque: Option<bool>,
 }
 
 /// The `streaming:` keys [`StreamingConfig`] does not hold. Both read the same
@@ -236,7 +248,8 @@ impl TranscodeFileConfig {
     ///
     /// # Errors
     ///
-    /// An `error_details` route pattern that is relative or not a valid glob.
+    /// An `error_details` route pattern that is relative or not a valid glob,
+    /// or a route rule that sets neither `enabled` nor `opaque`.
     pub(crate) fn options(&self) -> Result<crate::transcode::TranscodeOptions, String> {
         use crate::transcode::error::ErrorDetailsPolicy;
         let mut options = crate::transcode::TranscodeOptions::default()
@@ -246,9 +259,18 @@ impl TranscodeFileConfig {
                 ErrorDetailsPolicy::default()
             } else {
                 ErrorDetailsPolicy::disabled()
-            };
+            }
+            .with_opaque_details(cfg.opaque);
             let policy = cfg.routes.iter().try_fold(base, |policy, rule| {
-                policy.route(&rule.pattern, rule.enabled)
+                // A rule without a switch would match routes and change
+                // nothing, which is a config mistake, not an intent.
+                if rule.enabled.is_none() && rule.opaque.is_none() {
+                    return Err(format!(
+                        "error details route {:?} sets neither enabled nor opaque",
+                        rule.pattern
+                    ));
+                }
+                policy.rule(&rule.pattern, rule.enabled, rule.opaque)
             })?;
             options = options.with_error_details(policy);
         }

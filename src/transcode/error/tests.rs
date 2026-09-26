@@ -73,6 +73,11 @@ fn canonical_only() -> StatusDetails {
     StatusDetails::new(&DescriptorPool::new())
 }
 
+/// [`canonical_only`] with the opaque-detail extension switched on.
+fn canonical_with_opaque() -> StatusDetails {
+    canonical_only().with_opaque_details(true)
+}
+
 /// An `INVALID_ARGUMENT` status carrying `ErrorInfo` + `BadRequest`, the shape
 /// the issue's acceptance criterion names.
 fn rich_status() -> tonic::Status {
@@ -253,17 +258,34 @@ fn debug_info_is_dropped_under_any_type_url_prefix() {
 }
 
 #[test]
+fn unknown_detail_type_is_withheld_by_default() {
+    // Bytes of a type no descriptor describes cannot be inspected, so they may
+    // carry a DebugInfo in a field the proxy cannot see. Unless the extension
+    // is switched on, such a detail is withheld and `opaqueDetails` is absent.
+    let debug = tonic_types::pb::DebugInfo {
+        detail: "password=hunter2".into(),
+        ..Default::default()
+    };
+    let status =
+        status_with_raw_details(&[("type.googleapis.com/acme.v1.Wrapper", debug.encode_to_vec())]);
+    assert_eq!(
+        error_body(&status, Some(&canonical_only())),
+        json!({"error": "FAILED_PRECONDITION", "message": "raw", "code": 9, "details": []})
+    );
+}
+
+#[test]
 fn unknown_detail_type_goes_to_opaque_details() {
-    // A type neither pool knows has no ProtoJSON form. It is kept, with its
-    // original type URL and bytes, in `opaqueDetails` next to `details`, never
-    // inside `details` and never under `@type`, so no client can take it for a
-    // message of that type.
+    // With the extension on, a type neither pool knows (it has no ProtoJSON
+    // form) is kept, with its original type URL and bytes, in `opaqueDetails`
+    // next to `details`, never inside `details` and never under `@type`, so no
+    // client can take it for a message of that type.
     let status = status_with_raw_details(&[(
         "type.googleapis.com/acme.v1.Unknown",
         vec![0x08, 0x96, 0x01],
     )]);
     assert_eq!(
-        error_body(&status, Some(&canonical_only())),
+        error_body(&status, Some(&canonical_with_opaque())),
         json!({
             "error": "FAILED_PRECONDITION",
             "message": "raw",
@@ -304,7 +326,7 @@ fn opaque_index_is_the_position_among_forwarded_details() {
         ("type.googleapis.com/acme.v1.Unknown", vec![0x08, 0x01]),
         ("type.googleapis.com/google.rpc.ErrorInfo", info("LAST")),
     ]);
-    let body = error_body(&status, Some(&canonical_only()));
+    let body = error_body(&status, Some(&canonical_with_opaque()));
     assert_eq!(
         body["details"],
         json!([
@@ -533,7 +555,8 @@ fn debug_info_packed_in_an_any_detail_is_dropped() {
         ),
         ("type.googleapis.com/acme.v1.Unknown", vec![0x08, 0x01]),
     ]);
-    let body = error_body(&status, Some(&StatusDetails::new(&pool)));
+    let renderer = StatusDetails::new(&pool).with_opaque_details(true);
+    let body = error_body(&status, Some(&renderer));
     assert_eq!(body["details"], json!([]));
     assert_eq!(body["opaqueDetails"][0]["index"], 0);
     let text = body.to_string();
@@ -796,7 +819,8 @@ fn detail_with_required_debug_info_field_is_withheld() {
         ),
         ("type.googleapis.com/acme.Unknown", vec![1, 2, 3]),
     ]);
-    let body = error_body(&status, Some(&StatusDetails::new(&pool)));
+    let renderer = StatusDetails::new(&pool).with_opaque_details(true);
+    let body = error_body(&status, Some(&renderer));
     // The top-level Wrapper is withheld; inside Outer only the optional field
     // holding the Wrapper goes.
     assert_eq!(
@@ -1076,6 +1100,30 @@ fn policy_first_matching_rule_wins() {
     // one listed after it.
     let p = policy(true, &[("/v1/**", false), ("/v1/public/**", true)]).unwrap();
     assert!(!p.enabled_for("/v1/public/items"));
+}
+
+#[test]
+fn policy_opaque_is_off_by_default_and_decided_per_switch() {
+    // The opaque-detail extension is off unless switched on. Each switch is
+    // decided by the first matching rule that sets it, so an `opaque` rule
+    // listed first does not shadow a later `enabled` rule, and vice versa.
+    assert!(!ErrorDetailsPolicy::default().opaque_for("/v1/users/{id}"));
+    assert!(!ErrorDetailsPolicy::disabled().opaque_for("/v1/users/{id}"));
+    let p = ErrorDetailsPolicy::default()
+        .opaque_route("/v1/partner/**", true)
+        .unwrap()
+        .route("/v1/partner/internal/**", false)
+        .unwrap();
+    assert!(p.opaque_for("/v1/partner/orders"));
+    assert!(!p.enabled_for("/v1/partner/internal/x"));
+    assert!(p.enabled_for("/v1/partner/orders"));
+    assert!(!p.opaque_for("/v1/users/{id}"));
+    let p = ErrorDetailsPolicy::default()
+        .with_opaque_details(true)
+        .opaque_route("/v1/public/**", false)
+        .unwrap();
+    assert!(p.opaque_for("/v1/users/{id}"));
+    assert!(!p.opaque_for("/v1/public/items"));
 }
 
 #[test]

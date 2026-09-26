@@ -71,6 +71,9 @@ struct RouteEntry {
     error_details: Option<Arc<StatusDetails>>,
     /// Wrap NDJSON stream lines in `{"result"}` / `{"error"}` envelopes.
     ndjson_envelope: bool,
+    /// [`codec::has_required_fields`] of the response type, computed once so a
+    /// request does not walk the descriptor.
+    response_has_required: bool,
 }
 
 /// How [`routes_with_options`] builds the transcoded routes.
@@ -159,14 +162,26 @@ pub fn routes_with_options<S: TranscodeState>(
 
     tracing::info!("Registering {} transcoded REST→gRPC routes", bindings.len());
 
-    // One renderer shared by every route that returns details, built only if
-    // at least one does.
-    let mut status_details: Option<Arc<StatusDetails>> = None;
+    // At most two renderers, without and with the opaque-detail extension,
+    // each shared by every route that uses it and built only when one does.
+    // The second is a copy of the first: the descriptor pool inside is shared.
+    let mut status_details: [Option<Arc<StatusDetails>>; 2] = [None, None];
     let mut router: Router<S> = Router::new();
     for mut binding in bindings {
-        if options.error_details.enabled_for(&binding.axum_path) {
-            let renderer = status_details.get_or_insert_with(|| Arc::new(StatusDetails::new(pool)));
-            binding.entry.error_details = Some(Arc::clone(renderer));
+        let policy = &options.error_details;
+        if policy.enabled_for(&binding.axum_path) {
+            let opaque = policy.opaque_for(&binding.axum_path);
+            let slot = usize::from(opaque);
+            if status_details[slot].is_none() {
+                let base = status_details
+                    .iter()
+                    .flatten()
+                    .next()
+                    .map(|existing| existing.as_ref().clone())
+                    .unwrap_or_else(|| StatusDetails::new(pool));
+                status_details[slot] = Some(Arc::new(base.with_opaque_details(opaque)));
+            }
+            binding.entry.error_details = status_details[slot].clone();
         }
         binding.entry.ndjson_envelope = options.ndjson_envelope;
         let method = binding.entry.http_method;
@@ -353,7 +368,8 @@ async fn streaming_handler<S: TranscodeState>(
     metadata::apply_request_deadline(&mut grpc_request, &headers);
 
     let output_desc = entry.method.output();
-    let grpc_codec = codec::DynamicCodec::new(output_desc.clone());
+    let grpc_codec =
+        codec::DynamicCodec::with_required_check(output_desc.clone(), entry.response_has_required);
     let grpc_path = entry.grpc_path.clone();
 
     let mut grpc_client = Grpc::new(channel);
@@ -591,7 +607,8 @@ async fn transcode_handler<S: TranscodeState>(
     metadata::apply_request_deadline(&mut grpc_request, &headers);
 
     let output_desc = entry.method.output();
-    let grpc_codec = codec::DynamicCodec::new(output_desc.clone());
+    let grpc_codec =
+        codec::DynamicCodec::with_required_check(output_desc.clone(), entry.response_has_required);
     let grpc_path = entry.grpc_path.clone();
 
     let mut grpc_client = Grpc::new(channel);
@@ -665,6 +682,7 @@ fn extract_routes(pool: &DescriptorPool) -> Vec<RouteEntry> {
                 }
             };
 
+            let response_has_required = codec::has_required_fields(&method.output());
             for binding in extract_http_bindings(&method, &http_ext) {
                 entries.push(RouteEntry {
                     http_path: binding.http_path,
@@ -676,6 +694,7 @@ fn extract_routes(pool: &DescriptorPool) -> Vec<RouteEntry> {
                     // Decided per mounted path in `routes_with_options`.
                     error_details: None,
                     ndjson_envelope: false,
+                    response_has_required,
                 });
             }
         }
@@ -708,6 +727,7 @@ fn extract_streaming_routes(pool: &DescriptorPool) -> Vec<RouteEntry> {
                 }
             };
 
+            let response_has_required = codec::has_required_fields(&method.output());
             for binding in extract_http_bindings(&method, &http_ext) {
                 tracing::info!(
                     "Registering streaming route: {} {} → {}",
@@ -729,6 +749,7 @@ fn extract_streaming_routes(pool: &DescriptorPool) -> Vec<RouteEntry> {
                     // Decided per mounted path in `routes_with_options`.
                     error_details: None,
                     ndjson_envelope: false,
+                    response_has_required,
                 });
             }
         }

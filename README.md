@@ -112,14 +112,19 @@ streaming:
   ndjson_envelope: false
 
 # Optional: google.rpc.Status details in error bodies (see "Error responses").
-# On everywhere by default. Rules are checked in order and the first whose
+# On everywhere by default. `opaque` forwards details of types no descriptor
+# describes as `opaqueDetails` instead of withholding them (off by default).
+# Rules are checked in order; for each switch a rule sets, the first rule whose
 # pattern matches the mounted route decides; `*` stays within one path segment
 # (a path parameter counts as one), `**` spans segments.
 error_details:
   enabled: true
+  opaque: false
   routes:
     - pattern: "/v1/internal/**"
       enabled: false
+    - pattern: "/v1/partner/**"
+      opaque: true
 
 # Rate limiting (Shield)
 #
@@ -295,7 +300,10 @@ mapping (`INVALID_ARGUMENT` → 400, `NOT_FOUND` → 404, ...):
   the canonical `google/rpc/status.proto` and `error_details.proto`, which are
   always available. An upstream that sends no trailer yields `"details": []`.
 - `google.rpc.DebugInfo` is never forwarded: it carries stack traces and server
-  internals meant for the service's operators.
+  internals meant for the service's operators. It is removed wherever the
+  proxy knows the schema; a detail whose type is in neither descriptor set
+  cannot be checked, so it is withheld too unless the opaque-detail extension
+  below is switched on.
 - Details are on for every route. They can be switched off globally or per
   route (see below); on such a route the `details` and `opaqueDetails` keys are
   absent and the body is `{"error", "code", "message"}`.
@@ -316,9 +324,14 @@ mapping (`INVALID_ARGUMENT` → 400, `NOT_FOUND` → 404, ...):
 
 **Opaque-detail extension.** ProtoJSON cannot represent an `Any` whose type is
 unknown to the writer, so a detail whose type is in neither descriptor set has
-no place in `details`. Rather than drop it, structured-proxy keeps it in a
-separate `opaqueDetails` array, which is its own extension and **not** part of
-ProtoJSON or `google.rpc.Status`:
+no place in `details`. By default such a detail is withheld: its bytes cannot
+be inspected, and a `DebugInfo` in one of its fields would otherwise reach the
+client. When switched on (`opaque: true`, globally or in a route rule, or
+`ErrorDetailsPolicy::with_opaque_details` / `opaque_route`), structured-proxy
+keeps it in a separate `opaqueDetails` array instead. Switch it on only for
+upstreams trusted not to nest a `DebugInfo` in types the proxy has no
+descriptor for. The array is structured-proxy's own extension and **not** part
+of ProtoJSON or `google.rpc.Status`:
 
 ```json
 {
@@ -384,9 +397,11 @@ warning for a top-level or `streaming:` key no setting reads, so a misspelled
 `error_detail:` or `ndjson_envelop:` shows up at startup instead of silently
 leaving the default in force. An embedding
 service can choose in code with `ProxyServer::with_error_details`. Overrides are
-checked in the order they are added and the first whose pattern matches the
-mounted route decides; `*` stays within one path segment (a path parameter
-counts as one) and `**` spans segments:
+checked in the order they are added; for each switch (`enabled`, `opaque`) the
+first rule whose pattern matches the mounted route and that sets the switch
+decides, otherwise the global value; `*` stays within one path segment (a path
+parameter counts as one) and `**` spans segments. A config rule that sets
+neither switch is rejected:
 
 ```rust
 use structured_proxy::transcode::error::ErrorDetailsPolicy;
@@ -397,6 +412,8 @@ use structured_proxy::{config::ProxyConfig, ProxyServer};
 let policy = ErrorDetailsPolicy::default().route("/v1/admin/**", false)?;
 // Or: off everywhere except a public sub-route.
 // let policy = ErrorDetailsPolicy::disabled().route("/v1/public/**", true)?;
+// Unknown detail types as `opaqueDetails` for one trusted partner surface.
+let policy = policy.opaque_route("/v1/partner/**", true)?;
 Ok(ProxyServer::from_config(config).with_error_details(policy))
 # }
 ```

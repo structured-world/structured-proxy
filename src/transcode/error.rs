@@ -86,7 +86,8 @@ pub fn status_to_response_with_details(
 /// `error` is the gRPC code name, `code` its number and `message` the status
 /// message. With `details`, the body also carries `details`: the upstream's
 /// `google.rpc.Status.details` in proto3 JSON form (empty when the upstream sent
-/// none), plus `opaqueDetails` for details whose type no descriptor describes;
+/// none), plus `opaqueDetails` for details whose type no descriptor describes
+/// when the renderer forwards them ([`StatusDetails::with_opaque_details`]);
 /// without it, both keys are absent and the trailer is not read. When the
 /// details cannot be rendered faithfully the whole body is a generic `INTERNAL`
 /// instead, never a partial or reinterpreted set of details.
@@ -182,11 +183,28 @@ pub(crate) fn grpc_code_name(code: tonic::Code) -> &'static str {
 ///     .unwrap();
 /// assert!(!policy.enabled_for("/v1/users/{id}"));
 /// assert!(policy.enabled_for("/v1/public/items"));
+///
+/// // The opaque-detail extension, off unless switched on, here for one route.
+/// let policy = ErrorDetailsPolicy::default()
+///     .opaque_route("/v1/partner/**", true)
+///     .unwrap();
+/// assert!(!policy.opaque_for("/v1/users/{id}"));
+/// assert!(policy.opaque_for("/v1/partner/orders"));
 /// ```
 #[derive(Debug, Clone)]
 pub struct ErrorDetailsPolicy {
     enabled: bool,
-    routes: Vec<(GlobMatcher, bool)>,
+    opaque: bool,
+    routes: Vec<RouteRule>,
+}
+
+/// One override: a route glob and the switches it sets. A switch it leaves
+/// `None` is decided by a later rule or the global value.
+#[derive(Debug, Clone)]
+struct RouteRule {
+    matcher: GlobMatcher,
+    enabled: Option<bool>,
+    opaque: Option<bool>,
 }
 
 impl ErrorDetailsPolicy {
@@ -194,6 +212,7 @@ impl ErrorDetailsPolicy {
     pub fn disabled() -> Self {
         Self {
             enabled: false,
+            opaque: false,
             routes: Vec::new(),
         }
     }
@@ -205,7 +224,41 @@ impl ErrorDetailsPolicy {
     ///
     /// A pattern that does not start with `/` (it could never match a route)
     /// or is not a valid glob.
-    pub fn route(mut self, pattern: &str, enabled: bool) -> Result<Self, String> {
+    pub fn route(self, pattern: &str, enabled: bool) -> Result<Self, String> {
+        self.rule(pattern, Some(enabled), None)
+    }
+
+    /// Set, for every route without an override, whether a detail whose type
+    /// no descriptor describes goes to `opaqueDetails` (see
+    /// [`StatusDetails::with_opaque_details`]). Off by default: such bytes
+    /// cannot be checked for a nested DebugInfo.
+    pub fn with_opaque_details(mut self, enabled: bool) -> Self {
+        self.opaque = enabled;
+        self
+    }
+
+    /// Add an override of the opaque-detail extension for the routes `pattern`
+    /// matches, checked after the ones added before it.
+    ///
+    /// # Errors
+    ///
+    /// As [`route`](Self::route).
+    pub fn opaque_route(self, pattern: &str, enabled: bool) -> Result<Self, String> {
+        self.rule(pattern, None, Some(enabled))
+    }
+
+    /// Add an override setting either switch or both; the first matching rule
+    /// that sets a switch decides it.
+    ///
+    /// # Errors
+    ///
+    /// As [`route`](Self::route).
+    pub(crate) fn rule(
+        mut self,
+        pattern: &str,
+        enabled: Option<bool>,
+        opaque: Option<bool>,
+    ) -> Result<Self, String> {
         // Route paths always start with `/`; a relative pattern is a
         // missing-slash typo that would silently never apply.
         if !pattern.starts_with('/') {
@@ -213,29 +266,49 @@ impl ErrorDetailsPolicy {
                 "error details route pattern {pattern:?} must start with '/'"
             ));
         }
-        self.routes
-            .push((crate::shield::matcher::path_glob(pattern)?, enabled));
+        self.routes.push(RouteRule {
+            matcher: crate::shield::matcher::path_glob(pattern)?,
+            enabled,
+            opaque,
+        });
         Ok(self)
     }
 
     /// Whether the route mounted at `route_path` (axum form, e.g.
-    /// `/v1/users/{id}`) returns details: the first matching rule decides,
-    /// otherwise the global switch.
+    /// `/v1/users/{id}`) returns details: the first matching rule that sets
+    /// it decides, otherwise the global switch.
     pub fn enabled_for(&self, route_path: &str) -> bool {
-        for (matcher, enabled) in &self.routes {
-            if matcher.is_match(route_path) {
-                return *enabled;
-            }
-        }
-        self.enabled
+        self.decide(route_path, |rule| rule.enabled)
+            .unwrap_or(self.enabled)
+    }
+
+    /// Whether the route mounted at `route_path` forwards details of unknown
+    /// types in `opaqueDetails`: the first matching rule that sets it decides,
+    /// otherwise the global switch.
+    pub fn opaque_for(&self, route_path: &str) -> bool {
+        self.decide(route_path, |rule| rule.opaque)
+            .unwrap_or(self.opaque)
+    }
+
+    fn decide(
+        &self,
+        route_path: &str,
+        switch: impl Fn(&RouteRule) -> Option<bool>,
+    ) -> Option<bool> {
+        self.routes
+            .iter()
+            .filter_map(|rule| switch(rule).map(|value| (rule, value)))
+            .find(|(rule, _)| rule.matcher.is_match(route_path))
+            .map(|(_, value)| value)
     }
 }
 
 impl Default for ErrorDetailsPolicy {
-    /// Details on every route.
+    /// Details on every route, the opaque-detail extension off.
     fn default() -> Self {
         Self {
             enabled: true,
+            opaque: false,
             routes: Vec::new(),
         }
     }
@@ -442,11 +515,12 @@ fn complete_with_canonical(pool: &mut DescriptorPool, canonical: &DescriptorPool
 #[derive(Debug, Clone)]
 pub struct StatusDetails {
     pool: DescriptorPool,
+    opaque: bool,
 }
 
 impl StatusDetails {
     /// Build a renderer over `product`, completed with the canonical
-    /// descriptors it lacks.
+    /// descriptors it lacks. The opaque-detail extension starts off.
     pub fn new(product: &DescriptorPool) -> Self {
         let mut canonical = DescriptorPool::global();
         canonical
@@ -454,7 +528,20 @@ impl StatusDetails {
             .expect("tonic-types ships a valid google.rpc descriptor set");
         let mut pool = product.clone();
         complete_with_canonical(&mut pool, &canonical);
-        Self { pool }
+        Self {
+            pool,
+            opaque: false,
+        }
+    }
+
+    /// Whether a detail whose type no descriptor describes goes to
+    /// `opaqueDetails` (see [`opaque_entry`]) instead of being withheld. Its
+    /// bytes cannot be inspected, so a DebugInfo it carries in a field would
+    /// reach the client: switch it on only for upstreams trusted not to nest
+    /// one in types the proxy has no descriptor for.
+    pub fn with_opaque_details(mut self, enabled: bool) -> Self {
+        self.opaque = enabled;
+        self
     }
 
     /// The details of `status`, `google.rpc.DebugInfo` left out.
@@ -462,8 +549,9 @@ impl StatusDetails {
     /// A detail whose type resolves goes to `details` in its ProtoJSON `Any`
     /// form: `@type` plus the message fields, or `@type` plus `value` for a
     /// well-known type with a special JSON representation. A type no descriptor
-    /// describes has no ProtoJSON form (the mapping requires the type), so it
-    /// goes to the opaque-detail extension instead (see [`opaque_entry`]).
+    /// describes has no ProtoJSON form (the mapping requires the type) and its
+    /// bytes cannot be checked for a DebugInfo, so it is withheld, or goes to
+    /// the opaque-detail extension (see [`opaque_entry`]) when switched on.
     ///
     /// # Errors
     ///
@@ -511,9 +599,15 @@ impl StatusDetails {
                     // An Any detail packing DebugInfo, withheld like a direct one.
                     None => continue,
                 },
-                None => rendered
-                    .opaque
-                    .push(opaque_entry(index, type_url, &any.value)),
+                None if self.opaque => {
+                    rendered
+                        .opaque
+                        .push(opaque_entry(index, type_url, &any.value));
+                }
+                None => {
+                    tracing::debug!(%type_url, "error detail of an unknown type withheld");
+                    continue;
+                }
             }
             index += 1;
         }
