@@ -11,7 +11,10 @@ use axum::Json;
 use base64::Engine as _;
 use globset::GlobMatcher;
 use prost::Message as _;
-use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor, SerializeOptions};
+use prost_reflect::{
+    DescriptorPool, DynamicMessage, Kind, MessageDescriptor, ReflectMessage, SerializeOptions,
+    Value as PbValue,
+};
 use serde_json::{Map, Value};
 
 /// Full name of `google.rpc.DebugInfo`. It carries stack traces and server
@@ -265,40 +268,18 @@ fn has_special_json(full_name: &str) -> bool {
     )
 }
 
-/// Whether `value` is the ProtoJSON of a packed `google.rpc.DebugInfo`: an
-/// object whose `@type` names it, or an `Any` whose `value` is one.
-fn is_packed_debug_info(value: &Value) -> bool {
-    let Some(fields) = value.as_object() else {
-        return false;
-    };
-    let type_name = fields
-        .get("@type")
-        .and_then(Value::as_str)
-        .map(|url| url.rsplit_once('/').map_or(url, |(_, name)| name));
-    match type_name {
-        Some(DEBUG_INFO) => true,
-        Some("google.protobuf.Any") => fields.get("value").is_some_and(is_packed_debug_info),
-        _ => false,
-    }
-}
+/// Full name of `google.protobuf.Any`.
+const ANY: &str = "google.protobuf.Any";
 
-/// Remove every packed `DebugInfo` below `value`, at any depth: an array
-/// element is dropped, an object field (a message field or map entry) is
-/// cleared, which ProtoJSON reads as unset. A `Struct` key that merely looks
-/// like a DebugInfo `@type` is removed as well; over-withholding is the safe
-/// side of that ambiguity.
-fn strip_debug_info(value: &mut Value) {
-    match value {
-        Value::Array(items) => {
-            items.retain(|item| !is_packed_debug_info(item));
-            items.iter_mut().for_each(strip_debug_info);
-        }
-        Value::Object(fields) => {
-            fields.retain(|_, field| !is_packed_debug_info(field));
-            fields.values_mut().for_each(strip_debug_info);
-        }
-        _ => {}
-    }
+/// The type name an `Any.type_url` names, or `None` when the URL is malformed.
+///
+/// The URL must contain a `/`, and the part after the last one is the type's
+/// full name (`google/protobuf/any.proto`). Anything else (a bare name, a
+/// trailing `/`, a query suffix, an empty segment) could disguise a
+/// DebugInfo, so callers refuse the whole status on `None`.
+fn any_type_name(type_url: &str) -> Option<&str> {
+    let (_, name) = type_url.rsplit_once('/')?;
+    is_full_name(name).then_some(name)
 }
 
 /// Whether `name` is a protobuf full name: dot-separated identifiers, each a
@@ -341,6 +322,110 @@ fn opaque_entry(index: usize, type_url: &str, value: &[u8]) -> Value {
     Value::Object(out)
 }
 
+/// Add to `pool` every top-level message and enum of `canonical` it does not
+/// define, per type rather than per file.
+///
+/// A product may define some canonical types itself: in a file of another name,
+/// or in its own revision of the canonical file holding only a subset. Those
+/// definitions win. The canonical types it lacks still go in, through a copy
+/// of the canonical file renamed under `structured-proxy/canonical/` and
+/// reduced to the missing types; the copy also imports the product files that
+/// define the types it dropped, so its references resolve to the product's
+/// revisions.
+fn complete_with_canonical(pool: &mut DescriptorPool, canonical: &DescriptorPool) {
+    use std::collections::{BTreeSet, HashMap};
+
+    // Canonical file name → the pool files that now provide its types in its
+    // place (its renamed copy, product files defining some of them). A file
+    // importing it imports those instead.
+    let mut stand_ins: HashMap<String, BTreeSet<String>> = HashMap::new();
+    // `files()` lists dependencies before their dependents, so each file finds
+    // its imports already merged.
+    for file in canonical.files() {
+        let mut proto = file.file_descriptor_proto().clone();
+        let package = proto.package().to_owned();
+        let full = |name: &str| {
+            if package.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{package}.{name}")
+            }
+        };
+        // Files of the pool that already define a type of this file.
+        let mut defining_files = BTreeSet::new();
+        proto.message_type.retain(|message| {
+            match pool.get_message_by_name(&full(message.name())) {
+                Some(existing) => {
+                    defining_files.insert(existing.parent_file().name().to_owned());
+                    false
+                }
+                None => true,
+            }
+        });
+        proto
+            .enum_type
+            .retain(|en| match pool.get_enum_by_name(&full(en.name())) {
+                Some(existing) => {
+                    defining_files.insert(existing.parent_file().name().to_owned());
+                    false
+                }
+                None => true,
+            });
+        let everything_present = proto.message_type.is_empty() && proto.enum_type.is_empty();
+        let file_present = pool.get_file_by_name(file.name()).is_some();
+        if everything_present {
+            // Typically the very same file. When the types live in files of
+            // other names, importers of this one import those instead.
+            if !file_present {
+                stand_ins.insert(file.name().to_owned(), defining_files);
+            }
+            continue;
+        }
+        // A copy that leaves types out, or whose name the product already uses,
+        // goes in under its own name; importers then need it plus the product
+        // files that define the rest.
+        let renamed = !defining_files.is_empty() || file_present;
+        let mut provided_by = defining_files.clone();
+        if renamed {
+            let name = format!("structured-proxy/canonical/{}", file.name());
+            proto.name = Some(name.clone());
+            provided_by.insert(name);
+        }
+        let mut dependencies = BTreeSet::new();
+        for dep in &proto.dependency {
+            match stand_ins.get(dep) {
+                Some(files) => {
+                    // A product revision of the dependency stays importable
+                    // next to the copy that completes it.
+                    if pool.get_file_by_name(dep).is_some() {
+                        dependencies.insert(dep.clone());
+                    }
+                    dependencies.extend(files.iter().cloned());
+                }
+                None => {
+                    dependencies.insert(dep.clone());
+                }
+            }
+        }
+        dependencies.extend(defining_files);
+        proto.dependency = dependencies.into_iter().collect();
+        // Indexes into the old dependency list; nothing here needs them.
+        proto.public_dependency.clear();
+        proto.weak_dependency.clear();
+        proto.source_code_info = None;
+        match pool.add_file_descriptor_proto(proto) {
+            Ok(()) => {
+                if renamed {
+                    stand_ins.insert(file.name().to_owned(), provided_by);
+                }
+            }
+            Err(e) => {
+                tracing::debug!(file = %file.name(), "canonical descriptor not merged: {e}");
+            }
+        }
+    }
+}
+
 /// Renders the typed details of a gRPC status (`grpc-status-details-bin`) as
 /// proto3 JSON.
 ///
@@ -368,19 +453,7 @@ impl StatusDetails {
             .decode_file_descriptor_set(tonic_types::pb::FILE_DESCRIPTOR_SET)
             .expect("tonic-types ships a valid google.rpc descriptor set");
         let mut pool = product.clone();
-        // `files()` lists dependencies before their dependents, so each
-        // canonical file finds its imports already present.
-        for file in canonical.files() {
-            if pool.get_file_by_name(file.name()).is_some() {
-                continue;
-            }
-            // A product that defines the same types under another file name
-            // keeps its own definitions: the conflicting canonical file is
-            // left out.
-            if let Err(e) = pool.add_file_descriptor_proto(file.file_descriptor_proto().clone()) {
-                tracing::debug!(file = %file.name(), "canonical descriptor not merged: {e}");
-            }
-        }
+        complete_with_canonical(&mut pool, &canonical);
         Self { pool }
     }
 
@@ -424,31 +497,20 @@ impl StatusDetails {
         // the numbering does not reveal that one was withheld.
         let mut index = 0usize;
         for any in &decoded.details {
-            // ProtoJSON identifies the type by the last `/`-segment of the URL
-            // (`type.googleapis.com/google.rpc.ErrorInfo`). A name that is not
-            // a protobuf full name (empty after a trailing `/`, a query suffix,
-            // an empty segment) could be a disguised DebugInfo, so the whole
-            // status is refused rather than its bytes passed on as opaque.
             let type_url = any.type_url.as_str();
-            let type_name = type_url.rsplit_once('/').map_or(type_url, |(_, name)| name);
-            if !is_full_name(type_name) {
+            let Some(type_name) = any_type_name(type_url) else {
                 tracing::error!(%type_url, "error detail with a malformed type URL");
                 return Err(MalformedStatus);
-            }
+            };
             if type_name == DEBUG_INFO {
                 continue;
             }
             match self.resolve(type_name) {
-                Some(desc) => {
-                    let mut entry = self.typed_entry(type_url, type_name, desc, &any.value)?;
-                    // An Any detail packing DebugInfo is withheld like a direct
-                    // one; DebugInfo packed deeper is cut out of the entry.
-                    if is_packed_debug_info(&entry) {
-                        continue;
-                    }
-                    strip_debug_info(&mut entry);
-                    rendered.details.push(entry);
-                }
+                Some(desc) => match self.typed_entry(type_url, type_name, desc, &any.value)? {
+                    Some(entry) => rendered.details.push(entry),
+                    // An Any detail packing DebugInfo, withheld like a direct one.
+                    None => continue,
+                },
                 None => rendered
                     .opaque
                     .push(opaque_entry(index, type_url, &any.value)),
@@ -458,49 +520,162 @@ impl StatusDetails {
         Ok(rendered)
     }
 
-    /// The ProtoJSON `Any` form of a detail whose type resolved.
+    /// The ProtoJSON `Any` form of a detail whose type resolved, with every
+    /// DebugInfo packed inside it removed; `None` when the detail is itself an
+    /// `Any` packing a DebugInfo.
     fn typed_entry(
         &self,
         type_url: &str,
         type_name: &str,
         desc: MessageDescriptor,
         value: &[u8],
-    ) -> Result<Value, MalformedStatus> {
+    ) -> Result<Option<Value>, MalformedStatus> {
         // ProtoJSON puts a well-known type with a special JSON representation
         // under `value` whatever that JSON looks like (a Struct is an object,
         // yet still wrapped), so the choice follows the type, not the shape.
+        // Empty is one of them (JSON `{}` in the ProtoJSON table), as in Go's
+        // protojson and prost-reflect, so it is wrapped too.
         let wrapped = has_special_json(desc.full_name());
-        let json = self.to_json(type_name, desc, value)?;
+        let mut msg = DynamicMessage::decode(desc, value).map_err(|e| {
+            tracing::error!(detail = %type_name, "undecodable error detail: {e}");
+            MalformedStatus
+        })?;
+        if self.scrub(&mut msg)?.is_none() {
+            return Ok(None);
+        }
+        let json = msg
+            .serialize_with_options(serde_json::value::Serializer, &SerializeOptions::new())
+            .map_err(|e| {
+                tracing::error!(detail = %type_name, "error detail has no valid JSON form: {e}");
+                MalformedStatus
+            })?;
         let mut out = Map::new();
         out.insert("@type".into(), type_url.into());
         match json {
-            Value::Object(fields) if !wrapped => out.extend(fields),
+            Value::Object(fields) if !wrapped => {
+                // A field whose JSON name is `@type` would replace the Any's
+                // own type URL, and there is no faithful ProtoJSON form for it.
+                if fields.contains_key("@type") {
+                    tracing::error!(detail = %type_name, "error detail has a field named @type");
+                    return Err(MalformedStatus);
+                }
+                out.extend(fields);
+            }
             other => {
                 out.insert("value".into(), other);
             }
         }
-        Ok(Value::Object(out))
+        Ok(Some(Value::Object(out)))
     }
 
     fn resolve(&self, type_name: &str) -> Option<MessageDescriptor> {
         self.pool.get_message_by_name(type_name)
     }
 
-    fn to_json(
-        &self,
-        type_name: &str,
-        desc: MessageDescriptor,
-        value: &[u8],
-    ) -> Result<Value, MalformedStatus> {
-        let msg = DynamicMessage::decode(desc, value).map_err(|e| {
-            tracing::error!(detail = %type_name, "undecodable error detail: {e}");
+    /// Remove every DebugInfo an `Any` packs anywhere below `msg`, following
+    /// only fields whose type is `google.protobuf.Any` (singular, repeated or
+    /// map values), so data such as a `Struct` key named `@type` is never
+    /// mistaken for one. Returns `None` when `msg` is itself an `Any` packing a
+    /// DebugInfo (the caller drops it), otherwise whether anything changed.
+    fn scrub(&self, msg: &mut DynamicMessage) -> Result<Option<bool>, MalformedStatus> {
+        let desc = msg.descriptor();
+        if desc.full_name() == ANY {
+            return self.scrub_any(msg);
+        }
+        let mut changed = false;
+        for field in desc.fields() {
+            let Kind::Message(_) = field.kind() else {
+                continue;
+            };
+            if !msg.has_field(&field) {
+                continue;
+            }
+            match msg.get_field_mut(&field) {
+                PbValue::Message(inner) => match self.scrub(inner)? {
+                    Some(inner_changed) => changed |= inner_changed,
+                    None => {
+                        msg.clear_field(&field);
+                        changed = true;
+                    }
+                },
+                PbValue::List(items) => {
+                    let before = items.len();
+                    let mut failed = None;
+                    items.retain_mut(|item| match item {
+                        PbValue::Message(inner) if failed.is_none() => match self.scrub(inner) {
+                            Ok(Some(inner_changed)) => {
+                                changed |= inner_changed;
+                                true
+                            }
+                            Ok(None) => false,
+                            Err(e) => {
+                                failed = Some(e);
+                                true
+                            }
+                        },
+                        _ => true,
+                    });
+                    if let Some(e) = failed {
+                        return Err(e);
+                    }
+                    changed |= items.len() != before;
+                }
+                PbValue::Map(entries) => {
+                    let mut dropped = Vec::new();
+                    for (key, value) in entries.iter_mut() {
+                        if let PbValue::Message(inner) = value {
+                            match self.scrub(inner)? {
+                                Some(inner_changed) => changed |= inner_changed,
+                                None => dropped.push(key.clone()),
+                            }
+                        }
+                    }
+                    for key in dropped {
+                        entries.remove(&key);
+                        changed = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(Some(changed))
+    }
+
+    /// [`scrub`](Self::scrub) for an `Any`: its type URL is checked like a
+    /// top-level detail's, a DebugInfo is reported for dropping, and a packed
+    /// message of a known type is scrubbed and re-packed if it changed.
+    fn scrub_any(&self, any: &mut DynamicMessage) -> Result<Option<bool>, MalformedStatus> {
+        let type_url = match any.get_field_by_name("type_url").as_deref() {
+            Some(PbValue::String(url)) => url.clone(),
+            _ => String::new(),
+        };
+        let Some(type_name) = any_type_name(&type_url) else {
+            tracing::error!(%type_url, "packed Any with a malformed type URL");
+            return Err(MalformedStatus);
+        };
+        if type_name == DEBUG_INFO {
+            return Ok(None);
+        }
+        // An unknown packed type has no JSON form; serialization reports it.
+        let Some(desc) = self.resolve(type_name) else {
+            return Ok(Some(false));
+        };
+        let bytes = match any.get_field_by_name("value").as_deref() {
+            Some(PbValue::Bytes(bytes)) => bytes.clone(),
+            _ => Default::default(),
+        };
+        let mut inner = DynamicMessage::decode(desc, bytes).map_err(|e| {
+            tracing::error!(detail = %type_name, "undecodable packed Any: {e}");
             MalformedStatus
         })?;
-        msg.serialize_with_options(serde_json::value::Serializer, &SerializeOptions::new())
-            .map_err(|e| {
-                tracing::error!(detail = %type_name, "error detail has no valid JSON form: {e}");
-                MalformedStatus
-            })
+        match self.scrub(&mut inner)? {
+            None => Ok(None),
+            Some(false) => Ok(Some(false)),
+            Some(true) => {
+                any.set_field_by_name("value", PbValue::Bytes(inner.encode_to_vec().into()));
+                Ok(Some(true))
+            }
+        }
     }
 }
 

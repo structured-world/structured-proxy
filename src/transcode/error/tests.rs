@@ -543,6 +543,143 @@ fn debug_info_packed_in_an_any_detail_is_dropped() {
     );
 }
 
+fn bad_request(field: &str) -> Vec<u8> {
+    tonic_types::pb::BadRequest {
+        field_violations: vec![tonic_types::pb::bad_request::FieldViolation {
+            field: field.into(),
+            description: "bad".into(),
+            ..Default::default()
+        }],
+    }
+    .encode_to_vec()
+}
+
+#[test]
+fn canonical_types_stay_available_when_the_product_defines_one_elsewhere() {
+    // The product defines its own google.rpc.ErrorInfo in a file of another
+    // name. That revision wins, and the rest of the canonical
+    // error_details.proto (BadRequest here) still renders typed instead of
+    // falling back to opaque bytes.
+    let pool = product_pool(
+        "acme/errors.proto",
+        "syntax = \"proto3\"; package google.rpc; message ErrorInfo { string reason = 1; string tenant = 9; }",
+    );
+    let desc = pool.get_message_by_name("google.rpc.ErrorInfo").unwrap();
+    let mut info = DynamicMessage::new(desc);
+    info.set_field_by_name("tenant", prost_reflect::Value::String("t-7".into()));
+    let status = status_with_raw_details(&[
+        (
+            "type.googleapis.com/google.rpc.ErrorInfo",
+            info.encode_to_vec(),
+        ),
+        (
+            "type.googleapis.com/google.rpc.BadRequest",
+            bad_request("email"),
+        ),
+    ]);
+    let body = error_body(&status, Some(&StatusDetails::new(&pool)));
+    assert_eq!(
+        body["details"],
+        json!([
+            {"@type": "type.googleapis.com/google.rpc.ErrorInfo", "tenant": "t-7"},
+            {
+                "@type": "type.googleapis.com/google.rpc.BadRequest",
+                "fieldViolations": [{"field": "email", "description": "bad"}]
+            }
+        ])
+    );
+    assert!(body.get("opaqueDetails").is_none(), "{body}");
+}
+
+#[test]
+fn canonical_types_missing_from_a_shadowed_file_stay_available() {
+    // The product ships its own google/rpc/error_details.proto with only a
+    // revised ErrorInfo; BadRequest from the canonical file must still
+    // resolve.
+    let pool = product_pool(
+        "google/rpc/error_details.proto",
+        "syntax = \"proto3\"; package google.rpc; message ErrorInfo { string reason = 1; string tenant = 9; }",
+    );
+    let status = status_with_raw_details(&[(
+        "type.googleapis.com/google.rpc.BadRequest",
+        bad_request("name"),
+    )]);
+    let body = error_body(&status, Some(&StatusDetails::new(&pool)));
+    assert_eq!(
+        body["details"],
+        json!([{
+            "@type": "type.googleapis.com/google.rpc.BadRequest",
+            "fieldViolations": [{"field": "name", "description": "bad"}]
+        }])
+    );
+}
+
+#[test]
+fn type_url_without_a_slash_fails_safely() {
+    // Any.type_url must contain a `/`; a bare type name is not a valid Any.
+    let status = status_with_raw_details(&[("google.rpc.ErrorInfo", error_info("R"))]);
+    assert_eq!(
+        error_body(&status, Some(&canonical_only())),
+        malformed_upstream_status_body()
+    );
+}
+
+#[test]
+fn field_json_named_at_type_fails_safely() {
+    // A product field whose JSON name is `@type` would overwrite the Any's
+    // own type URL when its fields are placed next to it.
+    let pool = product_pool(
+        "acme.proto",
+        "syntax = \"proto3\"; package acme.v1; message Tagged { string kind = 1 [json_name = \"@type\"]; }",
+    );
+    let desc = pool.get_message_by_name("acme.v1.Tagged").unwrap();
+    let mut tagged = DynamicMessage::new(desc);
+    tagged.set_field_by_name(
+        "kind",
+        prost_reflect::Value::String("type.googleapis.com/google.rpc.ErrorInfo".into()),
+    );
+    let status =
+        status_with_raw_details(&[("type.googleapis.com/acme.v1.Tagged", tagged.encode_to_vec())]);
+    assert_eq!(
+        error_body(&status, Some(&StatusDetails::new(&pool))),
+        malformed_upstream_status_body()
+    );
+}
+
+#[test]
+fn struct_keys_that_look_like_debug_info_are_kept() {
+    // DebugInfo is withheld where an Any packs it. A Struct is data: a key
+    // `@type` naming DebugInfo is just a string there, and the Struct must
+    // stay whole and validly wrapped.
+    use prost_reflect::prost_types::{value::Kind, Struct, Value as PbValue};
+    let mut fields = std::collections::BTreeMap::new();
+    fields.insert(
+        "@type".to_string(),
+        PbValue {
+            kind: Some(Kind::StringValue(
+                "type.googleapis.com/google.rpc.DebugInfo".into(),
+            )),
+        },
+    );
+    fields.insert(
+        "note".to_string(),
+        PbValue {
+            kind: Some(Kind::StringValue("keep".into())),
+        },
+    );
+    let status = status_with_raw_details(&[(
+        "type.googleapis.com/google.protobuf.Struct",
+        Struct { fields }.encode_to_vec(),
+    )]);
+    assert_eq!(
+        canonical_only().render(&status).unwrap().details,
+        vec![json!({
+            "@type": "type.googleapis.com/google.protobuf.Struct",
+            "value": {"@type": "type.googleapis.com/google.rpc.DebugInfo", "note": "keep"}
+        })]
+    );
+}
+
 /// Unwraps the message out of a reflected value built by [`packed`].
 struct DynamicMessageValue(DynamicMessage);
 
