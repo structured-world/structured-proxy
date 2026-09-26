@@ -680,6 +680,47 @@ fn struct_keys_that_look_like_debug_info_are_kept() {
     );
 }
 
+#[test]
+fn debug_info_typed_fields_are_removed() {
+    // A field typed as google.rpc.DebugInfo itself (not packed in an Any),
+    // singular, repeated or as a map value, is withheld like a packed one,
+    // while the rest of the message stays.
+    let pool = product_pool(
+        "google/rpc/debug_holder.proto",
+        "syntax = \"proto3\"; package google.rpc; \
+         message DebugInfo { repeated string stack_entries = 1; string detail = 2; } \
+         message Holder { DebugInfo one = 1; repeated DebugInfo many = 2; \
+         map<string, DebugInfo> by_key = 3; string keep = 4; }",
+    );
+    let debug_desc = pool.get_message_by_name("google.rpc.DebugInfo").unwrap();
+    let secret = || {
+        let mut debug = DynamicMessage::new(debug_desc.clone());
+        debug.set_field_by_name(
+            "detail",
+            prost_reflect::Value::String("password=hunter2".into()),
+        );
+        prost_reflect::Value::Message(debug)
+    };
+    let holder_desc = pool.get_message_by_name("google.rpc.Holder").unwrap();
+    let mut holder = DynamicMessage::new(holder_desc);
+    holder.set_field_by_name("one", secret());
+    holder.set_field_by_name("many", prost_reflect::Value::List(vec![secret(), secret()]));
+    let mut by_key = std::collections::HashMap::new();
+    by_key.insert(prost_reflect::MapKey::String("k".into()), secret());
+    holder.set_field_by_name("by_key", prost_reflect::Value::Map(by_key));
+    holder.set_field_by_name("keep", prost_reflect::Value::String("kept".into()));
+    let status = status_with_raw_details(&[(
+        "type.googleapis.com/google.rpc.Holder",
+        holder.encode_to_vec(),
+    )]);
+    let body = error_body(&status, Some(&StatusDetails::new(&pool)));
+    assert_eq!(
+        body["details"],
+        json!([{"@type": "type.googleapis.com/google.rpc.Holder", "keep": "kept"}])
+    );
+    assert!(!body.to_string().contains("hunter2"), "{body}");
+}
+
 /// Unwraps the message out of a reflected value built by [`packed`].
 struct DynamicMessageValue(DynamicMessage);
 

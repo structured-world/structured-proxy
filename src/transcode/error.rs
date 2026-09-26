@@ -572,15 +572,19 @@ impl StatusDetails {
         self.pool.get_message_by_name(type_name)
     }
 
-    /// Remove every DebugInfo an `Any` packs anywhere below `msg`, following
-    /// only fields whose type is `google.protobuf.Any` (singular, repeated or
-    /// map values), so data such as a `Struct` key named `@type` is never
-    /// mistaken for one. Returns `None` when `msg` is itself an `Any` packing a
-    /// DebugInfo (the caller drops it), otherwise whether anything changed.
+    /// Remove every DebugInfo anywhere below `msg`: a message field typed as
+    /// DebugInfo, or an `Any` packing one, whether singular, repeated or a map
+    /// value. Only the message types decide, so data such as a `Struct` key
+    /// named `@type` is never mistaken for one. Returns `None` when `msg` is
+    /// itself a DebugInfo or an `Any` packing one (the caller drops it),
+    /// otherwise whether anything changed.
     fn scrub(&self, msg: &mut DynamicMessage) -> Result<Option<bool>, MalformedStatus> {
         let desc = msg.descriptor();
         if desc.full_name() == ANY {
             return self.scrub_any(msg);
+        }
+        if desc.full_name() == DEBUG_INFO {
+            return Ok(None);
         }
         let mut changed = false;
         for field in desc.fields() {
