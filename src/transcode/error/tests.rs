@@ -721,6 +721,92 @@ fn debug_info_typed_fields_are_removed() {
     assert!(!body.to_string().contains("hunter2"), "{body}");
 }
 
+#[test]
+fn debug_info_extensions_are_removed() {
+    // A proto2 extension typed as DebugInfo is not one of the message's own
+    // fields, yet ProtoJSON renders it as `[google.rpc.debug]`; it is withheld
+    // like a regular field while the rest of the message stays.
+    let pool = product_pool(
+        "google/rpc/debug_extension.proto",
+        "syntax = \"proto2\"; package google.rpc; \
+         message DebugInfo { repeated string stack_entries = 1; optional string detail = 2; } \
+         message Extendable { optional string keep = 1; extensions 100 to 199; } \
+         extend Extendable { optional DebugInfo debug = 100; }",
+    );
+    let mut debug = DynamicMessage::new(pool.get_message_by_name("google.rpc.DebugInfo").unwrap());
+    debug.set_field_by_name(
+        "detail",
+        prost_reflect::Value::String("password=hunter2".into()),
+    );
+    let mut extendable =
+        DynamicMessage::new(pool.get_message_by_name("google.rpc.Extendable").unwrap());
+    extendable.set_field_by_name("keep", prost_reflect::Value::String("kept".into()));
+    extendable.set_extension(
+        &pool.get_extension_by_name("google.rpc.debug").unwrap(),
+        prost_reflect::Value::Message(debug),
+    );
+    let status = status_with_raw_details(&[(
+        "type.googleapis.com/google.rpc.Extendable",
+        extendable.encode_to_vec(),
+    )]);
+    let body = error_body(&status, Some(&StatusDetails::new(&pool)));
+    assert_eq!(
+        body["details"],
+        json!([{"@type": "type.googleapis.com/google.rpc.Extendable", "keep": "kept"}])
+    );
+    assert!(!body.to_string().contains("hunter2"), "{body}");
+}
+
+#[test]
+fn detail_with_required_debug_info_field_is_withheld() {
+    // Clearing a proto2 `required` DebugInfo field would forward a message
+    // that violates its own schema, so the whole detail is withheld instead,
+    // and it takes no opaque index, like a packed DebugInfo.
+    let pool = product_pool(
+        "google/rpc/debug_required.proto",
+        "syntax = \"proto2\"; package google.rpc; \
+         message DebugInfo { repeated string stack_entries = 1; optional string detail = 2; } \
+         message Wrapper { required DebugInfo info = 1; optional string keep = 2; } \
+         message Outer { optional Wrapper wrapper = 1; optional string keep = 2; }",
+    );
+    let debug_desc = pool.get_message_by_name("google.rpc.DebugInfo").unwrap();
+    let wrapper_desc = pool.get_message_by_name("google.rpc.Wrapper").unwrap();
+    let wrapper = || {
+        let mut debug = DynamicMessage::new(debug_desc.clone());
+        debug.set_field_by_name(
+            "detail",
+            prost_reflect::Value::String("password=hunter2".into()),
+        );
+        let mut wrapper = DynamicMessage::new(wrapper_desc.clone());
+        wrapper.set_field_by_name("info", prost_reflect::Value::Message(debug));
+        wrapper.set_field_by_name("keep", prost_reflect::Value::String("kept".into()));
+        wrapper
+    };
+    let mut outer = DynamicMessage::new(pool.get_message_by_name("google.rpc.Outer").unwrap());
+    outer.set_field_by_name("wrapper", prost_reflect::Value::Message(wrapper()));
+    outer.set_field_by_name("keep", prost_reflect::Value::String("outer".into()));
+    let status = status_with_raw_details(&[
+        (
+            "type.googleapis.com/google.rpc.Wrapper",
+            wrapper().encode_to_vec(),
+        ),
+        (
+            "type.googleapis.com/google.rpc.Outer",
+            outer.encode_to_vec(),
+        ),
+        ("type.googleapis.com/acme.Unknown", vec![1, 2, 3]),
+    ]);
+    let body = error_body(&status, Some(&StatusDetails::new(&pool)));
+    // The top-level Wrapper is withheld; inside Outer only the optional field
+    // holding the Wrapper goes.
+    assert_eq!(
+        body["details"],
+        json!([{"@type": "type.googleapis.com/google.rpc.Outer", "keep": "outer"}])
+    );
+    assert_eq!(body["opaqueDetails"][0]["index"], json!(1));
+    assert!(!body.to_string().contains("hunter2"), "{body}");
+}
+
 /// Unwraps the message out of a reflected value built by [`packed`].
 struct DynamicMessageValue(DynamicMessage);
 

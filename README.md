@@ -346,11 +346,14 @@ ProtoJSON or `google.rpc.Status`:
 - Only an unknown type goes there. A detail of a known type that fails to
   decode is a broken upstream status (see above), never an opaque entry.
 
-**Errors in server-streaming responses.** A stream that fails before its first
-message still owns the response: it gets the mapped HTTP status and the body
-above. Once the first message is sent, the `200` is already on the wire and
-cannot change, so the failure is delivered as a terminal frame whose payload is
-exactly that body, after which the stream ends and no further data follows:
+**Errors in server-streaming responses.** An upstream that rejects the call
+outright (a gRPC trailers-only response, with no response headers or messages)
+gets the mapped HTTP status and the body above. Once the upstream has accepted
+the call, the proxy answers `200` and starts the stream right away, so that
+headers and SSE keep-alives are not held back waiting for the first message.
+Any later failure, including one that arrives before the first message, is then
+delivered as a terminal frame whose payload is exactly that body, after which
+the stream ends and no further data follows:
 
 - **NDJSON**: the last line, framed by an extra
   `"@type": "type.googleapis.com/google.rpc.Status"` next to the error body. A

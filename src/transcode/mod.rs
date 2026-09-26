@@ -368,6 +368,10 @@ async fn streaming_handler<S: TranscodeState>(
         .server_streaming(grpc_request, grpc_path, grpc_codec)
         .await
     {
+        // Only a trailers-only rejection lands in `Err`. Once the upstream
+        // accepted the call, the response starts at once rather than waiting
+        // for the first item, so headers and SSE keep-alives are not held back;
+        // an error that comes before the first message is a terminal frame.
         Ok(response) => {
             let stream = response.into_inner();
             // The terminal frame renders like the unary error body. The

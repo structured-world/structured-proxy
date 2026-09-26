@@ -12,8 +12,8 @@ use base64::Engine as _;
 use globset::GlobMatcher;
 use prost::Message as _;
 use prost_reflect::{
-    DescriptorPool, DynamicMessage, Kind, MessageDescriptor, ReflectMessage, SerializeOptions,
-    Value as PbValue,
+    Cardinality, DescriptorPool, DynamicMessage, Kind, MessageDescriptor, ReflectMessage,
+    SerializeOptions, Value as PbValue,
 };
 use serde_json::{Map, Value};
 
@@ -587,62 +587,96 @@ impl StatusDetails {
             return Ok(None);
         }
         let mut changed = false;
-        for field in desc.fields() {
-            let Kind::Message(_) = field.kind() else {
-                continue;
-            };
-            if !msg.has_field(&field) {
+        let mut dropped_fields = Vec::new();
+        for (field, value) in msg.fields_mut() {
+            if !matches!(field.kind(), Kind::Message(_)) {
                 continue;
             }
-            match msg.get_field_mut(&field) {
-                PbValue::Message(inner) => match self.scrub(inner)? {
-                    Some(inner_changed) => changed |= inner_changed,
-                    None => {
-                        msg.clear_field(&field);
-                        changed = true;
-                    }
-                },
-                PbValue::List(items) => {
-                    let before = items.len();
-                    let mut failed = None;
-                    items.retain_mut(|item| match item {
-                        PbValue::Message(inner) if failed.is_none() => match self.scrub(inner) {
-                            Ok(Some(inner_changed)) => {
-                                changed |= inner_changed;
-                                true
-                            }
-                            Ok(None) => false,
-                            Err(e) => {
-                                failed = Some(e);
-                                true
-                            }
-                        },
-                        _ => true,
-                    });
-                    if let Some(e) = failed {
-                        return Err(e);
-                    }
-                    changed |= items.len() != before;
+            if !self.scrub_value(value, &mut changed)? {
+                // A proto2 `required` field cannot be cleared without making
+                // the message invalid, so the whole message goes instead.
+                if field.cardinality() == Cardinality::Required {
+                    return Ok(None);
                 }
-                PbValue::Map(entries) => {
-                    let mut dropped = Vec::new();
-                    for (key, value) in entries.iter_mut() {
-                        if let PbValue::Message(inner) = value {
-                            match self.scrub(inner)? {
-                                Some(inner_changed) => changed |= inner_changed,
-                                None => dropped.push(key.clone()),
-                            }
-                        }
-                    }
-                    for key in dropped {
-                        entries.remove(&key);
-                        changed = true;
-                    }
-                }
-                _ => {}
+                dropped_fields.push(field);
             }
         }
+        // Extensions are not among the message's own fields, yet ProtoJSON
+        // renders them (as `[full.name]`), so they are scrubbed the same way.
+        let mut dropped_extensions = Vec::new();
+        for (extension, value) in msg.extensions_mut() {
+            if !matches!(extension.kind(), Kind::Message(_)) {
+                continue;
+            }
+            if !self.scrub_value(value, &mut changed)? {
+                dropped_extensions.push(extension);
+            }
+        }
+        for field in dropped_fields {
+            msg.clear_field(&field);
+            changed = true;
+        }
+        for extension in dropped_extensions {
+            msg.clear_extension(&extension);
+            changed = true;
+        }
         Ok(Some(changed))
+    }
+
+    /// [`scrub`](Self::scrub) applied to one set field or extension value:
+    /// repeated elements and map entries that must go are removed in place.
+    /// Returns `false` when the value is a singular message that must go, so
+    /// the caller clears the field.
+    fn scrub_value(
+        &self,
+        value: &mut PbValue,
+        changed: &mut bool,
+    ) -> Result<bool, MalformedStatus> {
+        match value {
+            PbValue::Message(inner) => match self.scrub(inner)? {
+                Some(inner_changed) => *changed |= inner_changed,
+                None => return Ok(false),
+            },
+            PbValue::List(items) => {
+                let before = items.len();
+                let mut failed = None;
+                items.retain_mut(|item| match item {
+                    PbValue::Message(inner) if failed.is_none() => match self.scrub(inner) {
+                        Ok(Some(inner_changed)) => {
+                            *changed |= inner_changed;
+                            true
+                        }
+                        Ok(None) => false,
+                        Err(e) => {
+                            failed = Some(e);
+                            true
+                        }
+                    },
+                    _ => true,
+                });
+                if let Some(e) = failed {
+                    return Err(e);
+                }
+                *changed |= items.len() != before;
+            }
+            PbValue::Map(entries) => {
+                let mut dropped = Vec::new();
+                for (key, value) in entries.iter_mut() {
+                    if let PbValue::Message(inner) = value {
+                        match self.scrub(inner)? {
+                            Some(inner_changed) => *changed |= inner_changed,
+                            None => dropped.push(key.clone()),
+                        }
+                    }
+                }
+                for key in dropped {
+                    entries.remove(&key);
+                    *changed = true;
+                }
+            }
+            _ => {}
+        }
+        Ok(true)
     }
 
     /// [`scrub`](Self::scrub) for an `Any`: its type URL is checked like a
