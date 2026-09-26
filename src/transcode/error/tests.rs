@@ -222,7 +222,7 @@ fn debug_info_is_never_rendered() {
             )),
         ],
     );
-    let details = canonical_only().render(&status).unwrap();
+    let details = canonical_only().render(&status).unwrap().details;
     assert_eq!(
         details,
         vec![json!({
@@ -247,22 +247,80 @@ fn debug_info_is_dropped_under_any_type_url_prefix() {
         "example.com/types/google.rpc.DebugInfo",
         debug.encode_to_vec(),
     )]);
-    assert!(canonical_only().render(&status).unwrap().is_empty());
+    let rendered = canonical_only().render(&status).unwrap();
+    assert!(rendered.details.is_empty() && rendered.opaque.is_empty());
 }
 
 #[test]
-fn unknown_detail_type_keeps_type_and_base64_value() {
-    // A type neither pool knows has no ProtoJSON form; it is kept in the
-    // opaque-detail extension (original type URL, base64 of the original
-    // bytes) instead of being dropped.
+fn unknown_detail_type_goes_to_opaque_details() {
+    // A type neither pool knows has no ProtoJSON form. It is kept, with its
+    // original type URL and bytes, in `opaqueDetails` next to `details`, never
+    // inside `details` and never under `@type`, so no client can take it for a
+    // message of that type.
     let status = status_with_raw_details(&[(
         "type.googleapis.com/acme.v1.Unknown",
         vec![0x08, 0x96, 0x01],
     )]);
     assert_eq!(
-        canonical_only().render(&status).unwrap(),
-        vec![json!({"@type": "type.googleapis.com/acme.v1.Unknown", "value": "CJYB"})]
+        error_body(&status, Some(&canonical_only())),
+        json!({
+            "error": "FAILED_PRECONDITION",
+            "message": "raw",
+            "code": 9,
+            "details": [],
+            "opaqueDetails": [{
+                "index": 0,
+                "typeUrl": "type.googleapis.com/acme.v1.Unknown",
+                "bytes": "CJYB"
+            }]
+        })
     );
+}
+
+#[test]
+fn opaque_index_is_the_position_among_forwarded_details() {
+    // Upstream order: ErrorInfo, DebugInfo, unknown, ErrorInfo. DebugInfo is
+    // not forwarded and leaves no gap, so merging `details` and
+    // `opaqueDetails` by `index` restores the order the client may see:
+    // ErrorInfo (0), unknown (1), ErrorInfo (2).
+    let info = |reason: &str| {
+        tonic_types::pb::ErrorInfo {
+            reason: reason.into(),
+            ..Default::default()
+        }
+        .encode_to_vec()
+    };
+    let debug = tonic_types::pb::DebugInfo {
+        detail: "secret".into(),
+        ..Default::default()
+    };
+    let status = status_with_raw_details(&[
+        ("type.googleapis.com/google.rpc.ErrorInfo", info("FIRST")),
+        (
+            "type.googleapis.com/google.rpc.DebugInfo",
+            debug.encode_to_vec(),
+        ),
+        ("type.googleapis.com/acme.v1.Unknown", vec![0x08, 0x01]),
+        ("type.googleapis.com/google.rpc.ErrorInfo", info("LAST")),
+    ]);
+    let body = error_body(&status, Some(&canonical_only()));
+    assert_eq!(
+        body["details"],
+        json!([
+            {"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "FIRST"},
+            {"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "LAST"}
+        ])
+    );
+    assert_eq!(
+        body["opaqueDetails"],
+        json!([{"index": 1, "typeUrl": "type.googleapis.com/acme.v1.Unknown", "bytes": "CAE="}])
+    );
+}
+
+#[test]
+fn opaque_details_key_is_absent_when_every_type_resolves() {
+    let body = error_body(&rich_status(), Some(&canonical_only()));
+    assert!(body.get("opaqueDetails").is_none(), "{body}");
 }
 
 /// The body a failed call gets when the upstream's error status itself cannot
@@ -350,7 +408,7 @@ fn well_known_type_detail_goes_under_value() {
         duration.encode_to_vec(),
     )]);
     assert_eq!(
-        canonical_only().render(&status).unwrap(),
+        canonical_only().render(&status).unwrap().details,
         vec![json!({"@type": "type.googleapis.com/google.protobuf.Duration", "value": "1.500s"})]
     );
 }
@@ -371,7 +429,7 @@ fn product_defined_detail_type_renders_its_fields() {
         msg.encode_to_vec(),
     )]);
     assert_eq!(
-        StatusDetails::new(&pool).render(&status).unwrap(),
+        StatusDetails::new(&pool).render(&status).unwrap().details,
         vec![json!({
             "@type": "type.googleapis.com/acme.v1.QuotaTicket",
             "ticket": "T-1",
@@ -398,7 +456,7 @@ fn product_revision_of_a_canonical_type_wins() {
         msg.encode_to_vec(),
     )]);
     assert_eq!(
-        StatusDetails::new(&pool).render(&status).unwrap(),
+        StatusDetails::new(&pool).render(&status).unwrap().details,
         vec![json!({
             "@type": "type.googleapis.com/google.rpc.ErrorInfo",
             "reason": "R",

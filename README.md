@@ -284,8 +284,8 @@ mapping (`INVALID_ARGUMENT` → 400, `NOT_FOUND` → 404, ...):
 - `google.rpc.DebugInfo` is never forwarded: it carries stack traces and server
   internals meant for the service's operators.
 - Details are on for every route. An embedder can switch them off globally or
-  per route (see below); on such a route the `details` key is absent and the
-  body is `{"error", "code", "message"}`.
+  per route (see below); on such a route the `details` and `opaqueDetails` keys
+  are absent and the body is `{"error", "code", "message"}`.
 - Errors the proxy raises itself on a transcoded route use the same body: a
   request that cannot be mapped onto the RPC (`INVALID_ARGUMENT`, 400), an
   upstream that is not reachable (`UNAVAILABLE`, 503), a response that cannot
@@ -300,21 +300,36 @@ mapping (`INVALID_ARGUMENT` → 400, `NOT_FOUND` → 404, ...):
   trailer is not read, so this does not apply there.
 
 **Opaque-detail extension.** ProtoJSON cannot represent an `Any` whose type is
-unknown to the reader. Rather than drop such a detail (a type in neither
-descriptor set), structured-proxy keeps it in its own extension, which is
-**not** part of ProtoJSON:
+unknown to the writer, so a detail whose type is in neither descriptor set has
+no place in `details`. Rather than drop it, structured-proxy keeps it in a
+separate `opaqueDetails` array, which is its own extension and **not** part of
+ProtoJSON or `google.rpc.Status`:
 
 ```json
-{ "@type": "type.googleapis.com/acme.v1.QuotaTicket", "value": "CgNULTE=" }
+{
+  "error": "FAILED_PRECONDITION",
+  "code": 9,
+  "message": "quota exhausted",
+  "details": [
+    { "@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "QUOTA", "domain": "acme.example.com" }
+  ],
+  "opaqueDetails": [
+    { "index": 1, "typeUrl": "type.googleapis.com/acme.v1.QuotaTicket", "bytes": "CgNULTE=" }
+  ]
+}
 ```
 
-`@type` is the original type URL and `value` the standard base64 of the
-original bytes. `value` also appears on well-known types, holding their JSON
-there, so a consumer tells the two apart by `@type`: when it names a well-known
-type with a special JSON representation, `value` is that JSON; otherwise a
-string `value` is the opaque extension, and the consumer that knows the type
-base64-decodes it and parses the protobuf bytes itself. Consumers that do not
-handle the extension should skip such entries.
+- `typeUrl` is the original type URL and `bytes` the standard base64 of the
+  original bytes. An entry has no `@type` and never appears in `details`, so
+  `details` stays an array of ProtoJSON `Any` and nothing in the extension can
+  be taken for a message of the named type.
+- `index` is the entry's position among the forwarded details: merging
+  `details` and `opaqueDetails` by position restores the upstream's order.
+- `opaqueDetails` appears only when at least one detail went there. A client
+  that knows the type base64-decodes `bytes` and parses the protobuf itself; a
+  client that does not handle the extension ignores the key.
+- Only an unknown type goes there. A detail of a known type that fails to
+  decode is a broken upstream status (see above), never an opaque entry.
 
 **Errors in server-streaming responses.** A stream that fails before its first
 message still owns the response: it gets the mapped HTTP status and the body

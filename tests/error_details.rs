@@ -351,9 +351,10 @@ async fn unary_error_without_trailer_has_empty_details() {
 #[tokio::test]
 async fn product_unknown_and_well_known_details_are_told_apart() {
     // Three different renderings side by side: a product message expands to
-    // its fields, a well-known type with a special JSON form sits under
-    // `value` as that JSON, and an unresolvable type uses the opaque-detail
-    // extension (original type URL, base64 of the original bytes).
+    // its fields and a well-known type with a special JSON form sits under
+    // `value` as that JSON, both in `details`; the type no descriptor
+    // describes goes to `opaqueDetails` (its position, original type URL and
+    // base64 of the original bytes), never into `details`.
     let app = proxy(ErrorDetailsPolicy::default()).await;
     let (status, body) = get_json(&app, "/v1/things/mixed").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -361,9 +362,12 @@ async fn product_unknown_and_well_known_details_are_told_apart() {
         body["details"],
         json!([
             {"@type": "type.googleapis.com/test.v1.QuotaTicket", "ticket": "T-1"},
-            {"@type": "type.googleapis.com/acme.v1.Missing", "value": "CJYB"},
             {"@type": "type.googleapis.com/google.protobuf.Duration", "value": "1.500s"}
         ])
+    );
+    assert_eq!(
+        body["opaqueDetails"],
+        json!([{"index": 1, "typeUrl": "type.googleapis.com/acme.v1.Missing", "bytes": "CJYB"}])
     );
 }
 

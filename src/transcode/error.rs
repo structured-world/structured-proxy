@@ -83,7 +83,8 @@ pub fn status_to_response_with_details(
 /// `error` is the gRPC code name, `code` its number and `message` the status
 /// message. With `details`, the body also carries `details`: the upstream's
 /// `google.rpc.Status.details` in proto3 JSON form (empty when the upstream sent
-/// none); without it, the key is absent and the trailer is not read. When the
+/// none), plus `opaqueDetails` for details whose type no descriptor describes;
+/// without it, both keys are absent and the trailer is not read. When the
 /// details cannot be rendered faithfully the whole body is a generic `INTERNAL`
 /// instead, never a partial or reinterpreted set of details.
 pub fn error_body(status: &tonic::Status, details: Option<&StatusDetails>) -> Value {
@@ -106,19 +107,24 @@ fn render(status: &tonic::Status, details: Option<&StatusDetails>) -> (tonic::Co
             body(
                 tonic::Code::Internal,
                 MALFORMED_STATUS_MESSAGE,
-                Some(Vec::new()),
+                Some(RenderedDetails::default()),
             ),
         ),
     }
 }
 
-fn body(code: tonic::Code, message: &str, details: Option<Vec<Value>>) -> Value {
-    let mut body = Map::with_capacity(4);
+/// `opaqueDetails` appears only when a detail went to the extension, so a
+/// client that does not handle it sees nothing new otherwise.
+fn body(code: tonic::Code, message: &str, details: Option<RenderedDetails>) -> Value {
+    let mut body = Map::with_capacity(5);
     body.insert("error".into(), grpc_code_name(code).into());
     body.insert("message".into(), message.into());
     body.insert("code".into(), (code as i32).into());
-    if let Some(details) = details {
-        body.insert("details".into(), Value::Array(details));
+    if let Some(rendered) = details {
+        body.insert("details".into(), Value::Array(rendered.details));
+        if !rendered.opaque.is_empty() {
+            body.insert("opaqueDetails".into(), Value::Array(rendered.opaque));
+        }
     }
     Value::Object(body)
 }
@@ -232,6 +238,35 @@ impl Default for ErrorDetailsPolicy {
     }
 }
 
+/// The rendered details of one status.
+#[derive(Debug, Default)]
+struct RenderedDetails {
+    /// ProtoJSON `Any` entries, in upstream order.
+    details: Vec<Value>,
+    /// Opaque-detail extension entries, in upstream order.
+    opaque: Vec<Value>,
+}
+
+/// An entry of the structured-proxy opaque-detail extension, for a detail whose
+/// type no descriptor describes: `{"index", "typeUrl", "bytes"}`, where `index`
+/// is its position among the forwarded details (so merging `details` and
+/// `opaqueDetails` by position restores the upstream order), `typeUrl` the
+/// original type URL and `bytes` the standard base64 of the original bytes.
+/// It carries no `@type` and lives outside `details`, so it cannot be taken for
+/// a ProtoJSON `Any`.
+fn opaque_entry(index: usize, type_url: &str, value: &[u8]) -> Value {
+    let mut out = Map::with_capacity(3);
+    out.insert("index".into(), index.into());
+    out.insert("typeUrl".into(), type_url.into());
+    out.insert(
+        "bytes".into(),
+        base64::engine::general_purpose::STANDARD
+            .encode(value)
+            .into(),
+    );
+    Value::Object(out)
+}
+
 /// Renders the typed details of a gRPC status (`grpc-status-details-bin`) as
 /// proto3 JSON.
 ///
@@ -265,11 +300,11 @@ impl StatusDetails {
 
     /// The details of `status`, `google.rpc.DebugInfo` left out.
     ///
-    /// A detail whose type resolves is its ProtoJSON `Any` form: `@type` plus
-    /// the message fields, or `@type` plus `value` for a well-known type with a
-    /// special JSON representation. A type no descriptor describes has no
-    /// ProtoJSON form (the mapping requires the type), so it is kept in the
-    /// structured-proxy opaque-detail extension instead.
+    /// A detail whose type resolves goes to `details` in its ProtoJSON `Any`
+    /// form: `@type` plus the message fields, or `@type` plus `value` for a
+    /// well-known type with a special JSON representation. A type no descriptor
+    /// describes has no ProtoJSON form (the mapping requires the type), so it
+    /// goes to the opaque-detail extension instead (see [`opaque_entry`]).
     ///
     /// # Errors
     ///
@@ -277,57 +312,60 @@ impl StatusDetails {
     /// detail of a known type does not decode or has no valid JSON form. Such a
     /// detail is never passed on as opaque bytes, since that would present a
     /// broken value as an unknown one.
-    fn render(&self, status: &tonic::Status) -> Result<Vec<Value>, MalformedStatus> {
+    fn render(&self, status: &tonic::Status) -> Result<RenderedDetails, MalformedStatus> {
+        let mut rendered = RenderedDetails::default();
         let raw = status.details();
         if raw.is_empty() {
-            return Ok(Vec::new());
+            return Ok(rendered);
         }
         let decoded = tonic_types::pb::Status::decode(raw).map_err(|e| {
             tracing::error!("malformed grpc-status-details-bin trailer: {e}");
             MalformedStatus
         })?;
-        let mut details = Vec::with_capacity(decoded.details.len());
+        rendered.details.reserve(decoded.details.len());
+        // Position among the forwarded details: DebugInfo takes no index, so
+        // the numbering does not reveal that one was withheld.
+        let mut index = 0usize;
         for any in &decoded.details {
-            if let Some(detail) = self.render_any(&any.type_url, &any.value)? {
-                details.push(detail);
+            // The proto3 JSON mapping identifies the type by the last
+            // `/`-segment of the URL (`type.googleapis.com/google.rpc.ErrorInfo`).
+            let type_url = any.type_url.as_str();
+            let type_name = type_url.rsplit_once('/').map_or(type_url, |(_, name)| name);
+            if type_name == DEBUG_INFO {
+                continue;
             }
+            match self.resolve(type_name) {
+                Some(desc) => rendered
+                    .details
+                    .push(self.typed_entry(type_url, type_name, desc, &any.value)?),
+                None => rendered
+                    .opaque
+                    .push(opaque_entry(index, type_url, &any.value)),
+            }
+            index += 1;
         }
-        Ok(details)
+        Ok(rendered)
     }
 
-    /// One `Any`, or `None` for a detail that must not leave the proxy.
-    fn render_any(&self, type_url: &str, value: &[u8]) -> Result<Option<Value>, MalformedStatus> {
-        // The proto3 JSON mapping identifies the type by the last `/`-segment of
-        // the URL (`type.googleapis.com/google.rpc.ErrorInfo`).
-        let type_name = type_url.rsplit_once('/').map_or(type_url, |(_, name)| name);
-        if type_name == DEBUG_INFO {
-            return Ok(None);
-        }
-
+    /// The ProtoJSON `Any` form of a detail whose type resolved.
+    fn typed_entry(
+        &self,
+        type_url: &str,
+        type_name: &str,
+        desc: MessageDescriptor,
+        value: &[u8],
+    ) -> Result<Value, MalformedStatus> {
         let mut out = Map::new();
         out.insert("@type".into(), type_url.into());
-        match self.resolve(type_name) {
-            Some(desc) => match self.to_json(type_name, desc, value)? {
-                Value::Object(fields) => out.extend(fields),
-                // A well-known type with a special JSON representation
-                // (`Duration` as "1.5s") goes under `value` (ProtoJSON, `Any`).
-                other => {
-                    out.insert("value".into(), other);
-                }
-            },
-            // No descriptor for the type: ProtoJSON cannot express it, so the
-            // opaque-detail extension keeps the original bytes instead of
-            // dropping the detail. Not ProtoJSON; consumers opt into it.
-            None => {
-                out.insert(
-                    "value".into(),
-                    base64::engine::general_purpose::STANDARD
-                        .encode(value)
-                        .into(),
-                );
+        match self.to_json(type_name, desc, value)? {
+            Value::Object(fields) => out.extend(fields),
+            // A well-known type with a special JSON representation (`Duration`
+            // as "1.5s") goes under `value` (ProtoJSON, `Any`).
+            other => {
+                out.insert("value".into(), other);
             }
         }
-        Ok(Some(Value::Object(out)))
+        Ok(Value::Object(out))
     }
 
     fn resolve(&self, type_name: &str) -> Option<MessageDescriptor> {
