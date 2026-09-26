@@ -238,6 +238,44 @@ impl Default for ErrorDetailsPolicy {
     }
 }
 
+/// Whether `full_name` is a well-known type with a special ProtoJSON
+/// representation, which an `Any` carries under `value`
+/// (<https://protobuf.dev/programming-guides/json/#any>). The same set
+/// prost-reflect wraps when it serializes an `Any`.
+fn has_special_json(full_name: &str) -> bool {
+    matches!(
+        full_name,
+        "google.protobuf.Any"
+            | "google.protobuf.Timestamp"
+            | "google.protobuf.Duration"
+            | "google.protobuf.Struct"
+            | "google.protobuf.FloatValue"
+            | "google.protobuf.DoubleValue"
+            | "google.protobuf.Int32Value"
+            | "google.protobuf.Int64Value"
+            | "google.protobuf.UInt32Value"
+            | "google.protobuf.UInt64Value"
+            | "google.protobuf.BoolValue"
+            | "google.protobuf.StringValue"
+            | "google.protobuf.BytesValue"
+            | "google.protobuf.FieldMask"
+            | "google.protobuf.ListValue"
+            | "google.protobuf.Value"
+            | "google.protobuf.Empty"
+    )
+}
+
+/// Whether `name` is a protobuf full name: dot-separated identifiers, each a
+/// letter or `_` followed by letters, digits or `_`.
+fn is_full_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.split('.').all(|part| {
+            let mut chars = part.chars();
+            matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+}
+
 /// The rendered details of one status.
 #[derive(Debug, Default)]
 struct RenderedDetails {
@@ -322,15 +360,33 @@ impl StatusDetails {
             tracing::error!("malformed grpc-status-details-bin trailer: {e}");
             MalformedStatus
         })?;
+        // The trailer must describe the same error as grpc-status and
+        // grpc-message (gRPC richer error model); otherwise its details would
+        // be attached to an error they were not written for.
+        if decoded.code != status.code() as i32 || decoded.message != status.message() {
+            tracing::error!(
+                trailer_code = decoded.code,
+                status_code = status.code() as i32,
+                "grpc-status-details-bin disagrees with grpc-status / grpc-message"
+            );
+            return Err(MalformedStatus);
+        }
         rendered.details.reserve(decoded.details.len());
         // Position among the forwarded details: DebugInfo takes no index, so
         // the numbering does not reveal that one was withheld.
         let mut index = 0usize;
         for any in &decoded.details {
-            // The proto3 JSON mapping identifies the type by the last
-            // `/`-segment of the URL (`type.googleapis.com/google.rpc.ErrorInfo`).
+            // ProtoJSON identifies the type by the last `/`-segment of the URL
+            // (`type.googleapis.com/google.rpc.ErrorInfo`). A name that is not
+            // a protobuf full name (empty after a trailing `/`, a query suffix,
+            // an empty segment) could be a disguised DebugInfo, so the whole
+            // status is refused rather than its bytes passed on as opaque.
             let type_url = any.type_url.as_str();
             let type_name = type_url.rsplit_once('/').map_or(type_url, |(_, name)| name);
+            if !is_full_name(type_name) {
+                tracing::error!(%type_url, "error detail with a malformed type URL");
+                return Err(MalformedStatus);
+            }
             if type_name == DEBUG_INFO {
                 continue;
             }
@@ -355,12 +411,15 @@ impl StatusDetails {
         desc: MessageDescriptor,
         value: &[u8],
     ) -> Result<Value, MalformedStatus> {
+        // ProtoJSON puts a well-known type with a special JSON representation
+        // under `value` whatever that JSON looks like (a Struct is an object,
+        // yet still wrapped), so the choice follows the type, not the shape.
+        let wrapped = has_special_json(desc.full_name());
+        let json = self.to_json(type_name, desc, value)?;
         let mut out = Map::new();
         out.insert("@type".into(), type_url.into());
-        match self.to_json(type_name, desc, value)? {
-            Value::Object(fields) => out.extend(fields),
-            // A well-known type with a special JSON representation (`Duration`
-            // as "1.5s") goes under `value` (ProtoJSON, `Any`).
+        match json {
+            Value::Object(fields) if !wrapped => out.extend(fields),
             other => {
                 out.insert("value".into(), other);
             }

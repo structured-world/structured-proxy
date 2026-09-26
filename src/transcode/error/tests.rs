@@ -318,6 +318,94 @@ fn opaque_index_is_the_position_among_forwarded_details() {
 }
 
 #[test]
+fn object_valued_well_known_details_go_under_value() {
+    // ProtoJSON wraps every well-known type with a special JSON representation
+    // under `value`, decided by the type, not by the shape of its JSON: a
+    // Struct is a JSON object yet still goes under `value`, and its own
+    // `@type` key cannot overwrite the detail's.
+    use prost_reflect::prost_types::{value::Kind, Struct, Value as PbValue};
+    let mut fields = std::collections::BTreeMap::new();
+    fields.insert(
+        "@type".to_string(),
+        PbValue {
+            kind: Some(Kind::StringValue("forged".into())),
+        },
+    );
+    fields.insert(
+        "retry".to_string(),
+        PbValue {
+            kind: Some(Kind::BoolValue(true)),
+        },
+    );
+    let status = status_with_raw_details(&[
+        (
+            "type.googleapis.com/google.protobuf.Struct",
+            Struct { fields }.encode_to_vec(),
+        ),
+        ("type.googleapis.com/google.protobuf.Empty", Vec::new()),
+    ]);
+    assert_eq!(
+        canonical_only().render(&status).unwrap().details,
+        vec![
+            json!({
+                "@type": "type.googleapis.com/google.protobuf.Struct",
+                "value": {"@type": "forged", "retry": true}
+            }),
+            json!({"@type": "type.googleapis.com/google.protobuf.Empty", "value": {}}),
+        ]
+    );
+}
+
+#[test]
+fn debug_info_behind_a_malformed_type_url_is_not_forwarded() {
+    // A type URL whose name part is empty or not a protobuf full name cannot
+    // be told apart from a disguised DebugInfo, so it fails the error safely
+    // instead of shipping its bytes as an opaque detail.
+    let debug = tonic_types::pb::DebugInfo {
+        detail: "connection refused to 10.0.0.7:5432".into(),
+        ..Default::default()
+    };
+    for type_url in [
+        "type.googleapis.com/google.rpc.DebugInfo/",
+        "type.googleapis.com/google.rpc.DebugInfo?v=1",
+        "",
+        "type.googleapis.com/google..rpc.DebugInfo",
+    ] {
+        let status = status_with_raw_details(&[(type_url, debug.encode_to_vec())]);
+        let body = error_body(&status, Some(&canonical_only()));
+        assert_eq!(body, malformed_upstream_status_body(), "{type_url:?}");
+    }
+}
+
+#[test]
+fn trailer_code_or_message_disagreeing_with_the_status_fails_safely() {
+    // The rich status in the trailer must describe the same error as
+    // grpc-status / grpc-message; otherwise its details would be attached to
+    // an error they were not written for.
+    let details = canonical_only();
+    for (code, message) in [
+        (tonic::Code::NotFound, "raw"),
+        (tonic::Code::FailedPrecondition, "something else"),
+    ] {
+        let rpc = tonic_types::pb::Status {
+            code: code as i32,
+            message: message.into(),
+            ..Default::default()
+        };
+        let status = tonic::Status::with_details(
+            tonic::Code::FailedPrecondition,
+            "raw",
+            bytes::Bytes::from(rpc.encode_to_vec()),
+        );
+        assert_eq!(
+            error_body(&status, Some(&details)),
+            malformed_upstream_status_body(),
+            "{code:?} {message:?}"
+        );
+    }
+}
+
+#[test]
 fn opaque_details_key_is_absent_when_every_type_resolves() {
     let body = error_body(&rich_status(), Some(&canonical_only()));
     assert!(body.get("opaqueDetails").is_none(), "{body}");
