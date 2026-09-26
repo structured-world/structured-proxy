@@ -45,6 +45,7 @@ fn embedded_config_is_constructible() {
         // the config via from_file / from_yaml_str, where the default list applies).
         forwarded_headers: vec!["authorization".into()],
         streaming: Default::default(),
+        error_details: Default::default(),
     };
     // The server accepts a programmatically-built config (the embedded path).
     let _server = ProxyServer::from_config(config);

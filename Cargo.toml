@@ -40,6 +40,11 @@ bytes = "1"
 # gRPC client (to upstream service)
 tonic = "0.14"
 tonic-health = "0.14"
+# Canonical google.rpc.Status / error_details descriptors (FILE_DESCRIPTOR_SET)
+# and the Status message used to decode `grpc-status-details-bin`, so REST error
+# bodies can render typed details even when the product descriptors do not
+# import google/rpc/*.
+tonic-types = "0.14"
 prost = "0.14"
 
 # Async runtime
@@ -147,3 +152,6 @@ ed25519-dalek = "3"
 rand = "0.10"
 chrono = "0.4"
 tokio-stream = "0.1"
+# Compiles the in-memory test protos (google.api.http routes) of the
+# error-details integration test without a protoc binary.
+protox = "0.9"

@@ -422,7 +422,10 @@ impl ProxyServer {
         let cors = self.build_cors();
 
         // Build transcoding routes from descriptor pool.
-        let mut transcode_routes = transcode::routes(&pool, &self.config.aliases);
+        let error_details =
+            transcode::error::ErrorDetailsPolicy::from_config(&self.config.error_details)
+                .map_err(|e| anyhow::anyhow!("invalid error_details config: {e}"))?;
+        let mut transcode_routes = transcode::routes(&pool, &self.config.aliases, &error_details);
 
         // External authorization (Envoy ext_authz) gates only the proxied API
         // routes, never health / metrics / discovery. It runs inside the auth

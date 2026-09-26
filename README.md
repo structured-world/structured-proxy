@@ -18,6 +18,7 @@ Works with **any** gRPC service via proto descriptor files. No code generation, 
 - **Auto-generated OpenAPI** documentation from proto messages, served at `/openapi.json`
 - **Server-streaming** RPC → NDJSON by default, or Server-Sent Events via `Accept: text/event-stream` negotiation
 - **gRPC → HTTP status mapping** following the standard `google.rpc.Code` table
+- **Typed error details**: the upstream's `google.rpc.Status` details (`ErrorInfo`, `BadRequest`, `RetryInfo`, ...) reach the HTTP client as ProtoJSON, switchable globally and per route (see [Error responses](#error-responses))
 - **Header forwarding** from HTTP requests to gRPC metadata (configurable allow-list)
 - **Context propagation**: W3C trace-context (`traceparent` forwarded or synthesized) and client deadlines (`grpc-timeout`) carried across the REST↔gRPC boundary
 - **Path aliasing** for route remapping (e.g. `/oauth2/*` → `/v1/oauth2/*`)
@@ -106,6 +107,16 @@ streaming:
   # SSE keep-alive interval (seconds). Comment frames keep idle streams alive
   # through load balancers / nginx read timeouts. Default: 15.
   sse_keep_alive_secs: 15
+
+# Optional: typed google.rpc.Status details in error bodies (see "Error
+# responses"). On everywhere by default. Rules are checked in order and the
+# first whose pattern matches the mounted route decides; `*` stays within one
+# path segment (a path parameter counts as one), `**` spans segments.
+error_details:
+  enabled: true
+  routes:
+    - pattern: "/v1/internal/**"
+      enabled: false
 
 # Rate limiting (Shield)
 #
@@ -244,6 +255,79 @@ there is no boundary burst on top of this lag.
 
 See the `shield:` block under [Configuration](#configuration) for the full
 schema.
+
+## Error responses
+
+A failed gRPC call becomes a JSON body with the status of the gRPC → HTTP
+mapping (`INVALID_ARGUMENT` → 400, `NOT_FOUND` → 404, ...):
+
+```json
+{
+  "error": "INVALID_ARGUMENT",
+  "code": 3,
+  "message": "invalid email",
+  "details": [
+    {
+      "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+      "reason": "EMAIL_TAKEN",
+      "domain": "identity.example.com",
+      "metadata": { "email": "a@b.c" }
+    },
+    {
+      "@type": "type.googleapis.com/google.rpc.BadRequest",
+      "fieldViolations": [{ "field": "email", "description": "already registered" }]
+    }
+  ]
+}
+```
+
+- `code`, `message` and `details` follow `google.rpc.Status`; `error` is the
+  code's name. A client that parses the body as `google.rpc.Status` with a
+  strict ProtoJSON parser must let it ignore unknown fields.
+- `details` is the upstream's `grpc-status-details-bin` trailer, one entry per
+  `Any`, in [ProtoJSON](https://protobuf.dev/programming-guides/json/#any)
+  form: `@type` plus the message fields, or `@type` plus `value` for a
+  well-known type with a special JSON representation (`google.protobuf.Duration`
+  as `"1.500s"`). Types resolve from the service's descriptors first, then from
+  the canonical `google/rpc/status.proto` and `error_details.proto`, which are
+  always available. An upstream that sends no trailer yields `"details": []`.
+- `google.rpc.DebugInfo` is never forwarded: it carries stack traces and server
+  internals meant for the service's operators.
+- With details switched off for a route (`error_details` in the config), the
+  `details` key is absent and the body is `{"error", "code", "message"}`.
+
+**Opaque-detail extension.** ProtoJSON cannot represent an `Any` whose type is
+unknown to the reader. Rather than drop such a detail (a type in neither
+descriptor set, or bytes that do not decode as their type), structured-proxy
+keeps it in its own extension, which is **not** part of ProtoJSON:
+
+```json
+{ "@type": "type.googleapis.com/acme.v1.QuotaTicket", "value": "CgNULTE=" }
+```
+
+`@type` is the original type URL and `value` the standard base64 of the
+original bytes. `value` also appears on well-known types, holding their JSON
+there, so a consumer tells the two apart by `@type`: when it names a well-known
+type with a special JSON representation, `value` is that JSON; otherwise a
+string `value` is the opaque extension, and the consumer that knows the type
+base64-decodes it and parses the protobuf bytes itself. Consumers that do not
+handle the extension should skip such entries.
+
+**Errors in server-streaming responses.** A stream that fails before its first
+message still owns the response: it gets the mapped HTTP status and the body
+above. Once the first message is sent, the `200` is already on the wire and
+cannot change, so the failure is delivered as a terminal frame whose payload is
+exactly that body, after which the stream ends and no further data follows:
+
+- **NDJSON**: the last line. It is told apart from a data line by being last
+  and by its `error` + `code` fields; if the RPC's own messages carry top-level
+  `error` and `code` fields, use SSE, where the event type separates the two.
+- **SSE**: one event with type `stream-error` (listen with
+  `addEventListener("stream-error", ...)`), distinct from the `EventSource`
+  `onerror` that fires on transport failures.
+
+This is the HTTP/JSON transcoding format. It is not the Connect protocol's error
+format, and it is not an OAuth 2.0 token endpoint error body (RFC 6749 §5.2).
 
 ## Library Usage
 
