@@ -20,6 +20,7 @@ use prost::Message as _;
 use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor};
 use serde_json::{json, Value};
 use structured_proxy::transcode::codec::DynamicCodec;
+use structured_proxy::transcode::error::ErrorDetailsPolicy;
 use tonic_types::{BadRequest, DebugInfo, ErrorDetail, ErrorInfo, FieldViolation, StatusExt};
 
 // --- descriptors ------------------------------------------------------------
@@ -292,12 +293,12 @@ impl tower::Service<http::Request<tonic::body::Body>> for Things {
 
 // --- proxy harness ----------------------------------------------------------
 
-/// A proxy router in front of a fresh upstream, with `error_details_yaml`
-/// appended to the config (empty for the defaults).
-async fn proxy(error_details_yaml: &str) -> axum::Router {
+/// A proxy router in front of a fresh upstream, returning error details as
+/// `error_details` decides.
+async fn proxy(error_details: ErrorDetailsPolicy) -> axum::Router {
     let pool = pool();
     let upstream = common::serve(Things { pool: pool.clone() }).await;
-    common::proxy(&upstream, pool, error_details_yaml)
+    common::proxy(&upstream, pool, error_details)
 }
 
 async fn get(app: &axum::Router, path: &str, accept: Option<&str>) -> (StatusCode, String) {
@@ -320,7 +321,7 @@ async fn unary_error_carries_error_info_and_bad_request() {
     // The acceptance case: typed details arrive as ProtoJSON `Any`s next to
     // the existing fields, with the HTTP status of the gRPC → HTTP mapping,
     // and DebugInfo stays behind.
-    let app = proxy("").await;
+    let app = proxy(ErrorDetailsPolicy::default()).await;
     let (status, body) = get_json(&app, "/v1/things/rich").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(
@@ -338,7 +339,7 @@ async fn unary_error_carries_error_info_and_bad_request() {
 
 #[tokio::test]
 async fn unary_error_without_trailer_has_empty_details() {
-    let app = proxy("").await;
+    let app = proxy(ErrorDetailsPolicy::default()).await;
     let (status, body) = get_json(&app, "/v1/things/missing").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(
@@ -353,7 +354,7 @@ async fn product_unknown_and_well_known_details_are_told_apart() {
     // its fields, a well-known type with a special JSON form sits under
     // `value` as that JSON, and an unresolvable type uses the opaque-detail
     // extension (original type URL, base64 of the original bytes).
-    let app = proxy("").await;
+    let app = proxy(ErrorDetailsPolicy::default()).await;
     let (status, body) = get_json(&app, "/v1/things/mixed").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(
@@ -372,9 +373,12 @@ async fn product_unknown_and_well_known_details_are_told_apart() {
 async fn route_rule_switches_details_off_for_one_route() {
     // Only the matched route loses `details` (the key is absent, not empty);
     // its HTTP status and the other routes are unaffected.
-    let app =
-        proxy("error_details:\n  routes:\n    - pattern: \"/v1/quiet/*\"\n      enabled: false\n")
-            .await;
+    let app = proxy(
+        ErrorDetailsPolicy::default()
+            .route("/v1/quiet/*", false)
+            .unwrap(),
+    )
+    .await;
     let (status, quiet) = get_json(&app, "/v1/quiet/rich").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(
@@ -390,7 +394,9 @@ async fn global_switch_off_with_a_sub_route_back_on() {
     // Global off, `/v1/things/**` back on: the sub-route (including its
     // streaming routes) keeps details, everything else drops them.
     let app = proxy(
-        "error_details:\n  enabled: false\n  routes:\n    - pattern: \"/v1/things/**\"\n      enabled: true\n",
+        ErrorDetailsPolicy::disabled()
+            .route("/v1/things/**", true)
+            .unwrap(),
     )
     .await;
     let (_, quiet) = get_json(&app, "/v1/quiet/rich").await;
@@ -405,7 +411,7 @@ async fn global_switch_off_with_a_sub_route_back_on() {
 async fn global_switch_off_removes_details_from_stream_frames_too() {
     // The switch covers the in-stream terminal frame as well: a route with
     // details off ends its stream with the bare error body.
-    let app = proxy("error_details:\n  enabled: false\n").await;
+    let app = proxy(ErrorDetailsPolicy::disabled()).await;
     let (status, body) = get(&app, "/v1/things/x/watch", None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let last: Value = serde_json::from_str(body.lines().last().unwrap()).unwrap();
@@ -428,7 +434,7 @@ async fn unary_error_with_a_corrupt_known_detail_becomes_a_safe_internal() {
     // response. Before headers the proxy still owns the status, so the client
     // gets a generic 500 INTERNAL, not the upstream's NOT_FOUND with the detail
     // dropped, passed on as base64, or otherwise reinterpreted.
-    let app = proxy("").await;
+    let app = proxy(ErrorDetailsPolicy::default()).await;
     let (status, body) = get(&app, "/v1/things/corrupt", None).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(
@@ -442,7 +448,7 @@ async fn unary_error_with_a_corrupt_known_detail_becomes_a_safe_internal() {
 async fn stream_error_with_a_corrupt_known_detail_ends_with_a_safe_internal_frame() {
     // After the first message the 200 is sent, so the same failure becomes the
     // terminal frame instead, in both formats.
-    let app = proxy("").await;
+    let app = proxy(ErrorDetailsPolicy::default()).await;
     let (status, body) = get(&app, "/v1/things/corrupt/watch", None).await;
     assert_eq!(status, StatusCode::OK);
     let mut expected = malformed_upstream_status_body();
@@ -476,7 +482,7 @@ async fn unmappable_request_gets_the_shared_error_body() {
     // A request the proxy rejects before calling the upstream answers in the
     // same body as an upstream error on that route, so a client parses one
     // shape: here INVALID_ARGUMENT with empty details.
-    let app = proxy("").await;
+    let app = proxy(ErrorDetailsPolicy::default()).await;
     let (status, body) = get_json(&app, "/v1/things/rich?count=many").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"], "INVALID_ARGUMENT");
@@ -493,7 +499,9 @@ async fn unreachable_upstream_gets_the_shared_error_body() {
     let app = common::proxy(
         "http://127.0.0.1:1",
         pool(),
-        "error_details:\n  routes:\n    - pattern: \"/v1/quiet/*\"\n      enabled: false\n",
+        ErrorDetailsPolicy::default()
+            .route("/v1/quiet/*", false)
+            .unwrap(),
     );
     let (status, body) = get_json(&app, "/v1/things/rich").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -513,7 +521,7 @@ async fn unreachable_upstream_gets_the_shared_error_body() {
 async fn stream_refused_before_headers_maps_like_a_unary_error() {
     // No message was sent yet, so the proxy still owns the HTTP status: it is
     // mapped (PERMISSION_DENIED → 403) and the body is the unary error body.
-    let app = proxy("").await;
+    let app = proxy(ErrorDetailsPolicy::default()).await;
     let (status, body) = get_json(&app, "/v1/things/x/denied").await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(
@@ -537,7 +545,7 @@ async fn ndjson_stream_failing_after_first_message_ends_with_detailed_error_line
     // fails, so the status cannot change: the error arrives as exactly one
     // final NDJSON line holding the same body a unary error would have, marked
     // by `@type: google.rpc.Status` so it is not mistaken for a data line.
-    let app = proxy("").await;
+    let app = proxy(ErrorDetailsPolicy::default()).await;
     let (status, body) = get(&app, "/v1/things/x/watch", None).await;
     assert_eq!(status, StatusCode::OK);
     let lines: Vec<Value> = body
@@ -563,7 +571,7 @@ async fn ndjson_stream_failing_after_first_message_ends_with_detailed_error_line
 async fn sse_stream_failing_after_first_message_ends_with_detailed_stream_error_event() {
     // Same failure over SSE: one data event, then exactly one `stream-error`
     // event with the full error body, and nothing after it.
-    let app = proxy("").await;
+    let app = proxy(ErrorDetailsPolicy::default()).await;
     let (status, body) = get(&app, "/v1/things/x/watch", Some("text/event-stream")).await;
     assert_eq!(status, StatusCode::OK);
     let events: Vec<(Option<&str>, Value)> = body

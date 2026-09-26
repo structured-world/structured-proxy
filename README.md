@@ -18,7 +18,7 @@ Works with **any** gRPC service via proto descriptor files. No code generation, 
 - **Auto-generated OpenAPI** documentation from proto messages, served at `/openapi.json`
 - **Server-streaming** RPC → NDJSON by default, or Server-Sent Events via `Accept: text/event-stream` negotiation
 - **gRPC → HTTP status mapping** following the standard `google.rpc.Code` table
-- **Typed error details**: the upstream's `google.rpc.Status` details (`ErrorInfo`, `BadRequest`, `RetryInfo`, ...) reach the HTTP client as ProtoJSON, switchable globally and per route (see [Error responses](#error-responses))
+- **Typed error details**: the upstream's `google.rpc.Status` details (`ErrorInfo`, `BadRequest`, `RetryInfo`, ...) reach the HTTP client as ProtoJSON; an embedder can switch them off globally or per route (see [Error responses](#error-responses))
 - **Header forwarding** from HTTP requests to gRPC metadata (configurable allow-list)
 - **Context propagation**: W3C trace-context (`traceparent` forwarded or synthesized) and client deadlines (`grpc-timeout`) carried across the REST↔gRPC boundary
 - **Path aliasing** for route remapping (e.g. `/oauth2/*` → `/v1/oauth2/*`)
@@ -107,16 +107,6 @@ streaming:
   # SSE keep-alive interval (seconds). Comment frames keep idle streams alive
   # through load balancers / nginx read timeouts. Default: 15.
   sse_keep_alive_secs: 15
-
-# Optional: typed google.rpc.Status details in error bodies (see "Error
-# responses"). On everywhere by default. Rules are checked in order and the
-# first whose pattern matches the mounted route decides; `*` stays within one
-# path segment (a path parameter counts as one), `**` spans segments.
-error_details:
-  enabled: true
-  routes:
-    - pattern: "/v1/internal/**"
-      enabled: false
 
 # Rate limiting (Shield)
 #
@@ -293,8 +283,9 @@ mapping (`INVALID_ARGUMENT` → 400, `NOT_FOUND` → 404, ...):
   always available. An upstream that sends no trailer yields `"details": []`.
 - `google.rpc.DebugInfo` is never forwarded: it carries stack traces and server
   internals meant for the service's operators.
-- With details switched off for a route (`error_details` in the config), the
-  `details` key is absent and the body is `{"error", "code", "message"}`.
+- Details are on for every route. An embedder can switch them off globally or
+  per route (see below); on such a route the `details` key is absent and the
+  body is `{"error", "code", "message"}`.
 - Errors the proxy raises itself on a transcoded route use the same body: a
   request that cannot be mapped onto the RPC (`INVALID_ARGUMENT`, 400), an
   upstream that is not reachable (`UNAVAILABLE`, 503), a response that cannot
@@ -346,6 +337,25 @@ stream ends with an `INTERNAL` terminal frame.
 
 This is the HTTP/JSON transcoding format. It is not the Connect protocol's error
 format, and it is not an OAuth 2.0 token endpoint error body (RFC 6749 §5.2).
+
+**Switching details off.** An embedding service chooses per route with
+`ProxyServer::with_error_details`. Overrides are checked in the order they are
+added and the first whose pattern matches the mounted route decides; `*` stays
+within one path segment (a path parameter counts as one) and `**` spans
+segments:
+
+```rust
+use structured_proxy::transcode::error::ErrorDetailsPolicy;
+use structured_proxy::{config::ProxyConfig, ProxyServer};
+
+# fn build(config: ProxyConfig) -> Result<ProxyServer, String> {
+// Details everywhere except the internal admin surface.
+let policy = ErrorDetailsPolicy::default().route("/v1/admin/**", false)?;
+// Or: off everywhere except a public sub-route.
+// let policy = ErrorDetailsPolicy::disabled().route("/v1/public/**", true)?;
+Ok(ProxyServer::from_config(config).with_error_details(policy))
+# }
+```
 
 ## Library Usage
 
@@ -426,6 +436,8 @@ The hooks are:
   discovery.
 - **`with_extra_routes`** — registers extra stateless routes through a
   framework-agnostic adapter (request parts in, response parts out).
+- **`with_error_details`** — chooses which transcoded routes return the
+  upstream's `google.rpc.Status` details (see [Error responses](#error-responses)).
 
 ## JWT verification
 

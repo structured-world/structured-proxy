@@ -95,10 +95,17 @@ impl HttpMethod {
 
 /// Build transcoded REST→gRPC routes from a descriptor pool.
 ///
-/// Takes a `DescriptorPool`, optional path aliases from config and the policy
-/// deciding which routes return `google.rpc.Status` details in their error
-/// bodies. Returns an axum Router that transcodes REST requests to gRPC calls.
-pub fn routes<S: TranscodeState>(
+/// Takes a `DescriptorPool` and optional path aliases from config.
+/// Returns an axum Router that transcodes REST requests to gRPC calls. Error
+/// bodies carry `google.rpc.Status` details on every route; use
+/// [`routes_with_error_details`] to choose per route.
+pub fn routes<S: TranscodeState>(pool: &DescriptorPool, aliases: &[AliasConfig]) -> Router<S> {
+    routes_with_error_details(pool, aliases, &ErrorDetailsPolicy::default())
+}
+
+/// [`routes`], with `error_details` deciding which routes return
+/// `google.rpc.Status` details in their error bodies.
+pub fn routes_with_error_details<S: TranscodeState>(
     pool: &DescriptorPool,
     aliases: &[AliasConfig],
     error_details: &ErrorDetailsPolicy,
@@ -310,7 +317,7 @@ async fn streaming_handler<S: TranscodeState>(
     let mut grpc_client = Grpc::new(channel);
     if let Err(e) = grpc_client.ready().await {
         let status = tonic::Status::unavailable(format!("gRPC upstream not ready: {e}"));
-        return error::status_to_response(&status, entry.error_details.as_deref());
+        return error::status_to_response_with_details(&status, entry.error_details.as_deref());
     }
 
     let use_sse = wants_sse(&headers);
@@ -333,7 +340,9 @@ async fn streaming_handler<S: TranscodeState>(
                 ndjson_response(stream, render_error)
             }
         }
-        Err(status) => error::status_to_response(&status, entry.error_details.as_deref()),
+        Err(status) => {
+            error::status_to_response_with_details(&status, entry.error_details.as_deref())
+        }
     }
 }
 
@@ -490,7 +499,7 @@ fn decode_request(
 /// The 400 answer to a request [`decode_request`] could not map, in the same
 /// error body the upstream's own errors get on this route.
 fn bad_request(entry: &RouteEntry, message: String) -> Response {
-    error::status_to_response(
+    error::status_to_response_with_details(
         &tonic::Status::invalid_argument(message),
         entry.error_details.as_deref(),
     )
@@ -531,7 +540,7 @@ async fn transcode_handler<S: TranscodeState>(
     let mut grpc_client = Grpc::new(channel);
     if let Err(e) = grpc_client.ready().await {
         let status = tonic::Status::unavailable(format!("gRPC upstream not ready: {e}"));
-        return error::status_to_response(&status, entry.error_details.as_deref());
+        return error::status_to_response_with_details(&status, entry.error_details.as_deref());
     }
 
     match grpc_client.unary(grpc_request, grpc_path, grpc_codec).await {
@@ -559,14 +568,16 @@ async fn transcode_handler<S: TranscodeState>(
                 }
                 Err(e) => {
                     tracing::error!("Failed to serialize gRPC response: {e}");
-                    error::status_to_response(
+                    error::status_to_response_with_details(
                         &tonic::Status::internal("failed to serialize response"),
                         entry.error_details.as_deref(),
                     )
                 }
             }
         }
-        Err(status) => error::status_to_response(&status, entry.error_details.as_deref()),
+        Err(status) => {
+            error::status_to_response_with_details(&status, entry.error_details.as_deref())
+        }
     }
 }
 

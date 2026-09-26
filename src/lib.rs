@@ -114,6 +114,9 @@ pub struct ProxyServer {
     verify_path: Option<String>,
     /// Embedder-supplied JWT verifier, replacing the built-in one.
     token_verifier: Option<Arc<dyn TokenVerifier>>,
+    /// Which transcoded routes return `google.rpc.Status` details in their
+    /// error bodies (all of them unless overridden).
+    error_details: transcode::error::ErrorDetailsPolicy,
 }
 
 impl ProxyServer {
@@ -134,6 +137,7 @@ impl ProxyServer {
             extra_routes: Vec::new(),
             verify_path: None,
             token_verifier: None,
+            error_details: transcode::error::ErrorDetailsPolicy::default(),
         }
     }
 
@@ -197,6 +201,15 @@ impl ProxyServer {
     /// ignored (with a warning), since the verifier owns its own keys.
     pub fn with_token_verifier(mut self, verifier: Arc<dyn TokenVerifier>) -> Self {
         self.token_verifier = Some(verifier);
+        self
+    }
+
+    /// Choose which transcoded routes return the upstream's
+    /// `google.rpc.Status` details in their error bodies. Every route does by
+    /// default; see [`transcode::error::ErrorDetailsPolicy`] to switch them
+    /// off globally or per route.
+    pub fn with_error_details(mut self, policy: transcode::error::ErrorDetailsPolicy) -> Self {
+        self.error_details = policy;
         self
     }
 
@@ -422,10 +435,8 @@ impl ProxyServer {
         let cors = self.build_cors();
 
         // Build transcoding routes from descriptor pool.
-        let error_details =
-            transcode::error::ErrorDetailsPolicy::from_config(&self.config.error_details)
-                .map_err(|e| anyhow::anyhow!("invalid error_details config: {e}"))?;
-        let mut transcode_routes = transcode::routes(&pool, &self.config.aliases, &error_details);
+        let mut transcode_routes =
+            transcode::routes_with_error_details(&pool, &self.config.aliases, &self.error_details);
 
         // External authorization (Envoy ext_authz) gates only the proxied API
         // routes, never health / metrics / discovery. It runs inside the auth

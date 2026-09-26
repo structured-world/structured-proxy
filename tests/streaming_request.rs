@@ -88,7 +88,7 @@ async fn proxy() -> axum::Router {
     let pool: DescriptorPool = common::compile("test/v1/things.proto", THINGS_PROTO);
     let item = pool.get_message_by_name("test.v1.Item").unwrap();
     let upstream = common::serve(Things { item }).await;
-    common::proxy(&upstream, pool, "")
+    common::proxy(&upstream, pool, Default::default())
 }
 
 /// The NDJSON lines of a streaming response, parsed.

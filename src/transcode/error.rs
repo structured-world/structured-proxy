@@ -14,8 +14,6 @@ use prost::Message as _;
 use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor, SerializeOptions};
 use serde_json::{Map, Value};
 
-use crate::config::ErrorDetailsConfig;
-
 /// Full name of `google.rpc.DebugInfo`. It carries stack traces and server
 /// internals meant for the service's operators, so it never reaches an HTTP
 /// client.
@@ -57,12 +55,24 @@ const MALFORMED_STATUS_MESSAGE: &str = "upstream returned a malformed error stat
 #[derive(Debug)]
 struct MalformedStatus;
 
+/// Convert a `tonic::Status` into an axum HTTP response with a JSON error body
+/// `{"error", "message", "code"}`, without status details.
+///
+/// Use [`status_to_response_with_details`] to also render the upstream's
+/// `google.rpc.Status` details.
+pub fn status_to_response(status: tonic::Status) -> Response {
+    status_to_response_with_details(&status, None)
+}
+
 /// Convert a `tonic::Status` into an axum HTTP response with a JSON error body.
 ///
 /// The body is `{"error", "message", "code"}`, plus a `details` array when
 /// `details` is given (see [`error_body`]). The HTTP status follows the code the
 /// body reports, so a malformed upstream status answers 500.
-pub fn status_to_response(status: &tonic::Status, details: Option<&StatusDetails>) -> Response {
+pub fn status_to_response_with_details(
+    status: &tonic::Status,
+    details: Option<&StatusDetails>,
+) -> Response {
     let (code, body) = render(status, details);
     (grpc_to_http_status(code), Json(body)).into_response()
 }
@@ -136,11 +146,34 @@ pub(crate) fn grpc_code_name(code: tonic::Code) -> &'static str {
     }
 }
 
-/// Which routes return `details` in their error bodies, compiled from
-/// [`ErrorDetailsConfig`].
+/// Which routes return `details` in their error bodies.
 ///
-/// Decided once per route when the router is built, so a request pays nothing
-/// for it.
+/// A global switch plus per-route overrides, checked in the order they were
+/// added: the first whose pattern matches the route decides. A pattern is a
+/// glob over the mounted route path, where `*` stays within one segment and
+/// `**` spans segments; every path parameter counts as one segment, so
+/// `/v1/users/*` matches the route `/v1/users/{id}`. Decided once per route
+/// when the router is built, so a request pays nothing for it.
+///
+/// # Examples
+///
+/// ```
+/// use structured_proxy::transcode::error::ErrorDetailsPolicy;
+///
+/// // Details everywhere except the internal admin surface.
+/// let policy = ErrorDetailsPolicy::default()
+///     .route("/v1/admin/**", false)
+///     .unwrap();
+/// assert!(policy.enabled_for("/v1/users/{id}"));
+/// assert!(!policy.enabled_for("/v1/admin/users/{id}"));
+///
+/// // Off by default, back on for one sub-route.
+/// let policy = ErrorDetailsPolicy::disabled()
+///     .route("/v1/public/**", true)
+///     .unwrap();
+/// assert!(!policy.enabled_for("/v1/users/{id}"));
+/// assert!(policy.enabled_for("/v1/public/items"));
+/// ```
 #[derive(Debug, Clone)]
 pub struct ErrorDetailsPolicy {
     enabled: bool,
@@ -148,44 +181,32 @@ pub struct ErrorDetailsPolicy {
 }
 
 impl ErrorDetailsPolicy {
-    /// Compile the config, rejecting patterns that could never match a route.
+    /// No details on any route, until a [`route`](Self::route) switches them on.
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            routes: Vec::new(),
+        }
+    }
+
+    /// Add an override for the routes `pattern` matches, checked after the
+    /// ones added before it.
     ///
     /// # Errors
     ///
-    /// A pattern that does not start with `/` or is not a valid glob.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use structured_proxy::config::ErrorDetailsConfig;
-    /// use structured_proxy::transcode::error::ErrorDetailsPolicy;
-    ///
-    /// let policy = ErrorDetailsPolicy::from_config(&ErrorDetailsConfig::default()).unwrap();
-    /// assert!(policy.enabled_for("/v1/users/{id}"));
-    /// ```
-    pub fn from_config(cfg: &ErrorDetailsConfig) -> Result<Self, String> {
-        let routes = cfg
-            .routes
-            .iter()
-            .map(|rule| {
-                // Route paths always start with `/`; a relative pattern is a
-                // missing-slash typo that would silently never apply.
-                if !rule.pattern.starts_with('/') {
-                    return Err(format!(
-                        "error_details route pattern {:?} must start with '/'",
-                        rule.pattern
-                    ));
-                }
-                Ok((
-                    crate::shield::matcher::path_glob(&rule.pattern)?,
-                    rule.enabled,
-                ))
-            })
-            .collect::<Result<_, _>>()?;
-        Ok(Self {
-            enabled: cfg.enabled,
-            routes,
-        })
+    /// A pattern that does not start with `/` (it could never match a route)
+    /// or is not a valid glob.
+    pub fn route(mut self, pattern: &str, enabled: bool) -> Result<Self, String> {
+        // Route paths always start with `/`; a relative pattern is a
+        // missing-slash typo that would silently never apply.
+        if !pattern.starts_with('/') {
+            return Err(format!(
+                "error details route pattern {pattern:?} must start with '/'"
+            ));
+        }
+        self.routes
+            .push((crate::shield::matcher::path_glob(pattern)?, enabled));
+        Ok(self)
     }
 
     /// Whether the route mounted at `route_path` (axum form, e.g.

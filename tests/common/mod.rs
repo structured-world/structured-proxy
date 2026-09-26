@@ -6,6 +6,7 @@ use axum::body::Body;
 use http::StatusCode;
 use prost_reflect::DescriptorPool;
 use structured_proxy::config::ProxyConfig;
+use structured_proxy::transcode::error::ErrorDetailsPolicy;
 use structured_proxy::ProxyServer;
 use tower::ServiceExt;
 
@@ -94,15 +95,18 @@ where
     format!("http://{addr}")
 }
 
-/// The proxy router for `pool` in front of `upstream`, with `extra_yaml`
-/// appended to the config (empty for the defaults).
-pub fn proxy(upstream: &str, pool: DescriptorPool, extra_yaml: &str) -> axum::Router {
-    let config = ProxyConfig::from_yaml_str(&format!(
-        "upstream:\n  default: \"{upstream}\"\n{extra_yaml}"
-    ))
-    .unwrap();
+/// The proxy router for `pool` in front of `upstream`, returning error details
+/// as `error_details` decides.
+pub fn proxy(
+    upstream: &str,
+    pool: DescriptorPool,
+    error_details: ErrorDetailsPolicy,
+) -> axum::Router {
+    let config =
+        ProxyConfig::from_yaml_str(&format!("upstream:\n  default: \"{upstream}\"\n")).unwrap();
     ProxyServer::from_config(config)
         .with_descriptors(pool)
+        .with_error_details(error_details)
         .router()
         .unwrap()
 }

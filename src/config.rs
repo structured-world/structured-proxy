@@ -81,50 +81,6 @@ pub struct ProxyConfig {
     /// Server-streaming response behavior.
     #[serde(default)]
     pub streaming: StreamingConfig,
-
-    /// Typed `google.rpc.Status` details in REST error bodies.
-    #[serde(default)]
-    pub error_details: ErrorDetailsConfig,
-}
-
-/// Whether REST error bodies carry the typed details (`ErrorInfo`, `BadRequest`,
-/// ...) the upstream attached in the `grpc-status-details-bin` trailer.
-///
-/// On by default. `routes` narrows or widens that per route: rules are checked
-/// in order and the first whose `pattern` matches the route decides. A pattern
-/// is a glob over the mounted route path, where `*` stays within one segment and
-/// `**` spans segments; every path parameter counts as one segment, so
-/// `/v1/users/*` matches the route `/v1/users/{id}`.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-#[non_exhaustive]
-pub struct ErrorDetailsConfig {
-    /// Default for routes no rule matches. Default: true.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// Per-route overrides, first match wins.
-    #[serde(default)]
-    pub routes: Vec<ErrorDetailsRouteConfig>,
-}
-
-impl Default for ErrorDetailsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            routes: Vec::new(),
-        }
-    }
-}
-
-/// One per-route override of [`ErrorDetailsConfig::enabled`].
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-#[non_exhaustive]
-pub struct ErrorDetailsRouteConfig {
-    /// Glob over the mounted route path, e.g. `/v1/admin/**`.
-    pub pattern: String,
-    /// Whether matching routes return details.
-    pub enabled: bool,
 }
 
 fn default_forwarded_headers() -> Vec<String> {

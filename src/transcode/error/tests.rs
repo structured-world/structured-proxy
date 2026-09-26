@@ -3,8 +3,6 @@ use super::*;
 use serde_json::json;
 use tonic_types::{BadRequest, DebugInfo, ErrorDetail, ErrorInfo, FieldViolation, StatusExt};
 
-use crate::config::ErrorDetailsRouteConfig;
-
 #[test]
 fn test_grpc_to_http_mapping() {
     assert_eq!(grpc_to_http_status(tonic::Code::Ok), StatusCode::OK);
@@ -63,7 +61,7 @@ fn test_grpc_code_name() {
 #[test]
 fn test_status_to_response() {
     let status = tonic::Status::not_found("user not found");
-    let response = status_to_response(&status, None);
+    let response = status_to_response(status);
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
@@ -201,7 +199,7 @@ fn error_info_and_bad_request_render_as_canonical_json() {
 fn status_to_response_keeps_http_mapping_with_details() {
     // Rendering details must not change the HTTP status chosen by the
     // gRPC → HTTP mapping.
-    let resp = status_to_response(&rich_status(), Some(&canonical_only()));
+    let resp = status_to_response_with_details(&rich_status(), Some(&canonical_only()));
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -304,7 +302,7 @@ fn corrupt_known_detail_fails_the_error_safely() {
         error_body(&status, Some(&details)),
         malformed_upstream_status_body()
     );
-    let resp = status_to_response(&status, Some(&details));
+    let resp = status_to_response_with_details(&status, Some(&details));
     assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
 
@@ -424,7 +422,7 @@ fn malformed_trailer_fails_the_error_safely() {
         error_body(&status, Some(&details)),
         malformed_upstream_status_body()
     );
-    let resp = status_to_response(&status, Some(&details));
+    let resp = status_to_response_with_details(&status, Some(&details));
     assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
 
@@ -442,7 +440,7 @@ fn details_off_leaves_a_malformed_trailer_unread() {
         json!({"error": "NOT_FOUND", "message": "boom", "code": 5})
     );
     assert_eq!(
-        status_to_response(&status, None).status(),
+        status_to_response_with_details(&status, None).status(),
         StatusCode::NOT_FOUND
     );
 }
@@ -450,17 +448,14 @@ fn details_off_leaves_a_malformed_trailer_unread() {
 // --- policy -----------------------------------------------------------------
 
 fn policy(enabled: bool, routes: &[(&str, bool)]) -> Result<ErrorDetailsPolicy, String> {
-    let cfg = ErrorDetailsConfig {
-        enabled,
-        routes: routes
-            .iter()
-            .map(|(pattern, enabled)| ErrorDetailsRouteConfig {
-                pattern: (*pattern).to_string(),
-                enabled: *enabled,
-            })
-            .collect(),
+    let base = if enabled {
+        ErrorDetailsPolicy::default()
+    } else {
+        ErrorDetailsPolicy::disabled()
     };
-    ErrorDetailsPolicy::from_config(&cfg)
+    routes.iter().try_fold(base, |policy, (pattern, enabled)| {
+        policy.route(pattern, *enabled)
+    })
 }
 
 #[test]
