@@ -148,6 +148,35 @@ fn mixed_status(pool: &DescriptorPool) -> tonic::Status {
     )
 }
 
+/// `NOT_FOUND` whose `ErrorInfo` detail is truncated: a known type with bytes
+/// that do not decode, i.e. a broken upstream response.
+fn corrupt_status() -> tonic::Status {
+    let mut rpc = tonic_types::pb::Status {
+        code: tonic::Code::NotFound as i32,
+        message: "gone".into(),
+        ..Default::default()
+    };
+    rpc.details.push(Default::default());
+    let any = rpc.details.last_mut().expect("just pushed");
+    any.type_url = "type.googleapis.com/google.rpc.ErrorInfo".to_string();
+    any.value = vec![0x0a, 0x05, b'a'];
+    tonic::Status::with_details(
+        tonic::Code::NotFound,
+        "gone",
+        bytes::Bytes::from(rpc.encode_to_vec()),
+    )
+}
+
+/// The body a client gets instead of a broken upstream error status.
+fn malformed_upstream_status_body() -> Value {
+    json!({
+        "error": "INTERNAL",
+        "message": "upstream returned a malformed error status",
+        "code": 13,
+        "details": []
+    })
+}
+
 /// Unary RPCs fail according to the requested `name`.
 #[derive(Clone)]
 struct Failing {
@@ -166,12 +195,14 @@ impl tonic::server::UnaryService<DynamicMessage> for Failing {
         ready(Err(match name.as_str() {
             "rich" => rich_status(),
             "mixed" => mixed_status(&self.pool),
+            "corrupt" => corrupt_status(),
             _ => tonic::Status::not_found("no such thing"),
         }))
     }
 }
 
-/// `Watch`: one message, then a rich error after the response has started.
+/// `Watch`: one message, then an error after the response has started: the
+/// corrupt one for `name == "corrupt"`, the rich one otherwise.
 #[derive(Clone)]
 struct FailsMidStream {
     item: MessageDescriptor,
@@ -182,11 +213,15 @@ impl tonic::server::ServerStreamingService<DynamicMessage> for FailsMidStream {
     type ResponseStream = BoxStream<'static, Result<DynamicMessage, tonic::Status>>;
     type Future = Ready<Result<tonic::Response<Self::ResponseStream>, tonic::Status>>;
 
-    fn call(&mut self, _request: tonic::Request<DynamicMessage>) -> Self::Future {
+    fn call(&mut self, request: tonic::Request<DynamicMessage>) -> Self::Future {
+        let failure = match request.get_ref().get_field_by_name("name").as_deref() {
+            Some(prost_reflect::Value::String(name)) if name == "corrupt" => corrupt_status(),
+            _ => rich_status(),
+        };
         let mut first = DynamicMessage::new(self.item.clone());
         first.set_field_by_name("name", prost_reflect::Value::String("first".into()));
         first.set_field_by_name("count", prost_reflect::Value::I64(1));
-        let items: Vec<Result<DynamicMessage, tonic::Status>> = vec![Ok(first), Err(rich_status())];
+        let items: Vec<Result<DynamicMessage, tonic::Status>> = vec![Ok(first), Err(failure)];
         ready(Ok(tonic::Response::new(Box::pin(futures::stream::iter(
             items,
         )))))
@@ -382,6 +417,55 @@ async fn global_switch_off_removes_details_from_stream_frames_too() {
             "message": "invalid email",
             "code": 3
         })
+    );
+}
+
+// --- broken upstream status ---------------------------------------------------
+
+#[tokio::test]
+async fn unary_error_with_a_corrupt_known_detail_becomes_a_safe_internal() {
+    // The type resolves but its bytes do not decode: a broken upstream
+    // response. Before headers the proxy still owns the status, so the client
+    // gets a generic 500 INTERNAL, not the upstream's NOT_FOUND with the detail
+    // dropped, passed on as base64, or otherwise reinterpreted.
+    let app = proxy("").await;
+    let (status, body) = get(&app, "/v1/things/corrupt", None).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap(),
+        malformed_upstream_status_body()
+    );
+    assert!(!body.contains("CgVh") && !body.contains("gone"), "{body}");
+}
+
+#[tokio::test]
+async fn stream_error_with_a_corrupt_known_detail_ends_with_a_safe_internal_frame() {
+    // After the first message the 200 is sent, so the same failure becomes the
+    // terminal frame instead, in both formats.
+    let app = proxy("").await;
+    let (status, body) = get(&app, "/v1/things/corrupt/watch", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let mut expected = malformed_upstream_status_body();
+    expected["@type"] = "type.googleapis.com/google.rpc.Status".into();
+    let lines: Vec<Value> = body
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        lines,
+        vec![json!({"name": "first", "count": "1"}), expected]
+    );
+
+    let (status, body) = get(&app, "/v1/things/corrupt/watch", Some("text/event-stream")).await;
+    assert_eq!(status, StatusCode::OK);
+    let error_payload = body
+        .split("\n\n")
+        .find(|event| event.contains("event: stream-error"))
+        .and_then(|event| event.lines().find_map(|line| line.strip_prefix("data: ")))
+        .expect("a stream-error event");
+    assert_eq!(
+        serde_json::from_str::<Value>(error_payload).unwrap(),
+        malformed_upstream_status_body()
     );
 }
 

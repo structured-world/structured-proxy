@@ -224,7 +224,7 @@ fn debug_info_is_never_rendered() {
             )),
         ],
     );
-    let details = canonical_only().render(&status);
+    let details = canonical_only().render(&status).unwrap();
     assert_eq!(
         details,
         vec![json!({
@@ -249,7 +249,7 @@ fn debug_info_is_dropped_under_any_type_url_prefix() {
         "example.com/types/google.rpc.DebugInfo",
         debug.encode_to_vec(),
     )]);
-    assert!(canonical_only().render(&status).is_empty());
+    assert!(canonical_only().render(&status).unwrap().is_empty());
 }
 
 #[test]
@@ -262,23 +262,79 @@ fn unknown_detail_type_keeps_type_and_base64_value() {
         vec![0x08, 0x96, 0x01],
     )]);
     assert_eq!(
-        canonical_only().render(&status),
+        canonical_only().render(&status).unwrap(),
         vec![json!({"@type": "type.googleapis.com/acme.v1.Unknown", "value": "CJYB"})]
     );
 }
 
+/// The body a failed call gets when the upstream's error status itself cannot
+/// be rendered faithfully: a generic INTERNAL, with no decoder diagnostics.
+fn malformed_upstream_status_body() -> Value {
+    json!({
+        "error": "INTERNAL",
+        "message": "upstream returned a malformed error status",
+        "code": 13,
+        "details": []
+    })
+}
+
 #[test]
-fn undecodable_known_detail_falls_back_to_base64() {
-    // Bytes that do not decode as the named type (here a truncated
-    // length-delimited field) go to the opaque-detail extension rather than
-    // vanish.
+fn corrupt_known_detail_fails_the_error_safely() {
+    // The type resolves but its bytes do not decode (a truncated
+    // length-delimited field). That is a broken upstream response, not an
+    // unknown type: the whole error becomes a safe INTERNAL instead of the
+    // detail being passed on as opaque bytes, dropped, or half-rendered next
+    // to the valid one.
+    let valid = tonic_types::pb::ErrorInfo {
+        reason: "OK_ONE".into(),
+        ..Default::default()
+    };
+    let status = status_with_raw_details(&[
+        (
+            "type.googleapis.com/google.rpc.ErrorInfo",
+            valid.encode_to_vec(),
+        ),
+        (
+            "type.googleapis.com/google.rpc.ErrorInfo",
+            vec![0x0a, 0x05, b'a'],
+        ),
+    ]);
+    let details = canonical_only();
+    assert_eq!(
+        error_body(&status, Some(&details)),
+        malformed_upstream_status_body()
+    );
+    let resp = status_to_response(&status, Some(&details));
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[test]
+fn corrupt_well_known_detail_is_not_rendered_as_that_type() {
+    // A Duration whose bytes are truncated must not come out as a Duration
+    // (nor as base64 under the same `value` key a real Duration uses).
+    let status =
+        status_with_raw_details(&[("type.googleapis.com/google.protobuf.Duration", vec![0x08])]);
+    assert_eq!(
+        error_body(&status, Some(&canonical_only())),
+        malformed_upstream_status_body()
+    );
+}
+
+#[test]
+fn out_of_range_well_known_value_fails_the_error_safely() {
+    // Well-formed bytes carrying a value the type forbids: Duration is limited
+    // to ±315,576,000,000 seconds, so this one has no valid JSON form.
+    let duration = prost_reflect::prost_types::Duration {
+        seconds: 400_000_000_000,
+        nanos: 0,
+    };
     let status = status_with_raw_details(&[(
-        "type.googleapis.com/google.rpc.ErrorInfo",
-        vec![0x0a, 0x05, b'a'],
+        "type.googleapis.com/google.protobuf.Duration",
+        duration.encode_to_vec(),
     )]);
     assert_eq!(
-        canonical_only().render(&status),
-        vec![json!({"@type": "type.googleapis.com/google.rpc.ErrorInfo", "value": "CgVh"})]
+        error_body(&status, Some(&canonical_only())),
+        malformed_upstream_status_body()
     );
 }
 
@@ -296,7 +352,7 @@ fn well_known_type_detail_goes_under_value() {
         duration.encode_to_vec(),
     )]);
     assert_eq!(
-        canonical_only().render(&status),
+        canonical_only().render(&status).unwrap(),
         vec![json!({"@type": "type.googleapis.com/google.protobuf.Duration", "value": "1.500s"})]
     );
 }
@@ -317,7 +373,7 @@ fn product_defined_detail_type_renders_its_fields() {
         msg.encode_to_vec(),
     )]);
     assert_eq!(
-        StatusDetails::new(&pool).render(&status),
+        StatusDetails::new(&pool).render(&status).unwrap(),
         vec![json!({
             "@type": "type.googleapis.com/acme.v1.QuotaTicket",
             "ticket": "T-1",
@@ -344,7 +400,7 @@ fn product_revision_of_a_canonical_type_wins() {
         msg.encode_to_vec(),
     )]);
     assert_eq!(
-        StatusDetails::new(&pool).render(&status),
+        StatusDetails::new(&pool).render(&status).unwrap(),
         vec![json!({
             "@type": "type.googleapis.com/google.rpc.ErrorInfo",
             "reason": "R",
@@ -354,17 +410,40 @@ fn product_revision_of_a_canonical_type_wins() {
 }
 
 #[test]
-fn malformed_trailer_renders_no_details() {
-    // A trailer that is not a google.rpc.Status cannot be split into
-    // details; the body still answers with the status code and message.
+fn malformed_trailer_fails_the_error_safely() {
+    // A trailer that is not a google.rpc.Status is a broken upstream
+    // response; answering with the original code and an empty `details` would
+    // claim the upstream sent no details.
     let status = tonic::Status::with_details(
-        tonic::Code::Internal,
+        tonic::Code::NotFound,
+        "boom",
+        bytes::Bytes::from_static(&[0x1a, 0xff]),
+    );
+    let details = canonical_only();
+    assert_eq!(
+        error_body(&status, Some(&details)),
+        malformed_upstream_status_body()
+    );
+    let resp = status_to_response(&status, Some(&details));
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[test]
+fn details_off_leaves_a_malformed_trailer_unread() {
+    // With details switched off the trailer is never decoded, so it cannot
+    // fail the error: the upstream's own code and message pass through.
+    let status = tonic::Status::with_details(
+        tonic::Code::NotFound,
         "boom",
         bytes::Bytes::from_static(&[0x1a, 0xff]),
     );
     assert_eq!(
-        error_body(&status, Some(&canonical_only())),
-        json!({"error": "INTERNAL", "message": "boom", "code": 13, "details": []})
+        error_body(&status, None),
+        json!({"error": "NOT_FOUND", "message": "boom", "code": 5})
+    );
+    assert_eq!(
+        status_to_response(&status, None).status(),
+        StatusCode::NOT_FOUND
     );
 }
 

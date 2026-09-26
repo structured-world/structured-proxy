@@ -299,11 +299,19 @@ mapping (`INVALID_ARGUMENT` → 400, `NOT_FOUND` → 404, ...):
   request that cannot be mapped onto the RPC (`INVALID_ARGUMENT`, 400), an
   upstream that is not reachable (`UNAVAILABLE`, 503), a response that cannot
   be serialized (`INTERNAL`, 500). Their `details` is empty.
+- A broken upstream error status is never passed on in part or reinterpreted:
+  a trailer that is not a `google.rpc.Status`, or a detail of a known type whose
+  bytes do not decode or whose value has no valid JSON form (a `Duration`
+  beyond its range), turns the whole error into
+  `{"error": "INTERNAL", "code": 13, "message": "upstream returned a malformed error status", "details": []}`
+  (500, or the terminal frame of a started stream). The cause is logged by the
+  proxy and not sent to the client. With details switched off for a route the
+  trailer is not read, so this does not apply there.
 
 **Opaque-detail extension.** ProtoJSON cannot represent an `Any` whose type is
 unknown to the reader. Rather than drop such a detail (a type in neither
-descriptor set, or bytes that do not decode as their type), structured-proxy
-keeps it in its own extension, which is **not** part of ProtoJSON:
+descriptor set), structured-proxy keeps it in its own extension, which is
+**not** part of ProtoJSON:
 
 ```json
 { "@type": "type.googleapis.com/acme.v1.QuotaTicket", "value": "CgNULTE=" }
