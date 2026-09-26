@@ -304,9 +304,11 @@ mapping (`INVALID_ARGUMENT` → 400, `NOT_FOUND` → 404, ...):
   upstream that is not reachable (`UNAVAILABLE`, 503), a response that cannot
   be serialized (`INTERNAL`, 500). Their `details` is empty.
 - A broken upstream error status is never passed on in part or reinterpreted:
-  a trailer that is not a `google.rpc.Status`, or a detail of a known type whose
-  bytes do not decode or whose value has no valid JSON form (a `Duration`
-  beyond its range), turns the whole error into
+  a trailer that is not a `google.rpc.Status` or disagrees with `grpc-status` /
+  `grpc-message`, a type URL without a `/` or whose last segment is not a
+  protobuf full name, or a detail of a known type whose bytes do not decode or
+  whose value has no valid JSON form (a `Duration` beyond its range), turns the
+  whole error into
   `{"error": "INTERNAL", "code": 13, "message": "upstream returned a malformed error status", "details": []}`
   (500, or the terminal frame of a started stream). The cause is logged by the
   proxy and not sent to the client. With details switched off for a route the
@@ -374,7 +376,9 @@ format, and it is not an OAuth 2.0 token endpoint error body (RFC 6749 §5.2).
 **Switching details off.** In the config file, `error_details:` (see
 [Configuration](#configuration)) is read by the standalone binary and by
 `ProxyServer::from_yaml_str` / `ProxyServer::from_file`; it is not part of
-`ProxyConfig`, so `ProxyConfig::from_yaml_str` alone ignores it. An embedding
+`ProxyConfig`, so `ProxyConfig::from_yaml_str` alone ignores it. Both log a
+warning for a top-level key no setting reads, so a misspelled `error_detail:`
+shows up at startup instead of silently leaving details on. An embedding
 service can choose in code with `ProxyServer::with_error_details`. Overrides are
 checked in the order they are added and the first whose pattern matches the
 mounted route decides; `*` stays within one path segment (a path parameter

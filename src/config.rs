@@ -175,6 +175,44 @@ struct StreamingFileConfig {
     ndjson_envelope: bool,
 }
 
+/// Every top-level key a config file may use: the [`ProxyConfig`] fields plus
+/// the transcoding settings kept outside it.
+pub(crate) const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
+    "upstream",
+    "descriptors",
+    "listen",
+    "service",
+    "aliases",
+    "openapi",
+    "auth",
+    "shield",
+    "oidc_discovery",
+    "health",
+    "metrics",
+    "maintenance",
+    "cors",
+    "logging",
+    "metrics_classes",
+    "forwarded_headers",
+    "streaming",
+    "error_details",
+];
+
+/// The top-level keys of `yaml` that no setting reads, typically typos
+/// (`error_detail:` for `error_details:`) that would otherwise leave a default
+/// silently in force. They are reported, not rejected, so a file that loaded
+/// before keeps loading.
+pub(crate) fn unknown_top_level_keys(yaml: &str) -> Vec<String> {
+    let Ok(serde_yaml::Value::Mapping(map)) = serde_yaml::from_str(yaml) else {
+        return Vec::new();
+    };
+    map.keys()
+        .filter_map(|key| key.as_str())
+        .filter(|key| !KNOWN_TOP_LEVEL_KEYS.contains(key))
+        .map(str::to_owned)
+        .collect()
+}
+
 impl TranscodeFileConfig {
     /// Compile into the options the transcoded routes are built with.
     ///

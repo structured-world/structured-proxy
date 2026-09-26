@@ -351,6 +351,79 @@ openapi:
     assert!(openapi.version.is_none());
 }
 
+#[test]
+fn misspelled_top_level_key_is_reported() {
+    // `error_detail:` for `error_details:` would leave details on silently;
+    // it is reported, while known keys (including the ones read outside
+    // ProxyConfig) are not.
+    let yaml = r#"
+upstream:
+  default: "grpc://x:1"
+streaming:
+  ndjson_envelope: true
+error_details:
+  enabled: false
+error_detail:
+  enabled: false
+maintenence:
+  enabled: true
+"#;
+    assert_eq!(
+        unknown_top_level_keys(yaml),
+        vec!["error_detail".to_string(), "maintenence".to_string()]
+    );
+}
+
+#[test]
+fn known_top_level_keys_cover_every_proxy_config_field() {
+    // Exhaustive destructuring: adding a ProxyConfig field fails to compile
+    // here until the field is also listed as a known top-level key.
+    let config: ProxyConfig =
+        serde_yaml::from_str("upstream:\n  default: \"grpc://x:1\"\n").unwrap();
+    let ProxyConfig {
+        upstream: _,
+        descriptors: _,
+        listen: _,
+        service: _,
+        aliases: _,
+        openapi: _,
+        auth: _,
+        shield: _,
+        oidc_discovery: _,
+        health: _,
+        metrics: _,
+        maintenance: _,
+        cors: _,
+        logging: _,
+        metrics_classes: _,
+        forwarded_headers: _,
+        streaming: _,
+    } = config;
+    for key in [
+        "upstream",
+        "descriptors",
+        "listen",
+        "service",
+        "aliases",
+        "openapi",
+        "auth",
+        "shield",
+        "oidc_discovery",
+        "health",
+        "metrics",
+        "maintenance",
+        "cors",
+        "logging",
+        "metrics_classes",
+        "forwarded_headers",
+        "streaming",
+        "error_details",
+    ] {
+        assert!(KNOWN_TOP_LEVEL_KEYS.contains(&key), "{key}");
+    }
+    assert_eq!(KNOWN_TOP_LEVEL_KEYS.len(), 18);
+}
+
 /// The transcoding options a YAML document compiles to.
 fn transcode_options(yaml: &str) -> Result<crate::transcode::TranscodeOptions, String> {
     serde_yaml::from_str::<TranscodeFileConfig>(yaml)
