@@ -69,6 +69,48 @@ struct RouteEntry {
     /// Renderer for the status details of this route's errors; `None` when the
     /// error-details policy switches them off for the route.
     error_details: Option<Arc<StatusDetails>>,
+    /// Wrap NDJSON stream lines in `{"result"}` / `{"error"}` envelopes.
+    ndjson_envelope: bool,
+}
+
+/// How [`routes_with_options`] builds the transcoded routes.
+///
+/// # Examples
+///
+/// ```
+/// use structured_proxy::transcode::error::ErrorDetailsPolicy;
+/// use structured_proxy::transcode::TranscodeOptions;
+///
+/// let options = TranscodeOptions::default()
+///     .with_error_details(ErrorDetailsPolicy::default().route("/v1/admin/**", false).unwrap())
+///     .with_ndjson_envelope(true);
+/// # let _ = options;
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct TranscodeOptions {
+    pub(crate) error_details: ErrorDetailsPolicy,
+    pub(crate) ndjson_envelope: bool,
+}
+
+impl TranscodeOptions {
+    /// Which routes return `google.rpc.Status` details in their error bodies
+    /// (all of them by default).
+    pub fn with_error_details(mut self, policy: ErrorDetailsPolicy) -> Self {
+        self.error_details = policy;
+        self
+    }
+
+    /// Wrap every NDJSON line of a server-streaming response in an envelope:
+    /// `{"result": <message>}` for data, `{"error": <error body>}` for the
+    /// terminal error (the grpc-gateway stream shape). Off by default, when a
+    /// data line is the bare message and the error line carries an
+    /// `@type: google.rpc.Status` marker instead. Only the envelope keeps the
+    /// two apart for RPCs that stream `google.protobuf.Any`, `Struct`, `Value`
+    /// or `ListValue`, whose messages can carry any keys. SSE is unaffected.
+    pub fn with_ndjson_envelope(mut self, enabled: bool) -> Self {
+        self.ndjson_envelope = enabled;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -98,17 +140,16 @@ impl HttpMethod {
 /// Takes a `DescriptorPool` and optional path aliases from config.
 /// Returns an axum Router that transcodes REST requests to gRPC calls. Error
 /// bodies carry `google.rpc.Status` details on every route; use
-/// [`routes_with_error_details`] to choose per route.
+/// [`routes_with_options`] to choose per route or to frame NDJSON streams.
 pub fn routes<S: TranscodeState>(pool: &DescriptorPool, aliases: &[AliasConfig]) -> Router<S> {
-    routes_with_error_details(pool, aliases, &ErrorDetailsPolicy::default())
+    routes_with_options(pool, aliases, &TranscodeOptions::default())
 }
 
-/// [`routes`], with `error_details` deciding which routes return
-/// `google.rpc.Status` details in their error bodies.
-pub fn routes_with_error_details<S: TranscodeState>(
+/// [`routes`], built as `options` describe.
+pub fn routes_with_options<S: TranscodeState>(
     pool: &DescriptorPool,
     aliases: &[AliasConfig],
-    error_details: &ErrorDetailsPolicy,
+    options: &TranscodeOptions,
 ) -> Router<S> {
     let bindings = route_bindings(pool, aliases);
     if bindings.is_empty() {
@@ -123,10 +164,11 @@ pub fn routes_with_error_details<S: TranscodeState>(
     let mut status_details: Option<Arc<StatusDetails>> = None;
     let mut router: Router<S> = Router::new();
     for mut binding in bindings {
-        if error_details.enabled_for(&binding.axum_path) {
+        if options.error_details.enabled_for(&binding.axum_path) {
             let renderer = status_details.get_or_insert_with(|| Arc::new(StatusDetails::new(pool)));
             binding.entry.error_details = Some(Arc::clone(renderer));
         }
+        binding.entry.ndjson_envelope = options.ndjson_envelope;
         let method = binding.entry.http_method;
         let entry = Arc::new(binding.entry);
         let method_router: MethodRouter<S> = if binding.streaming {
@@ -331,13 +373,14 @@ async fn streaming_handler<S: TranscodeState>(
             // The terminal frame renders like the unary error body. The
             // closure takes over this request's route handle, so the stream
             // keeps it alive without another refcount.
+            let envelope = entry.ndjson_envelope;
             let render_error = move |status: &tonic::Status| {
                 error::error_body(status, entry.error_details.as_deref())
             };
             if use_sse {
                 sse_response(stream, render_error, proxy_state.sse_keep_alive_secs())
             } else {
-                ndjson_response(stream, render_error)
+                ndjson_response(stream, render_error, envelope)
             }
         }
         Err(status) => {
@@ -358,9 +401,13 @@ enum StreamFrame {
     Error(serde_json::Value),
 }
 
-/// Type URL marking the terminal error line of an NDJSON stream. A data line is
-/// the ProtoJSON of a response message, which carries a top-level `@type` only
-/// when the RPC streams `google.protobuf.Any` itself.
+/// Type URL marking the terminal error line of an unenveloped NDJSON stream. A
+/// data line is the ProtoJSON of a response message, which carries a top-level
+/// `@type` only when the RPC streams `google.protobuf.Any`; `Struct`, `Value`
+/// and `ListValue` can carry any key at all. For those RPCs no in-band marker
+/// is collision-free, which is what the opt-in envelope
+/// ([`TranscodeOptions::with_ndjson_envelope`]) is for; the unenveloped shape
+/// stays the default so existing NDJSON readers keep working.
 const STATUS_TYPE_URL: &str = "type.googleapis.com/google.rpc.Status";
 
 /// Turn a gRPC message stream into a stream of serialized JSON frames, stopping
@@ -403,17 +450,31 @@ where
 }
 
 /// Build an NDJSON (`application/x-ndjson`) streaming response.
-fn ndjson_response<St, R>(stream: St, render_error: R) -> Response
+///
+/// With `envelope`, every line is wrapped: `{"result": <message>}` for data and
+/// `{"error": <error body>}` for the terminal error. Without it, a data line is
+/// the bare message and the error line is the error body plus an
+/// `@type: google.rpc.Status` marker (see [`STATUS_TYPE_URL`]).
+fn ndjson_response<St, R>(stream: St, render_error: R, envelope: bool) -> Response
 where
     St: futures::Stream<Item = Result<DynamicMessage, tonic::Status>> + Send + 'static,
     R: Fn(&tonic::Status) -> serde_json::Value + Send + 'static,
 {
-    // Data and error frames are both JSON lines. The error line is the last
-    // one, and carries `@type: google.rpc.Status` next to the error body so a
-    // reader can tell it from a data line without guessing from its fields.
-    let byte_stream = json_frames(stream, render_error).map(|frame| {
+    let byte_stream = json_frames(stream, render_error).map(move |frame| {
         let mut line = match frame {
+            // The message is already serialized; wrap the text instead of
+            // parsing it back into a value.
+            StreamFrame::Data(s) if envelope => {
+                let mut wrapped = String::with_capacity(s.len() + 12);
+                wrapped.push_str("{\"result\":");
+                wrapped.push_str(&s);
+                wrapped.push('}');
+                wrapped
+            }
             StreamFrame::Data(s) => s,
+            StreamFrame::Error(body) if envelope => {
+                serde_json::json!({ "error": body }).to_string()
+            }
             StreamFrame::Error(mut body) => {
                 if let Some(fields) = body.as_object_mut() {
                     fields.insert("@type".into(), STATUS_TYPE_URL.into());
@@ -616,8 +677,9 @@ fn extract_routes(pool: &DescriptorPool) -> Vec<RouteEntry> {
                     method: method.clone(),
                     body: binding.body,
                     response_body: binding.response_body,
-                    // Decided per mounted path in `routes`.
+                    // Decided per mounted path in `routes_with_options`.
                     error_details: None,
+                    ndjson_envelope: false,
                 });
             }
         }
@@ -668,8 +730,9 @@ fn extract_streaming_routes(pool: &DescriptorPool) -> Vec<RouteEntry> {
                     method: method.clone(),
                     body: binding.body,
                     response_body: binding.response_body,
-                    // Decided per mounted path in `routes`.
+                    // Decided per mounted path in `routes_with_options`.
                     error_details: None,
+                    ndjson_envelope: false,
                 });
             }
         }

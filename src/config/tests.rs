@@ -350,3 +350,80 @@ openapi:
     assert!(openapi.title.is_none());
     assert!(openapi.version.is_none());
 }
+
+/// The transcoding options a YAML document compiles to.
+fn transcode_options(yaml: &str) -> Result<crate::transcode::TranscodeOptions, String> {
+    serde_yaml::from_str::<TranscodeFileConfig>(yaml)
+        .map_err(|e| e.to_string())?
+        .options()
+}
+
+#[test]
+fn transcode_settings_default_to_details_everywhere_and_no_envelope() {
+    // A file that names neither key keeps the defaults: details on every
+    // route, bare NDJSON lines.
+    let options = transcode_options("upstream:\n  default: \"grpc://x:1\"\n").unwrap();
+    assert!(options.error_details.enabled_for("/v1/users/{id}"));
+    assert!(!options.ndjson_envelope);
+}
+
+#[test]
+fn transcode_settings_read_error_details_and_the_ndjson_envelope() {
+    // Both keys come from the same file as the ProxyConfig, next to its own
+    // `streaming` keys, and the route rules keep their order.
+    let yaml = r#"
+upstream:
+  default: "grpc://x:1"
+streaming:
+  sse_keep_alive_secs: 30
+  ndjson_envelope: true
+error_details:
+  enabled: false
+  routes:
+    - pattern: "/v1/public/internal/*"
+      enabled: false
+    - pattern: "/v1/public/**"
+      enabled: true
+"#;
+    let options = transcode_options(yaml).unwrap();
+    assert!(options.ndjson_envelope);
+    assert!(options.error_details.enabled_for("/v1/public/items"));
+    assert!(!options
+        .error_details
+        .enabled_for("/v1/public/internal/{id}"));
+    assert!(!options.error_details.enabled_for("/v1/admin/items"));
+    // The ProxyConfig still reads its own streaming key from the same section.
+    let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+    assert_eq!(config.streaming.sse_keep_alive_secs, 30);
+}
+
+#[test]
+fn transcode_settings_reject_unknown_error_details_key() {
+    // `enable` for `enabled` would otherwise leave details on silently.
+    let err = transcode_options(
+        "upstream:\n  default: \"grpc://x:1\"\nerror_details:\n  enable: false\n",
+    )
+    .unwrap_err();
+    assert!(err.contains("enable"), "{err}");
+}
+
+#[test]
+fn transcode_settings_require_enabled_on_a_route_rule() {
+    // A rule without `enabled` states no decision.
+    let err = transcode_options(
+        "upstream:\n  default: \"grpc://x:1\"\nerror_details:\n  routes:\n    - pattern: \"/v1/**\"\n",
+    )
+    .unwrap_err();
+    assert!(err.contains("enabled"), "{err}");
+}
+
+#[test]
+fn transcode_settings_reject_a_relative_route_pattern() {
+    // `v1/admin/**` never matches a route path; accepting it would leave
+    // details on where the operator meant to turn them off.
+    let err = transcode_options(
+        "upstream:\n  default: \"grpc://x:1\"\nerror_details:\n  routes:\n    - pattern: \"v1/admin/**\"\n      enabled: false\n",
+    )
+    .unwrap_err();
+    assert!(err.contains("must start with '/'"), "{err}");
+}

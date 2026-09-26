@@ -479,6 +479,65 @@ async fn stream_error_with_a_corrupt_known_detail_ends_with_a_safe_internal_fram
     );
 }
 
+// --- YAML settings ------------------------------------------------------------
+
+/// A proxy created from a YAML document (upstream plus `extra_yaml`), the way
+/// the standalone binary reads its config file.
+async fn proxy_from_yaml(extra_yaml: &str) -> axum::Router {
+    let pool = pool();
+    let upstream = common::serve(Things { pool: pool.clone() }).await;
+    structured_proxy::ProxyServer::from_yaml_str(&format!(
+        "upstream:\n  default: \"{upstream}\"\n{extra_yaml}"
+    ))
+    .unwrap()
+    .with_descriptors(pool)
+    .router()
+    .unwrap()
+}
+
+#[tokio::test]
+async fn yaml_switches_route_details_off_and_envelopes_ndjson() {
+    // Both settings come from the config file: the quiet route loses its
+    // details, the others keep them, and NDJSON lines are enveloped.
+    let app = proxy_from_yaml(
+        "error_details:\n  routes:\n    - pattern: \"/v1/quiet/*\"\n      enabled: false\nstreaming:\n  ndjson_envelope: true\n",
+    )
+    .await;
+    let (_, quiet) = get_json(&app, "/v1/quiet/rich").await;
+    assert!(quiet.get("details").is_none(), "{quiet}");
+    let (_, loud) = get_json(&app, "/v1/things/rich").await;
+    assert_eq!(loud["details"], rich_details());
+
+    let (status, body) = get(&app, "/v1/things/x/watch", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let lines: Vec<Value> = body
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        lines,
+        vec![
+            json!({"result": {"name": "first", "count": "1"}}),
+            json!({"error": {
+                "error": "INVALID_ARGUMENT",
+                "message": "invalid email",
+                "code": 3,
+                "details": rich_details()
+            }}),
+        ]
+    );
+}
+
+#[test]
+fn yaml_with_an_invalid_error_details_pattern_is_rejected() {
+    let err = structured_proxy::ProxyServer::from_yaml_str(
+        "upstream:\n  default: \"http://127.0.0.1:1\"\nerror_details:\n  routes:\n    - pattern: \"v1/**\"\n      enabled: false\n",
+    )
+    .err()
+    .expect("a relative pattern must be rejected");
+    assert!(err.to_string().contains("must start with '/'"), "{err}");
+}
+
 // --- errors the proxy raises itself ------------------------------------------
 
 #[tokio::test]

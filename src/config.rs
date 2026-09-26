@@ -123,6 +123,83 @@ impl Default for StreamingConfig {
     }
 }
 
+/// Transcoding settings read from the same YAML document as [`ProxyConfig`] by
+/// [`ProxyServer::from_yaml_str`](crate::ProxyServer::from_yaml_str) and
+/// [`ProxyServer::from_file`](crate::ProxyServer::from_file):
+///
+/// ```yaml
+/// error_details:
+///   enabled: true
+///   routes:
+///     - pattern: "/v1/admin/**"
+///       enabled: false
+/// streaming:
+///   ndjson_envelope: true
+/// ```
+///
+/// They live outside [`ProxyConfig`] so that embedders who build it as a
+/// struct literal are not affected.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct TranscodeFileConfig {
+    #[serde(default)]
+    error_details: Option<ErrorDetailsFileConfig>,
+    #[serde(default)]
+    streaming: StreamingFileConfig,
+}
+
+/// `error_details:`. A typo here would silently change what clients learn
+/// about server-side failures, so unknown keys are rejected.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ErrorDetailsFileConfig {
+    /// Default for routes no rule matches.
+    #[serde(default = "default_true")]
+    enabled: bool,
+    /// Per-route overrides, first match wins.
+    #[serde(default)]
+    routes: Vec<ErrorDetailsRouteFileConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ErrorDetailsRouteFileConfig {
+    pattern: String,
+    enabled: bool,
+}
+
+/// The `streaming:` keys [`StreamingConfig`] does not hold. Both read the same
+/// section, so neither can reject the other's keys.
+#[derive(Debug, Default, Deserialize)]
+struct StreamingFileConfig {
+    #[serde(default)]
+    ndjson_envelope: bool,
+}
+
+impl TranscodeFileConfig {
+    /// Compile into the options the transcoded routes are built with.
+    ///
+    /// # Errors
+    ///
+    /// An `error_details` route pattern that is relative or not a valid glob.
+    pub(crate) fn options(&self) -> Result<crate::transcode::TranscodeOptions, String> {
+        use crate::transcode::error::ErrorDetailsPolicy;
+        let mut options = crate::transcode::TranscodeOptions::default()
+            .with_ndjson_envelope(self.streaming.ndjson_envelope);
+        if let Some(cfg) = &self.error_details {
+            let base = if cfg.enabled {
+                ErrorDetailsPolicy::default()
+            } else {
+                ErrorDetailsPolicy::disabled()
+            };
+            let policy = cfg.routes.iter().try_fold(base, |policy, rule| {
+                policy.route(&rule.pattern, rule.enabled)
+            })?;
+            options = options.with_error_details(policy);
+        }
+        Ok(options)
+    }
+}
+
 /// Upstream gRPC service configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpstreamConfig {

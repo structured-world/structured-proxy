@@ -247,7 +247,12 @@ async fn ndjson_error_frame_is_terminal() {
         Err(tonic::Status::internal("boom")),
         Ok(item_message_named("bob", 2)),
     ];
-    let body = collect_body(ndjson_response(futures::stream::iter(items), no_details)).await;
+    let body = collect_body(ndjson_response(
+        futures::stream::iter(items),
+        no_details,
+        false,
+    ))
+    .await;
     let lines: Vec<&str> = body.lines().collect();
     assert_eq!(lines.len(), 2, "stream must stop after the error frame");
     assert!(lines[0].contains("alice"));
@@ -290,7 +295,7 @@ async fn ndjson_terminal_frame_carries_status_details() {
     let render = move |s: &tonic::Status| error::error_body(s, Some(&renderer));
 
     let items = vec![Ok(item_message_named("alice", 1)), Err(status)];
-    let body = collect_body(ndjson_response(futures::stream::iter(items), render)).await;
+    let body = collect_body(ndjson_response(futures::stream::iter(items), render, false)).await;
     let lines: Vec<&str> = body.lines().collect();
     assert_eq!(lines.len(), 2);
     let frame: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
@@ -360,7 +365,7 @@ async fn serialization_failure_ends_the_stream_with_the_shared_error_body() {
         Ok(unserializable_message()),
         Ok(item_message_named("bob", 2)),
     ];
-    let body = collect_body(ndjson_response(futures::stream::iter(items), render)).await;
+    let body = collect_body(ndjson_response(futures::stream::iter(items), render, false)).await;
     let lines: Vec<&str> = body.lines().collect();
     assert_eq!(lines.len(), 2, "{body}");
     let frame: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
@@ -391,6 +396,37 @@ async fn sse_error_payload_is_the_unary_body_without_the_ndjson_marker() {
         .unwrap();
     let frame: serde_json::Value = serde_json::from_str(payload).unwrap();
     assert_eq!(frame, expected);
+}
+
+#[tokio::test]
+async fn ndjson_envelope_wraps_data_and_error_lines() {
+    // With the envelope every line says what it is by its only key, so a data
+    // message can never be read as the terminal error, whatever it contains;
+    // the error line then needs no marker, and nothing follows it.
+    let status = tonic::Status::internal("boom");
+    let expected_error = error::error_body(&status, None);
+    let items = vec![
+        Ok(item_message_named("alice", 1)),
+        Err(status),
+        Ok(item_message_named("bob", 2)),
+    ];
+    let body = collect_body(ndjson_response(
+        futures::stream::iter(items),
+        no_details,
+        true,
+    ))
+    .await;
+    let lines: Vec<serde_json::Value> = body
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        lines,
+        vec![
+            serde_json::json!({"result": {"name": "alice", "count": "1"}}),
+            serde_json::json!({"error": expected_error}),
+        ]
+    );
 }
 
 #[test]
@@ -454,6 +490,7 @@ fn ndjson_response_omits_manual_transfer_encoding() {
     let resp = ndjson_response(
         futures::stream::empty::<Result<DynamicMessage, tonic::Status>>(),
         no_details,
+        false,
     );
     assert_eq!(
         resp.headers().get("content-type").unwrap(),
