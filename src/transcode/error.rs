@@ -265,6 +265,42 @@ fn has_special_json(full_name: &str) -> bool {
     )
 }
 
+/// Whether `value` is the ProtoJSON of a packed `google.rpc.DebugInfo`: an
+/// object whose `@type` names it, or an `Any` whose `value` is one.
+fn is_packed_debug_info(value: &Value) -> bool {
+    let Some(fields) = value.as_object() else {
+        return false;
+    };
+    let type_name = fields
+        .get("@type")
+        .and_then(Value::as_str)
+        .map(|url| url.rsplit_once('/').map_or(url, |(_, name)| name));
+    match type_name {
+        Some(DEBUG_INFO) => true,
+        Some("google.protobuf.Any") => fields.get("value").is_some_and(is_packed_debug_info),
+        _ => false,
+    }
+}
+
+/// Remove every packed `DebugInfo` below `value`, at any depth: an array
+/// element is dropped, an object field (a message field or map entry) is
+/// cleared, which ProtoJSON reads as unset. A `Struct` key that merely looks
+/// like a DebugInfo `@type` is removed as well; over-withholding is the safe
+/// side of that ambiguity.
+fn strip_debug_info(value: &mut Value) {
+    match value {
+        Value::Array(items) => {
+            items.retain(|item| !is_packed_debug_info(item));
+            items.iter_mut().for_each(strip_debug_info);
+        }
+        Value::Object(fields) => {
+            fields.retain(|_, field| !is_packed_debug_info(field));
+            fields.values_mut().for_each(strip_debug_info);
+        }
+        _ => {}
+    }
+}
+
 /// Whether `name` is a protobuf full name: dot-separated identifiers, each a
 /// letter or `_` followed by letters, digits or `_`.
 fn is_full_name(name: &str) -> bool {
@@ -308,32 +344,44 @@ fn opaque_entry(index: usize, type_url: &str, value: &[u8]) -> Value {
 /// Renders the typed details of a gRPC status (`grpc-status-details-bin`) as
 /// proto3 JSON.
 ///
-/// A detail type is resolved in the product descriptors first, so a service's
-/// own detail messages (and its own `google.rpc` revision) render as it defines
-/// them, then in the canonical `google/rpc/status.proto` and
-/// `error_details.proto`, which are always available even when the product
-/// descriptors do not import them.
+/// Detail types resolve in one pool: the product descriptors, completed with
+/// the well-known types and the canonical `google/rpc/status.proto` and
+/// `error_details.proto` for whatever the product does not define itself. A
+/// service's own detail messages (and its own `google.rpc` revision) render as
+/// it defines them, the canonical ones are always available even when the
+/// product descriptors do not import them, and a type packed inside another
+/// detail resolves from the same pool as the detail itself.
 ///
 /// Details use the canonical proto3 JSON mapping (unset fields omitted, 64-bit
 /// integers as strings), the form clients of the `google.rpc` model expect.
 #[derive(Debug, Clone)]
 pub struct StatusDetails {
-    product: DescriptorPool,
-    canonical: DescriptorPool,
+    pool: DescriptorPool,
 }
 
 impl StatusDetails {
-    /// Build a renderer that resolves detail types in `product` first, then in
-    /// the canonical `google.rpc` descriptors.
+    /// Build a renderer over `product`, completed with the canonical
+    /// descriptors it lacks.
     pub fn new(product: &DescriptorPool) -> Self {
         let mut canonical = DescriptorPool::global();
         canonical
             .decode_file_descriptor_set(tonic_types::pb::FILE_DESCRIPTOR_SET)
             .expect("tonic-types ships a valid google.rpc descriptor set");
-        Self {
-            product: product.clone(),
-            canonical,
+        let mut pool = product.clone();
+        // `files()` lists dependencies before their dependents, so each
+        // canonical file finds its imports already present.
+        for file in canonical.files() {
+            if pool.get_file_by_name(file.name()).is_some() {
+                continue;
+            }
+            // A product that defines the same types under another file name
+            // keeps its own definitions: the conflicting canonical file is
+            // left out.
+            if let Err(e) = pool.add_file_descriptor_proto(file.file_descriptor_proto().clone()) {
+                tracing::debug!(file = %file.name(), "canonical descriptor not merged: {e}");
+            }
         }
+        Self { pool }
     }
 
     /// The details of `status`, `google.rpc.DebugInfo` left out.
@@ -391,9 +439,16 @@ impl StatusDetails {
                 continue;
             }
             match self.resolve(type_name) {
-                Some(desc) => rendered
-                    .details
-                    .push(self.typed_entry(type_url, type_name, desc, &any.value)?),
+                Some(desc) => {
+                    let mut entry = self.typed_entry(type_url, type_name, desc, &any.value)?;
+                    // An Any detail packing DebugInfo is withheld like a direct
+                    // one; DebugInfo packed deeper is cut out of the entry.
+                    if is_packed_debug_info(&entry) {
+                        continue;
+                    }
+                    strip_debug_info(&mut entry);
+                    rendered.details.push(entry);
+                }
                 None => rendered
                     .opaque
                     .push(opaque_entry(index, type_url, &any.value)),
@@ -428,9 +483,7 @@ impl StatusDetails {
     }
 
     fn resolve(&self, type_name: &str) -> Option<MessageDescriptor> {
-        self.product
-            .get_message_by_name(type_name)
-            .or_else(|| self.canonical.get_message_by_name(type_name))
+        self.pool.get_message_by_name(type_name)
     }
 
     fn to_json(

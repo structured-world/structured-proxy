@@ -127,7 +127,8 @@ fn product_pool(name: &str, source: &str) -> DescriptorPool {
             if name == self.name {
                 protox::file::File::from_source(name, &self.source)
             } else {
-                Err(protox::Error::file_not_found(name))
+                // google/protobuf/*.proto for imports such as any.proto.
+                protox::file::GoogleFileResolver::new().open_file(name)
             }
         }
     }
@@ -402,6 +403,155 @@ fn trailer_code_or_message_disagreeing_with_the_status_fails_safely() {
             malformed_upstream_status_body(),
             "{code:?} {message:?}"
         );
+    }
+}
+
+/// `acme.v1.Wrapper { Any cause = 1; repeated Any causes = 2; }`, a product
+/// detail that imports any.proto but not google/rpc.
+fn wrapper_pool() -> DescriptorPool {
+    product_pool(
+        "acme.proto",
+        "syntax = \"proto3\"; package acme.v1; import \"google/protobuf/any.proto\"; \
+         message Wrapper { google.protobuf.Any cause = 1; repeated google.protobuf.Any causes = 2; }",
+    )
+}
+
+/// An `Any` packing `message` under `type_url`, as a reflected value.
+fn packed(pool: &DescriptorPool, type_url: &str, message: Vec<u8>) -> prost_reflect::Value {
+    let mut any = DynamicMessage::new(pool.get_message_by_name("google.protobuf.Any").unwrap());
+    any.set_field_by_name("type_url", prost_reflect::Value::String(type_url.into()));
+    any.set_field_by_name("value", prost_reflect::Value::Bytes(message.into()));
+    prost_reflect::Value::Message(any)
+}
+
+fn secret_debug_info() -> Vec<u8> {
+    tonic_types::pb::DebugInfo {
+        stack_entries: vec!["at db::write (db.rs:7)".into()],
+        detail: "password=hunter2".into(),
+    }
+    .encode_to_vec()
+}
+
+fn error_info(reason: &str) -> Vec<u8> {
+    tonic_types::pb::ErrorInfo {
+        reason: reason.into(),
+        ..Default::default()
+    }
+    .encode_to_vec()
+}
+
+#[test]
+fn nested_canonical_type_resolves_inside_a_product_detail() {
+    // The product descriptors know Wrapper but not google.rpc.ErrorInfo; the
+    // ErrorInfo packed inside it must still render from the canonical
+    // descriptors instead of failing the whole error.
+    let pool = wrapper_pool();
+    let mut wrapper = DynamicMessage::new(pool.get_message_by_name("acme.v1.Wrapper").unwrap());
+    wrapper.set_field_by_name(
+        "cause",
+        packed(
+            &pool,
+            "type.googleapis.com/google.rpc.ErrorInfo",
+            error_info("NESTED"),
+        ),
+    );
+    let status = status_with_raw_details(&[(
+        "type.googleapis.com/acme.v1.Wrapper",
+        wrapper.encode_to_vec(),
+    )]);
+    assert_eq!(
+        StatusDetails::new(&pool).render(&status).unwrap().details,
+        vec![json!({
+            "@type": "type.googleapis.com/acme.v1.Wrapper",
+            "cause": {"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "NESTED"}
+        })]
+    );
+}
+
+#[test]
+fn debug_info_nested_in_a_product_detail_is_removed() {
+    // DebugInfo packed in an Any field, singular or repeated, is withheld at
+    // any depth, while the rest of the detail stays.
+    let pool = wrapper_pool();
+    let mut wrapper = DynamicMessage::new(pool.get_message_by_name("acme.v1.Wrapper").unwrap());
+    wrapper.set_field_by_name(
+        "cause",
+        packed(
+            &pool,
+            "type.googleapis.com/google.rpc.DebugInfo",
+            secret_debug_info(),
+        ),
+    );
+    wrapper.set_field_by_name(
+        "causes",
+        prost_reflect::Value::List(vec![
+            packed(
+                &pool,
+                "type.googleapis.com/google.rpc.ErrorInfo",
+                error_info("KEPT"),
+            ),
+            packed(
+                &pool,
+                "type.googleapis.com/google.rpc.DebugInfo",
+                secret_debug_info(),
+            ),
+        ]),
+    );
+    let status = status_with_raw_details(&[(
+        "type.googleapis.com/acme.v1.Wrapper",
+        wrapper.encode_to_vec(),
+    )]);
+    let body = error_body(&status, Some(&StatusDetails::new(&pool)));
+    assert_eq!(
+        body["details"],
+        json!([{
+            "@type": "type.googleapis.com/acme.v1.Wrapper",
+            "causes": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "KEPT"}]
+        }])
+    );
+    let text = body.to_string();
+    assert!(
+        !text.contains("hunter2") && !text.contains("db.rs"),
+        "{text}"
+    );
+}
+
+#[test]
+fn debug_info_packed_in_an_any_detail_is_dropped() {
+    // A detail that is itself an Any wrapping DebugInfo is dropped like a
+    // direct DebugInfo and takes no index.
+    let pool = wrapper_pool();
+    let DynamicMessageValue(any) = DynamicMessageValue::from(packed(
+        &pool,
+        "type.googleapis.com/google.rpc.DebugInfo",
+        secret_debug_info(),
+    ));
+    let status = status_with_raw_details(&[
+        (
+            "type.googleapis.com/google.protobuf.Any",
+            any.encode_to_vec(),
+        ),
+        ("type.googleapis.com/acme.v1.Unknown", vec![0x08, 0x01]),
+    ]);
+    let body = error_body(&status, Some(&StatusDetails::new(&pool)));
+    assert_eq!(body["details"], json!([]));
+    assert_eq!(body["opaqueDetails"][0]["index"], 0);
+    let text = body.to_string();
+    assert!(
+        !text.contains("hunter2") && !text.contains("db.rs"),
+        "{text}"
+    );
+}
+
+/// Unwraps the message out of a reflected value built by [`packed`].
+struct DynamicMessageValue(DynamicMessage);
+
+impl From<prost_reflect::Value> for DynamicMessageValue {
+    fn from(value: prost_reflect::Value) -> Self {
+        match value {
+            prost_reflect::Value::Message(message) => Self(message),
+            other => panic!("expected a message, got {other:?}"),
+        }
     }
 }
 
