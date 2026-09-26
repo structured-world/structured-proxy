@@ -6,6 +6,8 @@
 //! refused before any response header, and a stream that fails after its first
 //! message, in both NDJSON and SSE.
 
+mod common;
+
 use std::convert::Infallible;
 use std::future::{ready, Ready};
 use std::pin::Pin;
@@ -17,41 +19,10 @@ use http::StatusCode;
 use prost::Message as _;
 use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor};
 use serde_json::{json, Value};
-use structured_proxy::config::ProxyConfig;
 use structured_proxy::transcode::codec::DynamicCodec;
-use structured_proxy::ProxyServer;
 use tonic_types::{BadRequest, DebugInfo, ErrorDetail, ErrorInfo, FieldViolation, StatusExt};
-use tower::ServiceExt;
 
 // --- descriptors ------------------------------------------------------------
-
-const HTTP_PROTO: &str = r#"
-syntax = "proto3";
-package google.api;
-message HttpRule {
-  string selector = 1;
-  oneof pattern {
-    string get = 2;
-    string put = 3;
-    string post = 4;
-    string delete = 5;
-    string patch = 6;
-  }
-  string body = 7;
-  string response_body = 12;
-  repeated HttpRule additional_bindings = 11;
-}
-"#;
-
-const ANNOTATIONS_PROTO: &str = r#"
-syntax = "proto3";
-package google.api;
-import "google/api/http.proto";
-import "google/protobuf/descriptor.proto";
-extend google.protobuf.MethodOptions {
-  HttpRule http = 72295728;
-}
-"#;
 
 const THINGS_PROTO: &str = r#"
 syntax = "proto3";
@@ -84,27 +55,8 @@ service Things {
 }
 "#;
 
-/// Serves the three test sources from memory, and descriptor.proto from
-/// protox's bundled Google files.
-struct TestProtos;
-
-impl protox::file::FileResolver for TestProtos {
-    fn open_file(&self, name: &str) -> Result<protox::file::File, protox::Error> {
-        let source = match name {
-            "google/api/http.proto" => HTTP_PROTO,
-            "google/api/annotations.proto" => ANNOTATIONS_PROTO,
-            "test/v1/things.proto" => THINGS_PROTO,
-            _ => return protox::file::GoogleFileResolver::new().open_file(name),
-        };
-        protox::file::File::from_source(name, source)
-    }
-}
-
 fn pool() -> DescriptorPool {
-    protox::Compiler::with_file_resolver(TestProtos)
-        .open_file("test/v1/things.proto")
-        .expect("test protos compile")
-        .descriptor_pool()
+    common::compile("test/v1/things.proto", THINGS_PROTO)
 }
 
 fn item_desc(pool: &DescriptorPool) -> MessageDescriptor {
@@ -303,37 +255,14 @@ impl tower::Service<http::Request<tonic::body::Body>> for Things {
     }
 }
 
-/// Start the upstream on a random local port and return its URL.
-async fn start_upstream(pool: DescriptorPool) -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let incoming = futures::stream::unfold(listener, |listener| async move {
-        let conn = listener.accept().await.map(|(stream, _)| stream);
-        Some((conn, listener))
-    });
-    tokio::spawn(
-        tonic::transport::Server::builder()
-            .add_service(Things { pool })
-            .serve_with_incoming(incoming),
-    );
-    format!("http://{addr}")
-}
-
 // --- proxy harness ----------------------------------------------------------
 
 /// A proxy router in front of a fresh upstream, with `error_details_yaml`
 /// appended to the config (empty for the defaults).
 async fn proxy(error_details_yaml: &str) -> axum::Router {
     let pool = pool();
-    let upstream = start_upstream(pool.clone()).await;
-    let config = ProxyConfig::from_yaml_str(&format!(
-        "upstream:\n  default: \"{upstream}\"\n{error_details_yaml}"
-    ))
-    .unwrap();
-    ProxyServer::from_config(config)
-        .with_descriptors(pool)
-        .router()
-        .unwrap()
+    let upstream = common::serve(Things { pool: pool.clone() }).await;
+    common::proxy(&upstream, pool, error_details_yaml)
 }
 
 async fn get(app: &axum::Router, path: &str, accept: Option<&str>) -> (StatusCode, String) {
@@ -341,16 +270,7 @@ async fn get(app: &axum::Router, path: &str, accept: Option<&str>) -> (StatusCod
     if let Some(accept) = accept {
         req = req.header("accept", accept);
     }
-    let resp = app
-        .clone()
-        .oneshot(req.body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    (status, String::from_utf8(bytes.to_vec()).unwrap())
+    common::send(app, req.body(Body::empty()).unwrap()).await
 }
 
 async fn get_json(app: &axum::Router, path: &str) -> (StatusCode, Value) {
