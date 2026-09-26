@@ -376,8 +376,51 @@ async fn global_switch_off_removes_details_from_stream_frames_too() {
     let last: Value = serde_json::from_str(body.lines().last().unwrap()).unwrap();
     assert_eq!(
         last,
-        json!({"error": "INVALID_ARGUMENT", "message": "invalid email", "code": 3})
+        json!({
+            "@type": "type.googleapis.com/google.rpc.Status",
+            "error": "INVALID_ARGUMENT",
+            "message": "invalid email",
+            "code": 3
+        })
     );
+}
+
+// --- errors the proxy raises itself ------------------------------------------
+
+#[tokio::test]
+async fn unmappable_request_gets_the_shared_error_body() {
+    // A request the proxy rejects before calling the upstream answers in the
+    // same body as an upstream error on that route, so a client parses one
+    // shape: here INVALID_ARGUMENT with empty details.
+    let app = proxy("").await;
+    let (status, body) = get_json(&app, "/v1/things/rich?count=many").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "INVALID_ARGUMENT");
+    assert_eq!(body["code"], 3);
+    assert_eq!(body["details"], json!([]));
+    assert!(body["message"].is_string());
+}
+
+#[tokio::test]
+async fn unreachable_upstream_gets_the_shared_error_body() {
+    // Nothing listens on the upstream port: 503 UNAVAILABLE in the shared
+    // body. With details switched off for the route, the key is absent here
+    // too.
+    let app = common::proxy(
+        "http://127.0.0.1:1",
+        pool(),
+        "error_details:\n  routes:\n    - pattern: \"/v1/quiet/*\"\n      enabled: false\n",
+    );
+    let (status, body) = get_json(&app, "/v1/things/rich").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"], "UNAVAILABLE");
+    assert_eq!(body["code"], 14);
+    assert_eq!(body["details"], json!([]));
+
+    let (status, quiet) = get_json(&app, "/v1/quiet/rich").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(quiet["code"], 14);
+    assert!(quiet.get("details").is_none(), "{quiet}");
 }
 
 // --- streaming --------------------------------------------------------------
@@ -408,7 +451,8 @@ async fn stream_refused_before_headers_maps_like_a_unary_error() {
 async fn ndjson_stream_failing_after_first_message_ends_with_detailed_error_line() {
     // The 200 and the first message are already on the wire when the upstream
     // fails, so the status cannot change: the error arrives as exactly one
-    // final NDJSON line holding the same body a unary error would have.
+    // final NDJSON line holding the same body a unary error would have, marked
+    // by `@type: google.rpc.Status` so it is not mistaken for a data line.
     let app = proxy("").await;
     let (status, body) = get(&app, "/v1/things/x/watch", None).await;
     assert_eq!(status, StatusCode::OK);
@@ -421,6 +465,7 @@ async fn ndjson_stream_failing_after_first_message_ends_with_detailed_error_line
         vec![
             json!({"name": "first", "count": "1"}),
             json!({
+                "@type": "type.googleapis.com/google.rpc.Status",
                 "error": "INVALID_ARGUMENT",
                 "message": "invalid email",
                 "code": 3,

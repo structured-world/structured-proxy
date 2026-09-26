@@ -295,6 +295,10 @@ mapping (`INVALID_ARGUMENT` → 400, `NOT_FOUND` → 404, ...):
   internals meant for the service's operators.
 - With details switched off for a route (`error_details` in the config), the
   `details` key is absent and the body is `{"error", "code", "message"}`.
+- Errors the proxy raises itself on a transcoded route use the same body: a
+  request that cannot be mapped onto the RPC (`INVALID_ARGUMENT`, 400), an
+  upstream that is not reachable (`UNAVAILABLE`, 503), a response that cannot
+  be serialized (`INTERNAL`, 500). Their `details` is empty.
 
 **Opaque-detail extension.** ProtoJSON cannot represent an `Any` whose type is
 unknown to the reader. Rather than drop such a detail (a type in neither
@@ -319,12 +323,18 @@ above. Once the first message is sent, the `200` is already on the wire and
 cannot change, so the failure is delivered as a terminal frame whose payload is
 exactly that body, after which the stream ends and no further data follows:
 
-- **NDJSON**: the last line. It is told apart from a data line by being last
-  and by its `error` + `code` fields; if the RPC's own messages carry top-level
-  `error` and `code` fields, use SSE, where the event type separates the two.
+- **NDJSON**: the last line, framed by an extra
+  `"@type": "type.googleapis.com/google.rpc.Status"` next to the error body. A
+  data line is the ProtoJSON of a response message, which has a top-level
+  `@type` only when the RPC streams `google.protobuf.Any` itself; a reader tells
+  the error line apart by that marker.
 - **SSE**: one event with type `stream-error` (listen with
   `addEventListener("stream-error", ...)`), distinct from the `EventSource`
-  `onerror` that fires on transport failures.
+  `onerror` that fires on transport failures. The event type is the framing,
+  so the event data is exactly the error body, without the NDJSON marker.
+
+The same applies to a message the proxy cannot serialize mid-stream: the
+stream ends with an `INTERNAL` terminal frame.
 
 This is the HTTP/JSON transcoding format. It is not the Connect protocol's error
 format, and it is not an OAuth 2.0 token endpoint error body (RFC 6749 §5.2).

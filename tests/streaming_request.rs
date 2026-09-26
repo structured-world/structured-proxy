@@ -166,6 +166,8 @@ async fn post_stream_with_malformed_body_is_rejected_before_the_upstream() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     let error: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(error["error"], "INVALID_ARGUMENT");
+    assert_eq!(error["code"], 3);
+    assert_eq!(error["details"], json!([]));
 }
 
 #[tokio::test]
@@ -182,4 +184,6 @@ async fn get_stream_with_ill_typed_query_is_rejected_before_the_upstream() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     let error: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(error["error"], "INVALID_ARGUMENT");
+    assert_eq!(error["code"], 3);
+    assert_eq!(error["details"], json!([]));
 }

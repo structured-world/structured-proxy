@@ -294,7 +294,7 @@ async fn streaming_handler<S: TranscodeState>(
         &body_bytes,
     ) {
         Ok(msg) => msg,
-        Err(message) => return bad_request(message),
+        Err(message) => return bad_request(&entry, message),
     };
 
     let grpc_metadata =
@@ -309,14 +309,8 @@ async fn streaming_handler<S: TranscodeState>(
 
     let mut grpc_client = Grpc::new(channel);
     if let Err(e) = grpc_client.ready().await {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": "UNAVAILABLE",
-                "message": format!("gRPC upstream not ready: {e}"),
-            })),
-        )
-            .into_response();
+        let status = tonic::Status::unavailable(format!("gRPC upstream not ready: {e}"));
+        return error::status_to_response(&status, entry.error_details.as_deref());
     }
 
     let use_sse = wants_sse(&headers);
@@ -343,15 +337,22 @@ async fn streaming_handler<S: TranscodeState>(
     }
 }
 
-/// One JSON frame of a streaming response, already serialized.
+/// One frame of a streaming response: a serialized message, or the error body
+/// (see [`error::error_body`]) that ends the stream.
 ///
 /// `Error` is terminal: [`json_frames`] stops the stream right after yielding
 /// it, so an error frame is always the last thing a client sees regardless of
-/// whether it came from a gRPC status or a serialization failure.
+/// whether it came from a gRPC status or a serialization failure. It stays a
+/// JSON value so each format can add its own framing before serializing it.
 enum StreamFrame {
     Data(String),
-    Error(String),
+    Error(serde_json::Value),
 }
+
+/// Type URL marking the terminal error line of an NDJSON stream. A data line is
+/// the ProtoJSON of a response message, which carries a top-level `@type` only
+/// when the RPC streams `google.protobuf.Any` itself.
+const STATUS_TYPE_URL: &str = "type.googleapis.com/google.rpc.Status";
 
 /// Turn a gRPC message stream into a stream of serialized JSON frames, stopping
 /// after the first error so error frames are unambiguously terminal.
@@ -378,18 +379,14 @@ where
                 Ok(s) => StreamFrame::Data(s),
                 Err(e) => {
                     *stopped = true;
-                    StreamFrame::Error(
-                        serde_json::json!({
-                            "error": "INTERNAL",
-                            "message": format!("serialization error: {e}"),
-                        })
-                        .to_string(),
-                    )
+                    StreamFrame::Error(render_error(&tonic::Status::internal(format!(
+                        "serialization error: {e}"
+                    ))))
                 }
             },
             Err(status) => {
                 *stopped = true;
-                StreamFrame::Error(render_error(&status).to_string())
+                StreamFrame::Error(render_error(&status))
             }
         };
         futures::future::ready(Some(frame))
@@ -402,11 +399,18 @@ where
     St: futures::Stream<Item = Result<DynamicMessage, tonic::Status>> + Send + 'static,
     R: Fn(&tonic::Status) -> serde_json::Value + Send + 'static,
 {
-    // Data and error frames are both JSON lines; an error is distinguished by
-    // its `error` field and by being the final line (see `json_frames`).
+    // Data and error frames are both JSON lines. The error line is the last
+    // one, and carries `@type: google.rpc.Status` next to the error body so a
+    // reader can tell it from a data line without guessing from its fields.
     let byte_stream = json_frames(stream, render_error).map(|frame| {
         let mut line = match frame {
-            StreamFrame::Data(s) | StreamFrame::Error(s) => s,
+            StreamFrame::Data(s) => s,
+            StreamFrame::Error(mut body) => {
+                if let Some(fields) = body.as_object_mut() {
+                    fields.insert("@type".into(), STATUS_TYPE_URL.into());
+                }
+                body.to_string()
+            }
         };
         line.push('\n');
         Ok::<axum::body::Bytes, std::io::Error>(axum::body::Bytes::from(line))
@@ -435,7 +439,9 @@ where
     let event_stream = json_frames(stream, render_error).map(|frame| {
         let event = match frame {
             StreamFrame::Data(s) => Event::default().data(s),
-            StreamFrame::Error(s) => Event::default().event("stream-error").data(s),
+            StreamFrame::Error(body) => Event::default()
+                .event("stream-error")
+                .data(body.to_string()),
         };
         Ok::<Event, std::convert::Infallible>(event)
     });
@@ -481,16 +487,13 @@ fn decode_request(
         .map_err(|e| format!("failed to decode request: {e}"))
 }
 
-/// The 400 answer to a request [`decode_request`] could not map.
-fn bad_request(message: String) -> Response {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(serde_json::json!({
-            "error": "INVALID_ARGUMENT",
-            "message": message,
-        })),
+/// The 400 answer to a request [`decode_request`] could not map, in the same
+/// error body the upstream's own errors get on this route.
+fn bad_request(entry: &RouteEntry, message: String) -> Response {
+    error::status_to_response(
+        &tonic::Status::invalid_argument(message),
+        entry.error_details.as_deref(),
     )
-        .into_response()
 }
 
 /// Generic transcoding handler.
@@ -512,7 +515,7 @@ async fn transcode_handler<S: TranscodeState>(
         &body_bytes,
     ) {
         Ok(msg) => msg,
-        Err(message) => return bad_request(message),
+        Err(message) => return bad_request(&entry, message),
     };
 
     let grpc_metadata =
@@ -527,14 +530,8 @@ async fn transcode_handler<S: TranscodeState>(
 
     let mut grpc_client = Grpc::new(channel);
     if let Err(e) = grpc_client.ready().await {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": "UNAVAILABLE",
-                "message": format!("gRPC upstream not ready: {e}"),
-            })),
-        )
-            .into_response();
+        let status = tonic::Status::unavailable(format!("gRPC upstream not ready: {e}"));
+        return error::status_to_response(&status, entry.error_details.as_deref());
     }
 
     match grpc_client.unary(grpc_request, grpc_path, grpc_codec).await {
@@ -562,14 +559,10 @@ async fn transcode_handler<S: TranscodeState>(
                 }
                 Err(e) => {
                     tracing::error!("Failed to serialize gRPC response: {e}");
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({
-                            "error": "INTERNAL",
-                            "message": "failed to serialize response",
-                        })),
+                    error::status_to_response(
+                        &tonic::Status::internal("failed to serialize response"),
+                        entry.error_details.as_deref(),
                     )
-                        .into_response()
                 }
             }
         }

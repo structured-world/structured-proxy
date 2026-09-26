@@ -286,7 +286,7 @@ async fn ndjson_terminal_frame_carries_status_details() {
         ))],
     );
     let renderer = Arc::new(error::StatusDetails::new(&DescriptorPool::new()));
-    let expected = error::error_body(&status, Some(&renderer));
+    let mut expected = error::error_body(&status, Some(&renderer));
     let render = move |s: &tonic::Status| error::error_body(s, Some(&renderer));
 
     let items = vec![Ok(item_message_named("alice", 1)), Err(status)];
@@ -294,11 +294,103 @@ async fn ndjson_terminal_frame_carries_status_details() {
     let lines: Vec<&str> = body.lines().collect();
     assert_eq!(lines.len(), 2);
     let frame: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    // The line is the unary error body plus the NDJSON frame marker.
+    expected["@type"] = STATUS_TYPE_URL.into();
     assert_eq!(frame, expected);
     assert_eq!(
         frame["details"][0]["@type"],
         "type.googleapis.com/google.rpc.ErrorInfo"
     );
+}
+
+/// A `Wrapper { google.protobuf.Any payload = 1; }` whose payload names a type
+/// no pool knows, so it cannot be serialized to JSON.
+fn unserializable_message() -> DynamicMessage {
+    use prost_reflect::prost_types::{
+        field_descriptor_proto::{Label, Type},
+        DescriptorProto, FieldDescriptorProto, FileDescriptorProto,
+    };
+
+    let wrapper = DescriptorProto {
+        name: Some("Wrapper".to_string()),
+        field: vec![FieldDescriptorProto {
+            name: Some("payload".to_string()),
+            number: Some(1),
+            label: Some(Label::Optional as i32),
+            r#type: Some(Type::Message as i32),
+            type_name: Some(".google.protobuf.Any".to_string()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let file = FileDescriptorProto {
+        name: Some("wrapper.proto".to_string()),
+        package: Some("test.v1".to_string()),
+        dependency: vec!["google/protobuf/any.proto".to_string()],
+        message_type: vec![wrapper],
+        syntax: Some("proto3".to_string()),
+        ..Default::default()
+    };
+    let mut pool = DescriptorPool::global();
+    pool.add_file_descriptor_proto(file).unwrap();
+    let desc = pool.get_message_by_name("test.v1.Wrapper").unwrap();
+    let any_desc = pool.get_message_by_name("google.protobuf.Any").unwrap();
+
+    let mut any = DynamicMessage::new(any_desc);
+    any.set_field_by_name(
+        "type_url",
+        prost_reflect::Value::String("type.googleapis.com/acme.v1.Unknown".into()),
+    );
+    let mut msg = DynamicMessage::new(desc);
+    msg.set_field_by_name("payload", prost_reflect::Value::Message(any));
+    // Sanity: the fixture really is unserializable.
+    assert!(message_to_json_string(&msg, &response_serialize_options()).is_err());
+    msg
+}
+
+#[tokio::test]
+async fn serialization_failure_ends_the_stream_with_the_shared_error_body() {
+    // A message the proxy cannot turn into JSON ends the stream like an
+    // upstream error: one terminal INTERNAL frame in the route's error body
+    // (here with details on, so `details` is present and empty), then nothing.
+    let renderer = Arc::new(error::StatusDetails::new(&DescriptorPool::new()));
+    let render = move |s: &tonic::Status| error::error_body(s, Some(&renderer));
+    let items = vec![
+        Ok(item_message_named("alice", 1)),
+        Ok(unserializable_message()),
+        Ok(item_message_named("bob", 2)),
+    ];
+    let body = collect_body(ndjson_response(futures::stream::iter(items), render)).await;
+    let lines: Vec<&str> = body.lines().collect();
+    assert_eq!(lines.len(), 2, "{body}");
+    let frame: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    assert_eq!(frame["@type"], STATUS_TYPE_URL);
+    assert_eq!(frame["error"], "INTERNAL");
+    assert_eq!(frame["code"], 13);
+    assert_eq!(frame["details"], serde_json::json!([]));
+    assert!(
+        frame["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("serialization error: "),
+        "{frame}"
+    );
+}
+
+#[tokio::test]
+async fn sse_error_payload_is_the_unary_body_without_the_ndjson_marker() {
+    // SSE frames the error by its event type, so the payload is exactly the
+    // body a unary error gets: no `@type` marker.
+    let status = tonic::Status::permission_denied("nope");
+    let expected = error::error_body(&status, None);
+    let items = vec![Err(status)];
+    let body = collect_body(sse_response(futures::stream::iter(items), no_details, 15)).await;
+    let payload = body
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .unwrap();
+    let frame: serde_json::Value = serde_json::from_str(payload).unwrap();
+    assert_eq!(frame, expected);
 }
 
 #[test]
