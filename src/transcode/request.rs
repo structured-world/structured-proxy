@@ -240,23 +240,20 @@ fn build(
     }
 
     if let Some(presence) = &mut presence {
-        for_each_group(query, |key, values| {
-            let target = Target {
-                root: input,
-                inside: root_inside,
-                prefix: None,
-                key,
-                values,
-            };
-            inside |= bind(
-                &mut message,
-                target,
-                Binding::Fill,
-                Some(&mut *presence),
-                &mut path,
-            )?;
-            Ok(())
-        })?;
+        let start = Start {
+            root: input,
+            inside: root_inside,
+            prefix: None,
+        };
+        inside |= bind_pairs(
+            &mut message,
+            query,
+            start,
+            Binding::Fill,
+            Some(presence),
+            None,
+            &mut path,
+        )?;
     }
     if inside {
         check_well_known(&message)?;
@@ -414,7 +411,7 @@ fn remove_path<'k>(
 ) {
     let mut segments = segments.peekable();
     while let Some(segment) = segments.next() {
-        let Some(field) = field_named(&desc, segment) else {
+        let Some(field) = field_named(&desc, segment, &mut false) else {
             return;
         };
         let Some(object) = value.as_object_mut() else {
@@ -513,33 +510,20 @@ fn form_body(
         }
         _ => (None, has_special_json(input)),
     };
-    let mut inside = false;
-    for_each_group(pairs, |key, values| {
-        let target = Target {
-            root: input,
-            inside: start_inside,
-            prefix: prefix.as_ref(),
-            key,
-            values,
-        };
-        let Some(field_inside) = resolve(target, path) else {
-            return Ok(());
-        };
-        // The path sets these fields whatever the form holds, so their form
-        // values are never decoded, as a JSON body's are not.
-        if path_params.keys().any(|bound| covers(bound, path)) {
-            return Ok(());
-        }
-        assign(
-            &mut message,
-            path,
-            values,
-            Binding::Set,
-            presence.as_deref_mut(),
-        )?;
-        inside |= field_inside;
-        Ok(())
-    })?;
+    let start = Start {
+        root: input,
+        inside: start_inside,
+        prefix: prefix.as_ref(),
+    };
+    let inside = bind_pairs(
+        &mut message,
+        pairs,
+        start,
+        Binding::Set,
+        presence,
+        Some(path_params),
+        path,
+    )?;
     Ok((message, inside))
 }
 
@@ -561,22 +545,125 @@ fn covers(bound: &str, path: &[FieldDescriptor]) -> bool {
     })
 }
 
-/// Call `f` once per distinct key of `pairs`, with every value of that key in
-/// request order.
-fn for_each_group<'p>(
-    pairs: &'p [(Cow<'p, str>, Cow<'p, str>)],
-    mut f: impl FnMut(&'p str, &[&'p str]) -> Result<(), String>,
-) -> Result<(), String> {
-    // A stable sort keeps the values of each key in request order.
+/// Where the keys of a query or form start: `root`, or its message field
+/// `prefix`; `inside` when that message is a well-known type.
+#[derive(Clone, Copy)]
+struct Start<'a> {
+    root: &'a MessageDescriptor,
+    inside: bool,
+    prefix: Option<&'a FieldDescriptor>,
+}
+
+/// Bind every key of `pairs` to its field, with all the values of that field
+/// in request order, and tell whether a field inside a well-known type was
+/// set. A key the path binds (`path_params`, for a form) is left to the path.
+///
+/// Keys are grouped by the field they name, not by spelling: `tag_ids` and
+/// `tagIds` are one field, and binding them apart would let one replace the
+/// other's values.
+fn bind_pairs(
+    message: &mut DynamicMessage,
+    pairs: &[(Cow<'_, str>, Cow<'_, str>)],
+    start: Start<'_>,
+    binding: Binding,
+    mut presence: Option<&mut Presence>,
+    path_params: Option<&HashMap<String, String>>,
+    path: &mut Vec<FieldDescriptor>,
+) -> Result<bool, String> {
+    // A stable sort keeps the values of each spelling in request order.
     let mut order: Vec<usize> = (0..pairs.len()).collect();
     order.sort_by(|&a, &b| pairs[a].0.cmp(&pairs[b].0));
     let mut values = Vec::new();
+    let mut inside = false;
+    // Spellings that used a JSON name, by the proto-name key they stand for.
+    // Only a request that mixes the two spellings of a field pays for this.
+    let mut aliased: Vec<(String, &[usize])> = Vec::new();
     for run in order.chunk_by(|&a, &b| pairs[a].0 == pairs[b].0) {
         values.clear();
         values.extend(run.iter().map(|&i| pairs[i].1.as_ref()));
-        f(pairs[run[0]].0.as_ref(), &values)?;
+        let target = Target {
+            root: start.root,
+            inside: start.inside,
+            prefix: start.prefix,
+            key: &pairs[run[0]].0,
+            values: &values,
+        };
+        let Some(resolved) = resolve(target, path) else {
+            continue;
+        };
+        if resolved.aliased {
+            let own = &path[usize::from(start.prefix.is_some())..];
+            let canonical = own.iter().map(|f| f.name()).collect::<Vec<_>>().join(".");
+            aliased.push((canonical, run));
+            continue;
+        }
+        inside |= bind_resolved(
+            message,
+            path,
+            &values,
+            binding,
+            presence.as_deref_mut(),
+            path_params,
+        )? && resolved.inside;
     }
-    Ok(())
+    if aliased.is_empty() {
+        return Ok(inside);
+    }
+
+    aliased.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut indices = Vec::new();
+    for group in aliased.chunk_by(|a, b| a.0 == b.0) {
+        let canonical = group[0].0.as_str();
+        indices.clear();
+        for (_, run) in group {
+            indices.extend_from_slice(run);
+        }
+        // The proto-name spelling, bound above with its own values only.
+        let from = order.partition_point(|&i| pairs[i].0.as_ref() < canonical);
+        let to = order.partition_point(|&i| pairs[i].0.as_ref() <= canonical);
+        indices.extend_from_slice(&order[from..to]);
+        indices.sort_unstable();
+        values.clear();
+        values.extend(indices.iter().map(|&i| pairs[i].1.as_ref()));
+        let target = Target {
+            root: start.root,
+            inside: start.inside,
+            prefix: start.prefix,
+            key: canonical,
+            values: &values,
+        };
+        let Some(resolved) = resolve(target, path) else {
+            continue;
+        };
+        inside |= bind_resolved(
+            message,
+            path,
+            &values,
+            binding,
+            presence.as_deref_mut(),
+            path_params,
+        )? && resolved.inside;
+    }
+    Ok(inside)
+}
+
+/// Assign `values` to the resolved `path` unless a path parameter binds it.
+/// True when it was assigned.
+fn bind_resolved(
+    message: &mut DynamicMessage,
+    path: &[FieldDescriptor],
+    values: &[&str],
+    binding: Binding,
+    presence: Option<&mut Presence>,
+    path_params: Option<&HashMap<String, String>>,
+) -> Result<bool, String> {
+    // The path sets these fields whatever the form holds, so their form
+    // values are never decoded, as a JSON body's are not.
+    if path_params.is_some_and(|bound| bound.keys().any(|key| covers(key, path))) {
+        return Ok(false);
+    }
+    assign(message, path, values, binding, presence)?;
+    Ok(true)
 }
 
 /// Set the field `target` names to its values (see [`resolve`] and
@@ -589,11 +676,20 @@ fn bind(
     presence: Option<&mut Presence>,
     path: &mut Vec<FieldDescriptor>,
 ) -> Result<bool, String> {
-    let Some(inside) = resolve(target, path) else {
+    let Some(resolved) = resolve(target, path) else {
         return Ok(false);
     };
     assign(message, path, target.values, binding, presence)?;
-    Ok(inside)
+    Ok(resolved.inside)
+}
+
+/// What [`resolve`] found besides the fields on the way.
+#[derive(Clone, Copy)]
+struct Resolved {
+    /// The field lies inside a well-known type.
+    inside: bool,
+    /// A segment named its field by a JSON name that is not its proto name.
+    aliased: bool,
 }
 
 /// Resolve the dotted key of `target` into the fields on the way, in `path`,
@@ -605,9 +701,10 @@ fn bind(
 /// a well-known type (`at.nanos` of a Timestamp) is bound like any other, and
 /// the value it leaves is checked once the request is built (see
 /// [`check_well_known`]).
-fn resolve(target: Target<'_>, path: &mut Vec<FieldDescriptor>) -> Option<bool> {
+fn resolve(target: Target<'_>, path: &mut Vec<FieldDescriptor>) -> Option<Resolved> {
     path.clear();
     let mut inside = target.inside;
+    let mut aliased = false;
     let mut owned;
     let mut desc = match target.prefix {
         Some(field) => {
@@ -623,7 +720,7 @@ fn resolve(target: Target<'_>, path: &mut Vec<FieldDescriptor>) -> Option<bool> 
     let mut segments = target.key.split('.');
     let mut leaf = segments.next().unwrap_or_default();
     for next in segments {
-        let field = field_named(desc, leaf)?;
+        let field = field_named(desc, leaf, &mut aliased)?;
         let Kind::Message(inner) = field.kind() else {
             return None;
         };
@@ -636,14 +733,23 @@ fn resolve(target: Target<'_>, path: &mut Vec<FieldDescriptor>) -> Option<bool> 
         desc = &owned;
         leaf = next;
     }
-    path.push(field_named(desc, leaf)?);
-    Some(inside)
+    path.push(field_named(desc, leaf, &mut aliased)?);
+    Some(Resolved { inside, aliased })
 }
 
-/// The field of `desc` named `name`, by its proto name or else its JSON name.
-fn field_named(desc: &MessageDescriptor, name: &str) -> Option<FieldDescriptor> {
-    desc.get_field_by_name(name)
-        .or_else(|| desc.get_field_by_json_name(name))
+/// The field of `desc` named `name`, by its proto name or else its JSON name;
+/// `aliased` is set when only the JSON name matched.
+fn field_named(
+    desc: &MessageDescriptor,
+    name: &str,
+    aliased: &mut bool,
+) -> Option<FieldDescriptor> {
+    if let Some(field) = desc.get_field_by_name(name) {
+        return Some(field);
+    }
+    let field = desc.get_field_by_json_name(name)?;
+    *aliased = true;
+    Some(field)
 }
 
 /// Set the field at the end of `path` to `values`: all of them for a repeated

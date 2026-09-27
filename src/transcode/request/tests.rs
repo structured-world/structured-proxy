@@ -237,6 +237,7 @@ message Req {
   google.protobuf.StringValue note = 19;
   google.protobuf.Struct meta = 20;
   int32 max_items = 21;
+  repeated int32 tag_ids = 22;
 }
 "#;
 
@@ -941,6 +942,60 @@ fn form_and_query_keys_bind_by_proto_or_json_name() {
     )
     .unwrap();
     assert_eq!(json(&message), serde_json::json!({"maxItems": 7, "age": 1}));
+}
+
+#[test]
+fn both_names_of_one_field_bind_as_one_key_in_request_order() {
+    // `tag_ids` and `tagIds` are one field: a repeated one gets every value in
+    // request order, a singular one the last value sent, whichever name it
+    // came under.
+    let message = build_req(
+        BodyMapping::None,
+        Body::Absent,
+        &[],
+        "tag_ids=1&tagIds=2&tag_ids=3&maxItems=5&max_items=6",
+    )
+    .unwrap();
+    assert_eq!(
+        json(&message),
+        serde_json::json!({"tagIds": [1, 2, 3], "maxItems": 6})
+    );
+    let message = build_req(
+        BodyMapping::None,
+        Body::Absent,
+        &[],
+        "max_items=6&maxItems=5",
+    )
+    .unwrap();
+    assert_eq!(json(&message), serde_json::json!({"maxItems": 5}));
+    let message = build_req(
+        BodyMapping::Root,
+        Body::Form(b"tagIds=1&tag_ids=2&maxItems=5&max_items=6"),
+        &[],
+        "",
+    )
+    .unwrap();
+    assert_eq!(
+        json(&message),
+        serde_json::json!({"tagIds": [1, 2], "maxItems": 6})
+    );
+}
+
+#[test]
+fn the_query_fills_a_form_bound_well_known_field_the_form_left_out() {
+    // A form bound to a Timestamp field sets it field by field, like any
+    // message field, so the query fills what the form did not send.
+    let message = build_req(
+        BodyMapping::Field("at".into()),
+        Body::Form(b"seconds=5"),
+        &[],
+        "at.nanos=7&at.seconds=9",
+    )
+    .unwrap();
+    assert_eq!(
+        json(&message),
+        serde_json::json!({"at": "1970-01-01T00:00:05.000000007Z"})
+    );
 }
 
 #[test]

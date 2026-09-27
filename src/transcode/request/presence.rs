@@ -90,14 +90,13 @@ impl Presence {
     }
 
     /// Record `path` as set by something other than the body: every field on
-    /// the way as fields, the last one as an object when `object` (a form
-    /// body bound to that field), as a whole otherwise.
-    pub(super) fn record_path(&mut self, path: &[FieldDescriptor], object: bool) {
+    /// the way as fields, and the last one as fields too when `fields` (a form
+    /// body bound to that field, whose keys are its fields even for a
+    /// well-known type), as a whole otherwise.
+    pub(super) fn record_path(&mut self, path: &[FieldDescriptor], fields: bool) {
         for (depth, field) in path.iter().enumerate() {
-            let held = if depth + 1 < path.len() {
+            let held = if fields || depth + 1 < path.len() {
                 Held::Fields
-            } else if object {
-                Held::Object
             } else {
                 Held::Whole
             };
