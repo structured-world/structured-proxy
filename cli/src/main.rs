@@ -4,12 +4,14 @@
 //! structured-proxy --config proxy.yaml
 //! ```
 
+use anyhow::Context as _;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(
     name = "structured-proxy",
+    version,
     about = "Universal gRPC→REST transcoding proxy"
 )]
 struct Cli {
@@ -27,7 +29,8 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     // Reads the ProxyConfig and the transcoding settings kept outside it
     // (error_details, streaming.ndjson_envelope) from the same file.
-    let server = structured_proxy::ProxyServer::from_file(std::path::Path::new(&cli.config))?;
+    let server = structured_proxy::ProxyServer::from_file(std::path::Path::new(&cli.config))
+        .with_context(|| format!("loading config {}", cli.config))?;
     let config = server.config();
 
     tracing::info!(

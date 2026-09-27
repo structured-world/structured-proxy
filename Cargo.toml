@@ -1,7 +1,16 @@
+# The library lives at the root; the binary is its own package in cli/, so a
+# crate that depends on the library compiles none of the binary's dependencies.
+[workspace]
+members = ["cli"]
+
+# Both packages are released together, at one version.
+[workspace.package]
+version = "4.3.0"
+
 [package]
 name = "structured-proxy"
 description = "Universal gRPC→REST transcoding proxy — config-driven, works with any gRPC service"
-version = "4.3.0"
+version.workspace = true
 edition = "2021"
 authors = ["Dmitry Prudnikov <mail@polaz.com>"]
 license = "Apache-2.0"
@@ -16,10 +25,6 @@ categories = ["network-programming", "web-programming::http-server"]
 # Redis-backed rate-limit store (and its intra-doc links) are documented.
 [package.metadata.docs.rs]
 features = ["redis"]
-
-[[bin]]
-name = "structured-proxy"
-path = "src/main.rs"
 
 [lib]
 name = "structured_proxy"
@@ -64,7 +69,6 @@ prost-reflect = { version = "0.16", features = ["serde"] }
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Error handling
 thiserror = "2"
@@ -109,9 +113,7 @@ base64 = "0.23"
 sha2 = "0.11"
 url = "2"
 getrandom = "0.4"
-
-# CLI
-clap = { version = "4", features = ["derive"] }
+# Envoy ext_authz `Authorization/Check` messages (External AuthZ).
 envoy-types = "0.7"
 
 [features]
