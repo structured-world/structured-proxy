@@ -206,7 +206,11 @@ fn build(
         (_, Body::Form(bytes)) => {
             let pairs: Vec<(Cow<'_, str>, Cow<'_, str>)> =
                 url::form_urlencoded::parse(bytes).collect();
-            form_body(input, mapping, &pairs, presence.as_mut(), &mut path)?
+            let form = Form {
+                pairs: &pairs,
+                path_params,
+            };
+            form_body(input, mapping, form, presence.as_mut(), &mut path)?
         }
     };
 
@@ -405,10 +409,11 @@ fn deserialize_input<'de, D: Deserializer<'de>>(
 fn form_body(
     input: &MessageDescriptor,
     mapping: &BodyMapping,
-    pairs: &[(Cow<'_, str>, Cow<'_, str>)],
+    form: Form<'_, '_>,
     mut presence: Option<&mut Presence>,
     path: &mut Vec<FieldDescriptor>,
 ) -> Result<DynamicMessage, String> {
+    let Form { pairs, path_params } = form;
     let mut message = DynamicMessage::new(input.clone());
     let prefix = match mapping {
         BodyMapping::Field(name) => {
@@ -426,6 +431,18 @@ fn form_body(
         _ => None,
     };
     for_each_group(pairs, |key, values| {
+        // The path sets these fields whatever the form holds, so their form
+        // values are never decoded, as a JSON body's are not.
+        let bound = |bound: &str| match &prefix {
+            Some(field) => bound
+                .strip_prefix(field.name())
+                .and_then(|rest| rest.strip_prefix('.'))
+                .is_some_and(|rest| covers(rest, key)),
+            None => covers(bound, key),
+        };
+        if path_params.keys().any(|key| bound(key)) {
+            return Ok(());
+        }
         let target = Target {
             prefix: prefix.as_ref(),
             key,
@@ -440,6 +457,19 @@ fn form_body(
         )
     })?;
     Ok(message)
+}
+
+/// A form body and the path parameters that override it.
+#[derive(Clone, Copy)]
+struct Form<'p, 'q> {
+    pairs: &'p [(Cow<'q, str>, Cow<'q, str>)],
+    path_params: &'p HashMap<String, String>,
+}
+
+/// Whether the dotted field path `bound` is `key` or a field above it.
+fn covers(bound: &str, key: &str) -> bool {
+    key.strip_prefix(bound)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
 }
 
 /// Call `f` once per distinct key of `pairs`, with every value of that key in

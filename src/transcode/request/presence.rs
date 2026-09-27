@@ -8,7 +8,7 @@
 //! body spelled them; they are matched against fields (by JSON or proto name)
 //! only for the few keys a query names.
 
-use prost_reflect::{FieldDescriptor, MessageDescriptor};
+use prost_reflect::{FieldDescriptor, Kind, MessageDescriptor};
 use serde::de::value::StringDeserializer;
 use serde::de::{self, DeserializeSeed, Deserializer, IntoDeserializer, MapAccess, Visitor};
 use std::fmt;
@@ -93,7 +93,10 @@ impl Presence {
     }
 
     /// Whether a query parameter for `path` must leave it alone: the path was
-    /// set, or a field above it was set to something other than an object.
+    /// set, or a field above it was set to something other than an object of
+    /// its fields. A well-known type read from its own JSON form (a `Struct`,
+    /// an object `Value`) counts as set whole: its object's keys are not its
+    /// fields.
     pub(super) fn blocks(&mut self, path: &[FieldDescriptor]) -> bool {
         if self.whole {
             return true;
@@ -106,13 +109,17 @@ impl Presence {
             self.matched.truncate(depth);
             let parent = depth == 0 || self.matched.get(depth - 1) == Some(&true);
             let key = &self.names[entry.start as usize..entry.end as usize];
-            let hit = parent
-                && path
-                    .get(depth)
-                    .is_some_and(|field| key == field.name() || key == field.json_name());
-            if hit && (depth + 1 == path.len() || !entry.object) {
-                return true;
+            let field = path
+                .get(depth)
+                .filter(|field| parent && (key == field.name() || key == field.json_name()));
+            if let Some(field) = field {
+                let whole = !entry.object
+                    || matches!(field.kind(), Kind::Message(message) if has_special_json(&message));
+                if depth + 1 == path.len() || whole {
+                    return true;
+                }
             }
+            let hit = field.is_some();
             // Pad to this depth when a level was skipped under a non-match.
             self.matched.resize(depth, false);
             self.matched.push(hit);

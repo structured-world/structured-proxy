@@ -200,6 +200,7 @@ package t;
 import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
 import "google/protobuf/wrappers.proto";
+import "google/protobuf/struct.proto";
 
 enum Size {
   SIZE_UNSPECIFIED = 0;
@@ -234,6 +235,7 @@ message Req {
   }
   uint64 big = 18;
   google.protobuf.StringValue note = 19;
+  google.protobuf.Struct meta = 20;
 }
 "#;
 
@@ -753,6 +755,57 @@ fn a_path_bound_field_is_taken_from_the_path_whatever_the_body_holds() {
     )
     .unwrap_err();
     assert!(err.starts_with("failed to decode request body"), "{err}");
+}
+
+#[test]
+fn a_path_bound_form_field_is_taken_from_the_path_whatever_the_form_holds() {
+    // The form is the body, so the path wins over it as over a JSON body.
+    let message = build_req(
+        BodyMapping::Root,
+        Body::Form(b"age=old&count=3"),
+        &[("age", "7")],
+        "",
+    )
+    .unwrap();
+    assert_eq!(json(&message), serde_json::json!({"age": 7, "count": "3"}));
+    // Under `body: "address"` the form keys sit below the field.
+    let message = build_req(
+        BodyMapping::Field("address".into()),
+        Body::Form(b"city=x&zip=z"),
+        &[("address.city", "rome")],
+        "",
+    )
+    .unwrap();
+    assert_eq!(
+        json(&message),
+        serde_json::json!({"address": {"city": "rome", "zip": "z"}})
+    );
+    // A wrong value in a field the path does not bind is still an error.
+    let err = build_req(
+        BodyMapping::Root,
+        Body::Form(b"age=old&count=many"),
+        &[("age", "7")],
+        "",
+    )
+    .unwrap_err();
+    assert!(err.contains("`count`"), "{err}");
+}
+
+#[test]
+fn a_nested_well_known_type_in_the_body_is_set_whole() {
+    // A Struct reads its body object as its own keys, not as its fields, so
+    // the body sets the whole Struct and the query cannot reach into it.
+    let message = build_req(
+        BodyMapping::Root,
+        Body::Json(br#"{"meta": {"k": "v"}}"#),
+        &[],
+        "meta.fields=x&age=1",
+    )
+    .unwrap();
+    assert_eq!(
+        json(&message),
+        serde_json::json!({"meta": {"k": "v"}, "age": 1})
+    );
 }
 
 #[test]
