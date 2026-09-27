@@ -440,8 +440,9 @@ grpc-gateway do, so the same service works behind any of them.
 its HTTP response headers. Every ASCII entry becomes a header, in order, with
 repeated values as repeated fields; a key sent in both the initial metadata and
 the trailers keeps both values. This covers a successful unary call (initial
-metadata and trailers), a failed call (its trailers-only metadata, so a `401`
-carries its `WWW-Authenticate`), and the initial metadata of a server-streaming
+metadata and trailers), a failed call (its trailers-only metadata, or the
+response headers and trailers of a call that failed after sending headers, so a
+`401` carries its `WWW-Authenticate`), and the initial metadata of a server-streaming
 call (its trailers arrive after the headers are sent and are not forwarded).
 Never forwarded:
 
@@ -469,8 +470,9 @@ metadata `x-http-code` (grpc-gateway's convention) sets the HTTP status: one
 integer from 200 to 599. Anything else (a value that is not three digits, out
 of range, or given twice) turns the answer into
 `{"error": "INTERNAL", "code": 13, "message": "upstream returned a malformed response", "details": []}`
-(500), with nothing else of the upstream's answer. `204` and `304` are sent
-without a body or `Content-Type` (RFC 9110 §15.3.5, §15.4.5). Errors keep the
+(500), with nothing else of the upstream's answer. `204`, `205` and `304` are
+sent without a body or `Content-Type` (RFC 9110 §15.3.5, §15.3.6, §15.4.5).
+Errors keep the
 `google.rpc.Code` mapping: a protocol-specific error body is a successful
 answer with `x-http-code` and that body. Server-streaming calls ignore the key.
 
@@ -511,7 +513,8 @@ method, so a `*` rule answers it whatever that method is. `custom` works in
 `additional_bindings` too. A `*` rule takes its path for every method, so
 another binding on that path is rejected at startup. OpenAPI lists a `*` rule
 under every operation, and cannot describe an extension method. Only a real
-CORS preflight (an `OPTIONS` request with `Access-Control-Request-Method`) is
+CORS preflight (an `OPTIONS` request with both `Origin` and
+`Access-Control-Request-Method`) is
 answered by the CORS layer; any other `OPTIONS` request reaches its route.
 
 ## Library Usage

@@ -1,6 +1,98 @@
 use super::*;
 use axum::routing::get;
 
+/// Serves a minimal `google/api` from memory plus one test file.
+struct OneApi(&'static str);
+
+impl protox::file::FileResolver for OneApi {
+    fn open_file(&self, name: &str) -> Result<protox::file::File, protox::Error> {
+        let source = match name {
+            "google/api/annotations.proto" => {
+                r#"syntax = "proto3";
+package google.api;
+import "google/protobuf/descriptor.proto";
+message HttpRule {
+  oneof pattern { string get = 2; string post = 4; }
+  string body = 7;
+  string response_body = 12;
+}
+extend google.protobuf.MethodOptions { HttpRule http = 72295728; }
+"#
+            }
+            "api.proto" => self.0,
+            _ => return protox::file::GoogleFileResolver::new().open_file(name),
+        };
+        protox::file::File::from_source(name, source)
+    }
+}
+
+/// A descriptor pool compiled from one annotated `.proto` source.
+fn api_pool(source: &'static str) -> DescriptorPool {
+    protox::Compiler::with_file_resolver(OneApi(source))
+        .open_file("api.proto")
+        .unwrap()
+        .descriptor_pool()
+}
+
+#[test]
+fn response_body_names_proto_fields_not_json_keys() {
+    // `response_body` is a proto field path (`user_info`), while the
+    // serialized message uses JSON names (`userInfo`); multi-word fields must
+    // still resolve, at every level.
+    let pool = api_pool(
+        r#"syntax = "proto3";
+package t;
+message Inner { string display_name = 1; }
+message Resp { Inner user_info = 1; }
+"#,
+    );
+    let inner_desc = pool.get_message_by_name("t.Inner").unwrap();
+    let mut inner = DynamicMessage::new(inner_desc);
+    inner.set_field_by_name("display_name", prost_reflect::Value::String("Ann".into()));
+    let mut resp = DynamicMessage::new(pool.get_message_by_name("t.Resp").unwrap());
+    resp.set_field_by_name("user_info", prost_reflect::Value::Message(inner));
+
+    let json = |path| {
+        serde_json::from_slice::<serde_json::Value>(&json_body(&resp, Some(path)).unwrap()).unwrap()
+    };
+    assert_eq!(json("user_info"), serde_json::json!({"displayName": "Ann"}));
+    assert_eq!(json("user_info.display_name"), serde_json::json!("Ann"));
+    // A path that names no field is JSON null, as before.
+    assert_eq!(json("user_info.missing"), serde_json::Value::Null);
+    assert_eq!(json("userInfo"), serde_json::Value::Null);
+}
+
+#[test]
+fn alias_paths_are_converted_like_the_route_they_alias() {
+    // An alias keeps the route's field template, so it must go through the
+    // same template conversion: `{path=**}` is axum's `{*path}`, never a
+    // literal capture named `path=**` that leaves the field unbound.
+    let pool = api_pool(
+        r#"syntax = "proto3";
+package t;
+import "google/api/annotations.proto";
+message Req { string path = 1; }
+service S {
+  rpc Get(Req) returns (Req) { option (google.api.http) = { get: "/v1/files/{path=**}" }; }
+  rpc Watch(Req) returns (stream Req) { option (google.api.http) = { get: "/v1/logs/{path=*}" }; }
+}
+"#,
+    );
+    let alias: AliasConfig = serde_yaml::from_str("from: /api/{path}\nto: /v1").unwrap();
+    let paths = route_paths(&pool, &[alias]);
+    for expected in [
+        "/v1/files/{*path}",
+        "/api/files/{*path}",
+        "/v1/logs/{path}",
+        "/api/logs/{path}",
+    ] {
+        assert!(
+            paths.contains(&("GET".to_owned(), expected.to_owned())),
+            "{expected} missing from {paths:?}"
+        );
+    }
+}
+
 #[test]
 fn test_proto_path_to_axum() {
     // axum 0.8: proto `{param}` IS the native capture syntax, pass through verbatim.

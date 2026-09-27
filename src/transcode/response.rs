@@ -168,15 +168,18 @@ pub(crate) fn with_upstream_headers(response: Response, upstream: HeaderMap) -> 
 }
 
 /// A response with `status`, `headers` and `body`, typed by `content_type`.
-/// `204` and `304` carry neither content nor a `Content-Type`, whatever the
-/// upstream returned (RFC 9110 §15.3.5, §15.4.5).
+/// `204`, `205` and `304` carry neither content nor a `Content-Type`, whatever
+/// the upstream returned (RFC 9110 §15.3.5, §15.3.6, §15.4.5).
 pub(crate) fn build(
     status: StatusCode,
     mut headers: HeaderMap,
     content_type: Option<HeaderValue>,
     body: Body,
 ) -> Response {
-    let no_content = matches!(status, StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED);
+    let no_content = matches!(
+        status,
+        StatusCode::NO_CONTENT | StatusCode::RESET_CONTENT | StatusCode::NOT_MODIFIED
+    );
     let body = if no_content { Body::empty() } else { body };
     if let (Some(content_type), false) = (content_type, no_content) {
         headers.insert(CONTENT_TYPE, content_type);

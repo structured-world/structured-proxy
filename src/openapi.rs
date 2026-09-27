@@ -270,6 +270,8 @@ fn build_operation(
                     !path_params.contains(&f.name().to_string()) && body_field != Some(f.name())
                 })
                 .map(|field| {
+                    // A message-typed parameter refers to its schema by `$ref`.
+                    register_nested(&field, schemas);
                     json!({
                         "name": field.name(),
                         "in": "query",

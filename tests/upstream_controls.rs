@@ -57,6 +57,9 @@ service Controls {
   rpc Trailers(Req) returns (Reply) {
     option (google.api.http) = { get: "/v1/trailers" };
   }
+  rpc LateError(Req) returns (Reply) {
+    option (google.api.http) = { get: "/v1/late-error" };
+  }
   rpc Token(TokenRequest) returns (google.api.HttpBody) {
     option (google.api.http) = { post: "/v1/token" body: "*" };
   }
@@ -313,6 +316,8 @@ impl tonic::server::ServerStreamingService<DynamicMessage> for Streaming {
                     Err(tonic::Status::internal("disk failed")),
                 ],
                 ("Download", "empty") => Vec::new(),
+                // Headers sent, then a failure before the first message.
+                ("Download", "late-denied") => vec![Err(invalid_token())],
                 ("Download", _) => vec![
                     Ok(http_body(pool, "text/csv", b"a,b\n")),
                     // Only the first message's content type counts.
@@ -355,6 +360,28 @@ fn trailers_response(pool: &DescriptorPool) -> http::Response<tonic::body::Body>
         .unwrap()
 }
 
+/// A `LateError` answer written by hand: response headers with metadata
+/// (`x-initial`), then no message and an `UNAUTHENTICATED` in the trailers,
+/// which carry the challenge. tonic's server API would send a trailers-only
+/// response instead.
+fn late_error_response() -> http::Response<tonic::body::Body> {
+    let mut trailers = HeaderMap::new();
+    trailers.insert("grpc-status", "16".parse().unwrap());
+    trailers.insert("grpc-message", "expired".parse().unwrap());
+    trailers.insert(
+        "www-authenticate",
+        "Bearer error=\"invalid_token\"".parse().unwrap(),
+    );
+    let frames: Vec<Result<http_body::Frame<Bytes>, Infallible>> =
+        vec![Ok(http_body::Frame::trailers(trailers))];
+    let body = http_body_util::StreamBody::new(futures::stream::iter(frames));
+    http::Response::builder()
+        .header("content-type", "application/grpc")
+        .header("x-initial", "1")
+        .body(tonic::body::Body::new(body))
+        .unwrap()
+}
+
 /// The `test.v1.Controls` gRPC service, dispatching by method path.
 #[derive(Clone)]
 struct Controls {
@@ -384,10 +411,14 @@ impl tower::Service<http::Request<tonic::body::Body>> for Controls {
                 .strip_prefix("/test.v1.Controls/")
                 .unwrap()
                 .to_owned();
-            if rpc == "Trailers" {
+            if rpc == "Trailers" || rpc == "LateError" {
                 // Read the request to its end before answering.
                 let _request = req.into_body().collect().await.unwrap();
-                return Ok(trailers_response(&pool));
+                return Ok(if rpc == "Trailers" {
+                    trailers_response(&pool)
+                } else {
+                    late_error_response()
+                });
             }
             let method = pool
                 .get_service_by_name("test.v1.Controls")
@@ -537,6 +568,34 @@ async fn trailers_only_error_carries_its_metadata() {
     );
     assert_eq!(json_body(&body)["error"], "UNAUTHENTICATED");
     assert_eq!(values(&headers, "content-type"), ["application/json"]);
+}
+
+#[tokio::test]
+async fn unary_error_after_headers_carries_initial_metadata_and_trailers() {
+    // The upstream sent response headers, then failed in its trailers: the
+    // error keeps both, initial metadata first, as tonic's own unary call
+    // does.
+    let app = proxy().await;
+    let (status, headers, body) = call(&app, Method::GET, "/v1/late-error").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(values(&headers, "x-initial"), ["1"]);
+    assert_eq!(
+        values(&headers, "www-authenticate"),
+        ["Bearer error=\"invalid_token\""]
+    );
+    assert_eq!(json_body(&body)["message"], "expired");
+}
+
+#[tokio::test]
+async fn http_body_stream_failing_before_its_first_message_keeps_initial_metadata() {
+    // Headers were sent before the failure, so they belong to the error
+    // response, next to the failure's own metadata.
+    let app = proxy().await;
+    let (status, headers, _) = call(&app, Method::GET, "/v1/files/late-denied").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(values(&headers, "x-stream"), ["1"]);
+    assert_eq!(values(&headers, "cache-control"), ["max-age=60"]);
+    assert!(values(&headers, "www-authenticate")[0].starts_with("Bearer error="));
 }
 
 #[tokio::test]
@@ -699,6 +758,21 @@ async fn http_body_field_receives_the_raw_body_next_to_path_fields() {
         serde_json::from_str::<Value>(&body).unwrap(),
         json!({"name": "report|text/csv|a,b"})
     );
+}
+
+#[tokio::test]
+async fn query_key_naming_the_raw_body_field_does_not_break_the_upload() {
+    // The body binds `file`, and the body wins over the query: a `file`
+    // query parameter (or one under it) is ignored rather than bound into
+    // the HttpBody field before the raw body replaces it.
+    let app = proxy().await;
+    let request = http::Request::put("/v1/uploads/report?file=x&file.content_type=y")
+        .header("content-type", "text/csv")
+        .body(Body::from("a,b"))
+        .unwrap();
+    let (status, _, body) = send(&app, request).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(json_body(&body), json!({"name": "report|text/csv|a,b"}));
 }
 
 #[tokio::test]

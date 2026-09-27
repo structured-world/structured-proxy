@@ -76,9 +76,15 @@ enum RequestBody {
     Parsed(request::BodyMapping),
     /// Raw bytes and `Content-Type` into the input message, a `google.api.HttpBody`.
     RawRoot,
-    /// Raw bytes and `Content-Type` into the HttpBody field (of that type) `body`
-    /// names; the other fields still come from path and query.
-    RawField(FieldDescriptor, MessageDescriptor),
+    /// Raw bytes and `Content-Type` into the HttpBody field `body` names; the
+    /// other fields still come from path and query.
+    RawField {
+        /// The rule's `body` mapping, which keeps the field out of query binding.
+        mapping: request::BodyMapping,
+        field: FieldDescriptor,
+        /// The field's type, a `google.api.HttpBody`.
+        http_body: MessageDescriptor,
+    },
 }
 
 /// What the HTTP response body is made of.
@@ -375,7 +381,7 @@ fn route_bindings(pool: &DescriptorPool, aliases: &[AliasConfig]) -> Vec<RouteBi
                 if alias.from.ends_with("/{path}") {
                     let prefix = alias.from.trim_end_matches("/{path}");
                     bindings.push(RouteBinding {
-                        axum_path: format!("{prefix}{suffix}"),
+                        axum_path: proto_path_to_axum(&format!("{prefix}{suffix}")),
                         entry: entry.clone(),
                     });
                 }
@@ -443,10 +449,20 @@ fn json_body(
         return message_to_json_bytes(msg, &opts);
     };
     // Walk the tree by moving each subtree out, so nothing is copied.
+    // `response_body` names proto fields, while the tree is keyed by their
+    // JSON names, so each segment is resolved through the descriptor.
     let mut value = Some(msg.serialize_with_options(serde_json::value::Serializer, &opts)?);
+    let mut desc = Some(prost_reflect::ReflectMessage::descriptor(msg));
     for segment in path.split('.') {
-        value = match value {
-            Some(serde_json::Value::Object(mut fields)) => fields.remove(segment),
+        let field = desc.as_ref().and_then(|d| d.get_field_by_name(segment));
+        desc = match field.as_ref().map(FieldDescriptor::kind) {
+            Some(prost_reflect::Kind::Message(inner)) => Some(inner),
+            _ => None,
+        };
+        value = match (value, field) {
+            (Some(serde_json::Value::Object(mut fields)), Some(field)) => {
+                fields.remove(field.json_name())
+            }
             _ => None,
         };
     }
@@ -596,16 +612,43 @@ async fn call_unary(
         .server_streaming(request, entry.grpc_path.clone(), entry.codec())
         .await?;
     let (initial, mut stream, _) = response.into_parts();
-    let message = stream
-        .message()
-        .await?
-        .ok_or_else(|| tonic::Status::internal("Missing response message."))?;
-    let trailers = stream.trailers().await?;
+    let message = match stream.message().await {
+        Ok(Some(message)) => message,
+        Ok(None) => {
+            let status = tonic::Status::internal("Missing response message.");
+            return Err(with_initial(status, initial));
+        }
+        Err(status) => return Err(with_initial(status, initial)),
+    };
+    let trailers = match stream.trailers().await {
+        Ok(trailers) => trailers,
+        Err(status) => return Err(with_initial(status, initial)),
+    };
     Ok(UnaryAnswer {
         initial,
         message,
         trailers,
     })
+}
+
+/// A failure that came after the upstream's response headers, with their
+/// metadata put ahead of the failure's own: both belong to the error
+/// response, as tonic's `Grpc::unary` keeps them.
+fn with_initial(mut status: tonic::Status, initial: MetadataMap) -> tonic::Status {
+    let own = std::mem::take(status.metadata_mut()).into_headers();
+    let mut merged = initial.into_headers();
+    let mut last: Option<HeaderName> = None;
+    // A header map yields a name only with the first value of each key.
+    for (name, value) in own {
+        if let Some(name) = name {
+            merged.append(&name, value);
+            last = Some(name);
+        } else if let Some(name) = &last {
+            merged.append(name, value);
+        }
+    }
+    *status.metadata_mut() = MetadataMap::from_headers(merged);
+    status
 }
 
 /// Serve a unary RPC.
@@ -685,11 +728,10 @@ fn invalid_content_type(entry: &RouteEntry) -> Response {
 }
 
 /// The HTTP response to a failed call, carrying the failure's metadata as
-/// headers unless its details were malformed and the answer is the generic
-/// `INTERNAL`. Only the failure's own metadata is used (a trailers-only
-/// response, or the trailers ending the call): a failure the proxy's client
-/// raises itself, such as an undecodable message, has none, so nothing of an
-/// answer the proxy rejected reaches the client.
+/// headers (a trailers-only response, or the response headers and trailers of
+/// a call that failed after them, see [`with_initial`]) unless its details
+/// were malformed and the answer is the generic `INTERNAL`, which then carries
+/// nothing of the upstream's answer.
 fn upstream_error(mut status: tonic::Status, entry: &RouteEntry) -> Response {
     let (response, faithful) = error::render_response(&status, entry.error_details.as_deref());
     let metadata = std::mem::take(status.metadata_mut());
@@ -726,13 +768,12 @@ async fn streaming_call(
         Err(status) => return upstream_error(status, &entry),
     };
     let (initial, stream, _) = response.into_parts();
+    if matches!(entry.response, ResponseShape::HttpBody(_)) {
+        return http_body_stream(stream, entry, initial).await;
+    }
     let mut upstream = UpstreamHeaders::default();
     upstream.absorb(initial, &entry.denied_headers);
     let headers = upstream.into_headers();
-
-    if matches!(entry.response, ResponseShape::HttpBody(_)) {
-        return http_body_stream(stream, entry, headers).await;
-    }
     // Once the upstream accepted the call, the response starts at once rather
     // than waiting for the first item, so headers and SSE keep-alives are not
     // held back; an error that comes before the first message is a terminal
@@ -752,19 +793,23 @@ async fn streaming_call(
 
 /// A server-streaming HttpBody response: `Content-Type` from the first
 /// message, so the headers wait for it, then every message's `data` as it
-/// arrives. An error before the first message is an ordinary error response;
-/// after it, the raw body has no in-band error frame, so the body is aborted
+/// arrives. An error before the first message is an ordinary error response,
+/// with the initial metadata the upstream sent before it; after the first
+/// message, the raw body has no in-band error frame, so the body is aborted
 /// and the client sees a truncated transfer instead of a clean end.
 async fn http_body_stream(
     mut stream: tonic::Streaming<DynamicMessage>,
     entry: Arc<RouteEntry>,
-    headers: HeaderMap,
+    initial: MetadataMap,
 ) -> Response {
     let first = match stream.message().await {
         Ok(Some(message)) => entry.raw_body(message).unwrap_or_default(),
         Ok(None) => httpbody::RawBody::default(),
-        Err(status) => return upstream_error(status, &entry),
+        Err(status) => return upstream_error(with_initial(status, initial), &entry),
     };
+    let mut upstream = UpstreamHeaders::default();
+    upstream.absorb(initial, &entry.denied_headers);
+    let headers = upstream.into_headers();
     let content_type = match content_type_header(&first.content_type) {
         Ok(content_type) => content_type,
         Err(()) => return invalid_content_type(&entry),
@@ -930,15 +975,19 @@ fn decode_request(
     raw_query: Option<&str>,
     body_bytes: Bytes,
 ) -> Result<DynamicMessage, String> {
-    let mapping = match &entry.request_body {
-        RequestBody::Parsed(mapping) => mapping,
-        RequestBody::RawRoot | RequestBody::RawField(..) => &NO_PARSED_BODY,
-    };
-    // Only parse the body when the rule maps it onto the message.
-    let json_body = match mapping {
-        request::BodyMapping::None => serde_json::Value::Null,
-        _ => body::parse_body(body::content_type(headers), &body_bytes)
-            .map_err(|e| format!("failed to parse request body: {e}"))?,
+    // A raw field keeps its `body` mapping with a null placeholder, so query
+    // binding leaves that field to the body as it does for a parsed one.
+    let (mapping, json_body) = match &entry.request_body {
+        RequestBody::Parsed(request::BodyMapping::None) => {
+            (&NO_PARSED_BODY, serde_json::Value::Null)
+        }
+        RequestBody::Parsed(mapping) => (
+            mapping,
+            body::parse_body(body::content_type(headers), &body_bytes)
+                .map_err(|e| format!("failed to parse request body: {e}"))?,
+        ),
+        RequestBody::RawRoot => (&NO_PARSED_BODY, serde_json::Value::Null),
+        RequestBody::RawField { mapping, .. } => (mapping, serde_json::Value::Null),
     };
 
     // Query string → field bindings (fields not bound by path or body).
@@ -957,7 +1006,9 @@ fn decode_request(
         RequestBody::RawRoot => {
             httpbody::fill(&mut message, request_content_type(headers)?, body_bytes);
         }
-        RequestBody::RawField(field, http_body) => {
+        RequestBody::RawField {
+            field, http_body, ..
+        } => {
             let mut inner = DynamicMessage::new(http_body.clone());
             httpbody::fill(&mut inner, request_content_type(headers)?, body_bytes);
             message.set_field(field, prost_reflect::Value::Message(inner));
@@ -1043,15 +1094,22 @@ fn extract_routes(pool: &DescriptorPool) -> Vec<RouteEntry> {
 
 /// How a binding's `body` rule reaches `input`: raw into an HttpBody (the
 /// input itself with `body: "*"`, or the HttpBody field `body` names), parsed
-/// otherwise.
+/// otherwise. `body` names a field of the input itself, never a dotted path:
+/// `google/api/http.proto` requires "the referred field must not be a repeated
+/// field and must be present at the top-level of request message type".
 fn request_body(input: &MessageDescriptor, mapping: request::BodyMapping) -> RequestBody {
-    match &mapping {
-        request::BodyMapping::Root if httpbody::is_http_body(input) => RequestBody::RawRoot,
-        request::BodyMapping::Field(name) => match httpbody::http_body_field(input, name) {
-            Some((field, http_body)) => RequestBody::RawField(field, http_body),
-            None => RequestBody::Parsed(mapping),
+    let raw_field = match &mapping {
+        request::BodyMapping::Root if httpbody::is_http_body(input) => return RequestBody::RawRoot,
+        request::BodyMapping::Field(name) => httpbody::http_body_field(input, name),
+        _ => None,
+    };
+    match raw_field {
+        Some((field, http_body)) => RequestBody::RawField {
+            mapping,
+            field,
+            http_body,
         },
-        _ => RequestBody::Parsed(mapping),
+        None => RequestBody::Parsed(mapping),
     }
 }
 

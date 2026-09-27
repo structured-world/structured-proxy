@@ -50,6 +50,16 @@ async fn options_without_origin_reaches_the_route() {
 }
 
 #[tokio::test]
+async fn options_with_a_request_method_but_no_origin_reaches_the_route() {
+    // A preflight is a CORS request, and a CORS request carries `Origin`
+    // (Fetch §3.2.2): without it this is an ordinary OPTIONS, which a
+    // forward-auth check must see rather than the CORS layer's 200.
+    let (status, _, body) = send(options(&[("access-control-request-method", "PUT")])).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "OPTIONS");
+}
+
+#[tokio::test]
 async fn preflight_is_answered_by_the_cors_layer() {
     let (status, headers, body) = send(options(&[
         ("origin", "https://a.example"),

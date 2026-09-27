@@ -247,8 +247,12 @@ async fn build_without_content_type_sets_none() {
 
 #[tokio::test]
 async fn no_content_statuses_drop_body_and_content_type() {
-    // RFC 9110 §15.3.5 / §15.4.5: 204 and 304 cannot carry content.
-    for status in [StatusCode::NO_CONTENT, StatusCode::NOT_MODIFIED] {
+    // RFC 9110 §15.3.5 / §15.3.6 / §15.4.5: 204, 205 and 304 carry no content.
+    for status in [
+        StatusCode::NO_CONTENT,
+        StatusCode::RESET_CONTENT,
+        StatusCode::NOT_MODIFIED,
+    ] {
         let response = build(
             status,
             HeaderMap::new(),

@@ -135,6 +135,12 @@ message Item {
 message Note {
   string text = 1;
 }
+message Filter {
+  string q = 1;
+}
+message Search {
+  Filter filter = 1;
+}
 message Upload {
   string name = 1;
   google.api.HttpBody file = 2;
@@ -160,6 +166,9 @@ service Api {
   }
   rpc Put(Upload) returns (google.api.HttpBody) {
     option (google.api.http) = { put: "/v1/uploads/{name}" body: "file" };
+  }
+  rpc Find(Search) returns (Item) {
+    option (google.api.http) = { get: "/v1/find" };
   }
   rpc Raw(google.api.HttpBody) returns (google.api.HttpBody) {
     option (google.api.http) = { post: "/v1/raw" body: "*" };
@@ -267,6 +276,21 @@ fn body_rule_decides_body_and_query_fields() {
     let touch = &spec["paths"]["/v1/items:touch"]["post"];
     assert!(touch.get("requestBody").is_none(), "{touch}");
     assert_eq!(touch["parameters"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn message_typed_query_parameter_schema_is_registered() {
+    // `filter` is bound only through the query; its `$ref` must resolve to a
+    // schema in `components`.
+    let spec = spec(&[]);
+    let param = &spec["paths"]["/v1/find"]["get"]["parameters"][0];
+    assert_eq!(param["in"], "query");
+    assert_eq!(param["schema"]["$ref"], "#/components/schemas/Filter");
+    assert!(
+        spec["components"]["schemas"].get("Filter").is_some(),
+        "{}",
+        spec["components"]["schemas"]
+    );
 }
 
 #[test]

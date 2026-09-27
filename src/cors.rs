@@ -4,13 +4,14 @@
 //! no route could serve `OPTIONS`: not a `custom` rule, not a `*` rule, not the
 //! forward-auth endpoint, whose sub-request carries the original request's
 //! method and would be allowed through by that `200`. The Fetch standard (§3.2.2,
-//! CORS-preflight request) makes a preflight an `OPTIONS` request with
-//! `Access-Control-Request-Method`; any other `OPTIONS` is an ordinary request. Such a request passes the CORS layer under a stand-in
-//! method, so it gets the response headers of an ordinary CORS request, and has
-//! its method restored before anything else sees it.
+//! CORS request and CORS-preflight request) makes a preflight an `OPTIONS`
+//! request carrying both `Origin` and `Access-Control-Request-Method`; any other
+//! `OPTIONS` is an ordinary request. Such a request passes the CORS layer under a
+//! stand-in method, so it gets the response headers of an ordinary CORS request,
+//! and has its method restored before anything else sees it.
 
 use axum::extract::Request;
-use axum::http::header::ACCESS_CONTROL_REQUEST_METHOD;
+use axum::http::header::{ACCESS_CONTROL_REQUEST_METHOD, ORIGIN};
 use axum::http::Method;
 use axum::middleware::{self, Next};
 use axum::response::Response;
@@ -42,11 +43,10 @@ where
 
 /// Outermost: hide an ordinary `OPTIONS` from the CORS layer.
 async fn disguise_options(mut request: Request, next: Next) -> Response {
-    if request.method() == Method::OPTIONS
-        && !request
-            .headers()
-            .contains_key(ACCESS_CONTROL_REQUEST_METHOD)
-    {
+    let headers = request.headers();
+    let preflight =
+        headers.contains_key(ORIGIN) && headers.contains_key(ACCESS_CONTROL_REQUEST_METHOD);
+    if request.method() == Method::OPTIONS && !preflight {
         *request.method_mut() = stand_in();
         request.extensions_mut().insert(OrdinaryOptions);
     }
