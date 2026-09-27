@@ -1,3 +1,66 @@
+[workspace]
+# The release PR body: release-plz's default layout, except that the
+# cargo-semver-checks report is cut down to each failed lint and the items it
+# names. The raw report repeats every lint's description and reference links
+# and names the temporary checkout the old version was unpacked into. The
+# check itself stays on: it also bumps the major version for a breaking
+# change no commit declared.
+pr_body = '''
+{% set changes %}
+{%- for release in releases %}
+{%- if release.changelog %}{% if releases | length > 1 %}
+## `{{ release.package }}`
+{% endif %}
+<blockquote>
+
+{% if release.title %}## {{ release.title }}
+{% endif %}
+{{ release.changelog }}
+</blockquote>{% endif %}
+{% endfor %}
+{% endset %}
+
+## 🤖 New release
+{% for release in releases %}
+* `{{ release.package }}`: {% if release.previous_version and release.previous_version != release.next_version %}{{ release.previous_version }} -> {% endif %}{{ release.next_version }}{% if release.semver_check == "incompatible" %} (⚠ API breaking changes){% elif release.semver_check == "compatible" %} (✓ API compatible changes){% endif %}
+{%- endfor %}
+{%- for release in releases %}{% if release.breaking_changes %}
+
+### ⚠ `{{ release.package }}` breaking changes
+
+cargo-semver-checks against {{ release.previous_version }}:
+{% for line in release.breaking_changes | split(pat="
+") %}
+{%- if line is starting_with(pat="--- failure ") %}
+- {{ line | replace(from="--- failure ", to="") | replace(from=" ---", to="") }}
+{%- elif line is starting_with(pat="  ") and line is containing(pat=" in file ") %}
+  - `{{ line | split(pat=" in file ") | first | trim | replace(from=", previously", to="") }}`
+{%- endif %}
+{%- endfor %}{% endif %}{% endfor %}
+{% if changes %}
+<details><summary><i><b>Changelog</b></i></summary><p>
+{{ changes }}
+</p></details>
+{% endif %}
+---
+This PR was generated with [release-plz](https://github.com/release-plz/release-plz/).'''
+
+[changelog]
+# Setting the parsers replaces release-plz's defaults, so they are repeated
+# below the one addition.
+commit_parsers = [
+  # The structured-proxy-cli package this commit introduced was never
+  # released: the binary moved back into structured-proxy before the next
+  # release, so the entry would describe a change no user sees.
+  { sha = "90d746b1b3c879359776adaf4bbbac5b97bf1f38", skip = true },
+  { message = "^feat", group = "added" },
+  { message = "^changed", group = "changed" },
+  { message = "^deprecated", group = "deprecated" },
+  { message = "^fix", group = "fixed" },
+  { message = "^security", group = "security" },
+  { message = "^.*", group = "other" },
+]
+
 [[package]]
 name = "structured-proxy"
 # Preserve the existing tag scheme (v1.0.0, v1.0.1, ...) instead of the
