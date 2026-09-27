@@ -100,44 +100,55 @@ impl<'a> Body<'a> {
 ///
 /// ```
 /// use std::collections::HashMap;
-/// use prost_reflect::DescriptorPool;
+/// use prost_reflect::{MessageDescriptor, Value};
 /// use structured_proxy::transcode::request::{build_request_message, Body, BodyMapping};
 ///
-/// # fn run(pool: DescriptorPool) {
-/// let input = pool.get_message_by_name("google.protobuf.Duration").unwrap();
+/// // message Page { int32 size = 1; string cursor = 2; }
+/// # fn page() -> MessageDescriptor {
+/// #     use prost_reflect::prost::Message;
+/// #     use prost_reflect::prost_types::{
+/// #         field_descriptor_proto::{Label, Type},
+/// #         DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
+/// #     };
+/// #     let field = |name: &str, number, ty: Type| FieldDescriptorProto {
+/// #         name: Some(name.into()),
+/// #         number: Some(number),
+/// #         label: Some(Label::Optional as i32),
+/// #         r#type: Some(ty as i32),
+/// #         ..Default::default()
+/// #     };
+/// #     let file = FileDescriptorProto {
+/// #         name: Some("page.proto".into()),
+/// #         package: Some("example".into()),
+/// #         message_type: vec![DescriptorProto {
+/// #             name: Some("Page".into()),
+/// #             field: vec![field("size", 1, Type::Int32), field("cursor", 2, Type::String)],
+/// #             ..Default::default()
+/// #         }],
+/// #         syntax: Some("proto3".into()),
+/// #         ..Default::default()
+/// #     };
+/// #     let set = FileDescriptorSet { file: vec![file] };
+/// #     prost_reflect::DescriptorPool::decode(set.encode_to_vec().as_slice())
+/// #         .unwrap()
+/// #         .get_message_by_name("example.Page")
+/// #         .unwrap()
+/// # }
 /// let message = build_request_message(
-///     &input,
+///     &page(),
 ///     &BodyMapping::Root,
-///     Body::Json(br#"{"seconds": "5"}"#),
+///     Body::Json(br#"{"size": 0}"#),
 ///     &HashMap::new(),
-///     Some("nanos=7"),
+///     Some("size=50&cursor=abc"),
 /// )
 /// .unwrap();
-/// assert_eq!(message.get_field_by_name("nanos").unwrap().as_i32(), Some(7));
-/// # }
-/// # use prost_reflect::prost::Message;
-/// # let file = prost_reflect::prost_types::FileDescriptorProto {
-/// #     name: Some("d.proto".into()),
-/// #     package: Some("google.protobuf".into()),
-/// #     message_type: vec![prost_reflect::prost_types::DescriptorProto {
-/// #         name: Some("Duration".into()),
-/// #         field: vec![
-/// #             prost_reflect::prost_types::FieldDescriptorProto {
-/// #                 name: Some("seconds".into()), number: Some(1), label: Some(1), r#type: Some(3),
-/// #                 json_name: Some("seconds".into()), ..Default::default()
-/// #             },
-/// #             prost_reflect::prost_types::FieldDescriptorProto {
-/// #                 name: Some("nanos".into()), number: Some(2), label: Some(1), r#type: Some(5),
-/// #                 json_name: Some("nanos".into()), ..Default::default()
-/// #             },
-/// #         ],
-/// #         ..Default::default()
-/// #     }],
-/// #     syntax: Some("proto3".into()),
-/// #     ..Default::default()
-/// # };
-/// # let set = prost_reflect::prost_types::FileDescriptorSet { file: vec![file] };
-/// # run(DescriptorPool::decode(set.encode_to_vec().as_slice()).unwrap());
+/// // The body set `size`, to its default: the query cannot replace it.
+/// assert_eq!(message.get_field_by_name("size").unwrap().as_i32(), Some(0));
+/// // It left `cursor` out: the query fills it.
+/// assert_eq!(
+///     *message.get_field_by_name("cursor").unwrap(),
+///     Value::String("abc".into())
+/// );
 /// ```
 pub fn build_request_message(
     input: &MessageDescriptor,

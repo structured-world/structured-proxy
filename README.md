@@ -13,7 +13,7 @@ Works with **any** gRPC service via proto descriptor files. No code generation, 
 ## Features
 
 - **Dynamic REST routes** from proto descriptors using `google.api.http` annotations
-- **Full request mapping**: path params, query parameters (typed + repeated + nested), and `body` (`*` / named field / none)
+- **Full request mapping**: path params, query parameters (typed + repeated + nested), and a JSON or form `body` (`*` / named field / none), decoded straight into the request message (see [Request mapping](#request-mapping))
 - **`response_body`** to return a single response subfield, and **`additional_bindings`** for multiple routes per RPC
 - **`custom` rules**: any HTTP method (`HEAD`, `OPTIONS`, extension methods), or `kind: "*"` for every method
 - **Upstream-controlled HTTP answers**: response metadata becomes response headers, `x-http-code` sets the status, and `google.api.HttpBody` carries a raw body and content type in either direction, so OAuth 2.0 / OIDC endpoints, redirects and file downloads work as gRPC (see [Upstream controls](#upstream-controls))
@@ -211,6 +211,28 @@ buf build -o my-service.descriptor.bin
 # or
 protoc --descriptor_set_out=my-service.descriptor.bin --include_imports *.proto
 ```
+
+## Request mapping
+
+The gRPC request message is built from the three sources `google.api.http`
+names, in one pass and without an intermediate JSON tree:
+
+- **Precedence:** a path parameter wins over the body, and the body over the
+  query string. A query parameter only fills a field the body did not send;
+  a field sent at its default still counts as sent (`{"count": 0}` beats
+  `?count=5`), and a body key in the JSON name (`displayName`) and a query key
+  in the proto name (`display_name`) are the same field.
+- **JSON body:** the ProtoJSON of the input message (`body: "*"`) or of the
+  field `body` names. An unknown key is an error.
+- **Path, query and form values** (`application/x-www-form-urlencoded`
+  bodies) are strings, converted to each field's type the way ProtoJSON reads
+  them: numbers, `true`/`false`, enum names, base64 bytes, and the string form
+  of `Timestamp`, `Duration`, `FieldMask` and the wrapper types. A repeated key
+  fills a repeated field, `a.b` reaches a nested field, and an unknown key is
+  dropped.
+
+A value that is not valid for its field, or two members of one `oneof`, is
+answered with `INVALID_ARGUMENT` (400) before the upstream is called.
 
 ## Rate limiting
 
