@@ -1,16 +1,7 @@
-# The library lives at the root; the binary is its own package in cli/, so a
-# crate that depends on the library compiles none of the binary's dependencies.
-[workspace]
-members = ["cli"]
-
-# Both packages are released together, at one version.
-[workspace.package]
-version = "4.3.0"
-
 [package]
 name = "structured-proxy"
 description = "Universal gRPC→REST transcoding proxy — config-driven, works with any gRPC service"
-version.workspace = true
+version = "4.3.0"
 edition = "2021"
 authors = ["Dmitry Prudnikov <mail@polaz.com>"]
 license = "Apache-2.0"
@@ -29,6 +20,16 @@ features = ["redis"]
 [lib]
 name = "structured_proxy"
 path = "src/lib.rs"
+
+# The standalone proxy: `cargo install structured-proxy --features cli`. Behind
+# the `cli` feature, so a crate that depends on the library compiles none of
+# its dependencies.
+[[bin]]
+name = "structured-proxy"
+path = "src/main.rs"
+required-features = ["cli"]
+# Its crate name is the library's; the library's rustdoc is the one to keep.
+doc = false
 
 [dependencies]
 # HTTP framework
@@ -115,6 +116,10 @@ getrandom = "0.4"
 # Envoy ext_authz `Authorization/Check` messages (External AuthZ).
 envoy-types = "0.7"
 
+# The binary's command line and log output (the `cli` feature).
+clap = { version = "4", features = ["derive"], optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optional = true }
+
 [features]
 default = ["rust_crypto"]
 
@@ -143,6 +148,10 @@ aws_lc_rs = ["builtin_jwt", "jsonwebtoken/aws_lc_rs"]
 # Shared Redis-backed rate-limit store for multi-instance deployments.
 redis = ["dep:redis"]
 
+# The `structured-proxy` binary. Off by default: the library links none of its
+# dependencies unless asked. The release packages build it with `cli,redis`.
+cli = ["dep:clap", "dep:tracing-subscriber"]
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tower = { version = "0.5", features = ["util"] }
@@ -169,6 +178,11 @@ tokio-stream = "0.1"
 # Compiles the in-memory test protos (google.api.http routes) of the
 # error-details integration test without a protoc binary.
 protox = "0.9"
+
+# Runs the built binary, so it needs the binary built.
+[[test]]
+name = "cli"
+required-features = ["cli"]
 
 # The built-in verifier's cost with and without the claims cache.
 [[bench]]

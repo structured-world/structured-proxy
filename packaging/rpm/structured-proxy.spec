@@ -1,7 +1,7 @@
 # structured-proxy RPM spec.
 #
 # Build expects a pre-compiled musl-static `structured-proxy` binary in SOURCES/.
-# The CI release pipeline runs `cargo build --release -p structured-proxy-cli --target $TARGET-unknown-linux-musl --bin structured-proxy`,
+# The CI release pipeline runs `cargo build --release --target $TARGET-unknown-linux-musl --features cli,redis --bin structured-proxy`,
 # strips the result, copies it (and the packaging assets) into the rpmbuild
 # tree, then invokes `rpmbuild -bb`.
 

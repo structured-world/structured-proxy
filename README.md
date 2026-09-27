@@ -42,12 +42,16 @@ Works with **any** gRPC service via proto descriptor files. No code generation, 
 ## Quick Start
 
 ```bash
-# Install the binary (the structured-proxy-cli package)
-cargo install structured-proxy-cli
+# Install the binary (it sits behind the `cli` feature)
+cargo install structured-proxy --features cli
 
 # Run with your service config
 structured-proxy --config my-service.yaml
 ```
+
+Prebuilt static Linux binaries and deb/rpm packages are attached to each GitHub
+release. To embed the proxy in your own service instead, add the library with
+`cargo add structured-proxy` (see [Library Usage](#library-usage)).
 
 ## Configuration
 
@@ -570,10 +574,11 @@ answered by the CORS layer; any other `OPTIONS` request reaches its route.
 
 ## Library Usage
 
-The `structured-proxy` crate is the library alone: the binary lives in the
-`structured-proxy-cli` package, so a service that embeds the proxy compiles
-none of the command-line dependencies (`clap`, `tracing-subscriber`). The
-library starts no runtime and installs no logger of its own; it runs on the
+`cargo add structured-proxy` adds the library alone: the binary and its
+command-line dependencies (`clap`, `tracing-subscriber`) sit behind the `cli`
+feature, which is off by default, so a service that embeds the proxy compiles
+none of them. The library starts no runtime and installs no logger of its own;
+it runs on the
 embedder's tokio runtime and logs through `tracing` to whatever subscriber the
 embedder sets up.
 
