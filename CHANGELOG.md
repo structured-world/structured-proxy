@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.2.0](https://github.com/structured-world/structured-proxy/compare/v4.1.0...v4.2.0) - 2026-09-27
+
+### Added
+
+- *(transcode)* upstream-controlled HTTP answers ([#93](https://github.com/structured-world/structured-proxy/pull/93))
+
 ## [4.1.0](https://github.com/structured-world/structured-proxy/compare/v4.0.0...v4.1.0) - 2026-09-26
 
 ### Added
