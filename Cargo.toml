@@ -58,7 +58,6 @@ tokio = { version = "1", features = ["full"] }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_urlencoded = "0.7"
 serde_yaml = "0.9"
 
 # Streaming (server-streaming RPC handler)
@@ -176,3 +175,8 @@ protox = "0.9"
 name = "jwt_verify"
 harness = false
 required-features = ["builtin_jwt"]
+
+# Building a gRPC request message from path, query and body.
+[[bench]]
+name = "transcode_request"
+harness = false

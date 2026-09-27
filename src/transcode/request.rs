@@ -1,14 +1,24 @@
 //! Request message construction for REST→gRPC transcoding.
 //!
-//! Assembles the gRPC request JSON from three `google.api.http` sources, in
+//! Builds the gRPC request message from three `google.api.http` sources, in
 //! precedence order: path parameters (highest), the request body, then query
-//! parameters (lowest, fill only). Path and query values arrive as strings, so
-//! they are coerced to each field's proto type before prost-reflect decodes the
-//! message.
+//! parameters (lowest, fill only). A JSON body is deserialized straight into
+//! the message; path and query values arrive as strings and are converted to
+//! each field's proto type as they are set.
 
-use prost_reflect::{FieldDescriptor, Kind, MessageDescriptor};
-use serde_json::{Map, Value};
+mod presence;
+
+use std::borrow::Cow;
 use std::collections::HashMap;
+
+use prost_reflect::{
+    DynamicMessage, FieldDescriptor, Kind, MessageDescriptor, ReflectMessage, Value,
+};
+use serde::de::value::StrDeserializer;
+use serde::Deserializer;
+use serde_json::Value as JsonValue;
+
+use presence::{has_special_json, OneEntry, Presence, Recording};
 
 /// How the HTTP request body maps onto the gRPC request message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,426 +45,904 @@ impl BodyMapping {
     }
 }
 
-/// Build the request-message JSON from the body mapping, path params, and query.
+/// The HTTP request body the [`BodyMapping`] reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Body<'a> {
+    /// No body is read. Under [`BodyMapping::Field`] the field still belongs
+    /// to the body (a raw `google.api.HttpBody` filled afterwards), so query
+    /// parameters leave it alone.
+    Absent,
+    /// A JSON body (ProtoJSON of the mapped message or field). Empty means
+    /// `{}`.
+    Json(&'a [u8]),
+    /// An `application/x-www-form-urlencoded` body, bound field by field like
+    /// query parameters.
+    Form(&'a [u8]),
+}
+
+impl<'a> Body<'a> {
+    /// The body as its media type (no parameters) says: a form for
+    /// `application/x-www-form-urlencoded`, JSON otherwise.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use structured_proxy::transcode::request::Body;
+    ///
+    /// let form = Body::new(Some("application/x-www-form-urlencoded"), b"a=1");
+    /// assert_eq!(form, Body::Form(b"a=1"));
+    /// assert_eq!(Body::new(None, b"{}"), Body::Json(b"{}"));
+    /// ```
+    pub fn new(content_type: Option<&str>, bytes: &'a [u8]) -> Self {
+        match content_type {
+            Some(ct) if ct.starts_with("application/x-www-form-urlencoded") => Body::Form(bytes),
+            _ => Body::Json(bytes),
+        }
+    }
+}
+
+/// Build the request message from the body mapping, path params, and query.
 ///
 /// Path-bound fields win over the body, and the body wins over query parameters
-/// (query only fills fields not already set). Unknown query keys are dropped
-/// rather than rejected, matching common transcoder behavior.
+/// (query only fills fields the body did not set, even to their default).
+/// Unknown query, form and path keys are dropped rather than rejected,
+/// matching common transcoder behavior; an unknown key in a JSON body is an
+/// error, as ProtoJSON has it.
 ///
 /// # Errors
-/// Returns an error string if `body` maps to the message root but the parsed
-/// body is not a JSON object.
-pub fn build_request_json(
+/// A body that is not the ProtoJSON of the mapped message or field, a form
+/// body mapped onto a field that is not a message, or a path, query or form
+/// value that is not a valid value of its field. The message is meant for the
+/// client, as the text of an `INVALID_ARGUMENT` answer.
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::HashMap;
+/// use prost_reflect::{MessageDescriptor, Value};
+/// use structured_proxy::transcode::request::{build_request_message, Body, BodyMapping};
+///
+/// // message Page { int32 size = 1; string cursor = 2; }
+/// # fn page() -> MessageDescriptor {
+/// #     use prost_reflect::prost::Message;
+/// #     use prost_reflect::prost_types::{
+/// #         field_descriptor_proto::{Label, Type},
+/// #         DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
+/// #     };
+/// #     let field = |name: &str, number, ty: Type| FieldDescriptorProto {
+/// #         name: Some(name.into()),
+/// #         number: Some(number),
+/// #         label: Some(Label::Optional as i32),
+/// #         r#type: Some(ty as i32),
+/// #         ..Default::default()
+/// #     };
+/// #     let file = FileDescriptorProto {
+/// #         name: Some("page.proto".into()),
+/// #         package: Some("example".into()),
+/// #         message_type: vec![DescriptorProto {
+/// #             name: Some("Page".into()),
+/// #             field: vec![field("size", 1, Type::Int32), field("cursor", 2, Type::String)],
+/// #             ..Default::default()
+/// #         }],
+/// #         syntax: Some("proto3".into()),
+/// #         ..Default::default()
+/// #     };
+/// #     let set = FileDescriptorSet { file: vec![file] };
+/// #     prost_reflect::DescriptorPool::decode(set.encode_to_vec().as_slice())
+/// #         .unwrap()
+/// #         .get_message_by_name("example.Page")
+/// #         .unwrap()
+/// # }
+/// let message = build_request_message(
+///     &page(),
+///     &BodyMapping::Root,
+///     Body::Json(br#"{"size": 0}"#),
+///     &HashMap::new(),
+///     Some("size=50&cursor=abc"),
+/// )
+/// .unwrap();
+/// // The body set `size`, to its default: the query cannot replace it.
+/// assert_eq!(message.get_field_by_name("size").unwrap().as_i32(), Some(0));
+/// // It left `cursor` out: the query fills it.
+/// assert_eq!(
+///     *message.get_field_by_name("cursor").unwrap(),
+///     Value::String("abc".into())
+/// );
+/// ```
+pub fn build_request_message(
     input: &MessageDescriptor,
-    body_mapping: &BodyMapping,
-    body_json: Value,
+    mapping: &BodyMapping,
+    body: Body<'_>,
     path_params: &HashMap<String, String>,
-    query: &[(String, String)],
-) -> Result<Value, String> {
-    let mut root = match body_mapping {
-        BodyMapping::None => Value::Object(Map::new()),
-        BodyMapping::Root => match body_json {
-            Value::Object(_) => body_json,
-            Value::Null => Value::Object(Map::new()),
-            _ => return Err("request body must be a JSON object".to_string()),
-        },
-        BodyMapping::Field(field) => {
-            let mut m = Map::new();
-            m.insert(field.clone(), body_json);
-            Value::Object(m)
+    raw_query: Option<&str>,
+) -> Result<DynamicMessage, String> {
+    // Parsed without allocating wherever nothing needs unescaping.
+    let query: Vec<(Cow<'_, str>, Cow<'_, str>)> = match raw_query {
+        Some(q) => url::form_urlencoded::parse(q.as_bytes()).collect(),
+        None => Vec::new(),
+    };
+    build(input, mapping, body, path_params, &query)
+}
+
+/// Which source a string value comes from, and so whether it overwrites.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Binding {
+    /// Path parameters and form fields set their field.
+    Set,
+    /// Query parameters fill only what nothing else set.
+    Fill,
+}
+
+fn build(
+    input: &MessageDescriptor,
+    mapping: &BodyMapping,
+    body: Body<'_>,
+    path_params: &HashMap<String, String>,
+    query: &[(Cow<'_, str>, Cow<'_, str>)],
+) -> Result<DynamicMessage, String> {
+    // What the body and the path set matters only when a query can fill.
+    let body_len = match body {
+        Body::Json(bytes) | Body::Form(bytes) => bytes.len(),
+        Body::Absent => 0,
+    };
+    let mut presence = (!query.is_empty()).then(|| Presence::for_body(body_len));
+    // The fields of the path being bound, reused across keys.
+    let mut path = Vec::new();
+
+    // Whether a field inside a well-known type was set from a string.
+    let mut inside = false;
+
+    let mut message = match (mapping, body) {
+        (BodyMapping::None, _) => DynamicMessage::new(input.clone()),
+        (BodyMapping::Field(name), Body::Absent) => {
+            if let (Some(presence), Some(field)) = (&mut presence, input.get_field_by_name(name)) {
+                presence.record_path(&[field], false);
+            }
+            DynamicMessage::new(input.clone())
+        }
+        (BodyMapping::Root, Body::Absent) => DynamicMessage::new(input.clone()),
+        // An empty body is `{}`, whatever its media type.
+        (_, Body::Json(bytes) | Body::Form(bytes)) if bytes.is_empty() => {
+            json_body(input, mapping, b"{}", path_params, presence.as_mut())?
+        }
+        (_, Body::Json(bytes)) => json_body(input, mapping, bytes, path_params, presence.as_mut())?,
+        (_, Body::Form(bytes)) => {
+            let pairs: Vec<(Cow<'_, str>, Cow<'_, str>)> =
+                url::form_urlencoded::parse(bytes).collect();
+            let form = Form {
+                pairs: &pairs,
+                path_params,
+            };
+            let (message, form_inside) =
+                form_body(input, mapping, form, presence.as_mut(), &mut path)?;
+            inside = form_inside;
+            message
         }
     };
 
+    let root_inside = has_special_json(input);
     // Path params win over everything (the router already matched them).
     for (key, raw) in path_params {
-        set_field(&mut root, input, key, true, |field| {
-            coerce(&field.kind(), raw)
-        });
+        let target = Target {
+            root: input,
+            inside: root_inside,
+            prefix: None,
+            key,
+            values: &[raw.as_str()],
+        };
+        inside |= bind(
+            &mut message,
+            target,
+            Binding::Set,
+            presence.as_mut(),
+            &mut path,
+        )?;
     }
 
-    // Query params: group repeated keys, fill only fields not already present.
-    for (key, values) in group_query(query) {
-        set_field(&mut root, input, &key, false, |field| {
-            if field.is_list() {
-                Value::Array(values.iter().map(|v| coerce(&field.kind(), v)).collect())
-            } else {
-                // A non-repeated field bound multiple times takes the last value.
-                coerce(&field.kind(), values.last().expect("group is non-empty"))
+    if let Some(presence) = &mut presence {
+        let start = Start {
+            root: input,
+            inside: root_inside,
+            prefix: None,
+        };
+        inside |= bind_pairs(
+            &mut message,
+            query,
+            start,
+            Binding::Fill,
+            Some(presence),
+            None,
+            &mut path,
+        )?;
+    }
+    if inside {
+        check_well_known(&message)?;
+    }
+    Ok(message)
+}
+
+/// Refuse a well-known type set field by field whose value its JSON form
+/// could not hold: a Timestamp's `nanos` past 999999999, a Duration whose
+/// `seconds` and `nanos` differ in sign, an `Any` of an unknown type.
+/// Checked once all keys are bound, as they arrive in any order.
+fn check_well_known(message: &DynamicMessage) -> Result<(), String> {
+    let invalid = |e: &dyn std::fmt::Display| format!("invalid value for a well-known type: {e}");
+    check_time_ranges(message).map_err(|e| invalid(&e))?;
+    // Writing the ProtoJSON checks the rest (an `Any` must name a known type
+    // and decode as it, a `FieldMask` path must round-trip through camelCase,
+    // a `Value` number must be finite); the text is not kept.
+    serde_json::to_writer(std::io::sink(), message).map_err(|e| invalid(&e))
+}
+
+/// Check every `Timestamp` and `Duration` in `message` against the ranges
+/// their definitions set. prost-reflect's writer checks only part of them and
+/// carries excess nanos into seconds, which would change the value.
+fn check_time_ranges(message: &DynamicMessage) -> Result<(), &'static str> {
+    let field = |name| message.get_field_by_name(name);
+    match message.descriptor().full_name() {
+        // google/protobuf/timestamp.proto: seconds from 0001-01-01T00:00:00Z
+        // to 9999-12-31T23:59:59Z, nanos in [0, 999999999].
+        "google.protobuf.Timestamp" => {
+            let seconds = field("seconds").and_then(|v| v.as_i64()).unwrap_or(0);
+            let nanos = field("nanos").and_then(|v| v.as_i32()).unwrap_or(0);
+            if !(-62_135_596_800..=253_402_300_799).contains(&seconds)
+                || !(0..=999_999_999).contains(&nanos)
+            {
+                return Err("timestamp out of range");
             }
-        });
+        }
+        // google/protobuf/duration.proto: seconds within +-315576000000,
+        // nanos within +-999999999, and nanos of the same sign as a non-zero
+        // seconds.
+        "google.protobuf.Duration" => {
+            let seconds = field("seconds").and_then(|v| v.as_i64()).unwrap_or(0);
+            let nanos = field("nanos").and_then(|v| v.as_i32()).unwrap_or(0);
+            if seconds.unsigned_abs() > 315_576_000_000
+                || nanos.unsigned_abs() > 999_999_999
+                || (seconds > 0 && nanos < 0)
+                || (seconds < 0 && nanos > 0)
+            {
+                return Err("duration out of range");
+            }
+        }
+        _ => {}
     }
-
-    Ok(root)
+    for (_, value) in message.fields() {
+        check_value_time_ranges(value)?;
+    }
+    Ok(())
 }
 
-/// Parse a raw query string into ordered key/value pairs.
-///
-/// `None` and the empty string yield no pairs. A non-empty string must be valid
-/// `application/x-www-form-urlencoded`.
-///
-/// # Errors
-/// Returns an error string when the query cannot be parsed, so the caller can
-/// reject the request rather than silently dropping every query-bound field.
-pub fn parse_query(raw: Option<&str>) -> Result<Vec<(String, String)>, String> {
-    match raw {
-        None | Some("") => Ok(Vec::new()),
-        Some(q) => serde_urlencoded::from_str(q).map_err(|e| format!("invalid query string: {e}")),
+fn check_value_time_ranges(value: &Value) -> Result<(), &'static str> {
+    match value {
+        Value::Message(inner) => check_time_ranges(inner),
+        Value::List(items) => items.iter().try_for_each(check_value_time_ranges),
+        Value::Map(entries) => entries.values().try_for_each(check_value_time_ranges),
+        _ => Ok(()),
     }
 }
 
-/// Extract a (possibly dotted) subfield of the response JSON for `response_body`.
-///
-/// Returns `None` when any path segment is missing, letting the caller
-/// distinguish a misconfigured path from a field that is legitimately null.
-pub fn extract_response_body(value: &Value, path: &str) -> Option<Value> {
-    let mut cur = value;
-    for seg in path.split('.') {
-        cur = cur.get(seg)?;
-    }
-    Some(cur.clone())
+/// Where string values go: the field at the dotted path `key`, below the
+/// message field `prefix` of `root` when there is one, below `root` otherwise.
+#[derive(Clone, Copy)]
+struct Target<'a> {
+    root: &'a MessageDescriptor,
+    /// Whether the message the key starts in is a well-known type.
+    inside: bool,
+    prefix: Option<&'a FieldDescriptor>,
+    key: &'a str,
+    /// Every value of the key, in request order.
+    values: &'a [&'a str],
 }
 
-/// Group query pairs by key, preserving value order, so repeated keys
-/// (`?tag=a&tag=b`) collect into one entry for repeated-field binding.
-fn group_query(query: &[(String, String)]) -> Vec<(String, Vec<String>)> {
-    let mut grouped: Vec<(String, Vec<String>)> = Vec::new();
-    for (k, v) in query {
-        if let Some((_, vals)) = grouped.iter_mut().find(|(gk, _)| gk == k) {
-            vals.push(v.clone());
+/// Deserialize a JSON body in one pass.
+///
+/// The path wins over the body, so a body value for a field the path binds
+/// never decides the request, even when it is not a valid value of that field.
+/// Such a body fails the one pass; it is then read again without those keys.
+/// Only a failing body pays for the second read.
+fn json_body(
+    input: &MessageDescriptor,
+    mapping: &BodyMapping,
+    bytes: &[u8],
+    path_params: &HashMap<String, String>,
+    mut presence: Option<&mut Presence>,
+) -> Result<DynamicMessage, String> {
+    // A `null` body sets nothing, like `{}`.
+    if matches!(mapping, BodyMapping::Root) && trim_json_whitespace(bytes) == b"null" {
+        return Ok(DynamicMessage::new(input.clone()));
+    }
+    let mut de = serde_json::Deserializer::from_slice(bytes);
+    let first = deserialize(input, mapping, &mut de, presence.as_deref_mut())
+        .and_then(|message| de.end().map(|()| message));
+    let error = match first {
+        Ok(message) => return Ok(message),
+        Err(error) => error,
+    };
+    let fail = |e: serde_json::Error| format!("failed to decode request body: {e}");
+    if path_params.is_empty() {
+        return Err(fail(error));
+    }
+    // Not JSON at all: the path cannot change that.
+    let Ok(mut value) = serde_json::from_slice::<JsonValue>(bytes) else {
+        return Err(fail(error));
+    };
+    strip_path_fields(&mut value, input, mapping, path_params);
+    if let Some(presence) = presence.as_deref_mut() {
+        presence.clear();
+    }
+    deserialize(input, mapping, value, presence).map_err(fail)
+}
+
+/// Remove from `body` every key the path binds, under its JSON or proto name:
+/// the path sets those fields whatever the body holds.
+fn strip_path_fields(
+    body: &mut JsonValue,
+    input: &MessageDescriptor,
+    mapping: &BodyMapping,
+    path_params: &HashMap<String, String>,
+) {
+    for key in path_params.keys() {
+        let mut segments = key.split('.');
+        let desc = match mapping {
+            BodyMapping::Root => input.clone(),
+            // Under `body: "field"` the body is that field's value, so only
+            // the path keys below the field reach into it.
+            BodyMapping::Field(name) => {
+                if segments.next() != Some(name.as_str()) {
+                    continue;
+                }
+                match input.get_field_by_name(name).map(|f| f.kind()) {
+                    Some(Kind::Message(inner)) => inner,
+                    _ => continue,
+                }
+            }
+            BodyMapping::None => return,
+        };
+        remove_path(body, desc, segments);
+    }
+}
+
+/// Remove the field at `segments` below `desc` from the JSON object `value`.
+fn remove_path<'k>(
+    mut value: &mut JsonValue,
+    mut desc: MessageDescriptor,
+    segments: impl Iterator<Item = &'k str>,
+) {
+    let mut segments = segments.peekable();
+    while let Some(segment) = segments.next() {
+        let Some(field) = field_named(&desc, segment, &mut false) else {
+            return;
+        };
+        let Some(object) = value.as_object_mut() else {
+            return;
+        };
+        if segments.peek().is_none() {
+            object.remove(field.json_name());
+            object.remove(field.name());
+            return;
+        }
+        let Kind::Message(inner) = field.kind() else {
+            return;
+        };
+        let key = if object.contains_key(field.json_name()) {
+            field.json_name()
         } else {
-            grouped.push((k.clone(), vec![v.clone()]));
+            field.name()
+        };
+        let Some(next) = object.get_mut(key) else {
+            return;
+        };
+        value = next;
+        desc = inner;
+    }
+}
+
+fn trim_json_whitespace(bytes: &[u8]) -> &[u8] {
+    let ws = |b: &u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r');
+    let start = bytes.iter().position(|b| !ws(b)).unwrap_or(bytes.len());
+    let end = bytes.iter().rposition(|b| !ws(b)).map_or(start, |i| i + 1);
+    &bytes[start..end]
+}
+
+/// Deserialize `body` as the mapping says: the whole input message, or the
+/// value of one of its fields.
+fn deserialize<'de, D: Deserializer<'de>>(
+    input: &MessageDescriptor,
+    mapping: &BodyMapping,
+    body: D,
+    presence: Option<&mut Presence>,
+) -> Result<DynamicMessage, D::Error> {
+    match mapping {
+        BodyMapping::Field(name) => {
+            // Keyed by the JSON name, which prost-reflect looks up first, so
+            // no other field's JSON name can shadow it.
+            let field = input.get_field_by_name(name);
+            let key = field.as_ref().map_or(name.as_str(), |f| f.json_name());
+            deserialize_input(input, OneEntry { key, value: body }, presence)
+        }
+        _ => deserialize_input(input, body, presence),
+    }
+}
+
+fn deserialize_input<'de, D: Deserializer<'de>>(
+    input: &MessageDescriptor,
+    de: D,
+    presence: Option<&mut Presence>,
+) -> Result<DynamicMessage, D::Error> {
+    let Some(presence) = presence else {
+        return DynamicMessage::deserialize(input.clone(), de);
+    };
+    if has_special_json(input) {
+        presence.record_whole();
+        return DynamicMessage::deserialize(input.clone(), de);
+    }
+    DynamicMessage::deserialize(input.clone(), Recording::root(de, presence))
+}
+
+/// Bind a form body field by field, into the input message or the message
+/// field the mapping names.
+fn form_body(
+    input: &MessageDescriptor,
+    mapping: &BodyMapping,
+    form: Form<'_, '_>,
+    mut presence: Option<&mut Presence>,
+    path: &mut Vec<FieldDescriptor>,
+) -> Result<(DynamicMessage, bool), String> {
+    let Form { pairs, path_params } = form;
+    let mut message = DynamicMessage::new(input.clone());
+    let (prefix, start_inside) = match mapping {
+        BodyMapping::Field(name) => {
+            let (field, inner) = input
+                .get_field_by_name(name)
+                .filter(|f| !f.is_list() && !f.is_map())
+                .and_then(|f| match f.kind() {
+                    Kind::Message(inner) => Some((f, inner)),
+                    _ => None,
+                })
+                .ok_or_else(|| format!("a form body cannot fill field `{name}`"))?;
+            // The field is the body's even when the form is empty of it.
+            message.get_field_mut(&field);
+            if let Some(presence) = presence.as_deref_mut() {
+                presence.record_path(std::slice::from_ref(&field), true);
+            }
+            (Some(field), has_special_json(&inner))
+        }
+        _ => (None, has_special_json(input)),
+    };
+    let start = Start {
+        root: input,
+        inside: start_inside,
+        prefix: prefix.as_ref(),
+    };
+    let inside = bind_pairs(
+        &mut message,
+        pairs,
+        start,
+        Binding::Set,
+        presence,
+        Some(path_params),
+        path,
+    )?;
+    Ok((message, inside))
+}
+
+/// A form body and the path parameters that override it.
+#[derive(Clone, Copy)]
+struct Form<'p, 'q> {
+    pairs: &'p [(Cow<'q, str>, Cow<'q, str>)],
+    path_params: &'p HashMap<String, String>,
+}
+
+/// Whether the dotted path key `bound` names the field at the end of `path`
+/// or one above it. Path keys start at the input message, as `path` does.
+fn covers(bound: &str, path: &[FieldDescriptor]) -> bool {
+    let mut fields = path.iter();
+    bound.split('.').all(|segment| {
+        fields
+            .next()
+            .is_some_and(|f| segment == f.name() || segment == f.json_name())
+    })
+}
+
+/// Where the keys of a query or form start: `root`, or its message field
+/// `prefix`; `inside` when that message is a well-known type.
+#[derive(Clone, Copy)]
+struct Start<'a> {
+    root: &'a MessageDescriptor,
+    inside: bool,
+    prefix: Option<&'a FieldDescriptor>,
+}
+
+/// Bind every key of `pairs` to its field, with all the values of that field
+/// in request order, and tell whether a field inside a well-known type was
+/// set. A key the path binds (`path_params`, for a form) is left to the path.
+///
+/// Keys are grouped by the field they name, not by spelling: `tag_ids` and
+/// `tagIds` are one field, and binding them apart would let one replace the
+/// other's values.
+fn bind_pairs(
+    message: &mut DynamicMessage,
+    pairs: &[(Cow<'_, str>, Cow<'_, str>)],
+    start: Start<'_>,
+    binding: Binding,
+    mut presence: Option<&mut Presence>,
+    path_params: Option<&HashMap<String, String>>,
+    path: &mut Vec<FieldDescriptor>,
+) -> Result<bool, String> {
+    // A stable sort keeps the values of each spelling in request order.
+    let mut order: Vec<usize> = (0..pairs.len()).collect();
+    order.sort_by(|&a, &b| pairs[a].0.cmp(&pairs[b].0));
+    let mut values = Vec::new();
+    let mut inside = false;
+    // Spellings that used a JSON name, by the proto-name key they stand for.
+    // Only a request that mixes the two spellings of a field pays for this.
+    let mut aliased: Vec<(String, &[usize])> = Vec::new();
+    // Spellings whose own values failed to bind, with the error.
+    let mut failed: Vec<(&str, String)> = Vec::new();
+    for run in order.chunk_by(|&a, &b| pairs[a].0 == pairs[b].0) {
+        values.clear();
+        values.extend(run.iter().map(|&i| pairs[i].1.as_ref()));
+        let target = Target {
+            root: start.root,
+            inside: start.inside,
+            prefix: start.prefix,
+            key: &pairs[run[0]].0,
+            values: &values,
+        };
+        let Some(resolved) = resolve(target, path) else {
+            continue;
+        };
+        if resolved.aliased {
+            let own = &path[usize::from(start.prefix.is_some())..];
+            let canonical = own.iter().map(|f| f.name()).collect::<Vec<_>>().join(".");
+            aliased.push((canonical, run));
+            continue;
+        }
+        let bound = bind_resolved(
+            message,
+            path,
+            &values,
+            binding,
+            presence.as_deref_mut(),
+            path_params,
+        );
+        match bound {
+            Ok(set) => inside |= set && resolved.inside,
+            // A failed assignment leaves the message as it was (parsing and
+            // the oneof check come before any write). The error is held: when
+            // the field also came under its JSON name, the values of both
+            // spellings decide the outcome below, not this spelling alone.
+            Err(e) => failed.push((pairs[run[0]].0.as_ref(), e)),
         }
     }
-    grouped
+    aliased.sort_by(|a, b| a.0.cmp(&b.0));
+    // Failures come in key order; the first one no merge below redoes wins.
+    let covered = |key: &str| {
+        aliased
+            .binary_search_by(|(c, _)| c.as_str().cmp(key))
+            .is_ok()
+    };
+    if let Some((_, e)) = failed.into_iter().find(|(key, _)| !covered(key)) {
+        return Err(e);
+    }
+    if aliased.is_empty() {
+        return Ok(inside);
+    }
+    let mut indices = Vec::new();
+    for group in aliased.chunk_by(|a, b| a.0 == b.0) {
+        let canonical = group[0].0.as_str();
+        indices.clear();
+        for (_, run) in group {
+            indices.extend_from_slice(run);
+        }
+        // The proto-name spelling, bound above with its own values only.
+        let from = order.partition_point(|&i| pairs[i].0.as_ref() < canonical);
+        let to = order.partition_point(|&i| pairs[i].0.as_ref() <= canonical);
+        indices.extend_from_slice(&order[from..to]);
+        indices.sort_unstable();
+        values.clear();
+        values.extend(indices.iter().map(|&i| pairs[i].1.as_ref()));
+        let target = Target {
+            root: start.root,
+            inside: start.inside,
+            prefix: start.prefix,
+            key: canonical,
+            values: &values,
+        };
+        let Some(resolved) = resolve(target, path) else {
+            continue;
+        };
+        inside |= bind_resolved(
+            message,
+            path,
+            &values,
+            binding,
+            presence.as_deref_mut(),
+            path_params,
+        )? && resolved.inside;
+    }
+    Ok(inside)
 }
 
-/// Resolve a (possibly dotted) field path against the message descriptor and
-/// JSON tree, creating intermediate objects, then set the leaf via `make`.
+/// Assign `values` to the resolved `path` unless a path parameter binds it.
+/// True when it was assigned.
+fn bind_resolved(
+    message: &mut DynamicMessage,
+    path: &[FieldDescriptor],
+    values: &[&str],
+    binding: Binding,
+    presence: Option<&mut Presence>,
+    path_params: Option<&HashMap<String, String>>,
+) -> Result<bool, String> {
+    // The path sets these fields whatever the form holds, so their form
+    // values are never decoded, as a JSON body's are not.
+    if path_params.is_some_and(|bound| bound.keys().any(|key| covers(key, path))) {
+        return Ok(false);
+    }
+    assign(message, path, values, binding, presence)?;
+    Ok(true)
+}
+
+/// Set the field `target` names to its values (see [`resolve`] and
+/// [`assign`]). `path` is a buffer for the fields on the way. True when the
+/// field lies inside a well-known type.
+fn bind(
+    message: &mut DynamicMessage,
+    target: Target<'_>,
+    binding: Binding,
+    presence: Option<&mut Presence>,
+    path: &mut Vec<FieldDescriptor>,
+) -> Result<bool, String> {
+    let Some(resolved) = resolve(target, path) else {
+        return Ok(false);
+    };
+    assign(message, path, target.values, binding, presence)?;
+    Ok(resolved.inside)
+}
+
+/// What [`resolve`] found besides the fields on the way.
+#[derive(Clone, Copy)]
+struct Resolved {
+    /// The field lies inside a well-known type.
+    inside: bool,
+    /// A segment named its field by a JSON name that is not its proto name.
+    aliased: bool,
+}
+
+/// Resolve the dotted key of `target` into the fields on the way, in `path`,
+/// and tell whether the field lies inside a well-known type.
 ///
-/// `overwrite = false` leaves an already-present leaf untouched (query fill).
-/// Unknown fields or non-message intermediates are silently skipped.
-fn set_field<F>(root: &mut Value, input: &MessageDescriptor, dotted: &str, overwrite: bool, make: F)
+/// Each segment names a field by its proto name or its JSON name, as
+/// ProtoJSON reads a key. `None` when the key is dropped: it names no field,
+/// or passes through a field that is not a singular message. A field inside
+/// a well-known type (`at.nanos` of a Timestamp) is bound like any other, and
+/// the value it leaves is checked once the request is built (see
+/// [`check_well_known`]).
+fn resolve(target: Target<'_>, path: &mut Vec<FieldDescriptor>) -> Option<Resolved> {
+    path.clear();
+    let mut inside = target.inside;
+    let mut aliased = false;
+    let mut owned;
+    let mut desc = match target.prefix {
+        Some(field) => {
+            let Kind::Message(inner) = field.kind() else {
+                return None;
+            };
+            path.push(field.clone());
+            owned = inner;
+            &owned
+        }
+        None => target.root,
+    };
+    let mut segments = target.key.split('.');
+    let mut leaf = segments.next().unwrap_or_default();
+    for next in segments {
+        let field = field_named(desc, leaf, &mut aliased)?;
+        let Kind::Message(inner) = field.kind() else {
+            return None;
+        };
+        if field.is_list() || field.is_map() {
+            return None;
+        }
+        inside |= has_special_json(&inner);
+        path.push(field);
+        owned = inner;
+        desc = &owned;
+        leaf = next;
+    }
+    path.push(field_named(desc, leaf, &mut aliased)?);
+    Some(Resolved { inside, aliased })
+}
+
+/// The field of `desc` named `name`, by its proto name or else its JSON name;
+/// `aliased` is set when only the JSON name matched.
+fn field_named(
+    desc: &MessageDescriptor,
+    name: &str,
+    aliased: &mut bool,
+) -> Option<FieldDescriptor> {
+    if let Some(field) = desc.get_field_by_name(name) {
+        return Some(field);
+    }
+    let field = desc.get_field_by_json_name(name)?;
+    *aliased = true;
+    Some(field)
+}
+
+/// Set the field at the end of `path` to `values`: all of them for a repeated
+/// field, the last one otherwise. A [`Binding::Fill`] leaves a field the body
+/// or the path set, or one below a field they set to a non-object, alone.
+fn assign(
+    message: &mut DynamicMessage,
+    path: &[FieldDescriptor],
+    values: &[&str],
+    binding: Binding,
+    mut presence: Option<&mut Presence>,
+) -> Result<(), String> {
+    if binding == Binding::Fill && presence.as_deref_mut().is_some_and(|p| p.blocks(path)) {
+        return Ok(());
+    }
+
+    let (field, parents) = path
+        .split_last()
+        .expect("a resolved path ends in its field");
+    let value = field_value(field, values)?;
+    let mut holder = message;
+    for parent in parents {
+        check_oneof(holder, parent)?;
+        holder = match holder.get_field_mut(parent) {
+            Value::Message(inner) => inner,
+            _ => unreachable!("a singular message field holds a message"),
+        };
+    }
+    check_oneof(holder, field)?;
+    holder.set_field(field, value);
+    if binding == Binding::Set {
+        if let Some(presence) = presence {
+            presence.record_path(path, false);
+        }
+    }
+    Ok(())
+}
+
+/// Refuse to set `field` over another member of its oneof, as ProtoJSON
+/// refuses a body naming two of them.
+fn check_oneof(message: &DynamicMessage, field: &FieldDescriptor) -> Result<(), String> {
+    let Some(oneof) = field.containing_oneof() else {
+        return Ok(());
+    };
+    if oneof
+        .fields()
+        .any(|other| other.number() != field.number() && message.has_field(&other))
+    {
+        return Err(format!(
+            "multiple fields provided for oneof '{}'",
+            oneof.name()
+        ));
+    }
+    Ok(())
+}
+
+/// The value of `field` from its string forms.
+fn field_value(field: &FieldDescriptor, raw: &[&str]) -> Result<Value, String> {
+    let invalid = |e: String| format!("invalid value for field `{}`: {e}", field.name());
+    if field.is_map() {
+        return Err(invalid("a map field cannot be set from a string".into()));
+    }
+    let kind = field.kind();
+    if field.is_list() {
+        return raw
+            .iter()
+            .map(|raw| scalar(&kind, raw))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::List)
+            .map_err(invalid);
+    }
+    let raw = raw.last().expect("a bound key has a value");
+    scalar(&kind, raw).map_err(invalid)
+}
+
+/// A string as a value of `kind`, read as the ProtoJSON of that value would
+/// be: numbers in decimal (floats also `NaN`, `Infinity`, `-Infinity`), bools
+/// as `true`/`false`, enums by name, bytes as base64, and a message type from
+/// its JSON string form (a `Timestamp`, `Duration`, `FieldMask`, wrapper).
+fn scalar(kind: &Kind, raw: &str) -> Result<Value, String> {
+    Ok(match kind {
+        Kind::Double => Value::F64(parse_f64(raw)?),
+        Kind::Float => Value::F32(parse_f32(raw)?),
+        Kind::Int32 | Kind::Sint32 | Kind::Sfixed32 => Value::I32(parse(raw)?),
+        Kind::Int64 | Kind::Sint64 | Kind::Sfixed64 => Value::I64(parse(raw)?),
+        Kind::Uint32 | Kind::Fixed32 => Value::U32(parse(raw)?),
+        Kind::Uint64 | Kind::Fixed64 => Value::U64(parse(raw)?),
+        Kind::Bool => Value::Bool(parse(raw)?),
+        Kind::String => Value::String(raw.to_owned()),
+        Kind::Bytes => Value::Bytes(decode_base64(raw)?.into()),
+        Kind::Enum(desc) => Value::EnumNumber(
+            desc.get_value_by_name(raw)
+                .ok_or_else(|| format!("unrecognized enum value '{raw}'"))?
+                .number(),
+        ),
+        Kind::Message(desc) => Value::Message(
+            DynamicMessage::deserialize(
+                desc.clone(),
+                StrDeserializer::<serde::de::value::Error>::new(raw),
+            )
+            .map_err(|e| e.to_string())?,
+        ),
+    })
+}
+
+fn parse<T: std::str::FromStr>(raw: &str) -> Result<T, String>
 where
-    F: FnOnce(&FieldDescriptor) -> Value,
+    T::Err: std::fmt::Display,
 {
-    let segments: Vec<&str> = dotted.split('.').collect();
-    let mut desc = input.clone();
-    let mut cur = root;
-
-    for seg in &segments[..segments.len() - 1] {
-        let Some(field) = desc.get_field_by_name(seg) else {
-            return;
-        };
-        let Kind::Message(message) = field.kind() else {
-            return;
-        };
-        desc = message;
-        let Some(obj) = cur.as_object_mut() else {
-            return;
-        };
-        cur = obj
-            .entry((*seg).to_string())
-            .or_insert_with(|| Value::Object(Map::new()));
-    }
-
-    let leaf = segments[segments.len() - 1];
-    let Some(field) = desc.get_field_by_name(leaf) else {
-        return;
-    };
-    let Some(obj) = cur.as_object_mut() else {
-        return;
-    };
-    if !overwrite && obj.contains_key(leaf) {
-        return;
-    }
-    obj.insert(leaf.to_string(), make(&field));
+    raw.parse().map_err(|e: T::Err| e.to_string())
 }
 
-/// Coerce a path/query string to a JSON value matching the field's proto type,
-/// so prost-reflect's proto3-JSON decoder accepts it.
-///
-/// 32-bit integers and floats become JSON numbers; 64-bit integers stay strings
-/// (their canonical proto3-JSON form). Booleans parse to JSON booleans. Anything
-/// that fails to parse falls back to the raw string.
-fn coerce(kind: &Kind, raw: &str) -> Value {
-    match kind {
-        Kind::Bool => raw
-            .parse::<bool>()
-            .map(Value::Bool)
-            .unwrap_or_else(|_| Value::String(raw.to_string())),
-        Kind::Int32 | Kind::Sint32 | Kind::Sfixed32 => raw
-            .parse::<i32>()
-            .map(|n| Value::Number(n.into()))
-            .unwrap_or_else(|_| Value::String(raw.to_string())),
-        Kind::Uint32 | Kind::Fixed32 => raw
-            .parse::<u32>()
-            .map(|n| Value::Number(n.into()))
-            .unwrap_or_else(|_| Value::String(raw.to_string())),
-        Kind::Double | Kind::Float => raw
-            .parse::<f64>()
-            .ok()
-            .and_then(serde_json::Number::from_f64)
-            .map(Value::Number)
-            .unwrap_or_else(|| Value::String(raw.to_string())),
-        // 64-bit ints (canonical proto3 JSON is a string), strings, bytes, enums
-        // (name), and anything else pass through as a string.
-        _ => Value::String(raw.to_string()),
+/// Special float names of ProtoJSON.
+fn special_float(raw: &str) -> Option<f64> {
+    match raw {
+        "Infinity" => Some(f64::INFINITY),
+        "-Infinity" => Some(f64::NEG_INFINITY),
+        "NaN" => Some(f64::NAN),
+        _ => None,
+    }
+}
+
+/// A ProtoJSON double: one of the special names, or a decimal with a finite
+/// value. Rust's parser also reads `inf`, `nan` and `infinity` in any case,
+/// and an overflowing decimal as infinity; ProtoJSON has none of those
+/// (protobuf JSON mapping, "float, double").
+fn parse_f64(raw: &str) -> Result<f64, String> {
+    if let Some(special) = special_float(raw) {
+        return Ok(special);
+    }
+    match raw.parse::<f64>() {
+        Ok(value) if value.is_finite() => Ok(value),
+        Ok(_) => Err("value out of range, or not a decimal number".to_string()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// A ProtoJSON float: a special name, or a finite decimal within the `f32`
+/// range.
+fn parse_f32(raw: &str) -> Result<f32, String> {
+    let wide = parse_f64(raw)?;
+    if wide.is_finite() && (wide < f64::from(f32::MIN) || wide > f64::from(f32::MAX)) {
+        return Err("float value out of range".to_string());
+    }
+    // A special value casts to itself; a finite one is in range, so the cast
+    // rounds instead of saturating.
+    Ok(wide as f32)
+}
+
+/// Base64 as ProtoJSON reads it: the standard or the URL-safe alphabet,
+/// padded or not.
+fn decode_base64(raw: &str) -> Result<Vec<u8>, String> {
+    use base64::alphabet;
+    use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+    use base64::{DecodeError, Engine};
+
+    const CONFIG: GeneralPurposeConfig = GeneralPurposeConfig::new()
+        .with_decode_allow_trailing_bits(true)
+        .with_decode_padding_mode(DecodePaddingMode::Indifferent);
+    const STANDARD: GeneralPurpose = GeneralPurpose::new(&alphabet::STANDARD, CONFIG);
+    const URL_SAFE: GeneralPurpose = GeneralPurpose::new(&alphabet::URL_SAFE, CONFIG);
+
+    let mut buf = Vec::new();
+    match STANDARD.decode_vec(raw, &mut buf) {
+        Ok(()) => Ok(buf),
+        Err(DecodeError::InvalidByte(_, b'-' | b'_')) => {
+            buf.clear();
+            URL_SAFE
+                .decode_vec(raw, &mut buf)
+                .map(|()| buf)
+                .map_err(|e| format!("invalid base64: {e}"))
+        }
+        Err(e) => Err(format!("invalid base64: {e}")),
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use prost_reflect::prost::Message;
-    use prost_reflect::prost_types::{
-        field_descriptor_proto::{Label, Type},
-        DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
-    };
-    use prost_reflect::DescriptorPool;
-
-    fn field(
-        name: &str,
-        num: i32,
-        ty: Type,
-        label: Label,
-        type_name: Option<&str>,
-    ) -> FieldDescriptorProto {
-        FieldDescriptorProto {
-            name: Some(name.to_string()),
-            number: Some(num),
-            label: Some(label as i32),
-            r#type: Some(ty as i32),
-            type_name: type_name.map(|s| s.to_string()),
-            ..Default::default()
-        }
-    }
-
-    /// Build a small descriptor pool with a typed message for coercion tests.
-    fn test_msg() -> MessageDescriptor {
-        let nested = DescriptorProto {
-            name: Some("Nested".to_string()),
-            field: vec![field("city", 1, Type::String, Label::Optional, None)],
-            ..Default::default()
-        };
-        let msg = DescriptorProto {
-            name: Some("TestMsg".to_string()),
-            field: vec![
-                field("name", 1, Type::String, Label::Optional, None),
-                field("age", 2, Type::Int32, Label::Optional, None),
-                field("active", 3, Type::Bool, Label::Optional, None),
-                field("tags", 4, Type::String, Label::Repeated, None),
-                field("count", 5, Type::Int64, Label::Optional, None),
-                field(
-                    "nested",
-                    6,
-                    Type::Message,
-                    Label::Optional,
-                    Some(".test.TestMsg.Nested"),
-                ),
-            ],
-            nested_type: vec![nested],
-            ..Default::default()
-        };
-        let file = FileDescriptorProto {
-            name: Some("test.proto".to_string()),
-            package: Some("test".to_string()),
-            message_type: vec![msg],
-            syntax: Some("proto3".to_string()),
-            ..Default::default()
-        };
-        let fds = FileDescriptorSet { file: vec![file] };
-        let pool = DescriptorPool::decode(fds.encode_to_vec().as_slice()).unwrap();
-        pool.get_message_by_name("test.TestMsg").unwrap()
-    }
-
-    fn pp(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
-    }
-
-    fn qq(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
-    }
-
-    #[test]
-    fn coerce_unsigned_32_rejects_out_of_range() {
-        // u32 fields must not accept negatives or values above u32::MAX; those
-        // fall back to a raw string so prost-reflect rejects them precisely.
-        assert_eq!(coerce(&Kind::Uint32, "-1"), Value::String("-1".into()));
-        assert_eq!(
-            coerce(&Kind::Uint32, "4294967296"),
-            Value::String("4294967296".into())
-        );
-        assert_eq!(coerce(&Kind::Uint32, "42"), Value::Number(42.into()));
-        assert_eq!(coerce(&Kind::Fixed32, "-1"), Value::String("-1".into()));
-        // Signed 32-bit still accepts negatives.
-        assert_eq!(coerce(&Kind::Int32, "-5"), Value::Number((-5).into()));
-        // And rejects values outside i32 range.
-        assert_eq!(
-            coerce(&Kind::Int32, "2147483648"),
-            Value::String("2147483648".into())
-        );
-    }
-
-    #[test]
-    fn body_mapping_parse() {
-        assert_eq!(BodyMapping::parse(""), BodyMapping::None);
-        assert_eq!(BodyMapping::parse("*"), BodyMapping::Root);
-        assert_eq!(
-            BodyMapping::parse("resource"),
-            BodyMapping::Field("resource".into())
-        );
-    }
-
-    #[test]
-    fn body_root_merges_path_and_query() {
-        let m = test_msg();
-        let body = serde_json::json!({ "name": "alice" });
-        let out = build_request_json(
-            &m,
-            &BodyMapping::Root,
-            body,
-            &pp(&[("age", "30")]),
-            &qq(&[("active", "true")]),
-        )
-        .unwrap();
-        assert_eq!(out["name"], "alice");
-        assert_eq!(out["age"], 30); // Int32 coerced to a JSON number
-        assert_eq!(out["active"], true); // Bool coerced
-    }
-
-    #[test]
-    fn body_field_nests_body_under_named_field() {
-        let m = test_msg();
-        let body = serde_json::json!({ "city": "berlin" });
-        let out = build_request_json(
-            &m,
-            &BodyMapping::Field("nested".into()),
-            body,
-            &pp(&[]),
-            &qq(&[("name", "bob")]),
-        )
-        .unwrap();
-        assert_eq!(out["nested"]["city"], "berlin");
-        assert_eq!(out["name"], "bob");
-    }
-
-    #[test]
-    fn query_repeated_field_becomes_array() {
-        let m = test_msg();
-        let out = build_request_json(
-            &m,
-            &BodyMapping::None,
-            Value::Null,
-            &pp(&[]),
-            &qq(&[("tags", "a"), ("tags", "b")]),
-        )
-        .unwrap();
-        assert_eq!(out["tags"], serde_json::json!(["a", "b"]));
-    }
-
-    #[test]
-    fn query_dotted_path_sets_nested_field() {
-        let m = test_msg();
-        let out = build_request_json(
-            &m,
-            &BodyMapping::None,
-            Value::Null,
-            &pp(&[]),
-            &qq(&[("nested.city", "paris")]),
-        )
-        .unwrap();
-        assert_eq!(out["nested"]["city"], "paris");
-    }
-
-    #[test]
-    fn query_does_not_override_body_or_path() {
-        let m = test_msg();
-        let body = serde_json::json!({ "name": "from_body" });
-        let out = build_request_json(
-            &m,
-            &BodyMapping::Root,
-            body,
-            &pp(&[("age", "7")]),
-            &qq(&[("name", "from_query"), ("age", "99")]),
-        )
-        .unwrap();
-        assert_eq!(out["name"], "from_body"); // body wins over query
-        assert_eq!(out["age"], 7); // path wins over query
-    }
-
-    #[test]
-    fn int64_field_stays_string() {
-        let m = test_msg();
-        let out = build_request_json(
-            &m,
-            &BodyMapping::None,
-            Value::Null,
-            &pp(&[]),
-            &qq(&[("count", "9007199254740993")]),
-        )
-        .unwrap();
-        // 64-bit ints serialize as JSON strings in canonical proto3 JSON.
-        assert_eq!(out["count"], "9007199254740993");
-    }
-
-    #[test]
-    fn unknown_query_field_is_dropped() {
-        let m = test_msg();
-        let out = build_request_json(
-            &m,
-            &BodyMapping::None,
-            Value::Null,
-            &pp(&[]),
-            &qq(&[("does_not_exist", "x")]),
-        )
-        .unwrap();
-        assert_eq!(out.get("does_not_exist"), None);
-    }
-
-    #[test]
-    fn root_body_must_be_object() {
-        let m = test_msg();
-        let err = build_request_json(
-            &m,
-            &BodyMapping::Root,
-            serde_json::json!("a string"),
-            &pp(&[]),
-            &qq(&[]),
-        );
-        assert!(err.is_err());
-    }
-
-    #[test]
-    fn extract_response_body_walks_dotted_path() {
-        let v = serde_json::json!({ "result": { "token": "abc" } });
-        assert_eq!(
-            extract_response_body(&v, "result.token"),
-            Some(serde_json::json!("abc"))
-        );
-        assert_eq!(
-            extract_response_body(&v, "result"),
-            Some(serde_json::json!({ "token": "abc" }))
-        );
-        // A missing path is None (caller can warn), distinct from a null field.
-        assert_eq!(extract_response_body(&v, "missing"), None);
-    }
-
-    #[test]
-    fn parse_query_handles_empty_and_pairs() {
-        assert_eq!(parse_query(None).unwrap(), Vec::<(String, String)>::new());
-        assert_eq!(
-            parse_query(Some("")).unwrap(),
-            Vec::<(String, String)>::new()
-        );
-        assert_eq!(
-            parse_query(Some("a=1&b=2")).unwrap(),
-            vec![("a".into(), "1".into()), ("b".into(), "2".into())]
-        );
-    }
-}
+mod tests;
