@@ -979,6 +979,25 @@ fn both_names_of_one_field_bind_as_one_key_in_request_order() {
         json(&message),
         serde_json::json!({"tagIds": [1, 2], "maxItems": 6})
     );
+    // Only the value that wins is decoded, whichever name an earlier one
+    // came under; every value of a repeated field is decoded.
+    for (query, max_items) in [
+        ("max_items=bad&maxItems=5", Some(5)),
+        ("maxItems=bad&max_items=5", Some(5)),
+        ("maxItems=5&max_items=bad", None),
+    ] {
+        let result = build_req(BodyMapping::None, Body::Absent, &[], query);
+        match max_items {
+            Some(n) => assert_eq!(
+                json(&result.unwrap()),
+                serde_json::json!({"maxItems": n}),
+                "{query}"
+            ),
+            None => assert!(result.unwrap_err().contains("`max_items`"), "{query}"),
+        }
+    }
+    let err = build_req(BodyMapping::None, Body::Absent, &[], "tag_ids=x&tagIds=1").unwrap_err();
+    assert!(err.contains("`tag_ids`"), "{err}");
 }
 
 #[test]

@@ -578,6 +578,8 @@ fn bind_pairs(
     // Spellings that used a JSON name, by the proto-name key they stand for.
     // Only a request that mixes the two spellings of a field pays for this.
     let mut aliased: Vec<(String, &[usize])> = Vec::new();
+    // Spellings whose own values failed to bind, with the error.
+    let mut failed: Vec<(&str, String)> = Vec::new();
     for run in order.chunk_by(|&a, &b| pairs[a].0 == pairs[b].0) {
         values.clear();
         values.extend(run.iter().map(|&i| pairs[i].1.as_ref()));
@@ -597,20 +599,36 @@ fn bind_pairs(
             aliased.push((canonical, run));
             continue;
         }
-        inside |= bind_resolved(
+        let bound = bind_resolved(
             message,
             path,
             &values,
             binding,
             presence.as_deref_mut(),
             path_params,
-        )? && resolved.inside;
+        );
+        match bound {
+            Ok(set) => inside |= set && resolved.inside,
+            // A failed assignment leaves the message as it was (parsing and
+            // the oneof check come before any write). The error is held: when
+            // the field also came under its JSON name, the values of both
+            // spellings decide the outcome below, not this spelling alone.
+            Err(e) => failed.push((pairs[run[0]].0.as_ref(), e)),
+        }
+    }
+    aliased.sort_by(|a, b| a.0.cmp(&b.0));
+    // Failures come in key order; the first one no merge below redoes wins.
+    let covered = |key: &str| {
+        aliased
+            .binary_search_by(|(c, _)| c.as_str().cmp(key))
+            .is_ok()
+    };
+    if let Some((_, e)) = failed.into_iter().find(|(key, _)| !covered(key)) {
+        return Err(e);
     }
     if aliased.is_empty() {
         return Ok(inside);
     }
-
-    aliased.sort_by(|a, b| a.0.cmp(&b.0));
     let mut indices = Vec::new();
     for group in aliased.chunk_by(|a, b| a.0 == b.0) {
         let canonical = group[0].0.as_str();
