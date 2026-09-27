@@ -227,9 +227,12 @@ names, in one pass and without an intermediate JSON tree:
 - **Path, query and form values** (`application/x-www-form-urlencoded`
   bodies) are strings, converted to each field's type the way ProtoJSON reads
   them: numbers, `true`/`false`, enum names, base64 bytes, and the string form
-  of `Timestamp`, `Duration`, `FieldMask` and the wrapper types. A repeated key
-  fills a repeated field, `a.b` reaches a nested field, and an unknown key is
-  dropped.
+  of `Timestamp`, `Duration`, `FieldMask` and the wrapper types. A key names a
+  field by its proto or JSON name, a repeated key fills a repeated field, `a.b`
+  reaches a nested field, and an unknown key is dropped. A well-known type is
+  set only whole, from that string form: a key into its internal fields
+  (`at.nanos`, or `nanos` when the input message is a `Timestamp`) is dropped,
+  and a form body cannot fill one.
 
 A value that is not valid for its field, or two members of one `oneof`, is
 answered with `INVALID_ARGUMENT` (400) before the upstream is called.

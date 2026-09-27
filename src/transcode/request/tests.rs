@@ -236,6 +236,7 @@ message Req {
   uint64 big = 18;
   google.protobuf.StringValue note = 19;
   google.protobuf.Struct meta = 20;
+  int32 max_items = 21;
 }
 "#;
 
@@ -840,6 +841,59 @@ fn a_dotted_key_does_not_reach_inside_a_well_known_type() {
     )
     .unwrap_err();
     assert!(err.contains("`at`"), "{err}");
+}
+
+#[test]
+fn a_root_well_known_type_takes_no_field_wise_keys() {
+    // A well-known input type is set from its validated JSON form only, as
+    // one below the root is (nanos = 2000000000 is not a valid Timestamp).
+    let at = message_type("google.protobuf.Timestamp");
+    let message = build_request_message(
+        &at,
+        &BodyMapping::None,
+        Body::Absent,
+        &pp(&[("seconds", "5")]),
+        Some("nanos=2000000000"),
+    )
+    .unwrap();
+    assert_eq!(message, DynamicMessage::new(at.clone()));
+    // A form body holds no JSON form of the type to read it from.
+    let err = build_request_message(
+        &at,
+        &BodyMapping::Root,
+        Body::Form(b"seconds=5"),
+        &HashMap::new(),
+        None,
+    )
+    .unwrap_err();
+    assert!(err.contains("google.protobuf.Timestamp"), "{err}");
+}
+
+#[test]
+fn form_and_query_keys_bind_by_proto_or_json_name() {
+    // ProtoJSON reads a field under either name, and so do form and query keys.
+    let message = build_req(
+        BodyMapping::Root,
+        Body::Form(b"displayName=Alice&maxItems=3"),
+        &[],
+        "",
+    )
+    .unwrap();
+    assert_eq!(
+        json(&message),
+        serde_json::json!({"displayName": "Alice", "maxItems": 3})
+    );
+    let message = build_req(BodyMapping::None, Body::Absent, &[], "maxItems=4").unwrap();
+    assert_eq!(json(&message), serde_json::json!({"maxItems": 4}));
+    // The path wins over a form key in either naming, whatever it holds.
+    let message = build_req(
+        BodyMapping::Root,
+        Body::Form(b"maxItems=many&age=1"),
+        &[("max_items", "7")],
+        "",
+    )
+    .unwrap();
+    assert_eq!(json(&message), serde_json::json!({"maxItems": 7, "age": 1}));
 }
 
 #[test]

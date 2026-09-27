@@ -11,9 +11,7 @@ mod presence;
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use prost_reflect::{
-    DynamicMessage, FieldDescriptor, Kind, MessageDescriptor, ReflectMessage, Value,
-};
+use prost_reflect::{DynamicMessage, FieldDescriptor, Kind, MessageDescriptor, Value};
 use serde::de::value::StrDeserializer;
 use serde::Deserializer;
 use serde_json::Value as JsonValue;
@@ -214,9 +212,16 @@ fn build(
         }
     };
 
+    // A well-known input type is set whole from its JSON form; path and query
+    // keys would reach its internal fields.
+    if has_special_json(input) {
+        return Ok(message);
+    }
+
     // Path params win over everything (the router already matched them).
     for (key, raw) in path_params {
         let target = Target {
+            root: input,
             prefix: None,
             key,
             values: &[raw.as_str()],
@@ -233,6 +238,7 @@ fn build(
     if let Some(presence) = &mut presence {
         for_each_group(query, |key, values| {
             let target = Target {
+                root: input,
                 prefix: None,
                 key,
                 values,
@@ -249,10 +255,11 @@ fn build(
     Ok(message)
 }
 
-/// Where string values go: the field at the dotted proto path `key`, below
-/// the message field `prefix` when there is one.
+/// Where string values go: the field at the dotted path `key`, below the
+/// message field `prefix` of `root` when there is one, below `root` otherwise.
 #[derive(Clone, Copy)]
 struct Target<'a> {
+    root: &'a MessageDescriptor,
     prefix: Option<&'a FieldDescriptor>,
     key: &'a str,
     /// Every value of the key, in request order.
@@ -335,7 +342,7 @@ fn remove_path<'k>(
 ) {
     let mut segments = segments.peekable();
     while let Some(segment) = segments.next() {
-        let Some(field) = desc.get_field_by_name(segment) else {
+        let Some(field) = field_named(&desc, segment) else {
             return;
         };
         let Some(object) = value.as_object_mut() else {
@@ -432,32 +439,33 @@ fn form_body(
             }
             Some(field)
         }
+        // Its keys would be the internal fields of a type read only whole.
+        _ if has_special_json(input) => {
+            return Err(format!("a form body cannot fill `{}`", input.full_name()));
+        }
         _ => None,
     };
     for_each_group(pairs, |key, values| {
-        // The path sets these fields whatever the form holds, so their form
-        // values are never decoded, as a JSON body's are not.
-        let bound = |bound: &str| match &prefix {
-            Some(field) => bound
-                .strip_prefix(field.name())
-                .and_then(|rest| rest.strip_prefix('.'))
-                .is_some_and(|rest| covers(rest, key)),
-            None => covers(bound, key),
-        };
-        if path_params.keys().any(|key| bound(key)) {
-            return Ok(());
-        }
         let target = Target {
+            root: input,
             prefix: prefix.as_ref(),
             key,
             values,
         };
-        bind(
+        if !resolve(target, path) {
+            return Ok(());
+        }
+        // The path sets these fields whatever the form holds, so their form
+        // values are never decoded, as a JSON body's are not.
+        if path_params.keys().any(|bound| covers(bound, path)) {
+            return Ok(());
+        }
+        assign(
             &mut message,
-            target,
+            path,
+            values,
             Binding::Set,
             presence.as_deref_mut(),
-            path,
         )
     })?;
     Ok(message)
@@ -470,10 +478,15 @@ struct Form<'p, 'q> {
     path_params: &'p HashMap<String, String>,
 }
 
-/// Whether the dotted field path `bound` is `key` or a field above it.
-fn covers(bound: &str, key: &str) -> bool {
-    key.strip_prefix(bound)
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+/// Whether the dotted path key `bound` names the field at the end of `path`
+/// or one above it. Path keys start at the input message, as `path` does.
+fn covers(bound: &str, path: &[FieldDescriptor]) -> bool {
+    let mut fields = path.iter();
+    bound.split('.').all(|segment| {
+        fields
+            .next()
+            .is_some_and(|f| segment == f.name() || segment == f.json_name())
+    })
 }
 
 /// Call `f` once per distinct key of `pairs`, with every value of that key in
@@ -494,63 +507,90 @@ fn for_each_group<'p>(
     Ok(())
 }
 
-/// Set the field `target` names to its values: all of them for a repeated
-/// field, the last one otherwise. `path` is a buffer for the fields on the way.
-///
-/// A key that names no field, or passes through a field that is not a
-/// singular message or is a well-known type, is dropped: a well-known type
-/// is set whole from its validated JSON form, never field by field (a
-/// Timestamp's `nanos` alone could hold an invalid value). A
-/// [`Binding::Fill`] leaves a field the body or the path set, or one below a
-/// field they set to a non-object, alone.
+/// Set the field `target` names to its values (see [`resolve`] and
+/// [`assign`]). `path` is a buffer for the fields on the way.
 fn bind(
     message: &mut DynamicMessage,
     target: Target<'_>,
     binding: Binding,
-    mut presence: Option<&mut Presence>,
+    presence: Option<&mut Presence>,
     path: &mut Vec<FieldDescriptor>,
 ) -> Result<(), String> {
-    let Target {
-        prefix,
-        key,
-        values,
-    } = target;
+    if !resolve(target, path) {
+        return Ok(());
+    }
+    assign(message, path, target.values, binding, presence)
+}
+
+/// Resolve the dotted key of `target` into the fields on the way, in `path`.
+///
+/// Each segment names a field by its proto name or its JSON name, as
+/// ProtoJSON reads a key. False when the key is dropped: it names no field,
+/// or passes through a field that is not a singular message or is a
+/// well-known type. A well-known type is set whole from its validated JSON
+/// form, never field by field (a Timestamp's `nanos` alone could hold an
+/// invalid value).
+fn resolve(target: Target<'_>, path: &mut Vec<FieldDescriptor>) -> bool {
     path.clear();
-    let mut desc = match prefix {
+    let mut owned;
+    let mut desc = match target.prefix {
         Some(field) => {
             let Kind::Message(inner) = field.kind() else {
-                return Ok(());
+                return false;
             };
             path.push(field.clone());
-            inner
+            owned = inner;
+            &owned
         }
-        None => message.descriptor(),
+        None => target.root,
     };
-    let mut segments = key.split('.');
+    let mut segments = target.key.split('.');
     let mut leaf = segments.next().unwrap_or_default();
     for next in segments {
-        let Some(field) = desc.get_field_by_name(leaf) else {
-            return Ok(());
+        let Some(field) = field_named(desc, leaf) else {
+            return false;
         };
         let Kind::Message(inner) = field.kind() else {
-            return Ok(());
+            return false;
         };
         if field.is_list() || field.is_map() || has_special_json(&inner) {
-            return Ok(());
+            return false;
         }
         path.push(field);
-        desc = inner;
+        owned = inner;
+        desc = &owned;
         leaf = next;
     }
-    let Some(field) = desc.get_field_by_name(leaf) else {
-        return Ok(());
+    let Some(field) = field_named(desc, leaf) else {
+        return false;
     };
     path.push(field);
+    true
+}
+
+/// The field of `desc` named `name`, by its proto name or else its JSON name.
+fn field_named(desc: &MessageDescriptor, name: &str) -> Option<FieldDescriptor> {
+    desc.get_field_by_name(name)
+        .or_else(|| desc.get_field_by_json_name(name))
+}
+
+/// Set the field at the end of `path` to `values`: all of them for a repeated
+/// field, the last one otherwise. A [`Binding::Fill`] leaves a field the body
+/// or the path set, or one below a field they set to a non-object, alone.
+fn assign(
+    message: &mut DynamicMessage,
+    path: &[FieldDescriptor],
+    values: &[&str],
+    binding: Binding,
+    mut presence: Option<&mut Presence>,
+) -> Result<(), String> {
     if binding == Binding::Fill && presence.as_deref_mut().is_some_and(|p| p.blocks(path)) {
         return Ok(());
     }
 
-    let (field, parents) = path.split_last().expect("the leaf was just pushed");
+    let (field, parents) = path
+        .split_last()
+        .expect("a resolved path ends in its field");
     let value = field_value(field, values)?;
     let mut holder = message;
     for parent in parents {
