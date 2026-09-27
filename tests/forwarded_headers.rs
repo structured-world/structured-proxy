@@ -1,6 +1,7 @@
 //! Forwarded request headers reach a real tonic upstream as the client sent
-//! them: every value, in order, over the actual HTTP/2 stream.
+//! them: every value, in order, over the actual HTTP/2 stream and in process.
 
+#[macro_use]
 mod common;
 
 use std::convert::Infallible;
@@ -89,16 +90,21 @@ impl tower::Service<http::Request<tonic::body::Body>> for Seen {
     }
 }
 
-async fn proxy() -> axum::Router {
-    let upstream = common::serve(Seen { pool: pool() }).await;
-    common::proxy(&upstream, pool(), ErrorDetailsPolicy::default())
+async fn proxy(upstream: common::Upstream) -> common::App {
+    common::proxy(
+        upstream,
+        Seen { pool: pool() },
+        pool(),
+        ErrorDetailsPolicy::default(),
+    )
+    .await
 }
 
-#[tokio::test]
+upstream_tests! {
 async fn every_value_of_a_repeated_header_reaches_the_upstream_in_order() {
     // RFC 9449 §4.3 has the server reject a request with two DPoP headers;
     // behind the proxy it can only do that if both arrive.
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let request = http::Request::get("/v1/seen")
         .header("dpop", "proof-a")
         .header("dpop", "proof-b")
@@ -112,12 +118,11 @@ async fn every_value_of_a_repeated_header_reaches_the_upstream_in_order() {
     );
 }
 
-#[tokio::test]
 async fn a_value_grpc_metadata_cannot_carry_is_refused() {
     // gRPC lets a receiver drop an ASCII metadata value outside %x20-%x7E, which
     // would change how many DPoP headers the upstream counts; the request is
     // refused instead of reaching it altered.
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let request = http::Request::get("/v1/seen")
         .header("dpop", "proof-a")
         .header("dpop", HeaderValue::from_bytes(b"caf\xe9").unwrap())
@@ -128,6 +133,21 @@ async fn a_value_grpc_metadata_cannot_carry_is_refused() {
     let body: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(body["error"], "INVALID_ARGUMENT");
     assert!(body["message"].as_str().unwrap().contains("dpop"), "{body}");
+}
+
+async fn a_single_value_is_unchanged() {
+    let app = proxy(UPSTREAM).await;
+    let request = http::Request::get("/v1/seen")
+        .header("dpop", "proof-a")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["name"],
+        "proof-a"
+    );
+}
 }
 
 #[tokio::test]
@@ -145,19 +165,4 @@ async fn a_forwarded_name_grpc_cannot_carry_is_a_config_error() {
         panic!("a forwarded header outside the gRPC key grammar must be rejected");
     };
     assert!(err.to_string().contains("x+proof"), "{err}");
-}
-
-#[tokio::test]
-async fn a_single_value_is_unchanged() {
-    let app = proxy().await;
-    let request = http::Request::get("/v1/seen")
-        .header("dpop", "proof-a")
-        .body(Body::empty())
-        .unwrap();
-    let (status, body) = common::send(&app, request).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&body).unwrap()["name"],
-        "proof-a"
-    );
 }

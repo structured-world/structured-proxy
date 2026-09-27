@@ -60,14 +60,17 @@ mod embed;
 pub mod hooks;
 pub mod oidc;
 pub mod openapi;
+pub mod service;
 pub mod shield;
 mod tls;
 pub mod transcode;
+pub mod upstream;
 
 /// Settle the process-wide JWT crypto provider. See
 /// [`install_default_crypto_provider`] for when a call is needed.
 #[cfg(feature = "builtin_jwt")]
 pub use auth::crypto::install_default_crypto_provider;
+pub use service::{serve, ProxyService};
 
 use axum::extract::State;
 use axum::http::{Request, StatusCode};
@@ -84,30 +87,25 @@ use std::sync::Arc;
 
 use config::{DescriptorSource, ProxyConfig};
 use hooks::{AuthDecider, ExtraRoute, OidcBackend, TokenVerifier};
+use upstream::Upstream;
 
-/// Shared state for all proxy handlers.
+/// What the proxy's handlers share. Every request extracts its own clone, so
+/// it holds the upstream handle and reference-counted settings only.
 #[derive(Clone, Debug)]
-pub struct ProxyState {
-    /// Service name from config.
-    pub service_name: String,
-    /// gRPC upstream address.
-    pub grpc_upstream: String,
-    /// Lazy gRPC channel to upstream service.
-    pub grpc_channel: tonic::transport::Channel,
-    /// Maintenance mode active.
-    pub maintenance_mode: bool,
-    /// Maintenance exempt path patterns.
-    pub maintenance_exempt: Vec<String>,
-    /// Maintenance message.
-    pub maintenance_message: String,
+pub(crate) struct ProxyState<U> {
+    /// The gRPC service transcoded calls and readiness probes go to.
+    pub(crate) upstream: U,
     /// Headers to forward from HTTP to gRPC.
-    pub forwarded_headers: Vec<String>,
-    /// Metrics namespace (derived from service name).
-    pub metrics_namespace: String,
-    /// Path class patterns for metrics.
-    pub metrics_classes: Vec<config::MetricsClassConfig>,
+    pub(crate) forwarded_headers: Arc<[String]>,
     /// SSE keep-alive interval (seconds) for server-streaming responses.
-    pub sse_keep_alive_secs: u64,
+    pub(crate) sse_keep_alive_secs: u64,
+}
+
+/// Maintenance mode: every request outside the exempt paths gets a `503`.
+#[derive(Debug)]
+struct Maintenance {
+    exempt: Vec<String>,
+    message: String,
 }
 
 /// Universal proxy server.
@@ -415,22 +413,81 @@ impl ProxyServer {
         Ok(routes)
     }
 
-    /// Build the axum router with all endpoints.
+    /// A lazy channel to the configured upstream address (`upstream.default`),
+    /// the upstream of the standalone proxy. It connects on first use, giving
+    /// up after five seconds.
+    ///
+    /// # Errors
+    ///
+    /// No upstream address is configured, or it is not a valid URI.
+    pub fn upstream(&self) -> anyhow::Result<tonic::transport::Channel> {
+        let Some(upstream) = &self.config.upstream else {
+            anyhow::bail!("no gRPC upstream address is configured (upstream.default)");
+        };
+        Ok(
+            tonic::transport::Channel::from_shared(upstream.default.clone())
+                .map_err(|e| anyhow::anyhow!("invalid gRPC upstream URL: {e}"))?
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .connect_lazy(),
+        )
+    }
+
+    /// The proxy's HTTP routes in front of the configured upstream address
+    /// (see [`upstream`](Self::upstream)), as an axum `Router` to serve or to
+    /// merge into an axum application. It answers HTTP only; use
+    /// [`service`](Self::service) for native gRPC on the same listener, or for
+    /// an upstream in process.
+    ///
+    /// # Errors
+    ///
+    /// No valid upstream address, or a configuration [`service`](Self::service)
+    /// rejects.
     pub fn router(&self) -> anyhow::Result<Router> {
+        self.routes(self.upstream()?)
+    }
+
+    /// The whole proxy as one tower service in front of `upstream`: native
+    /// gRPC requests reach `upstream` unchanged, every other request the
+    /// proxy's routes, whose transcoded calls go to `upstream` too. See
+    /// [`ProxyService`].
+    ///
+    /// `upstream` is any gRPC service ([`upstream::Upstream`]): the embedder's
+    /// own tonic services in process, with no socket between them and the
+    /// proxy, or a remote [`Channel`](tonic::transport::Channel) such as
+    /// [`upstream`](Self::upstream).
+    ///
+    /// # Errors
+    ///
+    /// An invalid configuration (see [`ProxyConfig::validate`]), descriptors
+    /// that cannot be loaded, a route mounted twice, or a malformed auth,
+    /// authz, shield or OIDC section.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use structured_proxy::ProxyServer;
+    ///
+    /// # fn build() -> anyhow::Result<()> {
+    /// let grpc = tonic::service::Routes::default(); // add your services here
+    /// let service = ProxyServer::from_yaml_str("service:\n  name: demo\n")?.service(grpc)?;
+    /// # let _ = service;
+    /// # Ok(())
+    /// # }
+    /// # build().unwrap();
+    /// ```
+    pub fn service<U: Upstream>(&self, upstream: U) -> anyhow::Result<ProxyService<U>> {
+        let routes = self.routes(upstream.clone())?;
+        Ok(ProxyService::new(upstream, routes))
+    }
+
+    /// Build the axum router with all endpoints, calling `upstream`.
+    fn routes<U: Upstream>(&self, upstream: U) -> anyhow::Result<Router> {
         // Enforce cross-field invariants on the embedded path too, where the
         // config is built directly instead of through `from_yaml_str`.
         self.config.validate()?;
         let pool = self.load_descriptors()?;
 
-        let grpc_upstream = self.config.upstream.default.clone();
-        let grpc_channel = tonic::transport::Channel::from_shared(grpc_upstream.clone())
-            .map_err(|e| anyhow::anyhow!("invalid gRPC upstream URL: {}", e))?
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .timeout(std::time::Duration::from_secs(5))
-            .connect_lazy();
-
         let service_name = self.config.service.name.clone();
-        let metrics_namespace = service_name.replace('-', "_");
 
         // The verify path that is actually mounted (branch-correct), if any.
         let verify_path = self.mounted_verify_path();
@@ -508,15 +565,8 @@ impl ProxyServer {
         }
 
         let state = ProxyState {
-            service_name: service_name.clone(),
-            grpc_upstream,
-            grpc_channel,
-            maintenance_mode: self.config.maintenance.enabled,
-            maintenance_exempt,
-            maintenance_message: self.config.maintenance.message.clone(),
-            forwarded_headers: self.config.forwarded_headers.clone(),
-            metrics_namespace,
-            metrics_classes: self.config.metrics_classes.clone(),
+            upstream,
+            forwarded_headers: self.config.forwarded_headers.as_slice().into(),
             sse_keep_alive_secs: self.config.streaming.sse_keep_alive_secs,
         };
 
@@ -574,15 +624,18 @@ impl ProxyServer {
                 .route(&health.live_path, get(|| async { StatusCode::OK }))
                 .route(
                     &health.ready_path,
-                    get(|State(state): State<ProxyState>| async move {
+                    get(|State(state): State<ProxyState<U>>| async move {
                         let mut client =
-                            tonic_health::pb::health_client::HealthClient::new(state.grpc_channel);
-                        match client
-                            .check(tonic_health::pb::HealthCheckRequest {
-                                service: String::new(),
-                            })
+                            tonic_health::pb::health_client::HealthClient::new(state.upstream);
+                        let check = client.check(tonic_health::pb::HealthCheckRequest {
+                            service: String::new(),
+                        });
+                        // An upstream that does not answer in time is not ready.
+                        match tokio::time::timeout(transcode::UPSTREAM_DEADLINE, check)
                             .await
-                        {
+                            .unwrap_or_else(|_| {
+                                Err(tonic::Status::deadline_exceeded("health check timed out"))
+                            }) {
                             Ok(resp) => {
                                 let status = resp.into_inner().status;
                                 if status
@@ -726,12 +779,19 @@ impl ProxyServer {
             ));
         }
 
-        let router = router
-            .layer(axum::middleware::from_fn_with_state(
-                state.clone(),
+        // Mounted only while maintenance is on, so normal traffic pays nothing
+        // for it.
+        if self.config.maintenance.enabled {
+            let maintenance = Arc::new(Maintenance {
+                exempt: maintenance_exempt,
+                message: self.config.maintenance.message.clone(),
+            });
+            router = router.layer(axum::middleware::from_fn_with_state(
+                maintenance,
                 maintenance_middleware,
-            ))
-            .layer(TraceLayer::new_for_http());
+            ));
+        }
+        let router = router.layer(TraceLayer::new_for_http());
         // Outermost: wraps every enforcement layer so short-circuited
         // responses keep CORS headers, and answers preflight before auth.
         let router = cors::layer(router, cors).with_state(state);
@@ -739,7 +799,10 @@ impl ProxyServer {
         Ok(router)
     }
 
-    fn build_openapi_routes(&self, pool: &DescriptorPool) -> Router<ProxyState> {
+    fn build_openapi_routes<S>(&self, pool: &DescriptorPool) -> Router<S>
+    where
+        S: Clone + Send + Sync + 'static,
+    {
         let openapi_config = match &self.config.openapi {
             Some(cfg) if cfg.enabled => cfg,
             _ => return Router::new(),
@@ -813,15 +876,21 @@ impl ProxyServer {
         }
     }
 
-    /// Start serving on configured address.
+    /// Serve the proxy on the configured listen address in front of the
+    /// configured upstream address: REST and native gRPC on one port (see
+    /// [`service`](Self::service) and [`serve`]).
+    ///
+    /// # Errors
+    ///
+    /// What [`upstream`](Self::upstream) and [`service`](Self::service)
+    /// reject, an invalid listen address, or a listener that fails.
     pub async fn serve(&self) -> anyhow::Result<()> {
-        let router = self.router()?;
-        let app = router.into_make_service_with_connect_info::<SocketAddr>();
+        let service = self.service(self.upstream()?)?;
         let addr: SocketAddr = self.config.listen.http.parse()?;
         let listener = tokio::net::TcpListener::bind(addr).await?;
 
         tracing::info!("{} listening on {}", self.config.service.name, addr);
-        axum::serve(listener, app).await?;
+        serve(listener, service).await?;
         Ok(())
     }
 }
@@ -846,126 +915,51 @@ fn normalize_route_shape(path: &str) -> String {
         .join("/")
 }
 
+impl Maintenance {
+    /// Whether `path` stays reachable: an exact exempt path, or `prefix` and
+    /// what lies below it for a `prefix/**` one (a sibling that only shares
+    /// the prefix, `/healthz` for `/health/**`, does not).
+    fn exempts(&self, path: &str) -> bool {
+        self.exempt
+            .iter()
+            .any(|pattern| match pattern.strip_suffix("/**") {
+                Some(prefix) => path
+                    .strip_prefix(prefix)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('/')),
+                None => path == pattern,
+            })
+    }
+}
+
 /// Maintenance mode middleware.
 async fn maintenance_middleware(
-    State(state): State<ProxyState>,
+    State(maintenance): State<Arc<Maintenance>>,
     request: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    if state.maintenance_mode {
-        let path = request.uri().path();
-        let exempt = state.maintenance_exempt.iter().any(|pattern| {
-            if pattern.ends_with("/**") {
-                let prefix = &pattern[..pattern.len() - 3];
-                path.starts_with(prefix)
-            } else {
-                path == pattern
-            }
-        });
-        if !exempt {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                [("retry-after", "300")],
-                state.maintenance_message.clone(),
-            )
-                .into_response();
-        }
+    if maintenance.exempts(request.uri().path()) {
+        return next.run(request).await;
     }
-    next.run(request).await
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [("retry-after", "300")],
+        maintenance.message.clone(),
+    )
+        .into_response()
 }
 
-/// Create a lazy gRPC channel for testing (connects to nowhere).
+/// A [`ProxyState`] for tests whose routers never call the upstream: a lazy
+/// channel to a port nothing listens on.
 #[cfg(test)]
-pub(crate) fn test_channel() -> tonic::transport::Channel {
-    tonic::transport::Channel::from_static("http://127.0.0.1:1")
-        .connect_timeout(std::time::Duration::from_millis(100))
-        .connect_lazy()
-}
-
-/// A minimal [`ProxyState`] for tests that only need a state to satisfy a
-/// `Router<ProxyState>` (the hook routers do not read it).
-#[cfg(test)]
-pub(crate) fn test_state() -> ProxyState {
+pub(crate) fn test_state() -> ProxyState<tonic::transport::Channel> {
     ProxyState {
-        service_name: "test".into(),
-        grpc_upstream: "http://127.0.0.1:1".into(),
-        grpc_channel: test_channel(),
-        maintenance_mode: false,
-        maintenance_exempt: vec![],
-        maintenance_message: String::new(),
-        forwarded_headers: vec![],
-        metrics_namespace: "test".into(),
-        metrics_classes: vec![],
+        upstream: tonic::transport::Channel::from_static("http://127.0.0.1:1")
+            .connect_timeout(std::time::Duration::from_millis(100))
+            .connect_lazy(),
+        forwarded_headers: Arc::from([]),
         sse_keep_alive_secs: 15,
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn normalize_route_shape_collapses_param_names() {
-        // Same shape, different param names → same key.
-        assert_eq!(
-            normalize_route_shape("/v1/x/{profile_id}"),
-            normalize_route_shape("/v1/x/{id}")
-        );
-        // Wildcard vs named capture stay distinct; literals are untouched.
-        assert_eq!(normalize_route_shape("/a/{p}/b"), "/a/{}/b");
-        assert_eq!(normalize_route_shape("/a/{*rest}"), "/a/{*}");
-        assert_ne!(
-            normalize_route_shape("/a/{p}"),
-            normalize_route_shape("/a/b")
-        );
-    }
-
-    #[test]
-    fn test_minimal_config_server() {
-        let yaml = r#"
-upstream:
-  default: "http://127.0.0.1:50051"
-"#;
-        let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
-        let server = ProxyServer::from_config(config);
-        assert!(server.descriptor_pool.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_maintenance_exempt_matching() {
-        let state = ProxyState {
-            service_name: "test".into(),
-            grpc_upstream: "http://localhost:50051".into(),
-            grpc_channel: test_channel(),
-            maintenance_mode: true,
-            maintenance_exempt: vec![
-                "/health/**".into(),
-                "/.well-known/**".into(),
-                "/metrics".into(),
-            ],
-            maintenance_message: "Down".into(),
-            forwarded_headers: vec![],
-            metrics_namespace: "test".into(),
-            metrics_classes: vec![],
-            sse_keep_alive_secs: 15,
-        };
-
-        let check = |path: &str| -> bool {
-            state.maintenance_exempt.iter().any(|pattern| {
-                if pattern.ends_with("/**") {
-                    let prefix = &pattern[..pattern.len() - 3];
-                    path.starts_with(prefix)
-                } else {
-                    path == pattern
-                }
-            })
-        };
-
-        assert!(check("/health"));
-        assert!(check("/health/ready"));
-        assert!(check("/.well-known/openid-configuration"));
-        assert!(check("/metrics"));
-        assert!(!check("/v1/auth/login"));
-        assert!(!check("/oauth2/token"));
-    }
-}
+mod tests;

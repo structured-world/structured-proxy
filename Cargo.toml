@@ -32,8 +32,9 @@ required-features = ["cli"]
 doc = false
 
 [dependencies]
-# HTTP framework
-axum = { version = "0.8", features = ["macros"] }
+# HTTP framework. `http2`: `serve` answers HTTP/1.1 and HTTP/2 on one port,
+# so native gRPC clients share the listener with REST ones.
+axum = { version = "0.8", features = ["macros", "http2"] }
 tower = "0.5"
 tower-http = { version = "0.7", features = ["cors", "trace"] }
 # Foundational HTTP types, used directly by the framework-agnostic embedding
@@ -42,6 +43,11 @@ tower-http = { version = "0.7", features = ["cors", "trace"] }
 # explicit.
 http = "1"
 bytes = "1"
+# The body bound of an upstream's responses and of requests `ProxyService`
+# accepts; already in the tree through hyper, axum and tonic.
+http-body = "1"
+# The response futures of `ProxyService`, named without boxing each one.
+pin-project-lite = "0.2"
 
 # gRPC client (to upstream service)
 tonic = "0.14"
@@ -158,7 +164,8 @@ redis = ["dep:redis"]
 cli = ["dep:clap", "dep:tracing-subscriber", "redis"]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# `test-util`: deadline tests run on a paused clock instead of waiting.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 # Trailer frames for the hand-written upstream response in

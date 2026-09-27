@@ -7,13 +7,28 @@ upstream:
   default: "grpc://localhost:4180"
 "#;
     let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
-    assert_eq!(config.upstream.default, "grpc://localhost:4180");
+    assert_eq!(config.upstream.unwrap().default, "grpc://localhost:4180");
     assert_eq!(config.listen.http, "0.0.0.0:8080");
     assert_eq!(config.service.name, "structured-proxy");
     assert_eq!(config.streaming.sse_keep_alive_secs, 15);
     assert!(config.descriptors.is_empty());
     assert!(config.auth.is_none());
     assert!(config.shield.is_none());
+}
+
+#[test]
+fn upstream_is_optional() {
+    // An embedder whose upstream is in process names no address.
+    let config: ProxyConfig = serde_yaml::from_str("service:\n  name: demo\n").unwrap();
+    assert!(config.upstream.is_none());
+}
+
+#[test]
+fn upstream_without_its_address_is_rejected() {
+    // A present `upstream:` block must say where: an empty one is a mistake,
+    // not a request for an in-process upstream.
+    let err = serde_yaml::from_str::<ProxyConfig>("upstream: {}\n").unwrap_err();
+    assert!(err.to_string().contains("default"), "{err}");
 }
 
 #[test]
@@ -231,7 +246,10 @@ forwarded_headers:
   - "x-request-id"
 "#;
     let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
-    assert_eq!(config.upstream.default, "grpc://sid-identity:4180");
+    assert_eq!(
+        config.upstream.as_ref().unwrap().default,
+        "grpc://sid-identity:4180"
+    );
     assert_eq!(config.listen.http, "0.0.0.0:9090");
     assert_eq!(config.service.name, "sid-proxy");
     assert_eq!(config.aliases.len(), 1);

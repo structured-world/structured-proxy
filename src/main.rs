@@ -41,10 +41,11 @@ fn main() -> anyhow::Result<()> {
     let (rt, source) = file.runtime.build().context("starting the async runtime")?;
 
     let config = server.config();
+    let upstream = config.upstream.as_ref().map_or("", |u| u.default.as_str());
     tracing::info!(
         service = %config.service.name,
         listen = %config.listen.http,
-        upstream = %config.upstream.default,
+        upstream = %upstream,
         descriptors = config.descriptors.len(),
         worker_threads = rt.metrics().num_workers(),
         worker_threads_from = %source,

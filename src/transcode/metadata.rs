@@ -312,9 +312,11 @@ fn hex(bytes: &[u8]) -> String {
 /// Apply a client-supplied deadline to the upstream gRPC call.
 ///
 /// Reads the gRPC-standard `grpc-timeout` header (`<int><unit>`, unit one of
-/// `H`/`M`/`S`/`m`/`u`/`n`) and sets it as the request timeout. Absent or
-/// malformed values leave the channel default in place. Returns the deadline
-/// that was applied, if any.
+/// `H`/`M`/`S`/`m`/`u`/`n`) and sets it as the request timeout, which travels
+/// to the upstream as its `grpc-timeout`. Absent or malformed values set
+/// nothing, leaving the proxy's own
+/// [`UPSTREAM_DEADLINE`](super::UPSTREAM_DEADLINE). Returns the deadline that
+/// was applied, if any.
 pub fn apply_request_deadline<T>(
     request: &mut tonic::Request<T>,
     headers: &HeaderMap,
@@ -332,7 +334,7 @@ pub fn apply_request_deadline<T>(
 /// Units: `H` hours, `M` minutes, `S` seconds, `m` milliseconds, `u`
 /// microseconds, `n` nanoseconds. Per the gRPC wire spec the value is at most 8
 /// digits. Returns `None` on a malformed value, an over-long digit run, or a
-/// zero duration (which would expire the call immediately, so the channel
+/// zero duration (which would expire the call immediately, so the proxy's
 /// default is used instead).
 fn parse_grpc_timeout(value: &str) -> Option<Duration> {
     let value = value.trim();

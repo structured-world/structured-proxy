@@ -20,7 +20,6 @@ use axum::routing::{get, on, MethodFilter, MethodRouter};
 use axum::{Json, Router};
 
 use crate::hooks::{AuthDecider, Decision, ExtraRoute, OidcBackend, RequestParts, RouteRequest};
-use crate::ProxyState;
 
 /// Cap on the body an extra-route handler will buffer (16 MiB). Extra routes are
 /// a stateless escape hatch, not a bulk-upload path; a bounded buffer keeps a
@@ -115,7 +114,10 @@ pub(crate) async fn verify_via_decider(
 }
 
 /// Routes for the stateless OIDC surface supplied by an [`OidcBackend`].
-pub(crate) fn oidc_backend_routes(backend: Arc<dyn OidcBackend>) -> Router<ProxyState> {
+pub(crate) fn oidc_backend_routes<S>(backend: Arc<dyn OidcBackend>) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
     let mut router = Router::new();
 
     // Static metadata documents (openid-configuration, provider-specific docs).
@@ -180,10 +182,13 @@ pub(crate) fn oidc_backend_routes(backend: Arc<dyn OidcBackend>) -> Router<Proxy
 ///
 /// Routes that share a path but differ in method are merged into one
 /// [`MethodRouter`], so registering `GET /x` and `POST /x` does not panic.
-pub(crate) fn extra_routes_router(routes: &[ExtraRoute]) -> Router<ProxyState> {
+pub(crate) fn extra_routes_router<S>(routes: &[ExtraRoute]) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
     use std::collections::HashMap;
 
-    let mut by_path: HashMap<String, MethodRouter<ProxyState>> = HashMap::new();
+    let mut by_path: HashMap<String, MethodRouter<S>> = HashMap::new();
     for route in routes {
         let Ok(filter) = MethodFilter::try_from(route.method.clone()) else {
             tracing::warn!(

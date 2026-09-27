@@ -21,6 +21,8 @@ Works with **any** gRPC service via proto descriptor files. No code generation, 
 - **Server-streaming** RPC → NDJSON by default, or Server-Sent Events via `Accept: text/event-stream` negotiation
 - **gRPC → HTTP status mapping** following the standard `google.rpc.Code` table
 - **Typed error details**: the upstream's `google.rpc.Status` details (`ErrorInfo`, `BadRequest`, `RetryInfo`, ...) reach the HTTP client as ProtoJSON, switchable globally and per route (see [Error responses](#error-responses))
+- **One port for REST and native gRPC**: HTTP/1.1 and HTTP/2 on the same listener, gRPC and gRPC-Web requests pass through to the upstream unchanged
+- **In-process upstream** for embedders: transcoded calls reach your own tonic services with no socket or loopback hop (see [Library Usage](#library-usage))
 - **Header forwarding** from HTTP requests to gRPC metadata (configurable allow-list)
 - **Context propagation**: W3C trace-context (`traceparent` forwarded or synthesized) and client deadlines (`grpc-timeout`) carried across the REST↔gRPC boundary
 - **Path aliasing** for route remapping (e.g. `/oauth2/*` → `/v1/oauth2/*`)
@@ -66,6 +68,8 @@ log line (`RUST_LOG=info`) states the count and where it came from.
 listen:
   http: "0.0.0.0:8080"
 
+# The gRPC service behind the proxy. Required by the standalone binary; an
+# embedder with an in-process upstream leaves it out.
 upstream:
   default: "http://127.0.0.1:50051"
 
@@ -613,7 +617,60 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-Or build the axum `Router` yourself for custom serving / embedding:
+`serve` answers HTTP/1.1 and HTTP/2 on one port: REST requests go to the
+proxy's routes, and requests with a gRPC or gRPC-Web content type go to the
+upstream as they arrived, so native gRPC clients can use the same address.
+
+### Your own gRPC services as the upstream
+
+A gRPC service that embeds the proxy to add REST (a forward-auth decision
+service, an API that also speaks gRPC) hands its own services to the proxy
+instead of an address. Transcoded calls then reach them in process: no
+socket, no loopback connection, no second HTTP/2 round, and they pass through
+the service's whole tonic stack (interceptors, layers) like a native gRPC
+call. `Request::remote_addr` in a handler gives the HTTP client's address.
+
+```rust
+use structured_proxy::ProxyServer;
+
+# async fn run() -> anyhow::Result<()> {
+// Your services, exactly as you would give them to tonic's server.
+let grpc = tonic::service::Routes::default(); // .add_service(MyServer::new(...))
+
+// No `upstream:` in the config: the upstream is `grpc`.
+let proxy = ProxyServer::from_file(std::path::Path::new("my-service.yaml"))?
+    .service(grpc)?;
+
+// REST and native gRPC on one port.
+let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
+structured_proxy::serve(listener, proxy).await?;
+# Ok(())
+# }
+```
+
+`ProxyServer::service` takes any gRPC tower service
+(`structured_proxy::upstream::Upstream`): `tonic::service::Routes`, a remote
+`tonic::transport::Channel` (what `ProxyServer::upstream` builds from the
+config), or anything else that speaks gRPC over `http` types. The result is a
+tower service, so it can also run on a server of your own.
+
+What the proxy does not serve is not its business: a request no route matches
+gets `404`, or goes to a service of yours with
+`ProxyService::with_fallback(my_axum_app)`. The proxy's middleware (CORS,
+maintenance, rate limits, auth) sees neither those requests nor native gRPC
+ones; they reach your service untouched.
+
+**Deadlines.** Every call waits at most five seconds for the upstream's
+response headers, or less when the client's `grpc-timeout` says so; after that
+the client gets `504` `DEADLINE_EXCEEDED`. The proxy enforces this itself, in
+process and remote alike. The client's `grpc-timeout` travels to the upstream;
+the five-second default does not, so an upstream that applies `grpc-timeout`
+to a whole call does not cut a long server stream short.
+
+### Merging into an axum application
+
+`ProxyServer::router` returns the proxy's HTTP routes in front of the
+configured upstream address, to serve or to merge into your own axum `Router`:
 
 ```rust
 use std::path::Path;

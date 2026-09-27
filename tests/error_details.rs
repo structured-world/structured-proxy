@@ -4,8 +4,10 @@
 //! gRPC server that fails with `tonic_types` details, so every case below goes
 //! over the actual `grpc-status-details-bin` trailer: unary errors, a stream
 //! refused before any response header, and a stream that fails after its first
-//! message, in both NDJSON and SSE.
+//! message, in both NDJSON and SSE. Every case runs against a remote and an
+//! in-process upstream.
 
+#[macro_use]
 mod common;
 
 use std::convert::Infallible;
@@ -293,15 +295,26 @@ impl tower::Service<http::Request<tonic::body::Body>> for Things {
 
 // --- proxy harness ----------------------------------------------------------
 
-/// A proxy router in front of a fresh upstream, returning error details as
+/// A proxy in front of a fresh upstream, returning error details as
 /// `error_details` decides.
-async fn proxy(error_details: ErrorDetailsPolicy) -> axum::Router {
+async fn proxy(upstream: common::Upstream, error_details: ErrorDetailsPolicy) -> common::App {
     let pool = pool();
-    let upstream = common::serve(Things { pool: pool.clone() }).await;
-    common::proxy(&upstream, pool, error_details)
+    common::proxy(upstream, Things { pool: pool.clone() }, pool, error_details).await
 }
 
-async fn get(app: &axum::Router, path: &str, accept: Option<&str>) -> (StatusCode, String) {
+/// A proxy created from a YAML document (the upstream plus `extra_yaml`), the
+/// way the standalone binary reads its config file.
+async fn proxy_from_yaml(upstream: common::Upstream, extra_yaml: &str) -> common::App {
+    let pool = pool();
+    common::app(upstream, Things { pool: pool.clone() }, |upstream_yaml| {
+        structured_proxy::ProxyServer::from_yaml_str(&format!("{upstream_yaml}{extra_yaml}"))
+            .unwrap()
+            .with_descriptors(pool)
+    })
+    .await
+}
+
+async fn get(app: &common::App, path: &str, accept: Option<&str>) -> (StatusCode, String) {
     let mut req = http::Request::get(path);
     if let Some(accept) = accept {
         req = req.header("accept", accept);
@@ -309,19 +322,19 @@ async fn get(app: &axum::Router, path: &str, accept: Option<&str>) -> (StatusCod
     common::send(app, req.body(Body::empty()).unwrap()).await
 }
 
-async fn get_json(app: &axum::Router, path: &str) -> (StatusCode, Value) {
+async fn get_json(app: &common::App, path: &str) -> (StatusCode, Value) {
     let (status, body) = get(app, path, None).await;
     (status, serde_json::from_str(&body).unwrap())
 }
 
+upstream_tests! {
 // --- unary ------------------------------------------------------------------
 
-#[tokio::test]
 async fn unary_error_carries_error_info_and_bad_request() {
     // The acceptance case: typed details arrive as ProtoJSON `Any`s next to
     // the existing fields, with the HTTP status of the gRPC → HTTP mapping,
     // and DebugInfo stays behind.
-    let app = proxy(ErrorDetailsPolicy::default()).await;
+    let app = proxy(UPSTREAM, ErrorDetailsPolicy::default()).await;
     let (status, body) = get_json(&app, "/v1/things/rich").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(
@@ -337,9 +350,8 @@ async fn unary_error_carries_error_info_and_bad_request() {
     assert!(!text.contains("register.rs") && !text.contains("users_email_key"));
 }
 
-#[tokio::test]
 async fn unary_error_without_trailer_has_empty_details() {
-    let app = proxy(ErrorDetailsPolicy::default()).await;
+    let app = proxy(UPSTREAM, ErrorDetailsPolicy::default()).await;
     let (status, body) = get_json(&app, "/v1/things/missing").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(
@@ -348,7 +360,6 @@ async fn unary_error_without_trailer_has_empty_details() {
     );
 }
 
-#[tokio::test]
 async fn product_unknown_and_well_known_details_are_told_apart() {
     // Three different renderings side by side: a product message expands to
     // its fields and a well-known type with a special JSON form sits under
@@ -357,6 +368,7 @@ async fn product_unknown_and_well_known_details_are_told_apart() {
     // base64 of the original bytes), never into `details`, on the route that
     // switches the extension on.
     let app = proxy(
+        UPSTREAM,
         ErrorDetailsPolicy::default()
             .opaque_route("/v1/things/*", true)
             .unwrap(),
@@ -385,11 +397,11 @@ async fn product_unknown_and_well_known_details_are_told_apart() {
 
 // --- per-route switch -------------------------------------------------------
 
-#[tokio::test]
 async fn route_rule_switches_details_off_for_one_route() {
     // Only the matched route loses `details` (the key is absent, not empty);
     // its HTTP status and the other routes are unaffected.
     let app = proxy(
+        UPSTREAM,
         ErrorDetailsPolicy::default()
             .route("/v1/quiet/*", false)
             .unwrap(),
@@ -405,11 +417,11 @@ async fn route_rule_switches_details_off_for_one_route() {
     assert_eq!(loud["details"], rich_details());
 }
 
-#[tokio::test]
 async fn global_switch_off_with_a_sub_route_back_on() {
     // Global off, `/v1/things/**` back on: the sub-route (including its
     // streaming routes) keeps details, everything else drops them.
     let app = proxy(
+        UPSTREAM,
         ErrorDetailsPolicy::disabled()
             .route("/v1/things/**", true)
             .unwrap(),
@@ -423,11 +435,10 @@ async fn global_switch_off_with_a_sub_route_back_on() {
     assert_eq!(denied["details"][0]["reason"], "NOT_OWNER");
 }
 
-#[tokio::test]
 async fn global_switch_off_removes_details_from_stream_frames_too() {
     // The switch covers the in-stream terminal frame as well: a route with
     // details off ends its stream with the bare error body.
-    let app = proxy(ErrorDetailsPolicy::disabled()).await;
+    let app = proxy(UPSTREAM, ErrorDetailsPolicy::disabled()).await;
     let (status, body) = get(&app, "/v1/things/x/watch", None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let last: Value = serde_json::from_str(body.lines().last().unwrap()).unwrap();
@@ -444,13 +455,12 @@ async fn global_switch_off_removes_details_from_stream_frames_too() {
 
 // --- broken upstream status ---------------------------------------------------
 
-#[tokio::test]
 async fn unary_error_with_a_corrupt_known_detail_becomes_a_safe_internal() {
     // The type resolves but its bytes do not decode: a broken upstream
     // response. Before headers the proxy still owns the status, so the client
     // gets a generic 500 INTERNAL, not the upstream's NOT_FOUND with the detail
     // dropped, passed on as base64, or otherwise reinterpreted.
-    let app = proxy(ErrorDetailsPolicy::default()).await;
+    let app = proxy(UPSTREAM, ErrorDetailsPolicy::default()).await;
     let (status, body) = get(&app, "/v1/things/corrupt", None).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(
@@ -460,11 +470,10 @@ async fn unary_error_with_a_corrupt_known_detail_becomes_a_safe_internal() {
     assert!(!body.contains("CgVh") && !body.contains("gone"), "{body}");
 }
 
-#[tokio::test]
 async fn stream_error_with_a_corrupt_known_detail_ends_with_a_safe_internal_frame() {
     // After the first message the 200 is sent, so the same failure becomes the
     // terminal frame instead, in both formats.
-    let app = proxy(ErrorDetailsPolicy::default()).await;
+    let app = proxy(UPSTREAM, ErrorDetailsPolicy::default()).await;
     let (status, body) = get(&app, "/v1/things/corrupt/watch", None).await;
     assert_eq!(status, StatusCode::OK);
     let mut expected = malformed_upstream_status_body();
@@ -493,25 +502,11 @@ async fn stream_error_with_a_corrupt_known_detail_ends_with_a_safe_internal_fram
 
 // --- YAML settings ------------------------------------------------------------
 
-/// A proxy created from a YAML document (upstream plus `extra_yaml`), the way
-/// the standalone binary reads its config file.
-async fn proxy_from_yaml(extra_yaml: &str) -> axum::Router {
-    let pool = pool();
-    let upstream = common::serve(Things { pool: pool.clone() }).await;
-    structured_proxy::ProxyServer::from_yaml_str(&format!(
-        "upstream:\n  default: \"{upstream}\"\n{extra_yaml}"
-    ))
-    .unwrap()
-    .with_descriptors(pool)
-    .router()
-    .unwrap()
-}
-
-#[tokio::test]
 async fn yaml_switches_route_details_off_and_envelopes_ndjson() {
     // Both settings come from the config file: the quiet route loses its
     // details, the others keep them, and NDJSON lines are enveloped.
     let app = proxy_from_yaml(
+        UPSTREAM,
         "error_details:\n  routes:\n    - pattern: \"/v1/quiet/*\"\n      enabled: false\nstreaming:\n  ndjson_envelope: true\n",
     )
     .await;
@@ -540,11 +535,11 @@ async fn yaml_switches_route_details_off_and_envelopes_ndjson() {
     );
 }
 
-#[tokio::test]
 async fn yaml_switches_opaque_details_globally_and_per_route() {
     // `opaque: true` turns the extension on everywhere and a rule setting only
     // `opaque: false` turns it back off for one route, leaving its details on.
     let app = proxy_from_yaml(
+        UPSTREAM,
         "error_details:\n  opaque: true\n  routes:\n    - pattern: \"/v1/quiet/*\"\n      opaque: false\n",
     )
     .await;
@@ -555,39 +550,13 @@ async fn yaml_switches_opaque_details_globally_and_per_route() {
     assert!(quiet.get("opaqueDetails").is_none(), "{quiet}");
 }
 
-#[test]
-fn yaml_route_rule_without_a_switch_is_rejected() {
-    // A rule that sets neither `enabled` nor `opaque` would match routes and
-    // change nothing, which is a mistake rather than an intent.
-    let err = structured_proxy::ProxyServer::from_yaml_str(
-        "upstream:\n  default: \"http://127.0.0.1:1\"\nerror_details:\n  routes:\n    - pattern: \"/v1/**\"\n",
-    )
-    .err()
-    .expect("a rule without a switch must be rejected");
-    assert!(
-        err.to_string().contains("neither enabled nor opaque"),
-        "{err}"
-    );
-}
-
-#[test]
-fn yaml_with_an_invalid_error_details_pattern_is_rejected() {
-    let err = structured_proxy::ProxyServer::from_yaml_str(
-        "upstream:\n  default: \"http://127.0.0.1:1\"\nerror_details:\n  routes:\n    - pattern: \"v1/**\"\n      enabled: false\n",
-    )
-    .err()
-    .expect("a relative pattern must be rejected");
-    assert!(err.to_string().contains("must start with '/'"), "{err}");
-}
-
 // --- errors the proxy raises itself ------------------------------------------
 
-#[tokio::test]
 async fn unmappable_request_gets_the_shared_error_body() {
     // A request the proxy rejects before calling the upstream answers in the
     // same body as an upstream error on that route, so a client parses one
     // shape: here INVALID_ARGUMENT with empty details.
-    let app = proxy(ErrorDetailsPolicy::default()).await;
+    let app = proxy(UPSTREAM, ErrorDetailsPolicy::default()).await;
     let (status, body) = get_json(&app, "/v1/things/rich?count=many").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"], "INVALID_ARGUMENT");
@@ -596,37 +565,12 @@ async fn unmappable_request_gets_the_shared_error_body() {
     assert!(body["message"].is_string());
 }
 
-#[tokio::test]
-async fn unreachable_upstream_gets_the_shared_error_body() {
-    // Nothing listens on the upstream port: 503 UNAVAILABLE in the shared
-    // body. With details switched off for the route, the key is absent here
-    // too.
-    let app = common::proxy(
-        "http://127.0.0.1:1",
-        pool(),
-        ErrorDetailsPolicy::default()
-            .route("/v1/quiet/*", false)
-            .unwrap(),
-    );
-    let (status, body) = get_json(&app, "/v1/things/rich").await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(body["error"], "UNAVAILABLE");
-    assert_eq!(body["code"], 14);
-    assert_eq!(body["details"], json!([]));
-
-    let (status, quiet) = get_json(&app, "/v1/quiet/rich").await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(quiet["code"], 14);
-    assert!(quiet.get("details").is_none(), "{quiet}");
-}
-
 // --- streaming --------------------------------------------------------------
 
-#[tokio::test]
 async fn stream_refused_before_headers_maps_like_a_unary_error() {
     // No message was sent yet, so the proxy still owns the HTTP status: it is
     // mapped (PERMISSION_DENIED → 403) and the body is the unary error body.
-    let app = proxy(ErrorDetailsPolicy::default()).await;
+    let app = proxy(UPSTREAM, ErrorDetailsPolicy::default()).await;
     let (status, body) = get_json(&app, "/v1/things/x/denied").await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(
@@ -644,13 +588,12 @@ async fn stream_refused_before_headers_maps_like_a_unary_error() {
     );
 }
 
-#[tokio::test]
 async fn ndjson_stream_failing_after_first_message_ends_with_detailed_error_line() {
     // The 200 and the first message are already on the wire when the upstream
     // fails, so the status cannot change: the error arrives as exactly one
     // final NDJSON line holding the same body a unary error would have, marked
     // by `@type: google.rpc.Status` so it is not mistaken for a data line.
-    let app = proxy(ErrorDetailsPolicy::default()).await;
+    let app = proxy(UPSTREAM, ErrorDetailsPolicy::default()).await;
     let (status, body) = get(&app, "/v1/things/x/watch", None).await;
     assert_eq!(status, StatusCode::OK);
     let lines: Vec<Value> = body
@@ -672,11 +615,10 @@ async fn ndjson_stream_failing_after_first_message_ends_with_detailed_error_line
     );
 }
 
-#[tokio::test]
 async fn sse_stream_failing_after_first_message_ends_with_detailed_stream_error_event() {
     // Same failure over SSE: one data event, then exactly one `stream-error`
     // event with the full error body, and nothing after it.
-    let app = proxy(ErrorDetailsPolicy::default()).await;
+    let app = proxy(UPSTREAM, ErrorDetailsPolicy::default()).await;
     let (status, body) = get(&app, "/v1/things/x/watch", Some("text/event-stream")).await;
     assert_eq!(status, StatusCode::OK);
     let events: Vec<(Option<&str>, Value)> = body
@@ -710,4 +652,58 @@ async fn sse_stream_failing_after_first_message_ends_with_detailed_stream_error_
             ),
         ]
     );
+}
+}
+
+#[test]
+fn yaml_route_rule_without_a_switch_is_rejected() {
+    // A rule that sets neither `enabled` nor `opaque` would match routes and
+    // change nothing, which is a mistake rather than an intent.
+    let err = structured_proxy::ProxyServer::from_yaml_str(
+        "upstream:\n  default: \"http://127.0.0.1:1\"\nerror_details:\n  routes:\n    - pattern: \"/v1/**\"\n",
+    )
+    .err()
+    .expect("a rule without a switch must be rejected");
+    assert!(
+        err.to_string().contains("neither enabled nor opaque"),
+        "{err}"
+    );
+}
+
+#[test]
+fn yaml_with_an_invalid_error_details_pattern_is_rejected() {
+    let err = structured_proxy::ProxyServer::from_yaml_str(
+        "upstream:\n  default: \"http://127.0.0.1:1\"\nerror_details:\n  routes:\n    - pattern: \"v1/**\"\n      enabled: false\n",
+    )
+    .err()
+    .expect("a relative pattern must be rejected");
+    assert!(err.to_string().contains("must start with '/'"), "{err}");
+}
+
+#[tokio::test]
+async fn unreachable_upstream_gets_the_shared_error_body() {
+    // Nothing listens on the remote upstream's port: 503 UNAVAILABLE in the
+    // shared body. With details switched off for the route, the key is absent
+    // here too.
+    let server = structured_proxy::ProxyServer::from_yaml_str(
+        "upstream:\n  default: \"http://127.0.0.1:1\"\n",
+    )
+    .unwrap()
+    .with_descriptors(pool())
+    .with_error_details(
+        ErrorDetailsPolicy::default()
+            .route("/v1/quiet/*", false)
+            .unwrap(),
+    );
+    let app = common::App::new(server.service(server.upstream().unwrap()).unwrap());
+    let (status, body) = get_json(&app, "/v1/things/rich").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"], "UNAVAILABLE");
+    assert_eq!(body["code"], 14);
+    assert_eq!(body["details"], json!([]));
+
+    let (status, quiet) = get_json(&app, "/v1/quiet/rich").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(quiet["code"], 14);
+    assert!(quiet.get("details").is_none(), "{quiet}");
 }

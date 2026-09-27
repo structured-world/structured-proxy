@@ -15,8 +15,12 @@ use std::path::PathBuf;
 /// `#[non_exhaustive]` instead, since those are deserialized, not hand-built.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProxyConfig {
-    /// Upstream gRPC service(s).
-    pub upstream: UpstreamConfig,
+    /// The remote gRPC upstream. Required by the standalone proxy and by
+    /// [`ProxyServer::upstream`](crate::ProxyServer::upstream); an embedder
+    /// whose upstream is in process
+    /// ([`ProxyServer::service`](crate::ProxyServer::service)) leaves it out.
+    #[serde(default)]
+    pub upstream: Option<UpstreamConfig>,
 
     /// Proto descriptor sources.
     #[serde(default, deserialize_with = "deserialize_descriptor_sources")]

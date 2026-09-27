@@ -2,8 +2,10 @@
 //! and reaches the upstream as that message.
 //!
 //! The upstream answers with the request it received, so each test sees what
-//! actually reached the service.
+//! actually reached the service. Every case runs against a remote and an
+//! in-process upstream.
 
+#[macro_use]
 mod common;
 
 use std::convert::Infallible;
@@ -87,20 +89,19 @@ impl tower::Service<http::Request<tonic::body::Body>> for Items {
     }
 }
 
-async fn proxy() -> axum::Router {
+async fn proxy(upstream: common::Upstream) -> common::App {
     let pool: DescriptorPool = common::compile("test/v1/items.proto", ITEMS_PROTO);
     let item = pool.get_message_by_name("test.v1.Item").unwrap();
-    let upstream = common::serve(Items { item }).await;
-    common::proxy(&upstream, pool, Default::default())
+    common::proxy(upstream, Items { item }, pool, Default::default()).await
 }
 
-async fn get(app: &axum::Router, uri: &str) -> (StatusCode, Value) {
+async fn get(app: &common::App, uri: &str) -> (StatusCode, Value) {
     let (status, body) =
         common::send(app, http::Request::get(uri).body(Body::empty()).unwrap()).await;
     (status, serde_json::from_str(&body).unwrap())
 }
 
-async fn post_form(app: &axum::Router, uri: &str, form: &'static str) -> (StatusCode, Value) {
+async fn post_form(app: &common::App, uri: &str, form: &'static str) -> (StatusCode, Value) {
     let request = http::Request::post(uri)
         .header("content-type", "application/x-www-form-urlencoded")
         .body(Body::from(form))
@@ -109,11 +110,11 @@ async fn post_form(app: &axum::Router, uri: &str, form: &'static str) -> (Status
     (status, serde_json::from_str(&body).unwrap())
 }
 
-#[tokio::test]
+upstream_tests! {
 async fn query_and_form_keys_bind_by_proto_or_json_name() {
     // ProtoJSON reads a field under either name; a query or form key does too,
     // rather than being dropped as unknown.
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let (status, body) = get(&app, "/v1/items/a?displayName=Ann&max_items=3").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
@@ -128,11 +129,10 @@ async fn query_and_form_keys_bind_by_proto_or_json_name() {
     );
 }
 
-#[tokio::test]
 async fn well_known_type_fields_bind_one_by_one() {
     // A Timestamp, Duration or wrapper can be sent whole or field by field;
     // none of the client's values is lost.
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let (status, body) = get(
         &app,
         "/v1/items/a?at.seconds=5&at.nanos=7&ttl=1.5s&note.value=hi",
@@ -149,11 +149,10 @@ async fn well_known_type_fields_bind_one_by_one() {
     assert_eq!(body["note"], "hello");
 }
 
-#[tokio::test]
 async fn an_invalid_well_known_value_is_rejected_before_the_upstream() {
     // Field by field a client could write what no JSON form holds: nanos past
     // 999999999, or seconds and nanos of opposite sign.
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     for uri in [
         "/v1/items/a?at.nanos=2000000000",
         "/v1/items/a?ttl.seconds=5&ttl.nanos=-1",
@@ -163,4 +162,5 @@ async fn an_invalid_well_known_value_is_rejected_before_the_upstream() {
         assert_eq!(body["error"], "INVALID_ARGUMENT", "{uri}");
         assert_eq!(body["code"], 3, "{uri}");
     }
+}
 }
