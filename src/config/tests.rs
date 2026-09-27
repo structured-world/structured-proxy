@@ -437,10 +437,72 @@ fn known_top_level_keys_cover_every_proxy_config_field() {
         "forwarded_headers",
         "streaming",
         "error_details",
+        "response_headers",
     ] {
         assert!(KNOWN_TOP_LEVEL_KEYS.contains(&key), "{key}");
     }
-    assert_eq!(KNOWN_TOP_LEVEL_KEYS.len(), 18);
+    assert_eq!(KNOWN_TOP_LEVEL_KEYS.len(), 19);
+}
+
+#[test]
+fn response_headers_key_is_known() {
+    // The deny-list lives outside ProxyConfig; its key must not be reported
+    // as a typo, while a misspelling of it is.
+    let yaml = r#"
+upstream:
+  default: "grpc://x:1"
+response_headers:
+  deny: ["x-debug-trace"]
+response_header:
+  deny: ["x-debug-trace"]
+"#;
+    assert_eq!(
+        unknown_config_keys(yaml),
+        vec!["response_header".to_string()]
+    );
+}
+
+#[test]
+fn transcode_settings_read_the_response_header_deny_list() {
+    // Names are normalized to lowercase header names, in order.
+    let options = transcode_options(
+        "upstream:\n  default: \"grpc://x:1\"\nresponse_headers:\n  deny: [\"X-Debug-Trace\", \"x-backend\"]\n",
+    )
+    .unwrap();
+    assert_eq!(
+        options
+            .denied_response_headers
+            .iter()
+            .map(|name| name.as_str())
+            .collect::<Vec<_>>(),
+        ["x-debug-trace", "x-backend"]
+    );
+}
+
+#[test]
+fn transcode_settings_without_response_headers_deny_nothing() {
+    let options = transcode_options("upstream:\n  default: \"grpc://x:1\"\n").unwrap();
+    assert!(options.denied_response_headers.is_empty());
+}
+
+#[test]
+fn transcode_settings_reject_an_invalid_deny_entry() {
+    // A space is not allowed in a header name; the entry could never match.
+    let err = transcode_options(
+        "upstream:\n  default: \"grpc://x:1\"\nresponse_headers:\n  deny: [\"x debug\"]\n",
+    )
+    .unwrap_err();
+    assert!(err.contains("not a header name"), "{err}");
+}
+
+#[test]
+fn transcode_settings_reject_unknown_response_headers_key() {
+    // `denied` for `deny` would otherwise let the header through silently.
+    let err = transcode_options(
+        "upstream:\n  default: \"grpc://x:1\"\nresponse_headers:\n  denied: [\"x-debug-trace\"]\n",
+    )
+    .unwrap_err();
+    assert!(err.contains("denied"), "{err}");
 }
 
 #[test]

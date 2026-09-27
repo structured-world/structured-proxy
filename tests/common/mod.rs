@@ -22,10 +22,27 @@ message HttpRule {
     string post = 4;
     string delete = 5;
     string patch = 6;
+    CustomHttpPattern custom = 8;
   }
   string body = 7;
   string response_body = 12;
   repeated HttpRule additional_bindings = 11;
+}
+message CustomHttpPattern {
+  string kind = 1;
+  string path = 2;
+}
+"#;
+
+/// `google/api/httpbody.proto`.
+const HTTPBODY_PROTO: &str = r#"
+syntax = "proto3";
+package google.api;
+import "google/protobuf/any.proto";
+message HttpBody {
+  string content_type = 1;
+  bytes data = 2;
+  repeated google.protobuf.Any extensions = 3;
 }
 "#;
 
@@ -39,8 +56,8 @@ extend google.protobuf.MethodOptions {
 }
 "#;
 
-/// Serves the google.api sources and one test file from memory, and
-/// descriptor.proto from protox's bundled Google files.
+/// Serves the google.api sources and one test file from memory, and the
+/// `google/protobuf` files from protox's bundled Google files.
 struct TestProtos {
     name: &'static str,
     source: &'static str,
@@ -51,6 +68,7 @@ impl protox::file::FileResolver for TestProtos {
         let source = match name {
             "google/api/http.proto" => HTTP_PROTO,
             "google/api/annotations.proto" => ANNOTATIONS_PROTO,
+            "google/api/httpbody.proto" => HTTPBODY_PROTO,
             _ if name == self.name => self.source,
             _ => return protox::file::GoogleFileResolver::new().open_file(name),
         };

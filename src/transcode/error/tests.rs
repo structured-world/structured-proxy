@@ -1149,3 +1149,77 @@ fn policy_rejects_invalid_glob() {
     let err = policy(true, &[("/v1/[admin", false)]).unwrap_err();
     assert!(err.contains("invalid glob pattern"), "{err}");
 }
+
+// --- google.api.HttpBody, malformed responses ---------------------------------
+
+#[test]
+fn http_body_detail_renders_without_product_descriptors() {
+    // google/api/httpbody.proto is canonical, like the google.rpc types: a
+    // detail of that type renders even when the product pool lacks it.
+    // content_type = "text/plain" (field 1), data = "hi" (field 2).
+    let http_body = b"\x0a\x0atext/plain\x12\x02hi".to_vec();
+    let status = status_with_raw_details(&[("type.googleapis.com/google.api.HttpBody", http_body)]);
+    let body = error_body(&status, Some(&canonical_only()));
+    assert_eq!(
+        body["details"],
+        json!([{
+            "@type": "type.googleapis.com/google.api.HttpBody",
+            "contentType": "text/plain",
+            "data": "aGk="
+        }])
+    );
+}
+
+#[test]
+fn render_response_reports_whether_the_error_is_the_upstreams() {
+    let (response, faithful) = render_response(&rich_status(), Some(&canonical_only()));
+    assert!(faithful);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // Without details the trailer is not read, so the error is always faithful.
+    let broken = tonic::Status::with_details(
+        tonic::Code::NotFound,
+        "gone",
+        bytes::Bytes::from_static(b"\xff\xff"),
+    );
+    let (response, faithful) = render_response(&broken, None);
+    assert!(faithful);
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    // With details on, a trailer that is not a google.rpc.Status is replaced.
+    let (response, faithful) = render_response(&broken, Some(&canonical_only()));
+    assert!(!faithful);
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+async fn json_of(response: Response) -> serde_json::Value {
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn malformed_response_is_an_internal_in_the_route_error_body() {
+    let response = malformed_response(Some(&canonical_only()));
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        json_of(response).await,
+        json!({
+            "error": "INTERNAL",
+            "message": "upstream returned a malformed response",
+            "code": 13,
+            "details": []
+        })
+    );
+    // With details off for the route, the key is absent as on every error.
+    let response = malformed_response(None);
+    assert_eq!(
+        json_of(response).await,
+        json!({
+            "error": "INTERNAL",
+            "message": "upstream returned a malformed response",
+            "code": 13
+        })
+    );
+}

@@ -45,6 +45,7 @@ compile_error!(
 
 pub mod auth;
 pub mod config;
+mod cors;
 mod embed;
 pub mod hooks;
 pub mod oidc;
@@ -141,19 +142,22 @@ impl ProxyServer {
     }
 
     /// Create from a YAML document: the [`ProxyConfig`] plus the transcoding
-    /// settings it does not hold (`error_details:` and
-    /// `streaming.ndjson_envelope`), applied as [`with_error_details`] and
-    /// [`with_ndjson_envelope`] would. A top-level or `streaming:` key no
-    /// setting reads is logged as a warning.
+    /// settings it does not hold (`error_details:`,
+    /// `streaming.ndjson_envelope` and `response_headers:`), applied as
+    /// [`with_error_details`], [`with_ndjson_envelope`] and
+    /// [`with_denied_response_headers`] would. A top-level or `streaming:` key
+    /// no setting reads is logged as a warning.
     ///
     /// # Errors
     ///
     /// Invalid YAML, a [`ProxyConfig`] that fails
-    /// [`validate`](ProxyConfig::validate), or an `error_details` route pattern
-    /// that is relative or not a valid glob.
+    /// [`validate`](ProxyConfig::validate), an `error_details` route pattern
+    /// that is relative or not a valid glob, or a `response_headers.deny`
+    /// entry that is not a header name.
     ///
     /// [`with_error_details`]: Self::with_error_details
     /// [`with_ndjson_envelope`]: Self::with_ndjson_envelope
+    /// [`with_denied_response_headers`]: Self::with_denied_response_headers
     pub fn from_yaml_str(yaml: &str) -> anyhow::Result<Self> {
         let config = ProxyConfig::from_yaml_str(yaml)?;
         for key in config::unknown_config_keys(yaml) {
@@ -162,7 +166,7 @@ impl ProxyServer {
         let settings: config::TranscodeFileConfig = serde_yaml::from_str(yaml)?;
         let options = settings
             .options()
-            .map_err(|e| anyhow::anyhow!("invalid error_details config: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("invalid transcoding config: {e}"))?;
         let mut server = Self::from_config(config);
         server.transcode = options;
         Ok(server)
@@ -259,6 +263,17 @@ impl ProxyServer {
     /// [`transcode::TranscodeOptions::with_ndjson_envelope`].
     pub fn with_ndjson_envelope(mut self, enabled: bool) -> Self {
         self.transcode = self.transcode.with_ndjson_envelope(enabled);
+        self
+    }
+
+    /// Keep these upstream response metadata keys off the HTTP responses of
+    /// the transcoded routes; see
+    /// [`transcode::TranscodeOptions::with_denied_response_headers`].
+    pub fn with_denied_response_headers(
+        mut self,
+        names: impl IntoIterator<Item = http::HeaderName>,
+    ) -> Self {
+        self.transcode = self.transcode.with_denied_response_headers(names);
         self
     }
 
@@ -692,11 +707,10 @@ impl ProxyServer {
                 state.clone(),
                 maintenance_middleware,
             ))
-            .layer(TraceLayer::new_for_http())
-            // Outermost: wraps every enforcement layer so short-circuited
-            // responses keep CORS headers, and answers preflight before auth.
-            .layer(cors)
-            .with_state(state);
+            .layer(TraceLayer::new_for_http());
+        // Outermost: wraps every enforcement layer so short-circuited
+        // responses keep CORS headers, and answers preflight before auth.
+        let router = cors::layer(router, cors).with_state(state);
 
         Ok(router)
     }

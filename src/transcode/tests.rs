@@ -1,90 +1,96 @@
 use super::*;
+use axum::routing::get;
 
-/// Build a standalone `HttpRule`-shaped descriptor (self-referential
-/// `additional_bindings`) so the binding parser can be tested without the
-/// google.api extension wiring.
-fn http_rule_descriptor() -> prost_reflect::MessageDescriptor {
-    use prost_reflect::prost::Message;
-    use prost_reflect::prost_types::{
-        field_descriptor_proto::{Label, Type},
-        DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
-    };
+/// Serves a minimal `google/api` from memory plus one test file.
+struct OneApi(&'static str);
 
-    let str_field = |name: &str, num: i32| FieldDescriptorProto {
-        name: Some(name.to_string()),
-        number: Some(num),
-        label: Some(Label::Optional as i32),
-        r#type: Some(Type::String as i32),
-        ..Default::default()
-    };
-    let rule = DescriptorProto {
-        name: Some("HttpRule".to_string()),
-        field: vec![
-            str_field("get", 2),
-            str_field("put", 3),
-            str_field("post", 4),
-            str_field("delete", 5),
-            str_field("patch", 6),
-            str_field("body", 7),
-            str_field("response_body", 12),
-            FieldDescriptorProto {
-                name: Some("additional_bindings".to_string()),
-                number: Some(11),
-                label: Some(Label::Repeated as i32),
-                r#type: Some(Type::Message as i32),
-                type_name: Some(".gapi.HttpRule".to_string()),
-                ..Default::default()
-            },
-        ],
-        ..Default::default()
-    };
-    let file = FileDescriptorProto {
-        name: Some("http.proto".to_string()),
-        package: Some("gapi".to_string()),
-        message_type: vec![rule],
-        syntax: Some("proto3".to_string()),
-        ..Default::default()
-    };
-    let fds = FileDescriptorSet { file: vec![file] };
-    let pool = DescriptorPool::decode(fds.encode_to_vec().as_slice()).unwrap();
-    pool.get_message_by_name("gapi.HttpRule").unwrap()
+impl protox::file::FileResolver for OneApi {
+    fn open_file(&self, name: &str) -> Result<protox::file::File, protox::Error> {
+        let source = match name {
+            "google/api/annotations.proto" => {
+                r#"syntax = "proto3";
+package google.api;
+import "google/protobuf/descriptor.proto";
+message HttpRule {
+  oneof pattern { string get = 2; string post = 4; }
+  string body = 7;
+  string response_body = 12;
+}
+extend google.protobuf.MethodOptions { HttpRule http = 72295728; }
+"#
+            }
+            "api.proto" => self.0,
+            _ => return protox::file::GoogleFileResolver::new().open_file(name),
+        };
+        protox::file::File::from_source(name, source)
+    }
+}
+
+/// A descriptor pool compiled from one annotated `.proto` source.
+fn api_pool(source: &'static str) -> DescriptorPool {
+    protox::Compiler::with_file_resolver(OneApi(source))
+        .open_file("api.proto")
+        .unwrap()
+        .descriptor_pool()
 }
 
 #[test]
-fn collect_bindings_reads_body_response_and_additional() {
-    let desc = http_rule_descriptor();
-
-    // additional_bindings entry: POST /v1/items with whole-body mapping.
-    let mut extra = DynamicMessage::new(desc.clone());
-    extra.set_field_by_name("post", prost_reflect::Value::String("/v1/items".into()));
-    extra.set_field_by_name("body", prost_reflect::Value::String("*".into()));
-
-    // primary rule: GET /v1/items/{id}, returns only the `result` subfield.
-    let mut rule = DynamicMessage::new(desc);
-    rule.set_field_by_name("get", prost_reflect::Value::String("/v1/items/{id}".into()));
-    rule.set_field_by_name(
-        "response_body",
-        prost_reflect::Value::String("result".into()),
+fn response_body_names_proto_fields_not_json_keys() {
+    // `response_body` is a proto field path (`user_info`), while the
+    // serialized message uses JSON names (`userInfo`); multi-word fields must
+    // still resolve, at every level.
+    let pool = api_pool(
+        r#"syntax = "proto3";
+package t;
+message Inner { string display_name = 1; }
+message Resp { Inner user_info = 1; }
+"#,
     );
-    rule.set_field_by_name(
-        "additional_bindings",
-        prost_reflect::Value::List(vec![prost_reflect::Value::Message(extra)]),
+    let inner_desc = pool.get_message_by_name("t.Inner").unwrap();
+    let mut inner = DynamicMessage::new(inner_desc);
+    inner.set_field_by_name("display_name", prost_reflect::Value::String("Ann".into()));
+    let mut resp = DynamicMessage::new(pool.get_message_by_name("t.Resp").unwrap());
+    resp.set_field_by_name("user_info", prost_reflect::Value::Message(inner));
+
+    let json = |path| {
+        serde_json::from_slice::<serde_json::Value>(&json_body(&resp, Some(path)).unwrap()).unwrap()
+    };
+    assert_eq!(json("user_info"), serde_json::json!({"displayName": "Ann"}));
+    assert_eq!(json("user_info.display_name"), serde_json::json!("Ann"));
+    // A path that names no field is JSON null, as before.
+    assert_eq!(json("user_info.missing"), serde_json::Value::Null);
+    assert_eq!(json("userInfo"), serde_json::Value::Null);
+}
+
+#[test]
+fn alias_paths_are_converted_like_the_route_they_alias() {
+    // An alias keeps the route's field template, so it must go through the
+    // same template conversion: `{path=**}` is axum's `{*path}`, never a
+    // literal capture named `path=**` that leaves the field unbound.
+    let pool = api_pool(
+        r#"syntax = "proto3";
+package t;
+import "google/api/annotations.proto";
+message Req { string path = 1; }
+service S {
+  rpc Get(Req) returns (Req) { option (google.api.http) = { get: "/v1/files/{path=**}" }; }
+  rpc Watch(Req) returns (stream Req) { option (google.api.http) = { get: "/v1/logs/{path=*}" }; }
+}
+"#,
     );
-
-    let bindings = collect_bindings(&rule);
-    assert_eq!(bindings.len(), 2);
-
-    // Primary: GET, no body, response_body = result.
-    assert!(matches!(bindings[0].http_method, HttpMethod::Get));
-    assert_eq!(bindings[0].http_path, "/v1/items/{id}");
-    assert_eq!(bindings[0].body, request::BodyMapping::None);
-    assert_eq!(bindings[0].response_body.as_deref(), Some("result"));
-
-    // Additional: POST, whole-body mapping, no response_body.
-    assert!(matches!(bindings[1].http_method, HttpMethod::Post));
-    assert_eq!(bindings[1].http_path, "/v1/items");
-    assert_eq!(bindings[1].body, request::BodyMapping::Root);
-    assert_eq!(bindings[1].response_body, None);
+    let alias: AliasConfig = serde_yaml::from_str("from: /api/{path}\nto: /v1").unwrap();
+    let paths = route_paths(&pool, &[alias]);
+    for expected in [
+        "/v1/files/{*path}",
+        "/api/files/{*path}",
+        "/v1/logs/{path}",
+        "/api/logs/{path}",
+    ] {
+        assert!(
+            paths.contains(&("GET".to_owned(), expected.to_owned())),
+            "{expected} missing from {paths:?}"
+        );
+    }
 }
 
 #[test]
