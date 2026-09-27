@@ -38,8 +38,9 @@ jobs:
           # reaches for `--all-features`, docs.rs and cargo-semver-checks
           # included) can produce that combination.
           - name: rust_crypto
-            # Pure-Rust default backend (RustCrypto / rsa), with the binary.
-            flags: "--features redis,cli"
+            # Pure-Rust default backend (RustCrypto / rsa), with the binary
+            # (`cli` carries `redis`).
+            flags: "--features cli"
           - name: aws_lc_rs
             # Opt-in constant-time backend (aws-lc, C FFI); disables the default.
             flags: "--no-default-features --features aws_lc_rs,redis"
@@ -49,7 +50,7 @@ jobs:
             # so no `rsa`), which is only true as long as nothing outside the
             # `builtin_jwt` gate reaches for jsonwebtoken — this leg is what
             # keeps that honest. The binary builds without a verifier too.
-            flags: "--no-default-features --features redis,cli"
+            flags: "--no-default-features --features cli"
           - name: all_features
             # Both backends at once, the build cargo-semver-checks and docs.rs
             # take. `aws_lc_rs` wins the tie; this leg keeps that wiring honest.
@@ -93,7 +94,7 @@ jobs:
         if: matrix.backend.name == 'rust_crypto'
         run: |
           tree=$(cargo tree -e normal --target all --prefix none --format '{p}')
-          if printf '%s\n' "$tree" | grep -E '^(clap|tracing-subscriber) v'; then
+          if printf '%s\n' "$tree" | grep -E '^(clap|tracing-subscriber|redis) v'; then
             echo "::error::the default build links a CLI-only dependency"
             exit 1
           fi

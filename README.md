@@ -42,7 +42,8 @@ Works with **any** gRPC service via proto descriptor files. No code generation, 
 ## Quick Start
 
 ```bash
-# Install the binary (it sits behind the `cli` feature)
+# Install the binary: the `cli` feature builds what the release packages ship,
+# Redis-backed shared rate limits included
 cargo install structured-proxy --features cli
 
 # Run with your service config

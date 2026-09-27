@@ -149,8 +149,9 @@ aws_lc_rs = ["builtin_jwt", "jsonwebtoken/aws_lc_rs"]
 redis = ["dep:redis"]
 
 # The `structured-proxy` binary. Off by default: the library links none of its
-# dependencies unless asked. The release packages build it with `cli,redis`.
-cli = ["dep:clap", "dep:tracing-subscriber"]
+# dependencies unless asked. It carries `redis`, so `cargo install
+# structured-proxy --features cli` builds what the release packages ship.
+cli = ["dep:clap", "dep:tracing-subscriber", "redis"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
