@@ -249,7 +249,11 @@ fn build(
     query: &[(Cow<'_, str>, Cow<'_, str>)],
 ) -> Result<DynamicMessage, String> {
     // What the body and the path set matters only when a query can fill.
-    let mut presence = (!query.is_empty()).then(Presence::default);
+    let body_len = match &source {
+        Source::Json(bytes) | Source::Form(bytes) => bytes.len(),
+        Source::Absent | Source::Value(_) => 0,
+    };
+    let mut presence = (!query.is_empty()).then(|| Presence::for_body(body_len));
     // The fields of the path being bound, reused across keys.
     let mut path = Vec::new();
 

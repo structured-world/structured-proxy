@@ -37,6 +37,18 @@ struct Entry {
 }
 
 impl Presence {
+    /// Room for the keys of a body of `len` bytes, up to a bound, so a
+    /// typical body records without regrowing and a large one does not
+    /// reserve memory in proportion to its size.
+    pub(super) fn for_body(len: usize) -> Self {
+        Self {
+            names: String::with_capacity(len.min(512)),
+            // A key and its value take at least 6 bytes: `"k":0,`.
+            entries: Vec::with_capacity((len / 6).min(64)),
+            matched: Vec::new(),
+        }
+    }
+
     /// Record `key` read at nesting level `depth`.
     fn record(&mut self, depth: usize, key: &str, object: bool) {
         let start = self.names.len();
