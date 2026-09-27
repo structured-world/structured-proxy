@@ -174,3 +174,8 @@ protox = "0.9"
 name = "jwt_verify"
 harness = false
 required-features = ["builtin_jwt"]
+
+# Building a gRPC request message from path, query and body.
+[[bench]]
+name = "transcode_request"
+harness = false

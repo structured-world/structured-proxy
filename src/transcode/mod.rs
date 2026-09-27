@@ -977,37 +977,30 @@ fn decode_request(
     raw_query: Option<&str>,
     body_bytes: Bytes,
 ) -> Result<DynamicMessage, String> {
-    // A raw field keeps its `body` mapping with a null placeholder, so query
-    // binding leaves that field to the body as it does for a parsed one.
-    let (mapping, json_body) = match &entry.request_body {
-        RequestBody::Parsed(request::BodyMapping::None) => {
-            (&NO_PARSED_BODY, serde_json::Value::Null)
+    // A raw field keeps its `body` mapping with no body read, so query binding
+    // leaves that field to the raw body. An HttpBody input with `body: "*"`
+    // takes every field from the raw body, so its query binds nothing
+    // (google/api/http.proto: with `*` there are no HTTP parameters).
+    let (mapping, body, raw_query) = match &entry.request_body {
+        RequestBody::Parsed(mapping @ request::BodyMapping::None) => {
+            (mapping, request::Body::Absent, raw_query)
         }
         RequestBody::Parsed(mapping) => (
             mapping,
-            body::parse_body(body::content_type(headers), &body_bytes)
-                .map_err(|e| format!("failed to parse request body: {e}"))?,
+            request::Body::new(body::content_type(headers), &body_bytes),
+            raw_query,
         ),
-        RequestBody::RawRoot => (&NO_PARSED_BODY, serde_json::Value::Null),
-        RequestBody::RawField { mapping, .. } => (mapping, serde_json::Value::Null),
+        RequestBody::RawRoot => (&NO_PARSED_BODY, request::Body::Absent, None),
+        RequestBody::RawField { mapping, .. } => (mapping, request::Body::Absent, raw_query),
     };
 
-    // Query string → field bindings (fields not bound by path or body).
-    // A malformed query is a client error: reject it rather than silently
-    // dropping every query-bound field. An HttpBody input with `body: "*"`
-    // takes every field from the raw body, so its query binds nothing
-    // (google/api/http.proto: with `*` there are no HTTP parameters).
-    let query_pairs = match entry.request_body {
-        RequestBody::RawRoot => Vec::new(),
-        _ => request::parse_query(raw_query)?,
-    };
-
-    let input_desc = entry.method.input();
-    let request_json =
-        request::build_request_json(&input_desc, mapping, json_body, path_params, &query_pairs)?;
-
-    let mut message = DynamicMessage::deserialize(input_desc, request_json)
-        .map_err(|e| format!("failed to decode request: {e}"))?;
+    let mut message = request::build_request_message(
+        &entry.method.input(),
+        mapping,
+        body,
+        path_params,
+        raw_query,
+    )?;
     match &entry.request_body {
         RequestBody::Parsed(_) => {}
         RequestBody::RawRoot => {
