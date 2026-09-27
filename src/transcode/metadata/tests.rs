@@ -278,3 +278,42 @@ fn a_forwarded_traceparent_is_not_duplicated() {
     let meta = http_headers_to_grpc_metadata(&headers, &["traceparent".to_string()]);
     assert_eq!(values(&meta, "traceparent"), [incoming.as_bytes().to_vec()]);
 }
+
+#[test]
+fn a_forwarded_tracestate_does_not_outlive_its_trace() {
+    // The incoming traceparent is invalid, so a fresh one is synthesized; the
+    // client's tracestate annotates a trace the upstream never sees.
+    let mut headers = HeaderMap::new();
+    headers.insert("traceparent", HeaderValue::from_static("garbage"));
+    headers.insert("tracestate", HeaderValue::from_static("congo=t61rcWkgMzE"));
+    let meta = http_headers_to_grpc_metadata(&headers, &["tracestate".to_string()]);
+    assert!(meta.get("tracestate").is_none());
+}
+
+#[test]
+fn every_tracestate_line_travels_with_its_trace() {
+    // W3C Trace Context §3.3: `tracestate` may arrive split over several
+    // header lines, which together form one list; dropping any line loses
+    // vendor entries.
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "traceparent",
+        HeaderValue::from_static("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"),
+    );
+    headers.append("tracestate", HeaderValue::from_static("congo=t61rcWkgMzE"));
+    headers.append(
+        "tracestate",
+        HeaderValue::from_static("rojo=00f067aa0ba902b7"),
+    );
+    for forwarded in [vec![], vec!["tracestate".to_string()]] {
+        let meta = http_headers_to_grpc_metadata(&headers, &forwarded);
+        assert_eq!(
+            values(&meta, "tracestate"),
+            [
+                b"congo=t61rcWkgMzE".to_vec(),
+                b"rojo=00f067aa0ba902b7".to_vec()
+            ],
+            "forwarded: {forwarded:?}"
+        );
+    }
+}

@@ -19,7 +19,10 @@ use tonic::metadata::MetadataMap;
 /// checks depend on (RFC 9449 §4.3 rejects a request with more than one
 /// `DPoP`). Then always propagates W3C trace-context (forwarding an incoming
 /// `traceparent` or synthesizing one so the upstream joins a single trace
-/// across the REST↔gRPC boundary).
+/// across the REST↔gRPC boundary). That step owns `traceparent` and
+/// `tracestate` even when they are listed: the upstream gets exactly one
+/// valid `traceparent`, and every `tracestate` line only with the trace it
+/// belongs to.
 pub fn http_headers_to_grpc_metadata(
     headers: &HeaderMap,
     forwarded_headers: &[String],
@@ -59,18 +62,29 @@ fn insert_ascii(metadata: &mut MetadataMap, key: &str, value: &[u8]) {
     }
 }
 
+/// Append an ASCII metadata entry, silently skipping non-ASCII keys/values.
+fn append_ascii(metadata: &mut MetadataMap, key: &'static str, value: &[u8]) {
+    if let Ok(v) = tonic::metadata::AsciiMetadataValue::try_from(value) {
+        metadata.append(key, v);
+    }
+}
+
 /// Propagate W3C trace-context into gRPC metadata.
 ///
 /// Forwards an incoming `traceparent` (and `tracestate`) only when it is
 /// well-formed per W3C §3.2.2; otherwise (missing or malformed) synthesizes a
 /// fresh one so the upstream always receives a single valid, joinable trace.
 fn inject_trace_context(metadata: &mut MetadataMap, headers: &HeaderMap) {
+    // tracestate only travels with the trace it annotates, so a forwarded one
+    // is replaced here in both branches.
+    metadata.remove("tracestate");
     if let Some(tp) = headers.get("traceparent").and_then(|v| v.to_str().ok()) {
         if is_valid_traceparent(tp) {
             insert_ascii(metadata, "traceparent", tp.as_bytes());
-            // tracestate only travels with the trace it annotates.
-            if let Some(ts) = headers.get("tracestate") {
-                insert_ascii(metadata, "tracestate", ts.as_bytes());
+            // Every line: W3C Trace Context §3.3 lets tracestate be split
+            // over several header lines that together form one list.
+            for ts in headers.get_all("tracestate") {
+                append_ascii(metadata, "tracestate", ts.as_bytes());
             }
             return;
         }

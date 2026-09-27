@@ -449,7 +449,10 @@ grpc-gateway do, so the same service works behind any of them.
 every value in the order the client sent it, so a check that depends on how
 often a header was sent (RFC 9449 §4.3 rejects a request with two `DPoP`
 headers) sees the same request behind the proxy. A `-bin` header keeps the
-base64 value it arrived with.
+base64 value it arrived with. W3C trace-context is the exception, listed or
+not: the upstream always gets exactly one valid `traceparent` (the client's
+first, or a fresh one when it is missing or malformed), and every `tracestate`
+line only with the client's own trace.
 
 **Response metadata → response headers.** The upstream's response metadata is
 its HTTP response headers. Every ASCII entry becomes a header, in order, with
