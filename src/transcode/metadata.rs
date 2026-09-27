@@ -5,13 +5,22 @@
 //! trace-context across the boundary, and carries a client deadline through as
 //! the upstream call timeout.
 
+use std::convert::Infallible;
 use std::time::Duration;
 
 use axum::http::header::Entry;
-use axum::http::{HeaderMap, HeaderName};
+use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use tonic::metadata::MetadataMap;
 
-/// Extract HTTP headers into a gRPC `MetadataMap`.
+/// A forwarded request header whose value gRPC metadata cannot carry.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("header `{header}` has a value gRPC metadata cannot carry")]
+pub struct InvalidForwardedHeader {
+    /// The header, as the request named it.
+    pub header: HeaderName,
+}
+
+/// Extract HTTP headers into a gRPC `MetadataMap`, or refuse the request.
 ///
 /// Forwards every value of each header listed in `forwarded_headers`, in
 /// order and byte for byte, as Envoy's gRPC-JSON transcoder and grpc-gateway
@@ -23,10 +32,50 @@ use tonic::metadata::MetadataMap;
 /// `tracestate` even when they are listed: the upstream gets exactly one
 /// valid `traceparent`, and every `tracestate` line only with the trace it
 /// belongs to.
+///
+/// # Errors
+/// A forwarded value gRPC metadata cannot carry: outside visible ASCII and
+/// space for a text key, not base64 for a `-bin` key (gRPC PROTOCOL-HTTP2,
+/// "Custom-Metadata"). gRPC lets a receiver drop such a value, which would
+/// change how many values the upstream sees, so the request is refused
+/// rather than forwarded altered.
+pub fn try_http_headers_to_grpc_metadata(
+    headers: &HeaderMap,
+    forwarded_headers: &[String],
+) -> Result<MetadataMap, InvalidForwardedHeader> {
+    forward(headers, forwarded_headers, |name, value| {
+        if carries(name, value.as_bytes()) {
+            Ok(())
+        } else {
+            Err(InvalidForwardedHeader {
+                header: name.clone(),
+            })
+        }
+    })
+}
+
+/// Extract HTTP headers into a gRPC `MetadataMap`, forwarding every value as
+/// it arrived, including one gRPC metadata cannot carry.
+#[deprecated(
+    note = "forwards values gRPC metadata cannot carry, which a receiver may drop; \
+            use try_http_headers_to_grpc_metadata"
+)]
 pub fn http_headers_to_grpc_metadata(
     headers: &HeaderMap,
     forwarded_headers: &[String],
 ) -> MetadataMap {
+    match forward::<Infallible>(headers, forwarded_headers, |_, _| Ok(())) {
+        Ok(metadata) => metadata,
+        Err(never) => match never {},
+    }
+}
+
+/// The metadata for `headers`, with `check` deciding on each forwarded value.
+fn forward<E>(
+    headers: &HeaderMap,
+    forwarded_headers: &[String],
+    mut check: impl FnMut(&HeaderName, &HeaderValue) -> Result<(), E>,
+) -> Result<MetadataMap, E> {
     let mut forwarded = HeaderMap::new();
     for name in forwarded_headers {
         let mut values = headers.get_all(name.as_str()).iter();
@@ -37,23 +86,63 @@ pub fn http_headers_to_grpc_metadata(
             .expect("a name the request carries a header under is a valid header name");
         // A name listed twice is forwarded once, so its values are not doubled.
         if let Entry::Vacant(entry) = forwarded.entry(name) {
+            check(entry.key(), first)?;
             let mut entry = entry.insert_entry(first.clone());
             for value in values {
+                check(entry.key(), value)?;
                 entry.append(value.clone());
             }
         }
     }
-    // A header value is already a valid metadata value, including a `-bin`
-    // key's, which carries base64 as the gRPC HTTP/2 mapping defines it.
     let mut metadata = MetadataMap::from_headers(forwarded);
 
     inject_trace_context(&mut metadata, headers);
 
-    metadata
+    Ok(metadata)
 }
 
-/// Insert an ASCII metadata entry, silently skipping non-ASCII keys/values.
+/// Whether gRPC metadata can carry `value` under `name` (gRPC PROTOCOL-HTTP2,
+/// "Custom-Metadata"): base64 for a `-bin` key, visible ASCII and space for a
+/// text key.
+fn carries(name: &HeaderName, value: &[u8]) -> bool {
+    if name.as_str().ends_with("-bin") {
+        is_base64_value(value)
+    } else {
+        is_ascii_value(value)
+    }
+}
+
+/// `ASCII-Value → 1*( %x20-%x7E )`. An empty value is allowed: HTTP allows an
+/// empty field value, and dropping it would change the count.
+fn is_ascii_value(value: &[u8]) -> bool {
+    value.iter().all(|b| (0x20..=0x7e).contains(b))
+}
+
+/// A `-bin` value: base64 (RFC 4648 §4), padded or not, possibly several
+/// comma-separated values, which a receiver must split before decoding.
+fn is_base64_value(value: &[u8]) -> bool {
+    value.split(|&b| b == b',').all(|part| {
+        let part = part.trim_ascii();
+        let data = part.strip_suffix(b"==").or_else(|| part.strip_suffix(b"="));
+        let alphabet = |data: &[u8]| {
+            data.iter()
+                .all(|&b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+        };
+        match data {
+            // Padding closes a four-digit group.
+            Some(data) => alphabet(data) && part.len() % 4 == 0,
+            // A lone last digit cannot encode a byte (RFC 4648 §4).
+            None => alphabet(part) && part.len() % 4 != 1,
+        }
+    })
+}
+
+/// Insert an ASCII metadata entry, silently skipping a key or value gRPC
+/// metadata cannot carry.
 fn insert_ascii(metadata: &mut MetadataMap, key: &str, value: &[u8]) {
+    if !is_ascii_value(value) {
+        return;
+    }
     if let (Ok(k), Ok(v)) = (
         key.parse::<tonic::metadata::MetadataKey<tonic::metadata::Ascii>>(),
         tonic::metadata::AsciiMetadataValue::try_from(value),
@@ -62,8 +151,12 @@ fn insert_ascii(metadata: &mut MetadataMap, key: &str, value: &[u8]) {
     }
 }
 
-/// Append an ASCII metadata entry, silently skipping non-ASCII keys/values.
+/// Append an ASCII metadata entry, silently skipping a value gRPC metadata
+/// cannot carry; W3C Trace Context lets a vendor discard such a `tracestate`.
 fn append_ascii(metadata: &mut MetadataMap, key: &'static str, value: &[u8]) {
+    if !is_ascii_value(value) {
+        return;
+    }
     if let Ok(v) = tonic::metadata::AsciiMetadataValue::try_from(value) {
         metadata.append(key, v);
     }

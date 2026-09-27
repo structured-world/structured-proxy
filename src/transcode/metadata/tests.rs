@@ -1,5 +1,9 @@
 use super::*;
-use axum::http::HeaderValue;
+
+/// The metadata for `headers`, for requests every value of which is valid.
+fn http_headers_to_grpc_metadata(headers: &HeaderMap, forwarded: &[String]) -> MetadataMap {
+    try_http_headers_to_grpc_metadata(headers, forwarded).expect("every forwarded value is valid")
+}
 
 fn default_headers() -> Vec<String> {
     vec![
@@ -229,13 +233,54 @@ fn every_value_of_a_repeated_header_is_forwarded_in_order() {
 }
 
 #[test]
-fn a_value_outside_visible_ascii_still_counts() {
-    // obs-text (RFC 9110 §5.5) is a valid field value; it travels next to the
-    // plain one, so the count reaching the upstream is the count sent.
+fn a_value_grpc_metadata_cannot_carry_refuses_the_request() {
+    // obs-text (RFC 9110 §5.5) and HTAB are valid HTTP field values but not
+    // gRPC ASCII-Values, which a receiver may drop and so change the count:
+    // the request is refused instead, naming the header.
+    for bad in [&b"caf\xe9"[..], b"a\tb"] {
+        let mut headers = HeaderMap::new();
+        headers.append("dpop", HeaderValue::from_static("proof-a"));
+        headers.append("dpop", HeaderValue::from_bytes(bad).unwrap());
+        let err = try_http_headers_to_grpc_metadata(&headers, &default_headers()).unwrap_err();
+        assert_eq!(err.header, "dpop");
+        assert!(err.to_string().contains("dpop"), "{err}");
+    }
+}
+
+#[test]
+fn space_and_empty_values_are_forwarded() {
+    // ASCII-Value allows space; an empty HTTP value is kept so the count holds.
+    let mut headers = HeaderMap::new();
+    headers.append("dpop", HeaderValue::from_static("a b"));
+    headers.append("dpop", HeaderValue::from_static(""));
+    let meta = http_headers_to_grpc_metadata(&headers, &default_headers());
+    assert_eq!(values(&meta, "dpop"), [b"a b".to_vec(), b"".to_vec()]);
+}
+
+#[test]
+fn a_binary_value_must_be_base64() {
+    // gRPC PROTOCOL-HTTP2: `-bin` values are base64 (RFC 4648 §4), padded or
+    // not, possibly several joined by commas.
+    for good in ["", "AAEC", "AA", "AA==", "AAE", "AAE=", "AAEC, AA=="] {
+        assert!(is_base64_value(good.as_bytes()), "{good:?}");
+    }
+    for bad in ["A", "A===", "=", "AA=A", "AA*C", "AAEC,A", "caf\u{e9}"] {
+        assert!(!is_base64_value(bad.as_bytes()), "{bad:?}");
+    }
+    let mut headers = HeaderMap::new();
+    headers.insert("x-trace-bin", HeaderValue::from_static("not base64!"));
+    let err =
+        try_http_headers_to_grpc_metadata(&headers, &["x-trace-bin".to_string()]).unwrap_err();
+    assert_eq!(err.header, "x-trace-bin");
+}
+
+#[test]
+#[expect(deprecated, reason = "the forwarding-as-is API stays available")]
+fn the_unchecked_conversion_still_forwards_every_value() {
     let mut headers = HeaderMap::new();
     headers.append("dpop", HeaderValue::from_static("proof-a"));
     headers.append("dpop", HeaderValue::from_bytes(b"caf\xe9").unwrap());
-    let meta = http_headers_to_grpc_metadata(&headers, &default_headers());
+    let meta = super::http_headers_to_grpc_metadata(&headers, &default_headers());
     assert_eq!(
         values(&meta, "dpop"),
         [b"proof-a".to_vec(), b"caf\xe9".to_vec()]

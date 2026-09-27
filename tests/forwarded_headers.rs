@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use axum::body::Body;
-use http::StatusCode;
+use http::{HeaderValue, StatusCode};
 use prost_reflect::{DescriptorPool, DynamicMessage, Value as PbValue};
 use structured_proxy::transcode::codec::DynamicCodec;
 use structured_proxy::transcode::error::ErrorDetailsPolicy;
@@ -50,11 +50,11 @@ impl tonic::server::UnaryService<DynamicMessage> for Seen {
     type Future = Ready<Result<tonic::Response<DynamicMessage>, tonic::Status>>;
 
     fn call(&mut self, request: tonic::Request<DynamicMessage>) -> Self::Future {
-        let seen: Vec<&str> = request
+        let seen: Vec<String> = request
             .metadata()
             .get_all("dpop")
             .iter()
-            .map(|v| v.to_str().unwrap())
+            .map(|v| String::from_utf8_lossy(v.as_encoded_bytes()).into_owned())
             .collect();
         let mut reply =
             DynamicMessage::new(self.pool.get_message_by_name("test.v1.Reply").unwrap());
@@ -110,6 +110,24 @@ async fn every_value_of_a_repeated_header_reaches_the_upstream_in_order() {
         serde_json::from_str::<serde_json::Value>(&body).unwrap()["name"],
         "proof-a|proof-b"
     );
+}
+
+#[tokio::test]
+async fn a_value_grpc_metadata_cannot_carry_is_refused() {
+    // gRPC lets a receiver drop an ASCII metadata value outside %x20-%x7E, which
+    // would change how many DPoP headers the upstream counts; the request is
+    // refused instead of reaching it altered.
+    let app = proxy().await;
+    let request = http::Request::get("/v1/seen")
+        .header("dpop", "proof-a")
+        .header("dpop", HeaderValue::from_bytes(b"caf\xe9").unwrap())
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["error"], "INVALID_ARGUMENT");
+    assert!(body["message"].as_str().unwrap().contains("dpop"), "{body}");
 }
 
 #[tokio::test]

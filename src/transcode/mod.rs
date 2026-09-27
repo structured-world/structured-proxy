@@ -577,11 +577,13 @@ async fn prepare<S: TranscodeState>(
     ),
     Rejection,
 > {
+    let request_metadata =
+        metadata::try_http_headers_to_grpc_metadata(headers, proxy_state.forwarded_headers())
+            .map_err(|e| Rejection::Unmappable(e.to_string()))?;
     let message = decode_request(entry, headers, path_params, raw_query, body)
         .map_err(Rejection::Unmappable)?;
     let mut request = tonic::Request::new(message);
-    *request.metadata_mut() =
-        metadata::http_headers_to_grpc_metadata(headers, proxy_state.forwarded_headers());
+    *request.metadata_mut() = request_metadata;
     metadata::apply_request_deadline(&mut request, headers);
 
     let mut client = Grpc::new(proxy_state.grpc_channel());
