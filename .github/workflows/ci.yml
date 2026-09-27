@@ -78,34 +78,50 @@ jobs:
       # The default and injected-verifier builds are pure Rust: no C crypto
       # (ring, aws-lc) on any target. The aws_lc_rs and all-features legs link
       # aws-lc by choice.
+      # The library and the CLI package carry the same feature names (the CLI
+      # forwards its own to the library), so each leg's flags select the same
+      # backend in both when applied to the whole workspace.
       - name: No C crypto
         if: matrix.backend.name == 'rust_crypto' || matrix.backend.name == 'injected_verifier'
         run: |
-          tree=$(cargo tree -e normal --target all --prefix none --format '{p}' ${{ matrix.backend.flags }})
+          tree=$(cargo tree --workspace -e normal --target all --prefix none --format '{p}' ${{ matrix.backend.flags }})
           if printf '%s\n' "$tree" | grep -E '^(ring|aws-lc-rs|aws-lc-sys) v'; then
             echo "::error::C crypto is linked into the ${{ matrix.backend.name }} build"
             exit 1
           fi
 
+      # A crate that depends on the library must not compile the binary's
+      # dependencies; they belong to the structured-proxy-cli package.
+      - name: No CLI dependencies in the library
+        if: matrix.backend.name == 'all_features'
+        run: |
+          tree=$(cargo tree -p structured-proxy -e normal --target all --prefix none --format '{p}' --all-features)
+          if printf '%s\n' "$tree" | grep -E '^(clap|tracing-subscriber) v'; then
+            echo "::error::the library links a CLI-only dependency"
+            exit 1
+          fi
+
       - name: Clippy
-        run: cargo clippy --all-targets ${{ matrix.backend.flags }}
+        run: cargo clippy --workspace --all-targets ${{ matrix.backend.flags }}
 
       - name: Build
-        run: cargo build --release ${{ matrix.backend.flags }}
+        run: cargo build --release --workspace ${{ matrix.backend.flags }}
 
       - name: Test
         env:
           # Exercises the rate-limit reconciliation against the Redis service.
           SHIELD_REDIS_TEST_URL: redis://127.0.0.1:6379/
-        run: cargo nextest run ${{ matrix.backend.flags }}
+        run: cargo nextest run --workspace ${{ matrix.backend.flags }}
 
       # nextest does not run doctests; cargo does.
       - name: Doc tests
-        run: cargo test --doc ${{ matrix.backend.flags }}
+        run: cargo test --doc --workspace ${{ matrix.backend.flags }}
 
+      # Packages and verifies both: the CLI against the library as packaged
+      # here, not the version on crates.io.
       - name: Publish dry-run
         if: matrix.backend.name == 'rust_crypto'
-        run: cargo publish --dry-run
+        run: cargo publish --dry-run --workspace
 
   security-audit:
     name: Security Audit

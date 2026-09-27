@@ -1,0 +1,43 @@
+[package]
+name = "structured-proxy-cli"
+description = "The structured-proxy binary: a config-driven gRPC→REST transcoding proxy"
+version.workspace = true
+edition = "2021"
+authors = ["Dmitry Prudnikov <mail@polaz.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/structured-world/structured-proxy"
+homepage = "https://github.com/structured-world/structured-proxy"
+readme = "../README.md"
+keywords = ["grpc", "rest", "proxy", "transcoding", "protobuf"]
+categories = ["network-programming", "web-programming::http-server", "command-line-utilities"]
+
+# Installed and packaged under the name it has always had, so deb/rpm
+# packages, the systemd unit and existing configs stay the same.
+[[bin]]
+name = "structured-proxy"
+path = "src/main.rs"
+# Its crate name is the library's (`structured_proxy`), so its rustdoc would
+# overwrite the library's in a workspace `cargo doc`; a binary has no API to
+# document.
+doc = false
+
+[dependencies]
+# The library, without its default features: this package's own features pick
+# the backends, so `--no-default-features` here reaches the library too.
+structured-proxy = { path = "..", version = "4.3.0", default-features = false }
+
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+anyhow = "1"
+
+[features]
+# The binary the release packages ship: pure-Rust JWT crypto and the shared
+# Redis rate-limit store, so `cargo install structured-proxy-cli` gives the
+# same build.
+default = ["rust_crypto", "redis"]
+# The library's features of the same names (see its Cargo.toml).
+rust_crypto = ["structured-proxy/rust_crypto"]
+aws_lc_rs = ["structured-proxy/aws_lc_rs"]
+redis = ["structured-proxy/redis"]
