@@ -263,6 +263,7 @@ syntax = "proto3";
 package t;
 import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
 
 enum Size {
   SIZE_UNSPECIFIED = 0;
@@ -296,6 +297,7 @@ message Req {
     string right = 17;
   }
   uint64 big = 18;
+  google.protobuf.StringValue note = 19;
 }
 "#;
 
@@ -311,11 +313,16 @@ impl protox::file::FileResolver for TypesProto {
 }
 
 fn req() -> MessageDescriptor {
+    message_type("t.Req")
+}
+
+/// A message type of the test pool, the well-known types included.
+fn message_type(name: &str) -> MessageDescriptor {
     protox::Compiler::with_file_resolver(TypesProto)
         .open_file("types.proto")
         .unwrap()
         .descriptor_pool()
-        .get_message_by_name("t.Req")
+        .get_message_by_name(name)
         .unwrap()
 }
 
@@ -713,6 +720,103 @@ fn two_members_of_a_oneof_are_an_error() {
     )
     .unwrap();
     assert_eq!(json(&message)["left"], "p");
+}
+
+#[test]
+fn a_body_that_is_a_well_known_type_beats_the_query() {
+    // A well-known input type reads its body as a whole (a string, not a map
+    // of fields), so the body sets the whole message and the query nothing.
+    let note = build_request_message(
+        &message_type("google.protobuf.StringValue"),
+        &BodyMapping::Root,
+        Body::Json(br#""from the body""#),
+        &HashMap::new(),
+        Some("value=query"),
+    )
+    .unwrap();
+    assert_eq!(json(&note), serde_json::json!("from the body"));
+    let at = build_request_message(
+        &message_type("google.protobuf.Timestamp"),
+        &BodyMapping::Root,
+        Body::Json(br#""2026-01-02T03:04:05Z""#),
+        &HashMap::new(),
+        Some("seconds=0&nanos=5"),
+    )
+    .unwrap();
+    assert_eq!(json(&at), serde_json::json!("2026-01-02T03:04:05Z"));
+}
+
+#[test]
+fn only_protojson_float_spellings_are_accepted() {
+    // ProtoJSON: a finite number, or exactly `NaN`, `Infinity`, `-Infinity`.
+    // Rust's parser also reads `inf`, `nan` and `infinity`, and an overflowing
+    // decimal as infinity; those are not the client's values.
+    for field in ["score", "ratio"] {
+        for raw in [
+            "inf", "-inf", "nan", "infinity", "INFINITY", "1e400", "-1e400",
+        ] {
+            let query = format!("{field}={raw}");
+            let err = build_req(BodyMapping::None, Body::Absent, &[], &query).unwrap_err();
+            assert!(err.contains(&format!("`{field}`")), "{query}: {err}");
+        }
+        for raw in ["Infinity", "-Infinity", "NaN", "1.5", "-0", "1e3"] {
+            let query = format!("{field}={raw}");
+            assert!(
+                build_req(BodyMapping::None, Body::Absent, &[], &query).is_ok(),
+                "{query}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_path_bound_field_is_taken_from_the_path_whatever_the_body_holds() {
+    // The path wins over the body, so a body value of the wrong type for a
+    // field the path binds does not decide the request.
+    let message = build_req(
+        BodyMapping::Root,
+        Body::Json(br#"{"displayName": 123, "address": {"city": 5, "zip": "z"}, "age": 2}"#),
+        &[("display_name", "path"), ("address.city", "rome")],
+        "age=9",
+    )
+    .unwrap();
+    assert_eq!(
+        json(&message),
+        serde_json::json!({
+            "displayName": "path", "age": 2,
+            "address": {"city": "rome", "zip": "z"}
+        })
+    );
+    // Without a query too, and with the proto name as the body key.
+    let message = build_req(
+        BodyMapping::Root,
+        Body::Json(br#"{"display_name": [1]}"#),
+        &[("display_name", "path")],
+        "",
+    )
+    .unwrap();
+    assert_eq!(json(&message), serde_json::json!({"displayName": "path"}));
+    // A body field bound to one field: a path key below it is taken the same way.
+    let message = build_req(
+        BodyMapping::Field("address".into()),
+        Body::Json(br#"{"city": false, "zip": "z"}"#),
+        &[("address.city", "rome")],
+        "",
+    )
+    .unwrap();
+    assert_eq!(
+        json(&message),
+        serde_json::json!({"address": {"city": "rome", "zip": "z"}})
+    );
+    // A wrong value in a field the path does not bind is still an error.
+    let err = build_req(
+        BodyMapping::Root,
+        Body::Json(br#"{"displayName": 123, "age": "old"}"#),
+        &[("display_name", "path")],
+        "",
+    )
+    .unwrap_err();
+    assert!(err.starts_with("failed to decode request body"), "{err}");
 }
 
 #[test]

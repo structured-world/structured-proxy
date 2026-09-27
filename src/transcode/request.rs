@@ -19,7 +19,7 @@ use serde::de::value::StrDeserializer;
 use serde::Deserializer;
 use serde_json::Value as JsonValue;
 
-use presence::{OneEntry, Presence, Recording};
+use presence::{has_special_json, OneEntry, Presence, Recording};
 
 /// How the HTTP request body maps onto the gRPC request message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,11 +279,16 @@ fn build(
         (BodyMapping::Root, Source::Absent) => DynamicMessage::new(input.clone()),
         // An empty body is `{}`, whatever its media type.
         (_, Source::Json(bytes) | Source::Form(bytes)) if bytes.is_empty() => {
-            json_body(input, mapping, b"{}", presence.as_mut())?
+            json_body(input, mapping, b"{}", path_params, presence.as_mut())?
         }
-        (_, Source::Json(bytes)) => json_body(input, mapping, bytes, presence.as_mut())?,
-        (_, Source::Value(value)) => deserialize(input, mapping, value, presence.as_mut())
-            .map_err(|e| format!("failed to decode request body: {e}"))?,
+        (_, Source::Json(bytes)) => {
+            json_body(input, mapping, bytes, path_params, presence.as_mut())?
+        }
+        (_, Source::Value(mut value)) => {
+            strip_path_fields(&mut value, input, mapping, path_params);
+            deserialize(input, mapping, value, presence.as_mut())
+                .map_err(|e| format!("failed to decode request body: {e}"))?
+        }
         (_, Source::Form(bytes)) => {
             let pairs: Vec<(Cow<'_, str>, Cow<'_, str>)> =
                 url::form_urlencoded::parse(bytes).collect();
@@ -337,21 +342,106 @@ struct Target<'a> {
 }
 
 /// Deserialize a JSON body in one pass.
+///
+/// The path wins over the body, so a body value for a field the path binds
+/// never decides the request, even when it is not a valid value of that field.
+/// Such a body fails the one pass; it is then read again without those keys.
+/// Only a failing body pays for the second read.
 fn json_body(
     input: &MessageDescriptor,
     mapping: &BodyMapping,
     bytes: &[u8],
-    presence: Option<&mut Presence>,
+    path_params: &HashMap<String, String>,
+    mut presence: Option<&mut Presence>,
 ) -> Result<DynamicMessage, String> {
     // A `null` body sets nothing, like `{}`.
     if matches!(mapping, BodyMapping::Root) && trim_json_whitespace(bytes) == b"null" {
         return Ok(DynamicMessage::new(input.clone()));
     }
     let mut de = serde_json::Deserializer::from_slice(bytes);
-    let message = deserialize(input, mapping, &mut de, presence)
-        .and_then(|message| de.end().map(|()| message))
-        .map_err(|e| format!("failed to decode request body: {e}"))?;
-    Ok(message)
+    let first = deserialize(input, mapping, &mut de, presence.as_deref_mut())
+        .and_then(|message| de.end().map(|()| message));
+    let error = match first {
+        Ok(message) => return Ok(message),
+        Err(error) => error,
+    };
+    let fail = |e: serde_json::Error| format!("failed to decode request body: {e}");
+    if path_params.is_empty() {
+        return Err(fail(error));
+    }
+    // Not JSON at all: the path cannot change that.
+    let Ok(mut value) = serde_json::from_slice::<JsonValue>(bytes) else {
+        return Err(fail(error));
+    };
+    strip_path_fields(&mut value, input, mapping, path_params);
+    if let Some(presence) = presence.as_deref_mut() {
+        presence.clear();
+    }
+    deserialize(input, mapping, value, presence).map_err(fail)
+}
+
+/// Remove from `body` every key the path binds, under its JSON or proto name:
+/// the path sets those fields whatever the body holds.
+fn strip_path_fields(
+    body: &mut JsonValue,
+    input: &MessageDescriptor,
+    mapping: &BodyMapping,
+    path_params: &HashMap<String, String>,
+) {
+    for key in path_params.keys() {
+        let mut segments = key.split('.');
+        let desc = match mapping {
+            BodyMapping::Root => input.clone(),
+            // Under `body: "field"` the body is that field's value, so only
+            // the path keys below the field reach into it.
+            BodyMapping::Field(name) => {
+                if segments.next() != Some(name.as_str()) {
+                    continue;
+                }
+                match input.get_field_by_name(name).map(|f| f.kind()) {
+                    Some(Kind::Message(inner)) => inner,
+                    _ => continue,
+                }
+            }
+            BodyMapping::None => return,
+        };
+        remove_path(body, desc, segments);
+    }
+}
+
+/// Remove the field at `segments` below `desc` from the JSON object `value`.
+fn remove_path<'k>(
+    mut value: &mut JsonValue,
+    mut desc: MessageDescriptor,
+    segments: impl Iterator<Item = &'k str>,
+) {
+    let mut segments = segments.peekable();
+    while let Some(segment) = segments.next() {
+        let Some(field) = desc.get_field_by_name(segment) else {
+            return;
+        };
+        let Some(object) = value.as_object_mut() else {
+            return;
+        };
+        if segments.peek().is_none() {
+            object.remove(field.json_name());
+            object.remove(field.name());
+            return;
+        }
+        let Kind::Message(inner) = field.kind() else {
+            return;
+        };
+        let key = if object.contains_key(field.json_name()) {
+            field.json_name()
+        } else {
+            field.name()
+        };
+        let Some(next) = object.get_mut(key) else {
+            return;
+        };
+        value = next;
+        desc = inner;
+    }
 }
 
 fn trim_json_whitespace(bytes: &[u8]) -> &[u8] {
@@ -389,10 +479,11 @@ fn deserialize_input<'de, D: Deserializer<'de>>(
     let Some(presence) = presence else {
         return DynamicMessage::deserialize(input.clone(), de);
     };
-    match Recording::root(de, presence, input) {
-        Ok(recording) => DynamicMessage::deserialize(input.clone(), recording),
-        Err(de) => DynamicMessage::deserialize(input.clone(), de),
+    if has_special_json(input) {
+        presence.record_whole();
+        return DynamicMessage::deserialize(input.clone(), de);
     }
+    DynamicMessage::deserialize(input.clone(), Recording::root(de, presence))
 }
 
 /// Bind a form body field by field, into the input message or the message
@@ -612,30 +703,31 @@ fn special_float(raw: &str) -> Option<f64> {
     }
 }
 
+/// A ProtoJSON double: one of the special names, or a decimal with a finite
+/// value. Rust's parser also reads `inf`, `nan` and `infinity` in any case,
+/// and an overflowing decimal as infinity; ProtoJSON has none of those
+/// (protobuf JSON mapping, "float, double").
 fn parse_f64(raw: &str) -> Result<f64, String> {
-    raw.parse::<f64>()
-        .or_else(|e| special_float(raw).ok_or(e))
-        .map_err(|e| e.to_string())
+    if let Some(special) = special_float(raw) {
+        return Ok(special);
+    }
+    match raw.parse::<f64>() {
+        Ok(value) if value.is_finite() => Ok(value),
+        Ok(_) => Err("value out of range, or not a decimal number".to_string()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
-/// A decimal with a finite `f64` value must lie within the `f32` range, as it
-/// must in a JSON number; anything else is read as an `f32` literal or a
-/// special name.
+/// A ProtoJSON float: a special name, or a finite decimal within the `f32`
+/// range.
 fn parse_f32(raw: &str) -> Result<f32, String> {
-    match raw.parse::<f64>() {
-        Ok(wide) if wide.is_finite() => {
-            if wide < f64::from(f32::MIN) || wide > f64::from(f32::MAX) {
-                Err("float value out of range".to_string())
-            } else {
-                // In range, so the cast rounds instead of saturating.
-                Ok(wide as f32)
-            }
-        }
-        _ => raw
-            .parse::<f32>()
-            .or_else(|e| special_float(raw).map(|v| v as f32).ok_or(e))
-            .map_err(|e| e.to_string()),
+    let wide = parse_f64(raw)?;
+    if wide.is_finite() && (wide < f64::from(f32::MIN) || wide > f64::from(f32::MAX)) {
+        return Err("float value out of range".to_string());
     }
+    // A special value casts to itself; a finite one is in range, so the cast
+    // rounds instead of saturating.
+    Ok(wide as f32)
 }
 
 /// Base64 as ProtoJSON reads it: the standard or the URL-safe alphabet,

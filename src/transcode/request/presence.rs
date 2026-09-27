@@ -22,6 +22,9 @@ pub(super) struct Presence {
     entries: Vec<Entry>,
     /// Whether each nesting level matched the path being checked.
     matched: Vec<bool>,
+    /// The body set the whole message at once (a well-known type read from
+    /// its JSON form), so no query parameter can fill any of it.
+    whole: bool,
 }
 
 #[derive(Debug)]
@@ -46,7 +49,20 @@ impl Presence {
             // A key and its value take at least 6 bytes: `"k":0,`.
             entries: Vec::with_capacity((len / 6).min(64)),
             matched: Vec::new(),
+            whole: false,
         }
+    }
+
+    /// Forget what a body pass recorded, keeping the buffers.
+    pub(super) fn clear(&mut self) {
+        self.names.clear();
+        self.entries.clear();
+        self.whole = false;
+    }
+
+    /// The body set the whole message.
+    pub(super) fn record_whole(&mut self) {
+        self.whole = true;
     }
 
     /// Record `key` read at nesting level `depth`.
@@ -79,6 +95,9 @@ impl Presence {
     /// Whether a query parameter for `path` must leave it alone: the path was
     /// set, or a field above it was set to something other than an object.
     pub(super) fn blocks(&mut self, path: &[FieldDescriptor]) -> bool {
+        if self.whole {
+            return true;
+        }
         // Entries come parent first, so each one matches when its parent did
         // and its own key names the field at its depth.
         self.matched.clear();
@@ -104,7 +123,7 @@ impl Presence {
 
 /// Whether prost-reflect reads `message` through its own JSON form rather than
 /// as a map of fields (its list of well-known types).
-fn has_special_json(message: &MessageDescriptor) -> bool {
+pub(super) fn has_special_json(message: &MessageDescriptor) -> bool {
     matches!(
         message.full_name(),
         "google.protobuf.Any"
@@ -138,21 +157,14 @@ pub(super) struct Recording<'p, D> {
 }
 
 impl<'p, D> Recording<'p, D> {
-    /// Record the keys of the `input` message `inner` holds, or `None` when
-    /// `input` is not read as a map of fields.
-    pub(super) fn root(
-        inner: D,
-        presence: &'p mut Presence,
-        input: &MessageDescriptor,
-    ) -> Result<Self, D> {
-        if has_special_json(input) {
-            return Err(inner);
-        }
-        Ok(Self {
+    /// Record the keys of the input message `inner` holds, which prost-reflect
+    /// reads as a map of fields (see [`has_special_json`]).
+    pub(super) fn root(inner: D, presence: &'p mut Presence) -> Self {
+        Self {
             inner,
             presence,
             depth: 0,
-        })
+        }
     }
 }
 
