@@ -478,10 +478,27 @@ fn known_top_level_keys_cover_every_proxy_config_field() {
         "streaming",
         "error_details",
         "response_headers",
+        "runtime",
     ] {
         assert!(KNOWN_TOP_LEVEL_KEYS.contains(&key), "{key}");
     }
-    assert_eq!(KNOWN_TOP_LEVEL_KEYS.len(), 19);
+    assert_eq!(KNOWN_TOP_LEVEL_KEYS.len(), 20);
+}
+
+#[test]
+fn runtime_key_is_known() {
+    // `runtime:` is the standalone binary's section: the library does not
+    // read it, but a file written for the binary must load through the
+    // library without a warning, while a misspelling of it is reported.
+    let yaml = r#"
+upstream:
+  default: "grpc://x:1"
+runtime:
+  worker_threads: 2
+runtimes:
+  worker_threads: 2
+"#;
+    assert_eq!(unknown_config_keys(yaml), vec!["runtimes".to_string()]);
 }
 
 #[test]

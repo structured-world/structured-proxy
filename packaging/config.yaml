@@ -38,6 +38,12 @@ descriptors: []
 service:
   name: "structured-proxy"
 
+# Worker threads of the async runtime, i.e. how many CPU cores the proxy keeps
+# busy. Unset: TOKIO_WORKER_THREADS, else the available parallelism (the cgroup
+# CPU quota on Linux). Must be at least 1.
+# runtime:
+#   worker_threads: 2
+
 # CORS: empty list = permissive (dev). List exact origins for production.
 cors:
   origins: []

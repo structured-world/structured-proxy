@@ -126,3 +126,104 @@ fn a_valid_config_starts_the_proxy() {
     std::fs::remove_file(&path).unwrap();
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
 }
+
+/// A config file for this test process holding `yaml`, removed on drop.
+struct ConfigFile(std::path::PathBuf);
+
+impl ConfigFile {
+    fn new(name: &str, yaml: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "structured-proxy-cli-test-{name}-{}.yaml",
+            std::process::id()
+        ));
+        std::fs::write(&path, yaml).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for ConfigFile {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_file(&self.0) {
+            eprintln!("could not remove {}: {e}", self.0.display());
+        }
+    }
+}
+
+#[test]
+fn configured_worker_threads_run_the_proxy_and_are_logged() {
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let config = ConfigFile::new(
+        "workers",
+        &format!(
+            "listen:\n  http: \"127.0.0.1:{port}\"\n\
+             upstream:\n  default: \"http://127.0.0.1:9\"\n\
+             descriptors: []\n\
+             runtime:\n  worker_threads: 2\n"
+        ),
+    );
+    let mut child = Command::new(BIN)
+        .arg("--config")
+        .arg(&config.0)
+        .env("RUST_LOG", "info")
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let _proxy = Running(child);
+
+    // Read the log on its own thread, so a proxy that never logs fails the
+    // test at the deadline instead of blocking it.
+    let (lines, logged) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if lines.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let start = loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let line = logged
+            .recv_timeout(left)
+            .expect("the proxy never logged its start");
+        if line.contains("Starting structured-proxy") {
+            break line;
+        }
+    };
+    assert!(start.contains("worker_threads=2"), "{start}");
+    assert!(
+        start.contains("worker_threads_from=runtime.worker_threads"),
+        "{start}"
+    );
+}
+
+#[test]
+fn a_bad_runtime_section_fails_at_startup_and_names_the_key() {
+    for (name, runtime, key) in [
+        ("zero", "worker_threads: 0", "runtime.worker_threads"),
+        ("text", "worker_threads: two", "runtime.worker_threads"),
+        ("unknown", "worker_thread: 2", "worker_thread"),
+    ] {
+        let config = ConfigFile::new(
+            name,
+            &format!("upstream:\n  default: \"http://127.0.0.1:9\"\nruntime:\n  {runtime}\n"),
+        );
+        let out = Command::new(BIN)
+            .arg("--config")
+            .arg(&config.0)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{name}");
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(stderr.contains(key), "{name}: {stderr}");
+    }
+}

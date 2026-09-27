@@ -49,6 +49,11 @@ cargo install structured-proxy-cli
 structured-proxy --config my-service.yaml
 ```
 
+The binary runs the proxy on a multi-thread async runtime. `runtime.worker_threads`
+in the config file sets how many worker threads, and so CPU cores, it keeps busy;
+unset, `TOKIO_WORKER_THREADS` or the available parallelism decides. The startup
+log line (`RUST_LOG=info`) states the count and where it came from.
+
 ## Configuration
 
 ```yaml
@@ -92,6 +97,14 @@ health:
 metrics:
   enabled: true
   path: "/metrics"
+
+# Optional: the async runtime of the standalone binary (the library runs on its
+# embedder's runtime and ignores this section).
+runtime:
+  # Worker threads, i.e. how many CPU cores the proxy keeps busy. Unset:
+  # TOKIO_WORKER_THREADS, else the available parallelism (the cgroup CPU quota
+  # on Linux). Must be at least 1.
+  worker_threads: 2
 
 # Optional: maintenance mode (returns 503 except for exempt paths)
 maintenance:

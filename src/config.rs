@@ -202,8 +202,9 @@ struct StreamingFileConfig {
     ndjson_envelope: bool,
 }
 
-/// Every top-level key a config file may use: the [`ProxyConfig`] fields plus
-/// the transcoding settings kept outside it.
+/// Every top-level key a config file may use: the [`ProxyConfig`] fields, the
+/// transcoding settings kept outside it, and `runtime`, which the standalone
+/// binary reads to build its async runtime (an embedder brings its own).
 pub(crate) const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "upstream",
     "descriptors",
@@ -224,6 +225,7 @@ pub(crate) const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "streaming",
     "error_details",
     "response_headers",
+    "runtime",
 ];
 
 /// Every `streaming:` key: the [`StreamingConfig`] fields plus the ones
