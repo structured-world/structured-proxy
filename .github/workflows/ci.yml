@@ -46,10 +46,11 @@ jobs:
             flags: "--no-default-features --features aws_lc_rs,redis"
           - name: injected_verifier
             # No built-in verifier at all: the build a consumer takes when it
-            # injects its own `hooks::TokenVerifier`. Links no JWT crypto (and
-            # so no `rsa`), which is only true as long as nothing outside the
-            # `builtin_jwt` gate reaches for jsonwebtoken — this leg is what
-            # keeps that honest. The binary builds without a verifier too.
+            # injects its own `hooks::TokenVerifier`. Links no JWT or TLS
+            # crypto (and so no `rsa`), which is only true as long as nothing
+            # outside the backend features reaches for jsonwebtoken or a
+            # rustls provider — this leg is what keeps that honest. The binary
+            # builds without a verifier too.
             flags: "--no-default-features --features cli"
           - name: all_features
             # Both backends at once, the build cargo-semver-checks and docs.rs
@@ -85,6 +86,18 @@ jobs:
           tree=$(cargo tree -e normal --target all --prefix none --format '{p}' ${{ matrix.backend.flags }})
           if printf '%s\n' "$tree" | grep -E '^(ring|aws-lc-rs|aws-lc-sys) v'; then
             echo "::error::C crypto is linked into the ${{ matrix.backend.name }} build"
+            exit 1
+          fi
+
+      # A build without a crypto backend (`default-features = false`, what a
+      # transcoding-only consumer takes) must pass an advisory scan without
+      # the ignores in deny.toml: none of the crates they cover is linked.
+      - name: No ignored advisories without a crypto backend
+        if: matrix.backend.name == 'injected_verifier'
+        run: |
+          tree=$(cargo tree -e normal --target all --prefix none --format '{p}' ${{ matrix.backend.flags }})
+          if printf '%s\n' "$tree" | grep -E '^(rsa|rustls-rustcrypto|paste) v|^rustls-webpki v0\.102\.'; then
+            echo "::error::the build without a crypto backend links a crate with an ignored advisory"
             exit 1
           fi
 

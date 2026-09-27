@@ -31,6 +31,16 @@
 //!   injection is how a consumer that needs a different one gets it without
 //!   deciding for everyone else who links this crate. Such a build takes
 //!   `default-features = false` and links no JWT crypto at all.
+//!
+//! ## Outbound TLS
+//!
+//! JWKS fetches and the rate-limit service go over rustls. The crypto provider
+//! is the one the process installed with
+//! `rustls::crypto::CryptoProvider::install_default`, else the one the crypto
+//! backend feature brings (aws-lc for `aws_lc_rs`, RustCrypto for
+//! `rust_crypto`). A build with neither feature links no TLS crypto, and a
+//! config that needs an outbound client then fails at startup unless a
+//! provider is installed first.
 
 // `builtin_jwt` is implied by each backend and never meant to stand alone: on
 // its own it would link jsonwebtoken with no provider, which panics at runtime.

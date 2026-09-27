@@ -791,27 +791,38 @@ async-trait = "0.1"
 serde_json = "1"
 ```
 
-which links no JWT crypto, and supplies the backend from its own binary. With no
+which links no JWT or TLS crypto (see [Outbound TLS](#outbound-tls)), and
+supplies the backend from its own binary. With no
 verifier injected and no backend feature, an `auth.mode: "jwt"` config is
 rejected at startup with that instruction, rather than silently accepting
 tokens.
 
 ## Outbound TLS
 
-The proxy's own HTTPS calls (JWKS fetches, the rate-limit service) use rustls
-with the pure-Rust RustCrypto provider (`rustls-rustcrypto`) and Mozilla's root
-store bundled from `webpki-roots`, so no system CA bundle is needed. Neither
-`ring` nor aws-lc is linked: the default build and the
-`default-features = false` build contain no C crypto, which CI checks. Only the
-opt-in `aws_lc_rs` JWT backend brings aws-lc in.
+The proxy's own HTTP calls (JWKS fetches, the rate-limit service) use rustls
+with Mozilla's root store bundled from `webpki-roots`, so no system CA bundle is
+needed. The rustls crypto provider is, in order:
 
-The provider verifies RSA server signatures with `rsa`, so every build links
-that crate, under the same RUSTSEC-2023-0071 note as the `rust_crypto` backend:
-only public-key verification runs. The current provider release still names
-`rustls-webpki` 0.102, whose CRL and name-constraint advisories are listed in
-`deny.toml` with why they do not apply: the provider reads only algorithm
-identifiers from it, and rustls verifies certificates with its own patched
-`rustls-webpki`.
+1. the one your process installed with
+   `rustls::crypto::CryptoProvider::install_default`, if any: an explicit
+   choice wins;
+2. aws-lc, with the `aws_lc_rs` feature;
+3. the pure-Rust RustCrypto provider (`rustls-rustcrypto`), with `rust_crypto`.
+
+Neither `ring` nor aws-lc is linked unless you ask: the default build contains
+no C crypto, which CI checks. A `default-features = false` build links no TLS
+crypto provider at all, so a crate that only transcodes pulls in neither `rsa`
+nor `rustls-rustcrypto`. If such a build configures a JWKS endpoint or the
+rate-limit service, install a provider before building the proxy (the client
+needs one even for an `http://` endpoint); otherwise startup fails with an error
+that says so.
+
+The RustCrypto provider verifies RSA server signatures with `rsa`, under the same
+RUSTSEC-2023-0071 note as the `rust_crypto` JWT backend: only public-key
+verification runs. Its current release still names `rustls-webpki` 0.102, whose
+CRL and name-constraint advisories are listed in `deny.toml` with why they do not
+apply: the provider reads only algorithm identifiers from it, and rustls
+verifies certificates with its own patched `rustls-webpki`.
 
 ## How It Works
 
