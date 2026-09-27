@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.0.0](https://github.com/structured-world/structured-proxy/compare/v4.3.0...v5.0.0) - 2026-09-27
+
+### Added
+
+- *(cli)* configure the number of runtime worker threads ([#111](https://github.com/structured-world/structured-proxy/pull/111))
+
+### Fixed
+
+- *(deps)* [**breaking**] link the TLS provider only with a crypto backend ([#114](https://github.com/structured-world/structured-proxy/pull/114))
+
+### Other
+
+- [**breaking**] ship the binary in the structured-proxy package ([#113](https://github.com/structured-world/structured-proxy/pull/113))
+- *(cli)* check a missing config at a path that cannot exist ([#110](https://github.com/structured-world/structured-proxy/pull/110))
+- *(transcode)* [**breaking**] decode requests without a JSON value tree ([#105](https://github.com/structured-world/structured-proxy/pull/105))
+- [**breaking**] move the binary into a structured-proxy-cli package ([#107](https://github.com/structured-world/structured-proxy/pull/107))
+
 ## [4.3.0](https://github.com/structured-world/structured-proxy/compare/v4.2.0...v4.3.0) - 2026-09-27
 
 ### Added
