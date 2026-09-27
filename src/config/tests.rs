@@ -25,14 +25,16 @@ fn jwt_cache_defaults_and_overrides() {
     assert!(cache.enabled);
     assert_eq!(cache.max_entries, 10_000);
     assert_eq!(cache.max_ttl_secs, 60);
+    assert_eq!(cache.max_token_bytes, 4096);
 
     // Keys given keep the rest at their defaults.
-    let yaml = "upstream:\n  default: \"grpc://x:1\"\nauth:\n  mode: jwt\n  jwt:\n    jwks_uri: \"https://idp/jwks\"\n    cache:\n      max_ttl_secs: 15\n";
+    let yaml = "upstream:\n  default: \"grpc://x:1\"\nauth:\n  mode: jwt\n  jwt:\n    jwks_uri: \"https://idp/jwks\"\n    cache:\n      max_ttl_secs: 15\n      max_token_bytes: 2048\n";
     let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
     let cache = &cfg.auth.unwrap().jwt.unwrap().cache;
     assert!(cache.enabled);
     assert_eq!(cache.max_entries, 10_000);
     assert_eq!(cache.max_ttl_secs, 15);
+    assert_eq!(cache.max_token_bytes, 2048);
 }
 
 #[test]

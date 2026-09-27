@@ -5,11 +5,15 @@
 //! An entry is reused until the earlier of the token's `exp` and a configured
 //! maximum age, which bounds how long a token keeps passing after its signing
 //! key has left the JWKS. Rejected tokens are never stored, so garbage cannot
-//! fill it. The size is capped without background work: expired entries are
-//! dropped when looked up, and swept when an insert finds the cache full.
+//! fill it, and tokens over a size limit are not stored either, so the memory
+//! held is bounded too. The size is capped without background work: expired
+//! entries are dropped when looked up, and swept when an insert finds the
+//! cache full.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+// no-std: caller-provided monotonic clock
+use std::time::Instant;
 
 use dashmap::DashMap;
 use serde_json::Value;
@@ -25,18 +29,28 @@ pub(crate) fn token_key(token: &str) -> TokenKey {
     Sha256::digest(token.as_bytes()).into()
 }
 
-/// Seconds since the Unix epoch, the unit of `exp` and `nbf`.
-// no-std: caller-provided clock
-pub(crate) fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+/// A moment on both clocks the cache reads, in whole seconds.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Now {
+    /// Unix time, the clock `exp` and `nbf` are written in.
+    pub(crate) unix: u64,
+    /// Seconds since the cache was built. Never goes back, so a wall clock
+    /// set back cannot stretch the maximum age of an entry.
+    pub(crate) mono: u64,
 }
 
 struct Entry {
     claims: Arc<Value>,
-    /// First second (Unix time) at which the entry is no longer used.
-    expires_at: u64,
+    /// The token's `exp` (Unix time): not used from this second on.
+    exp: u64,
+    /// `Now::mono` from which the entry is too old to use.
+    deadline: u64,
+}
+
+impl Entry {
+    fn live(&self, now: Now) -> bool {
+        now.unix < self.exp && now.mono < self.deadline
+    }
 }
 
 /// Verified claims by token, bounded in size and age.
@@ -47,9 +61,13 @@ pub(crate) struct ClaimsCache {
     taken: AtomicUsize,
     max_entries: usize,
     max_ttl_secs: u64,
-    /// When a full cache was last swept, so a burst of inserts into a cache
-    /// full of live entries sweeps at most once per second.
-    last_sweep: AtomicU64,
+    max_token_bytes: usize,
+    /// Origin of `Now::mono`.
+    started: Instant,
+    /// First `Now::mono` second at which a full cache may be swept again, so
+    /// a burst of inserts into a cache full of live entries sweeps at most
+    /// once per second. Only ever moves forward.
+    next_sweep: AtomicU64,
 }
 
 impl ClaimsCache {
@@ -58,10 +76,10 @@ impl ClaimsCache {
         if !config.enabled {
             return Ok(None);
         }
-        if config.max_entries == 0 || config.max_ttl_secs == 0 {
+        if config.max_entries == 0 || config.max_ttl_secs == 0 || config.max_token_bytes == 0 {
             return Err(
-                "auth.jwt.cache.max_entries and max_ttl_secs must be positive; \
-                 set enabled: false to turn the cache off"
+                "auth.jwt.cache.max_entries, max_ttl_secs and max_token_bytes must be \
+                 positive; set enabled: false to turn the cache off"
                     .to_string(),
             );
         }
@@ -70,21 +88,39 @@ impl ClaimsCache {
             taken: AtomicUsize::new(0),
             max_entries: config.max_entries,
             max_ttl_secs: config.max_ttl_secs,
-            last_sweep: AtomicU64::new(0),
+            max_token_bytes: config.max_token_bytes,
+            started: Instant::now(),
+            next_sweep: AtomicU64::new(0),
         }))
     }
 
+    /// Whether `token` is small enough to be cached.
+    pub(crate) fn admits(&self, token: &str) -> bool {
+        token.len() <= self.max_token_bytes
+    }
+
+    /// The current moment on both clocks.
+    pub(crate) fn now(&self) -> Now {
+        Now {
+            // no-std: caller-provided wall clock
+            unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+            mono: self.started.elapsed().as_secs(),
+        }
+    }
+
     /// The claims cached for `key`, if the entry is still valid at `now`.
-    pub(crate) fn get(&self, key: &TokenKey, now: u64) -> Option<Arc<Value>> {
+    pub(crate) fn get(&self, key: &TokenKey, now: Now) -> Option<Arc<Value>> {
         {
             let entry = self.entries.get(key)?;
-            if entry.expires_at > now {
+            if entry.live(now) {
                 return Some(entry.claims.clone());
             }
         }
         if self
             .entries
-            .remove_if(key, |_, entry| entry.expires_at <= now)
+            .remove_if(key, |_, entry| !entry.live(now))
             .is_some()
         {
             self.taken.fetch_sub(1, Ordering::Relaxed);
@@ -95,22 +131,20 @@ impl ClaimsCache {
     /// Store `claims`, just verified at `now`, for `key`. Nothing is stored
     /// for a token without `exp`, one not yet valid (`nbf` in the future), one
     /// that would expire at once, or when the cache is full of live entries.
-    pub(crate) fn insert(&self, key: TokenKey, claims: &Arc<Value>, now: u64) {
+    pub(crate) fn insert(&self, key: TokenKey, claims: &Arc<Value>, now: Now) {
+        // Never beyond `exp`: past it the verifier's own leeway decides.
         let Some(exp) = numeric_date(claims, "exp") else {
             return;
         };
-        if numeric_date(claims, "nbf").is_some_and(|nbf| nbf > now) {
+        if exp <= now.unix || numeric_date(claims, "nbf").is_some_and(|nbf| nbf > now.unix) {
             return;
         }
-        // Never beyond `exp`: past it the verifier's own leeway decides. The
-        // sum saturates on purpose: a `max_ttl_secs` near u64::MAX means "no
-        // age limit", and `exp` still bounds the result.
-        let expires_at = exp.min(now.saturating_add(self.max_ttl_secs));
-        if expires_at <= now {
-            return;
-        }
+        // Saturates on purpose: `mono` counts from start-up, so only a
+        // `max_ttl_secs` near u64::MAX reaches the bound, and that setting
+        // means "no age limit", with `exp` still in force.
+        let deadline = now.mono.saturating_add(self.max_ttl_secs);
         if !self.reserve() {
-            if self.last_sweep.swap(now, Ordering::Relaxed) == now {
+            if !self.claim_sweep(now.mono) {
                 return;
             }
             self.sweep(now);
@@ -120,7 +154,8 @@ impl ClaimsCache {
         }
         let entry = Entry {
             claims: claims.clone(),
-            expires_at,
+            exp,
+            deadline,
         };
         // The same token verified twice at once: the second store replaces
         // the first and gives its slot back.
@@ -138,11 +173,23 @@ impl ClaimsCache {
             .is_ok()
     }
 
-    /// Drop every entry expired at `now`, giving their slots back.
-    fn sweep(&self, now: u64) {
+    /// Whether the caller at second `mono` is the one to sweep: the first to
+    /// reach a second past the last sweep. A caller whose `mono` was read
+    /// before that sweep never sweeps, so late callers cannot repeat it.
+    fn claim_sweep(&self, mono: u64) -> bool {
+        self.next_sweep
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                // `mono` counts seconds since start-up: `+ 1` cannot overflow.
+                (mono >= next).then_some(mono + 1)
+            })
+            .is_ok()
+    }
+
+    /// Drop every entry no longer valid at `now`, giving their slots back.
+    fn sweep(&self, now: Now) {
         let mut freed = 0usize;
         self.entries.retain(|_, entry| {
-            let keep = entry.expires_at > now;
+            let keep = entry.live(now);
             freed += usize::from(!keep);
             keep
         });

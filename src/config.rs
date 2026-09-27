@@ -503,6 +503,11 @@ pub struct JwtCacheConfig {
     /// token keeps passing after its signing key leaves the JWKS. Default: 60.
     #[serde(default = "default_jwt_cache_max_ttl_secs")]
     pub max_ttl_secs: u64,
+    /// Longest token cached, in bytes; a longer one is verified on every
+    /// request. With `max_entries` it bounds the memory the cache holds, since
+    /// the claims kept are decoded from the token. Default: 4096.
+    #[serde(default = "default_jwt_cache_max_token_bytes")]
+    pub max_token_bytes: usize,
 }
 
 fn default_jwt_cache_max_entries() -> usize {
@@ -513,12 +518,17 @@ fn default_jwt_cache_max_ttl_secs() -> u64 {
     60
 }
 
+fn default_jwt_cache_max_token_bytes() -> usize {
+    4096
+}
+
 impl Default for JwtCacheConfig {
     fn default() -> Self {
         Self {
             enabled: true,
             max_entries: default_jwt_cache_max_entries(),
             max_ttl_secs: default_jwt_cache_max_ttl_secs(),
+            max_token_bytes: default_jwt_cache_max_token_bytes(),
         }
     }
 }

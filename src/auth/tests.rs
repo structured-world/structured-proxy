@@ -514,7 +514,7 @@ mod builtin {
     #[tokio::test]
     async fn repeated_token_is_verified_once_and_answers_the_same() {
         // The second request is served from the cache: same user header, same
-        // status, and still one cached verification.
+        // status, and the signature checked only for the first.
         let auth = auth_with_policy(&["admin"]);
         let app = app(auth.clone());
         let token = sign(serde_json::json!({
@@ -531,6 +531,41 @@ mod builtin {
             (StatusCode::OK, "user-42".into())
         );
         assert_eq!(auth.cached_tokens(), 1);
+        assert_eq!(verifications(&auth), 1);
+    }
+
+    fn verifications(auth: &Auth) -> usize {
+        auth.builtin_verifications.load(Ordering::Relaxed)
+    }
+
+    #[tokio::test]
+    async fn oversized_tokens_are_verified_every_time() {
+        let cfg = AuthConfig {
+            mode: "jwt".into(),
+            jwt: Some(JwtConfig {
+                issuer: Some("test-iss".into()),
+                audience: Some("test-aud".into()),
+                public_key_pem_file: Some(temp_pub_pem()),
+                cache: serde_yaml::from_str("max_token_bytes: 64").unwrap(),
+                ..jwt_claims_only()
+            }),
+            forward_auth: Some(secure_policy(&[])),
+            authz: None,
+        };
+        let auth = Auth::build(&cfg, None).unwrap().unwrap();
+        let app = app(auth.clone());
+        let token = sign(serde_json::json!({
+            "iss": "test-iss", "aud": "test-aud", "exp": future_exp(), "sub": "user-42"
+        }));
+        assert!(token.len() > 64);
+        for _ in 0..2 {
+            assert_eq!(
+                request(&app, &token).await,
+                (StatusCode::OK, "user-42".into())
+            );
+        }
+        assert_eq!(auth.cached_tokens(), 0);
+        assert_eq!(verifications(&auth), 2);
     }
 
     #[tokio::test]
@@ -583,11 +618,14 @@ mod builtin {
         let token = sign(serde_json::json!({
             "iss": "test-iss", "aud": "test-aud", "exp": future_exp(), "sub": "user-42"
         }));
-        assert_eq!(
-            request(&app, &token).await,
-            (StatusCode::OK, "user-42".into())
-        );
+        for _ in 0..2 {
+            assert_eq!(
+                request(&app, &token).await,
+                (StatusCode::OK, "user-42".into())
+            );
+        }
         assert_eq!(auth.cached_tokens(), 0);
+        assert_eq!(verifications(&auth), 2);
     }
 
     #[test]

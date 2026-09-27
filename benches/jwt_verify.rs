@@ -6,7 +6,7 @@ use std::hint::black_box;
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::http::Request;
+use axum::http::{Request, StatusCode};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use criterion::{criterion_group, criterion_main, Criterion};
@@ -64,13 +64,23 @@ fn bench(c: &mut Criterion) {
     ] {
         let app = app(&pem, cache);
         let authorization = format!("Bearer {token}");
+        let request = || {
+            Request::get("/secure")
+                .header("authorization", &authorization)
+                .body(Body::empty())
+                .unwrap()
+        };
+        // Timings of rejected requests would measure nothing. With the cache
+        // on, this request is also the one that fills it.
+        let status = runtime
+            .block_on(app.clone().oneshot(request()))
+            .unwrap()
+            .status();
+        assert_eq!(status, StatusCode::OK, "{name}: the bench token is refused");
         group.bench_function(name, |b| {
             b.to_async(&runtime).iter(|| {
                 let app = app.clone();
-                let request = Request::get("/secure")
-                    .header("authorization", &authorization)
-                    .body(Body::empty())
-                    .unwrap();
+                let request = request();
                 async move { black_box(app.oneshot(request).await.unwrap().status()) }
             });
         });

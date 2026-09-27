@@ -62,6 +62,10 @@ pub struct Auth {
     claims_headers: HashMap<String, String>,
     roles_claim: String,
     policies: Policies,
+    /// Signature checks the built-in verifier ran, so tests can tell a cache
+    /// hit from a second verification.
+    #[cfg(all(test, feature = "builtin_jwt"))]
+    builtin_verifications: std::sync::atomic::AtomicUsize,
 }
 
 impl Auth {
@@ -118,6 +122,8 @@ impl Auth {
             claims_headers,
             roles_claim,
             policies,
+            #[cfg(all(test, feature = "builtin_jwt"))]
+            builtin_verifications: std::sync::atomic::AtomicUsize::new(0),
         })))
     }
 
@@ -126,20 +132,28 @@ impl Auth {
     async fn verify(&self, token: &str) -> Option<Arc<Value>> {
         match &self.verifier {
             #[cfg(feature = "builtin_jwt")]
-            Verifier::Builtin(v, None) => v.verify(token).await.map(Arc::new),
-            #[cfg(feature = "builtin_jwt")]
-            Verifier::Builtin(v, Some(cache)) => {
+            Verifier::Builtin(v, Some(cache)) if cache.admits(token) => {
                 let key = cache::token_key(token);
-                let now = cache::unix_now();
+                let now = cache.now();
                 if let Some(claims) = cache.get(&key, now) {
                     return Some(claims);
                 }
-                let claims = Arc::new(v.verify(token).await?);
+                let claims = Arc::new(self.verify_builtin(v, token).await?);
                 cache.insert(key, &claims, now);
                 Some(claims)
             }
+            #[cfg(feature = "builtin_jwt")]
+            Verifier::Builtin(v, _) => self.verify_builtin(v, token).await.map(Arc::new),
             Verifier::Injected(v) => v.verify(token).await.map(Arc::new),
         }
+    }
+
+    #[cfg(feature = "builtin_jwt")]
+    async fn verify_builtin(&self, v: &verifier::ConfigVerifier, token: &str) -> Option<Value> {
+        #[cfg(test)]
+        self.builtin_verifications
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        v.verify(token).await
     }
 
     /// Number of cached verifications, for tests.
