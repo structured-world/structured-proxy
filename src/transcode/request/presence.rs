@@ -4,29 +4,32 @@
 //! A proto3 field without explicit presence reads the same whether the body
 //! set it to its default or omitted it, so presence cannot be read off the
 //! built message: `{"count": 0}` must still beat `?count=5`. The body's keys
-//! are recorded instead, by field number (a body may use the JSON or the proto
-//! name), during the one pass that builds the message.
+//! are recorded instead, during the one pass that builds the message, as the
+//! body spelled them; they are matched against fields (by JSON or proto name)
+//! only for the few keys a query names.
 
-use prost_reflect::{Kind, MessageDescriptor};
+use prost_reflect::{FieldDescriptor, MessageDescriptor};
 use serde::de::value::StringDeserializer;
 use serde::de::{self, DeserializeSeed, Deserializer, IntoDeserializer, MapAccess, Visitor};
 use std::fmt;
 
-/// Field paths set by the body or a path parameter, each a run of field
-/// numbers from the input message down.
+/// The keys set by the body, a path parameter or a form field, as a tree in
+/// the order they were read (a parent before its children).
 #[derive(Debug, Default)]
 pub(super) struct Presence {
-    /// Every recorded path, back to back.
-    numbers: Vec<u32>,
+    /// Every key, back to back.
+    names: String,
     entries: Vec<Entry>,
-    /// The path of the key being read, one number per nesting level.
-    stack: Vec<u32>,
+    /// Whether each nesting level matched the path being checked.
+    matched: Vec<bool>,
 }
 
 #[derive(Debug)]
 struct Entry {
-    start: usize,
-    len: usize,
+    depth: u32,
+    /// The key's bytes in `names`.
+    start: u32,
+    end: u32,
     /// The value was a JSON object, whose own keys are recorded below it; any
     /// other value (null, a string for a well-known type) sets the field as a
     /// whole.
@@ -34,30 +37,27 @@ struct Entry {
 }
 
 impl Presence {
-    fn record(&mut self, depth: usize, number: u32) {
-        self.stack.truncate(depth);
-        self.stack.push(number);
-        self.push(false);
-    }
-
-    /// Record `path` as set by something other than the body.
-    pub(super) fn record_path(&mut self, path: &[u32], object: bool) {
-        self.stack.clear();
-        self.stack.extend_from_slice(path);
-        self.push(object);
-    }
-
-    fn push(&mut self, object: bool) {
-        let start = self.numbers.len();
-        self.numbers.extend_from_slice(&self.stack);
+    /// Record `key` read at nesting level `depth`.
+    fn record(&mut self, depth: usize, key: &str, object: bool) {
+        let start = self.names.len();
+        self.names.push_str(key);
         self.entries.push(Entry {
-            start,
-            len: self.stack.len(),
+            depth: u32::try_from(depth).expect("fewer than 2^32 nesting levels"),
+            start: u32::try_from(start).expect("keys shorter than 4 GiB"),
+            end: u32::try_from(self.names.len()).expect("keys shorter than 4 GiB"),
             object,
         });
     }
 
-    /// The field whose key was recorded last holds an object.
+    /// Record `path` as set by something other than the body: every field on
+    /// the way as an object, the last one as an object when `object`.
+    pub(super) fn record_path(&mut self, path: &[FieldDescriptor], object: bool) {
+        for (depth, field) in path.iter().enumerate() {
+            self.record(depth, field.name(), object || depth + 1 < path.len());
+        }
+    }
+
+    /// The object the key recorded last holds.
     fn mark_object(&mut self) {
         if let Some(entry) = self.entries.last_mut() {
             entry.object = true;
@@ -66,11 +66,27 @@ impl Presence {
 
     /// Whether a query parameter for `path` must leave it alone: the path was
     /// set, or a field above it was set to something other than an object.
-    pub(super) fn blocks(&self, path: &[u32]) -> bool {
-        self.entries.iter().any(|entry| {
-            let set = &self.numbers[entry.start..entry.start + entry.len];
-            set == path || (!entry.object && path.starts_with(set))
-        })
+    pub(super) fn blocks(&mut self, path: &[FieldDescriptor]) -> bool {
+        // Entries come parent first, so each one matches when its parent did
+        // and its own key names the field at its depth.
+        self.matched.clear();
+        for entry in &self.entries {
+            let depth = entry.depth as usize;
+            self.matched.truncate(depth);
+            let parent = depth == 0 || self.matched.get(depth - 1) == Some(&true);
+            let key = &self.names[entry.start as usize..entry.end as usize];
+            let hit = parent
+                && path
+                    .get(depth)
+                    .is_some_and(|field| key == field.name() || key == field.json_name());
+            if hit && (depth + 1 == path.len() || !entry.object) {
+                return true;
+            }
+            // Pad to this depth when a level was skipped under a non-match.
+            self.matched.resize(depth, false);
+            self.matched.push(hit);
+        }
+        false
     }
 }
 
@@ -99,20 +115,13 @@ fn has_special_json(message: &MessageDescriptor) -> bool {
     )
 }
 
-/// The message type below a field whose keys are recorded too: a singular
-/// field of a message read as a map of fields.
-fn nested(kind: Kind, list_or_map: bool) -> Option<MessageDescriptor> {
-    match kind {
-        Kind::Message(message) if !list_or_map && !has_special_json(&message) => Some(message),
-        _ => None,
-    }
-}
-
-/// `inner`, recording into `presence` the keys of the `desc` message it holds.
+/// `inner`, recording into `presence` the keys of every JSON object
+/// prost-reflect reads from it as a message. The values of a
+/// `google.protobuf.Struct` are recorded too; no query parameter can reach
+/// below one, so those entries never match.
 pub(super) struct Recording<'p, D> {
     inner: D,
     presence: &'p mut Presence,
-    desc: MessageDescriptor,
     depth: usize,
 }
 
@@ -130,7 +139,6 @@ impl<'p, D> Recording<'p, D> {
         Ok(Self {
             inner,
             presence,
-            desc: input.clone(),
             depth: 0,
         })
     }
@@ -152,13 +160,11 @@ impl<'de, D: Deserializer<'de>> Deserializer<'de> for Recording<'_, D> {
         let Self {
             inner,
             presence,
-            desc,
             depth,
         } = self;
         inner.deserialize_option(OptionVisitor {
             visitor,
             presence,
-            desc,
             depth,
         })
     }
@@ -167,13 +173,11 @@ impl<'de, D: Deserializer<'de>> Deserializer<'de> for Recording<'_, D> {
         let Self {
             inner,
             presence,
-            desc,
             depth,
         } = self;
         inner.deserialize_map(MapVisitor {
             visitor,
             presence,
-            desc,
             depth,
         })
     }
@@ -219,7 +223,6 @@ impl<'de, D: Deserializer<'de>> Deserializer<'de> for Recording<'_, D> {
 struct OptionVisitor<'p, V> {
     visitor: V,
     presence: &'p mut Presence,
-    desc: MessageDescriptor,
     depth: usize,
 }
 
@@ -242,7 +245,6 @@ impl<'de, V: Visitor<'de>> Visitor<'de> for OptionVisitor<'_, V> {
         self.visitor.visit_some(Recording {
             inner,
             presence: self.presence,
-            desc: self.desc,
             depth: self.depth,
         })
     }
@@ -252,7 +254,6 @@ impl<'de, V: Visitor<'de>> Visitor<'de> for OptionVisitor<'_, V> {
 struct MapVisitor<'p, V> {
     visitor: V,
     presence: &'p mut Presence,
-    desc: MessageDescriptor,
     depth: usize,
 }
 
@@ -270,9 +271,7 @@ impl<'de, V: Visitor<'de>> Visitor<'de> for MapVisitor<'_, V> {
         self.visitor.visit_map(RecordingMap {
             inner,
             presence: self.presence,
-            desc: self.desc,
             depth: self.depth,
-            below: None,
         })
     }
 }
@@ -280,11 +279,7 @@ impl<'de, V: Visitor<'de>> Visitor<'de> for MapVisitor<'_, V> {
 struct RecordingMap<'p, A> {
     inner: A,
     presence: &'p mut Presence,
-    desc: MessageDescriptor,
     depth: usize,
-    /// The message type of the value about to be read, when its keys are
-    /// recorded too.
-    below: Option<MessageDescriptor>,
 }
 
 impl<'de, A: MapAccess<'de>> MapAccess<'de> for RecordingMap<'_, A> {
@@ -299,32 +294,17 @@ impl<'de, A: MapAccess<'de>> MapAccess<'de> for RecordingMap<'_, A> {
         let Some(key) = self.inner.next_key::<String>()? else {
             return Ok(None);
         };
-        // The lookup prost-reflect makes: the JSON name, then the proto name.
-        let field = self
-            .desc
-            .get_field_by_json_name(&key)
-            .or_else(|| self.desc.get_field_by_name(&key));
-        self.below = match field {
-            Some(field) => {
-                self.presence.record(self.depth, field.number());
-                nested(field.kind(), field.is_list() || field.is_map())
-            }
-            None => None,
-        };
+        self.presence.record(self.depth, &key, false);
         let key: StringDeserializer<A::Error> = key.into_deserializer();
         seed.deserialize(key).map(Some)
     }
 
     fn next_value_seed<S: DeserializeSeed<'de>>(&mut self, seed: S) -> Result<S::Value, A::Error> {
-        match self.below.take() {
-            Some(desc) => self.inner.next_value_seed(RecordingSeed {
-                seed,
-                presence: self.presence,
-                desc,
-                depth: self.depth + 1,
-            }),
-            None => self.inner.next_value_seed(seed),
-        }
+        self.inner.next_value_seed(RecordingSeed {
+            seed,
+            presence: self.presence,
+            depth: self.depth + 1,
+        })
     }
 
     fn size_hint(&self) -> Option<usize> {
@@ -335,7 +315,6 @@ impl<'de, A: MapAccess<'de>> MapAccess<'de> for RecordingMap<'_, A> {
 struct RecordingSeed<'p, S> {
     seed: S,
     presence: &'p mut Presence,
-    desc: MessageDescriptor,
     depth: usize,
 }
 
@@ -346,7 +325,6 @@ impl<'de, S: DeserializeSeed<'de>> DeserializeSeed<'de> for RecordingSeed<'_, S>
         self.seed.deserialize(Recording {
             inner,
             presence: self.presence,
-            desc: self.desc,
             depth: self.depth,
         })
     }

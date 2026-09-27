@@ -250,14 +250,14 @@ fn build(
 ) -> Result<DynamicMessage, String> {
     // What the body and the path set matters only when a query can fill.
     let mut presence = (!query.is_empty()).then(Presence::default);
-    // The field numbers of the path being bound, reused across keys.
+    // The fields of the path being bound, reused across keys.
     let mut path = Vec::new();
 
     let mut message = match (mapping, source) {
         (BodyMapping::None, _) => DynamicMessage::new(input.clone()),
         (BodyMapping::Field(name), Source::Absent) => {
             if let (Some(presence), Some(field)) = (&mut presence, input.get_field_by_name(name)) {
-                presence.record_path(&[field.number()], false);
+                presence.record_path(&[field], false);
             }
             DynamicMessage::new(input.clone())
         }
@@ -279,7 +279,7 @@ fn build(
     // Path params win over everything (the router already matched them).
     for (key, raw) in path_params {
         let target = Target {
-            prefix: &[],
+            prefix: None,
             key,
             values: &[raw.as_str()],
         };
@@ -295,7 +295,7 @@ fn build(
     if let Some(presence) = &mut presence {
         for_each_group(query, |key, values| {
             let target = Target {
-                prefix: &[],
+                prefix: None,
                 key,
                 values,
             };
@@ -312,10 +312,10 @@ fn build(
 }
 
 /// Where string values go: the field at the dotted proto path `key`, below
-/// the field numbers in `prefix`.
+/// the message field `prefix` when there is one.
 #[derive(Clone, Copy)]
 struct Target<'a> {
-    prefix: &'a [u32],
+    prefix: Option<&'a FieldDescriptor>,
     key: &'a str,
     /// Every value of the key, in request order.
     values: &'a [&'a str],
@@ -387,7 +387,7 @@ fn form_body(
     mapping: &BodyMapping,
     pairs: &[(Cow<'_, str>, Cow<'_, str>)],
     mut presence: Option<&mut Presence>,
-    path: &mut Vec<u32>,
+    path: &mut Vec<FieldDescriptor>,
 ) -> Result<DynamicMessage, String> {
     let mut message = DynamicMessage::new(input.clone());
     let prefix = match mapping {
@@ -399,16 +399,15 @@ fn form_body(
             // The field is the body's even when the form is empty of it.
             message.get_field_mut(&field);
             if let Some(presence) = presence.as_deref_mut() {
-                presence.record_path(&[field.number()], true);
+                presence.record_path(std::slice::from_ref(&field), true);
             }
-            Some(field.number())
+            Some(field)
         }
         _ => None,
     };
-    let prefix = prefix.as_slice();
     for_each_group(pairs, |key, values| {
         let target = Target {
-            prefix,
+            prefix: prefix.as_ref(),
             key,
             values,
         };
@@ -442,7 +441,7 @@ fn for_each_group<'p>(
 }
 
 /// Set the field `target` names to its values: all of them for a repeated
-/// field, the last one otherwise. `path` is a buffer for the field numbers.
+/// field, the last one otherwise. `path` is a buffer for the fields on the way.
 ///
 /// A key that names no field, or passes through a field that is not a
 /// singular message, is dropped. A [`Binding::Fill`] leaves a field the body
@@ -451,8 +450,8 @@ fn bind(
     message: &mut DynamicMessage,
     target: Target<'_>,
     binding: Binding,
-    presence: Option<&mut Presence>,
-    path: &mut Vec<u32>,
+    mut presence: Option<&mut Presence>,
+    path: &mut Vec<FieldDescriptor>,
 ) -> Result<(), String> {
     let Target {
         prefix,
@@ -460,14 +459,16 @@ fn bind(
         values,
     } = target;
     path.clear();
-    path.extend_from_slice(prefix);
-    let mut desc = message.descriptor();
-    for &number in prefix {
-        desc = match desc.get_field(number).map(|f| f.kind()) {
-            Some(Kind::Message(inner)) => inner,
-            _ => return Ok(()),
-        };
-    }
+    let mut desc = match prefix {
+        Some(field) => {
+            let Kind::Message(inner) = field.kind() else {
+                return Ok(());
+            };
+            path.push(field.clone());
+            inner
+        }
+        None => message.descriptor(),
+    };
     let mut segments = key.split('.');
     let mut leaf = segments.next().unwrap_or_default();
     for next in segments {
@@ -480,34 +481,30 @@ fn bind(
         if field.is_list() || field.is_map() {
             return Ok(());
         }
-        path.push(field.number());
+        path.push(field);
         desc = inner;
         leaf = next;
     }
     let Some(field) = desc.get_field_by_name(leaf) else {
         return Ok(());
     };
-    path.push(field.number());
-    if binding == Binding::Fill && presence.as_deref().is_some_and(|p| p.blocks(path)) {
+    path.push(field);
+    if binding == Binding::Fill && presence.as_deref_mut().is_some_and(|p| p.blocks(path)) {
         return Ok(());
     }
 
-    let value = field_value(&field, values)?;
-    let (parents, _) = path.split_at(path.len() - 1);
+    let (field, parents) = path.split_last().expect("the leaf was just pushed");
+    let value = field_value(field, values)?;
     let mut holder = message;
-    for &number in parents {
-        let parent = holder
-            .descriptor()
-            .get_field(number)
-            .expect("the path was resolved against these descriptors");
-        check_oneof(holder, &parent)?;
-        holder = match holder.get_field_mut(&parent) {
+    for parent in parents {
+        check_oneof(holder, parent)?;
+        holder = match holder.get_field_mut(parent) {
             Value::Message(inner) => inner,
             _ => unreachable!("a singular message field holds a message"),
         };
     }
-    check_oneof(holder, &field)?;
-    holder.set_field(&field, value);
+    check_oneof(holder, field)?;
+    holder.set_field(field, value);
     if binding == Binding::Set {
         if let Some(presence) = presence {
             presence.record_path(path, false);
