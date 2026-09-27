@@ -248,13 +248,18 @@ fn a_value_grpc_metadata_cannot_carry_refuses_the_request() {
 }
 
 #[test]
-fn space_and_empty_values_are_forwarded() {
-    // ASCII-Value allows space; an empty HTTP value is kept so the count holds.
+fn a_space_is_forwarded_but_an_empty_text_value_refuses_the_request() {
+    // `ASCII-Value → 1*( %x20-%x7E )`: space is allowed, an empty value is
+    // not, and a receiver dropping it would let `DPoP: proof` plus an empty
+    // `DPoP:` pass as a single proof.
     let mut headers = HeaderMap::new();
     headers.append("dpop", HeaderValue::from_static("a b"));
-    headers.append("dpop", HeaderValue::from_static(""));
     let meta = http_headers_to_grpc_metadata(&headers, &default_headers());
-    assert_eq!(values(&meta, "dpop"), [b"a b".to_vec(), b"".to_vec()]);
+    assert_eq!(values(&meta, "dpop"), [b"a b".to_vec()]);
+
+    headers.append("dpop", HeaderValue::from_static(""));
+    let err = try_http_headers_to_grpc_metadata(&headers, &default_headers()).unwrap_err();
+    assert_eq!(err.header, "dpop");
 }
 
 #[test]

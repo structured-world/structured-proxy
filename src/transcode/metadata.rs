@@ -34,8 +34,8 @@ pub struct InvalidForwardedHeader {
 /// belongs to.
 ///
 /// # Errors
-/// A forwarded value gRPC metadata cannot carry: outside visible ASCII and
-/// space for a text key, not base64 for a `-bin` key (gRPC PROTOCOL-HTTP2,
+/// A forwarded value gRPC metadata cannot carry: empty or outside visible
+/// ASCII and space for a text key, not base64 for a `-bin` key (gRPC PROTOCOL-HTTP2,
 /// "Custom-Metadata"). gRPC lets a receiver drop such a value, which would
 /// change how many values the upstream sees, so the request is refused
 /// rather than forwarded altered.
@@ -163,10 +163,10 @@ fn is_trace_context(name: &str) -> bool {
     name.eq_ignore_ascii_case("traceparent") || name.eq_ignore_ascii_case("tracestate")
 }
 
-/// `ASCII-Value → 1*( %x20-%x7E )`. An empty value is allowed: HTTP allows an
-/// empty field value, and dropping it would change the count.
+/// `ASCII-Value → 1*( %x20-%x7E )`. An empty value is valid HTTP but not a
+/// gRPC value, so a receiver may drop it and change the count.
 fn is_ascii_value(value: &[u8]) -> bool {
-    value.iter().all(|b| (0x20..=0x7e).contains(b))
+    !value.is_empty() && value.iter().all(|b| (0x20..=0x7e).contains(b))
 }
 
 /// A `-bin` value: base64 (RFC 4648 §4), padded or not, possibly several

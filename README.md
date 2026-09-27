@@ -450,8 +450,8 @@ every value in the order the client sent it, so a check that depends on how
 often a header was sent (RFC 9449 §4.3 rejects a request with two `DPoP`
 headers) sees the same request behind the proxy. A `-bin` header keeps the
 base64 it arrived with, one metadata value per comma-separated part. A value
-gRPC metadata cannot carry (outside visible ASCII and space, such as a tab or
-obs-text, or not canonical base64 under a `-bin` key) is refused with
+gRPC metadata cannot carry (empty, or outside visible ASCII and space, such as
+a tab or obs-text, or not canonical base64 under a `-bin` key) is refused with
 `INVALID_ARGUMENT` (400) naming the header: gRPC lets a receiver drop such a
 value, which would change what the upstream counts. A `forwarded_headers` name
 must be a gRPC metadata key (letters, digits, `_`, `-`, `.`), or the proxy
