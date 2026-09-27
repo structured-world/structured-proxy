@@ -178,6 +178,12 @@ auth:
     roles_claim: "roles" # array-of-strings claim used for required_roles
     claims_headers: # forward claims to the upstream as headers
       sub: "x-user-id"
+    # Verified tokens are reused until the earlier of their `exp` and
+    # max_ttl_secs (see "JWT verification"). Defaults shown.
+    cache:
+      enabled: true
+      max_entries: 10000
+      max_ttl_secs: 60
   # Route-level policies (require_auth + required_roles → 401 / 403)
   forward_auth:
     policies:
@@ -640,6 +646,27 @@ structured_proxy::install_default_crypto_provider();
 The call is idempotent, and installs the backend this crate was built with. It
 exists wherever the built-in verifier does, so a `default-features = false`
 build with an injected verifier neither has it nor needs it.
+
+**Verified-token cache.** A client sends the same token on every request until
+it expires, so the built-in verifier keeps the claims of each token it accepted
+(`auth.jwt.cache`, on by default) and skips the signature check on the next
+request with it; on an EdDSA token that turns ~41 µs into ~2 µs per request
+(`cargo bench --bench jwt_verify`). Route policies, the roles check and claim
+headers still run every time.
+
+- An entry is used until the earlier of the token's `exp` and `max_ttl_secs`
+  (default 60) after verification; `max_ttl_secs` bounds how long a token keeps
+  passing after its signing key leaves the JWKS. A token not yet valid (`nbf`
+  in the future) is not cached.
+- Rejected tokens are never cached. The cache is keyed by the SHA-256 of the
+  token, so no bearer token is kept in memory.
+- It holds at most `max_entries` (default 10000) tokens; once full of live
+  entries, a new token is verified but not stored. No background task runs:
+  expired entries go when looked up or when an insert finds the cache full.
+- It is per process and only skips repeated work, so replicas decide the same
+  way with or without it. Switch it off with `enabled: false`.
+- An injected verifier is not cached: it owns its policy (introspection,
+  revocation) and sees every request.
 
 **An injected verifier** is what you supply when neither of those is the right
 answer for your binary: a validated / FIPS crypto module, an HSM, or a verifier

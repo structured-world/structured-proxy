@@ -368,6 +368,7 @@ mod two_phase {
                 public_key_pem_file: Some(pem),
                 claims_headers: HashMap::new(),
                 roles_claim: "roles".into(),
+                cache: Default::default(),
             }),
             forward_auth: None,
             authz: None,

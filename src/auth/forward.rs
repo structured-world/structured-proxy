@@ -169,6 +169,7 @@ mod tests {
                 public_key_pem_file: Some(pem_path),
                 claims_headers,
                 roles_claim: "roles".into(),
+                cache: Default::default(),
             }),
             forward_auth: Some(ForwardAuthConfig {
                 enabled: true,

@@ -479,6 +479,48 @@ pub struct JwtConfig {
     /// path for nested claims, e.g. "realm_access.roles". Default: "roles".
     #[serde(default = "default_roles_claim")]
     pub roles_claim: String,
+    /// Cache of verified tokens for the built-in verifier, so a client that
+    /// sends the same token on every request pays for one signature check.
+    #[serde(default)]
+    pub cache: JwtCacheConfig,
+}
+
+/// `auth.jwt.cache`: verified claims are reused until the earlier of the
+/// token's `exp` and `max_ttl_secs` after verification. Applies to the
+/// built-in verifier only; an injected `TokenVerifier` is called every time.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct JwtCacheConfig {
+    /// Cache verified tokens. Default: true.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Most tokens kept at once; once full with live entries, a new token is
+    /// verified but not stored. Default: 10000.
+    #[serde(default = "default_jwt_cache_max_entries")]
+    pub max_entries: usize,
+    /// Longest time a verification is reused, in seconds. Bounds how long a
+    /// token keeps passing after its signing key leaves the JWKS. Default: 60.
+    #[serde(default = "default_jwt_cache_max_ttl_secs")]
+    pub max_ttl_secs: u64,
+}
+
+fn default_jwt_cache_max_entries() -> usize {
+    10_000
+}
+
+fn default_jwt_cache_max_ttl_secs() -> u64 {
+    60
+}
+
+impl Default for JwtCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_entries: default_jwt_cache_max_entries(),
+            max_ttl_secs: default_jwt_cache_max_ttl_secs(),
+        }
+    }
 }
 
 /// Default for [`JwtConfig::roles_claim`]. Also applied by the auth builder when

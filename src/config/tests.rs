@@ -17,6 +17,33 @@ upstream:
 }
 
 #[test]
+fn jwt_cache_defaults_and_overrides() {
+    // Without a `cache:` block the cache is on with its defaults.
+    let yaml = "upstream:\n  default: \"grpc://x:1\"\nauth:\n  mode: jwt\n  jwt:\n    jwks_uri: \"https://idp/jwks\"\n";
+    let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+    let cache = &cfg.auth.unwrap().jwt.unwrap().cache;
+    assert!(cache.enabled);
+    assert_eq!(cache.max_entries, 10_000);
+    assert_eq!(cache.max_ttl_secs, 60);
+
+    // Keys given keep the rest at their defaults.
+    let yaml = "upstream:\n  default: \"grpc://x:1\"\nauth:\n  mode: jwt\n  jwt:\n    jwks_uri: \"https://idp/jwks\"\n    cache:\n      max_ttl_secs: 15\n";
+    let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+    let cache = &cfg.auth.unwrap().jwt.unwrap().cache;
+    assert!(cache.enabled);
+    assert_eq!(cache.max_entries, 10_000);
+    assert_eq!(cache.max_ttl_secs, 15);
+}
+
+#[test]
+fn jwt_cache_rejects_unknown_keys() {
+    // `ttl` for `max_ttl_secs` would otherwise leave the default in force.
+    let yaml = "upstream:\n  default: \"grpc://x:1\"\nauth:\n  mode: jwt\n  jwt:\n    cache:\n      ttl: 15\n";
+    let err = serde_yaml::from_str::<ProxyConfig>(yaml).unwrap_err();
+    assert!(err.to_string().contains("ttl"), "{err}");
+}
+
+#[test]
 fn health_and_metrics_defaults_and_overrides() {
     // Defaults: enabled, conventional paths.
     let min: ProxyConfig = serde_yaml::from_str("upstream:\n  default: \"grpc://x:1\"\n").unwrap();
