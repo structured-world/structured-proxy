@@ -75,14 +75,39 @@ fn an_invalid_config_fails_before_listening() {
     assert!(!out.status.success());
 }
 
-#[test]
-fn a_valid_config_starts_the_proxy() {
-    // A port that was free a moment ago; the proxy binds it itself.
-    let port = TcpListener::bind("127.0.0.1:0")
+/// A port that was free a moment ago; the proxy binds it itself.
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
         .unwrap()
-        .port();
+        .port()
+}
+
+/// The response to `GET /health/live` once the proxy listens on `port`.
+/// Liveness does not depend on the upstream, so it answers as soon as the
+/// listener is up.
+fn live(port: u16) -> String {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
+            stream
+                .write_all(
+                    b"GET /health/live HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            return response;
+        }
+        assert!(Instant::now() < deadline, "the proxy never listened");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_valid_config_starts_the_proxy() {
+    let port = free_port();
     let path = std::env::temp_dir().join(format!(
         "structured-proxy-cli-test-{}.yaml",
         std::process::id()
@@ -106,25 +131,53 @@ fn a_valid_config_starts_the_proxy() {
             .unwrap(),
     );
 
-    // Liveness does not depend on the upstream, so it answers as soon as the
-    // listener is up.
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let response = loop {
-        if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
-            stream
-                .write_all(
-                    b"GET /health/live HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-                )
-                .unwrap();
-            let mut response = String::new();
-            stream.read_to_string(&mut response).unwrap();
-            break response;
-        }
-        assert!(Instant::now() < deadline, "the proxy never listened");
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    let response = live(port);
     std::fs::remove_file(&path).unwrap();
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+}
+
+#[test]
+fn the_binary_keeps_the_shared_rate_limit_store() {
+    // The installed binary is the one the release packages ship, so
+    // `shield.sync` works in it: without Redis compiled in, the proxy would
+    // warn and fall back to per-instance limits.
+    let port = free_port();
+    let dir = std::env::temp_dir();
+    let id = std::process::id();
+    let path = dir.join(format!("structured-proxy-cli-test-sync-{id}.yaml"));
+    let log_path = dir.join(format!("structured-proxy-cli-test-sync-{id}.log"));
+    std::fs::write(
+        &path,
+        format!(
+            "listen:\n  http: \"127.0.0.1:{port}\"\n\
+             upstream:\n  default: \"http://127.0.0.1:9\"\n\
+             descriptors: []\n\
+             shield:\n  enabled: true\n\
+             \x20 profiles:\n    anon: {{ rate: \"60/min\" }}\n\
+             \x20 rules:\n    - pattern: \"/api/**\"\n      key: {{ type: ip }}\n      profile: \"anon\"\n\
+             \x20 sync: {{ redis_url: \"redis://127.0.0.1:9/\", interval_ms: 500 }}\n"
+        ),
+    )
+    .unwrap();
+    let log = std::fs::File::create(&log_path).unwrap();
+    let proxy = Running(
+        Command::new(BIN)
+            .arg("--config")
+            .arg(&path)
+            .env("RUST_LOG", "warn")
+            .stdout(log)
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+
+    let response = live(port);
+    drop(proxy);
+    let output = std::fs::read_to_string(&log_path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    std::fs::remove_file(&log_path).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(!output.contains("not compiled in"), "{output}");
 }
 
 /// A config file for this test process holding `yaml`, removed on drop.
@@ -151,11 +204,7 @@ impl Drop for ConfigFile {
 
 #[test]
 fn configured_worker_threads_run_the_proxy_and_are_logged() {
-    let port = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let port = free_port();
     let config = ConfigFile::new(
         "workers",
         &format!(

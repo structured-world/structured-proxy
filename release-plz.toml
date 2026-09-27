@@ -1,18 +1,5 @@
-# The library and the CLI share one version (`[workspace.package]`) and are
-# released together.
 [[package]]
 name = "structured-proxy"
-version_group = "structured-proxy"
 # Preserve the existing tag scheme (v1.0.0, v1.0.1, ...) instead of the
 # release-plz default of "{package}-v{version}", so tag history stays continuous.
 git_tag_name = "v{{ version }}"
-
-[[package]]
-name = "structured-proxy-cli"
-version_group = "structured-proxy"
-# Published to crates.io with the library. The library's `v{version}` tag and
-# GitHub release stand for both (the release workflow builds the binary from
-# that tag); the CLI's own changes are recorded in its own changelog.
-git_tag_enable = false
-git_release_enable = false
-changelog_path = "cli/CHANGELOG.md"
