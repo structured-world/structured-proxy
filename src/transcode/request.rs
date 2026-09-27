@@ -419,7 +419,11 @@ fn form_body(
         BodyMapping::Field(name) => {
             let field = input
                 .get_field_by_name(name)
-                .filter(|f| !f.is_list() && !f.is_map() && matches!(f.kind(), Kind::Message(_)))
+                .filter(|f| {
+                    !f.is_list()
+                        && !f.is_map()
+                        && matches!(f.kind(), Kind::Message(m) if !has_special_json(&m))
+                })
                 .ok_or_else(|| format!("a form body cannot fill field `{name}`"))?;
             // The field is the body's even when the form is empty of it.
             message.get_field_mut(&field);
@@ -494,8 +498,11 @@ fn for_each_group<'p>(
 /// field, the last one otherwise. `path` is a buffer for the fields on the way.
 ///
 /// A key that names no field, or passes through a field that is not a
-/// singular message, is dropped. A [`Binding::Fill`] leaves a field the body
-/// or the path set, or one below a field they set to a non-object, alone.
+/// singular message or is a well-known type, is dropped: a well-known type
+/// is set whole from its validated JSON form, never field by field (a
+/// Timestamp's `nanos` alone could hold an invalid value). A
+/// [`Binding::Fill`] leaves a field the body or the path set, or one below a
+/// field they set to a non-object, alone.
 fn bind(
     message: &mut DynamicMessage,
     target: Target<'_>,
@@ -528,7 +535,7 @@ fn bind(
         let Kind::Message(inner) = field.kind() else {
             return Ok(());
         };
-        if field.is_list() || field.is_map() {
+        if field.is_list() || field.is_map() || has_special_json(&inner) {
             return Ok(());
         }
         path.push(field);

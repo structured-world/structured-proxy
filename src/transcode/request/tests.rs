@@ -809,6 +809,40 @@ fn a_nested_well_known_type_in_the_body_is_set_whole() {
 }
 
 #[test]
+fn a_dotted_key_does_not_reach_inside_a_well_known_type() {
+    // A Timestamp, wrapper or Struct is set from its validated JSON form only;
+    // writing one of its internal fields would skip that check
+    // (nanos = 2000000000 is not a valid Timestamp).
+    let message = build_req(
+        BodyMapping::None,
+        Body::Absent,
+        &[("ttl.seconds", "9")],
+        "at.nanos=2000000000&note.value=x&meta.fields=y&age=1",
+    )
+    .unwrap();
+    assert_eq!(json(&message), serde_json::json!({"age": 1}));
+    // The same holds for a form body.
+    let message = build_req(
+        BodyMapping::Root,
+        Body::Form(b"at.seconds=5&age=2"),
+        &[],
+        "",
+    )
+    .unwrap();
+    assert_eq!(json(&message), serde_json::json!({"age": 2}));
+    // A form body cannot be bound to a well-known type field either: its keys
+    // would be that type's internal fields.
+    let err = build_req(
+        BodyMapping::Field("at".into()),
+        Body::Form(b"seconds=5"),
+        &[],
+        "",
+    )
+    .unwrap_err();
+    assert!(err.contains("`at`"), "{err}");
+}
+
+#[test]
 fn a_body_media_type_picks_json_or_form() {
     assert_eq!(
         Body::new(Some("application/x-www-form-urlencoded"), b"a"),
