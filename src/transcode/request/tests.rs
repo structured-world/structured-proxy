@@ -810,19 +810,24 @@ fn a_nested_well_known_type_in_the_body_is_set_whole() {
 }
 
 #[test]
-fn a_dotted_key_does_not_reach_inside_a_well_known_type() {
-    // A Timestamp, wrapper or Struct is set from its validated JSON form only;
-    // writing one of its internal fields would skip that check
-    // (nanos = 2000000000 is not a valid Timestamp).
+fn a_well_known_type_bound_field_by_field_is_kept_and_must_be_valid() {
+    // Path, query and form keys reach the fields of a Timestamp, Duration or
+    // wrapper, so none of the client's values is lost.
     let message = build_req(
         BodyMapping::None,
         Body::Absent,
         &[("ttl.seconds", "9")],
-        "at.nanos=2000000000&note.value=x&meta.fields=y&age=1",
+        "at.seconds=5&at.nanos=7&note.value=x&age=1",
     )
     .unwrap();
-    assert_eq!(json(&message), serde_json::json!({"age": 1}));
-    // The same holds for a form body.
+    assert_eq!(
+        json(&message),
+        serde_json::json!({
+            "at": "1970-01-01T00:00:05.000000007Z", "ttl": "9s",
+            "note": "x", "age": 1
+        })
+    );
+    // A form body too, at the root or bound to a well-known type field.
     let message = build_req(
         BodyMapping::Root,
         Body::Form(b"at.seconds=5&age=2"),
@@ -830,43 +835,85 @@ fn a_dotted_key_does_not_reach_inside_a_well_known_type() {
         "",
     )
     .unwrap();
-    assert_eq!(json(&message), serde_json::json!({"age": 2}));
-    // A form body cannot be bound to a well-known type field either: its keys
-    // would be that type's internal fields.
+    assert_eq!(
+        json(&message),
+        serde_json::json!({"at": "1970-01-01T00:00:05Z", "age": 2})
+    );
+    let message = build_req(
+        BodyMapping::Field("note".into()),
+        Body::Form(b"value=hello"),
+        &[],
+        "",
+    )
+    .unwrap();
+    assert_eq!(json(&message), serde_json::json!({"note": "hello"}));
+    // A path parameter sets one field of it; the query may fill another, as
+    // beside a path-bound field of any message.
+    let message = build_req(
+        BodyMapping::None,
+        Body::Absent,
+        &[("at.seconds", "5")],
+        "at.nanos=7&at.seconds=9",
+    )
+    .unwrap();
+    assert_eq!(
+        json(&message),
+        serde_json::json!({"at": "1970-01-01T00:00:05.000000007Z"})
+    );
+    // The result must still be a value its JSON form could hold: nanos past
+    // 999999999, or seconds and nanos of opposite sign, are not.
+    for (path, query) in [
+        (&[][..], "at.nanos=2000000000"),
+        (&[("ttl.seconds", "5")][..], "ttl.nanos=-1"),
+        (&[][..], "at.seconds=253402300800"),
+    ] {
+        let err = build_req(BodyMapping::None, Body::Absent, path, query).unwrap_err();
+        assert!(err.starts_with("invalid value"), "{query}: {err}");
+    }
     let err = build_req(
         BodyMapping::Field("at".into()),
-        Body::Form(b"seconds=5"),
+        Body::Form(b"nanos=-5"),
         &[],
         "",
     )
     .unwrap_err();
-    assert!(err.contains("`at`"), "{err}");
+    assert!(err.starts_with("invalid value"), "{err}");
 }
 
 #[test]
-fn a_root_well_known_type_takes_no_field_wise_keys() {
-    // A well-known input type is set from its validated JSON form only, as
-    // one below the root is (nanos = 2000000000 is not a valid Timestamp).
+fn a_root_well_known_type_bound_field_by_field_must_be_valid() {
+    // The same holds when the input message itself is a well-known type.
     let at = message_type("google.protobuf.Timestamp");
     let message = build_request_message(
         &at,
         &BodyMapping::None,
         Body::Absent,
         &pp(&[("seconds", "5")]),
-        Some("nanos=2000000000"),
+        Some("nanos=7"),
     )
     .unwrap();
-    assert_eq!(message, DynamicMessage::new(at.clone()));
-    // A form body holds no JSON form of the type to read it from.
-    let err = build_request_message(
+    assert_eq!(
+        json(&message),
+        serde_json::json!("1970-01-01T00:00:05.000000007Z")
+    );
+    let message = build_request_message(
         &at,
         &BodyMapping::Root,
         Body::Form(b"seconds=5"),
         &HashMap::new(),
         None,
     )
+    .unwrap();
+    assert_eq!(json(&message), serde_json::json!("1970-01-01T00:00:05Z"));
+    let err = build_request_message(
+        &at,
+        &BodyMapping::None,
+        Body::Absent,
+        &pp(&[("seconds", "5")]),
+        Some("nanos=2000000000"),
+    )
     .unwrap_err();
-    assert!(err.contains("google.protobuf.Timestamp"), "{err}");
+    assert!(err.starts_with("invalid value"), "{err}");
 }
 
 #[test]

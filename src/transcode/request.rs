@@ -11,7 +11,9 @@ mod presence;
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use prost_reflect::{DynamicMessage, FieldDescriptor, Kind, MessageDescriptor, Value};
+use prost_reflect::{
+    DynamicMessage, FieldDescriptor, Kind, MessageDescriptor, ReflectMessage, Value,
+};
 use serde::de::value::StrDeserializer;
 use serde::Deserializer;
 use serde_json::Value as JsonValue;
@@ -187,6 +189,9 @@ fn build(
     // The fields of the path being bound, reused across keys.
     let mut path = Vec::new();
 
+    // Whether a field inside a well-known type was set from a string.
+    let mut inside = false;
+
     let mut message = match (mapping, body) {
         (BodyMapping::None, _) => DynamicMessage::new(input.clone()),
         (BodyMapping::Field(name), Body::Absent) => {
@@ -208,25 +213,24 @@ fn build(
                 pairs: &pairs,
                 path_params,
             };
-            form_body(input, mapping, form, presence.as_mut(), &mut path)?
+            let (message, form_inside) =
+                form_body(input, mapping, form, presence.as_mut(), &mut path)?;
+            inside = form_inside;
+            message
         }
     };
 
-    // A well-known input type is set whole from its JSON form; path and query
-    // keys would reach its internal fields.
-    if has_special_json(input) {
-        return Ok(message);
-    }
-
+    let root_inside = has_special_json(input);
     // Path params win over everything (the router already matched them).
     for (key, raw) in path_params {
         let target = Target {
             root: input,
+            inside: root_inside,
             prefix: None,
             key,
             values: &[raw.as_str()],
         };
-        bind(
+        inside |= bind(
             &mut message,
             target,
             Binding::Set,
@@ -239,20 +243,86 @@ fn build(
         for_each_group(query, |key, values| {
             let target = Target {
                 root: input,
+                inside: root_inside,
                 prefix: None,
                 key,
                 values,
             };
-            bind(
+            inside |= bind(
                 &mut message,
                 target,
                 Binding::Fill,
                 Some(&mut *presence),
                 &mut path,
-            )
+            )?;
+            Ok(())
         })?;
     }
+    if inside {
+        check_well_known(&message)?;
+    }
     Ok(message)
+}
+
+/// Refuse a well-known type set field by field whose value its JSON form
+/// could not hold: a Timestamp's `nanos` past 999999999, a Duration whose
+/// `seconds` and `nanos` differ in sign, an `Any` of an unknown type.
+/// Checked once all keys are bound, as they arrive in any order.
+fn check_well_known(message: &DynamicMessage) -> Result<(), String> {
+    let invalid = |e: &dyn std::fmt::Display| format!("invalid value for a well-known type: {e}");
+    check_time_ranges(message).map_err(|e| invalid(&e))?;
+    // Writing the ProtoJSON checks the rest (an `Any` must name a known type
+    // and decode as it, a `FieldMask` path must round-trip through camelCase,
+    // a `Value` number must be finite); the text is not kept.
+    serde_json::to_writer(std::io::sink(), message).map_err(|e| invalid(&e))
+}
+
+/// Check every `Timestamp` and `Duration` in `message` against the ranges
+/// their definitions set. prost-reflect's writer checks only part of them and
+/// carries excess nanos into seconds, which would change the value.
+fn check_time_ranges(message: &DynamicMessage) -> Result<(), &'static str> {
+    let field = |name| message.get_field_by_name(name);
+    match message.descriptor().full_name() {
+        // google/protobuf/timestamp.proto: seconds from 0001-01-01T00:00:00Z
+        // to 9999-12-31T23:59:59Z, nanos in [0, 999999999].
+        "google.protobuf.Timestamp" => {
+            let seconds = field("seconds").and_then(|v| v.as_i64()).unwrap_or(0);
+            let nanos = field("nanos").and_then(|v| v.as_i32()).unwrap_or(0);
+            if !(-62_135_596_800..=253_402_300_799).contains(&seconds)
+                || !(0..=999_999_999).contains(&nanos)
+            {
+                return Err("timestamp out of range");
+            }
+        }
+        // google/protobuf/duration.proto: seconds within +-315576000000,
+        // nanos within +-999999999, and nanos of the same sign as a non-zero
+        // seconds.
+        "google.protobuf.Duration" => {
+            let seconds = field("seconds").and_then(|v| v.as_i64()).unwrap_or(0);
+            let nanos = field("nanos").and_then(|v| v.as_i32()).unwrap_or(0);
+            if seconds.unsigned_abs() > 315_576_000_000
+                || nanos.unsigned_abs() > 999_999_999
+                || (seconds > 0 && nanos < 0)
+                || (seconds < 0 && nanos > 0)
+            {
+                return Err("duration out of range");
+            }
+        }
+        _ => {}
+    }
+    for (_, value) in message.fields() {
+        check_value_time_ranges(value)?;
+    }
+    Ok(())
+}
+
+fn check_value_time_ranges(value: &Value) -> Result<(), &'static str> {
+    match value {
+        Value::Message(inner) => check_time_ranges(inner),
+        Value::List(items) => items.iter().try_for_each(check_value_time_ranges),
+        Value::Map(entries) => entries.values().try_for_each(check_value_time_ranges),
+        _ => Ok(()),
+    }
 }
 
 /// Where string values go: the field at the dotted path `key`, below the
@@ -260,6 +330,8 @@ fn build(
 #[derive(Clone, Copy)]
 struct Target<'a> {
     root: &'a MessageDescriptor,
+    /// Whether the message the key starts in is a well-known type.
+    inside: bool,
     prefix: Option<&'a FieldDescriptor>,
     key: &'a str,
     /// Every value of the key, in request order.
@@ -419,17 +491,17 @@ fn form_body(
     form: Form<'_, '_>,
     mut presence: Option<&mut Presence>,
     path: &mut Vec<FieldDescriptor>,
-) -> Result<DynamicMessage, String> {
+) -> Result<(DynamicMessage, bool), String> {
     let Form { pairs, path_params } = form;
     let mut message = DynamicMessage::new(input.clone());
-    let prefix = match mapping {
+    let (prefix, start_inside) = match mapping {
         BodyMapping::Field(name) => {
-            let field = input
+            let (field, inner) = input
                 .get_field_by_name(name)
-                .filter(|f| {
-                    !f.is_list()
-                        && !f.is_map()
-                        && matches!(f.kind(), Kind::Message(m) if !has_special_json(&m))
+                .filter(|f| !f.is_list() && !f.is_map())
+                .and_then(|f| match f.kind() {
+                    Kind::Message(inner) => Some((f, inner)),
+                    _ => None,
                 })
                 .ok_or_else(|| format!("a form body cannot fill field `{name}`"))?;
             // The field is the body's even when the form is empty of it.
@@ -437,24 +509,22 @@ fn form_body(
             if let Some(presence) = presence.as_deref_mut() {
                 presence.record_path(std::slice::from_ref(&field), true);
             }
-            Some(field)
+            (Some(field), has_special_json(&inner))
         }
-        // Its keys would be the internal fields of a type read only whole.
-        _ if has_special_json(input) => {
-            return Err(format!("a form body cannot fill `{}`", input.full_name()));
-        }
-        _ => None,
+        _ => (None, has_special_json(input)),
     };
+    let mut inside = false;
     for_each_group(pairs, |key, values| {
         let target = Target {
             root: input,
+            inside: start_inside,
             prefix: prefix.as_ref(),
             key,
             values,
         };
-        if !resolve(target, path) {
+        let Some(field_inside) = resolve(target, path) else {
             return Ok(());
-        }
+        };
         // The path sets these fields whatever the form holds, so their form
         // values are never decoded, as a JSON body's are not.
         if path_params.keys().any(|bound| covers(bound, path)) {
@@ -466,9 +536,11 @@ fn form_body(
             values,
             Binding::Set,
             presence.as_deref_mut(),
-        )
+        )?;
+        inside |= field_inside;
+        Ok(())
     })?;
-    Ok(message)
+    Ok((message, inside))
 }
 
 /// A form body and the path parameters that override it.
@@ -508,35 +580,39 @@ fn for_each_group<'p>(
 }
 
 /// Set the field `target` names to its values (see [`resolve`] and
-/// [`assign`]). `path` is a buffer for the fields on the way.
+/// [`assign`]). `path` is a buffer for the fields on the way. True when the
+/// field lies inside a well-known type.
 fn bind(
     message: &mut DynamicMessage,
     target: Target<'_>,
     binding: Binding,
     presence: Option<&mut Presence>,
     path: &mut Vec<FieldDescriptor>,
-) -> Result<(), String> {
-    if !resolve(target, path) {
-        return Ok(());
-    }
-    assign(message, path, target.values, binding, presence)
+) -> Result<bool, String> {
+    let Some(inside) = resolve(target, path) else {
+        return Ok(false);
+    };
+    assign(message, path, target.values, binding, presence)?;
+    Ok(inside)
 }
 
-/// Resolve the dotted key of `target` into the fields on the way, in `path`.
+/// Resolve the dotted key of `target` into the fields on the way, in `path`,
+/// and tell whether the field lies inside a well-known type.
 ///
 /// Each segment names a field by its proto name or its JSON name, as
-/// ProtoJSON reads a key. False when the key is dropped: it names no field,
-/// or passes through a field that is not a singular message or is a
-/// well-known type. A well-known type is set whole from its validated JSON
-/// form, never field by field (a Timestamp's `nanos` alone could hold an
-/// invalid value).
-fn resolve(target: Target<'_>, path: &mut Vec<FieldDescriptor>) -> bool {
+/// ProtoJSON reads a key. `None` when the key is dropped: it names no field,
+/// or passes through a field that is not a singular message. A field inside
+/// a well-known type (`at.nanos` of a Timestamp) is bound like any other, and
+/// the value it leaves is checked once the request is built (see
+/// [`check_well_known`]).
+fn resolve(target: Target<'_>, path: &mut Vec<FieldDescriptor>) -> Option<bool> {
     path.clear();
+    let mut inside = target.inside;
     let mut owned;
     let mut desc = match target.prefix {
         Some(field) => {
             let Kind::Message(inner) = field.kind() else {
-                return false;
+                return None;
             };
             path.push(field.clone());
             owned = inner;
@@ -547,25 +623,21 @@ fn resolve(target: Target<'_>, path: &mut Vec<FieldDescriptor>) -> bool {
     let mut segments = target.key.split('.');
     let mut leaf = segments.next().unwrap_or_default();
     for next in segments {
-        let Some(field) = field_named(desc, leaf) else {
-            return false;
-        };
+        let field = field_named(desc, leaf)?;
         let Kind::Message(inner) = field.kind() else {
-            return false;
+            return None;
         };
-        if field.is_list() || field.is_map() || has_special_json(&inner) {
-            return false;
+        if field.is_list() || field.is_map() {
+            return None;
         }
+        inside |= has_special_json(&inner);
         path.push(field);
         owned = inner;
         desc = &owned;
         leaf = next;
     }
-    let Some(field) = field_named(desc, leaf) else {
-        return false;
-    };
-    path.push(field);
-    true
+    path.push(field_named(desc, leaf)?);
+    Some(inside)
 }
 
 /// The field of `desc` named `name`, by its proto name or else its JSON name.

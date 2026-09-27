@@ -229,10 +229,10 @@ names, in one pass and without an intermediate JSON tree:
   them: numbers, `true`/`false`, enum names, base64 bytes, and the string form
   of `Timestamp`, `Duration`, `FieldMask` and the wrapper types. A key names a
   field by its proto or JSON name, a repeated key fills a repeated field, `a.b`
-  reaches a nested field, and an unknown key is dropped. A well-known type is
-  set only whole, from that string form: a key into its internal fields
-  (`at.nanos`, or `nanos` when the input message is a `Timestamp`) is dropped,
-  and a form body cannot fill one.
+  reaches a nested field, and an unknown key is dropped. A well-known type can
+  also be set field by field (`at.seconds=5&at.nanos=7`, `note.value=x`, or a
+  form body bound to it); the result must be a value its JSON form could hold,
+  so `at.nanos=2000000000` is rejected.
 
 A value that is not valid for its field, or two members of one `oneof`, is
 answered with `INVALID_ARGUMENT` (400) before the upstream is called.

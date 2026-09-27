@@ -33,10 +33,22 @@ struct Entry {
     /// The key's bytes in `names`.
     start: u32,
     end: u32,
-    /// The value was a JSON object, whose own keys are recorded below it; any
-    /// other value (null, a string for a well-known type) sets the field as a
-    /// whole.
-    object: bool,
+    held: Held,
+}
+
+/// What the recorded key set its field to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Held {
+    /// A value other than an object (null, a string for a well-known type):
+    /// the field as a whole.
+    Whole,
+    /// A JSON object, whose own keys are recorded below it. Those keys are
+    /// fields unless the field is a well-known type (a `Struct`'s keys, an
+    /// `Any`'s `@type`), which the object then sets as a whole.
+    Object,
+    /// The fields on the way to one a path parameter or form key set: the
+    /// keys below are field names, whatever the field's type.
+    Fields,
 }
 
 impl Presence {
@@ -66,37 +78,45 @@ impl Presence {
     }
 
     /// Record `key` read at nesting level `depth`.
-    fn record(&mut self, depth: usize, key: &str, object: bool) {
+    fn record(&mut self, depth: usize, key: &str, held: Held) {
         let start = self.names.len();
         self.names.push_str(key);
         self.entries.push(Entry {
             depth: u32::try_from(depth).expect("fewer than 2^32 nesting levels"),
             start: u32::try_from(start).expect("keys shorter than 4 GiB"),
             end: u32::try_from(self.names.len()).expect("keys shorter than 4 GiB"),
-            object,
+            held,
         });
     }
 
     /// Record `path` as set by something other than the body: every field on
-    /// the way as an object, the last one as an object when `object`.
+    /// the way as fields, the last one as an object when `object` (a form
+    /// body bound to that field), as a whole otherwise.
     pub(super) fn record_path(&mut self, path: &[FieldDescriptor], object: bool) {
         for (depth, field) in path.iter().enumerate() {
-            self.record(depth, field.name(), object || depth + 1 < path.len());
+            let held = if depth + 1 < path.len() {
+                Held::Fields
+            } else if object {
+                Held::Object
+            } else {
+                Held::Whole
+            };
+            self.record(depth, field.name(), held);
         }
     }
 
     /// The object the key recorded last holds.
     fn mark_object(&mut self) {
         if let Some(entry) = self.entries.last_mut() {
-            entry.object = true;
+            entry.held = Held::Object;
         }
     }
 
     /// Whether a query parameter for `path` must leave it alone: the path was
     /// set, or a field above it was set to something other than an object of
-    /// its fields. A well-known type read from its own JSON form (a `Struct`,
-    /// an object `Value`) counts as set whole: its object's keys are not its
-    /// fields.
+    /// its fields. A well-known type the body or a form set as an object (a
+    /// `Struct`, an object `Value`) counts as set whole: its object's keys are
+    /// not its fields.
     pub(super) fn blocks(&mut self, path: &[FieldDescriptor]) -> bool {
         if self.whole {
             return true;
@@ -113,8 +133,13 @@ impl Presence {
                 .get(depth)
                 .filter(|field| parent && (key == field.name() || key == field.json_name()));
             if let Some(field) = field {
-                let whole = !entry.object
-                    || matches!(field.kind(), Kind::Message(message) if has_special_json(&message));
+                let whole = match entry.held {
+                    Held::Whole => true,
+                    Held::Object => {
+                        matches!(field.kind(), Kind::Message(message) if has_special_json(&message))
+                    }
+                    Held::Fields => false,
+                };
                 if depth + 1 == path.len() || whole {
                     return true;
                 }
@@ -325,7 +350,7 @@ impl<'de, A: MapAccess<'de>> MapAccess<'de> for RecordingMap<'_, A> {
         let Some(key) = self.inner.next_key::<String>()? else {
             return Ok(None);
         };
-        self.presence.record(self.depth, &key, false);
+        self.presence.record(self.depth, &key, Held::Whole);
         let key: StringDeserializer<A::Error> = key.into_deserializer();
         seed.deserialize(key).map(Some)
     }
