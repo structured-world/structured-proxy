@@ -11,6 +11,10 @@ use serde::Deserialize;
 /// The variable tokio reads for its default worker count.
 const WORKER_THREADS_ENV: &str = "TOKIO_WORKER_THREADS";
 
+/// Threads the runtime may add for blocking work (tokio's default), set
+/// explicitly because tokio adds it to the worker count unchecked.
+const MAX_BLOCKING_THREADS: usize = 512;
+
 /// The keys of the config file this binary reads itself; the library reads
 /// the rest and ignores these.
 #[derive(Debug, Default, Deserialize)]
@@ -79,9 +83,10 @@ impl RuntimeConfig {
     ///
     /// # Errors
     ///
-    /// The runtime cannot be created, or `TOKIO_WORKER_THREADS` is used and
-    /// is not a positive integer: tokio would panic on it, so it is read here
-    /// and refused with its name.
+    /// The runtime cannot be created, `TOKIO_WORKER_THREADS` is used and is
+    /// not a positive integer, or the worker count is so large that tokio's
+    /// thread limit overflows: tokio would panic on either, so they are
+    /// refused here with the name of the setting.
     pub fn build(&self) -> std::io::Result<(tokio::runtime::Runtime, WorkerSource)> {
         self.build_with(std::env::var_os(WORKER_THREADS_ENV).as_deref())
     }
@@ -112,8 +117,14 @@ impl RuntimeConfig {
                 WorkerSource::AvailableParallelism,
             ),
         };
+        if workers.checked_add(MAX_BLOCKING_THREADS).is_none() {
+            return Err(std::io::Error::other(format!(
+                "{source} is too large: {workers} worker threads"
+            )));
+        }
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(workers)
+            .max_blocking_threads(MAX_BLOCKING_THREADS)
             .enable_all()
             .build()?;
         Ok((runtime, source))

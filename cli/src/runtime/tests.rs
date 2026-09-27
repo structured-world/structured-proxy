@@ -30,7 +30,7 @@ fn without_the_key_the_environment_decides() {
 #[test]
 fn without_the_key_or_the_variable_the_available_parallelism_decides() {
     let (rt, source) = RuntimeConfig::default().build_with(None).unwrap();
-    let parallelism = std::thread::available_parallelism().unwrap().get();
+    let parallelism = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
     assert_eq!(rt.metrics().num_workers(), parallelism);
     assert_eq!(source, WorkerSource::AvailableParallelism);
 }
@@ -71,6 +71,23 @@ fn an_invalid_environment_value_is_refused_by_name() {
             .to_string();
         assert!(err.contains(WORKER_THREADS_ENV), "{value:?}: {err}");
     }
+}
+
+#[test]
+fn a_worker_count_that_overflows_the_thread_limit_is_refused_by_source() {
+    // tokio adds the blocking-thread limit to the worker count; a sum past
+    // usize::MAX panicked inside tokio instead of naming the setting.
+    let too_many = usize::MAX - MAX_BLOCKING_THREADS + 1;
+    let config = runtime(&format!("runtime:\n  worker_threads: {too_many}\n")).unwrap();
+    let err = config.build_with(None).unwrap_err().to_string();
+    assert!(err.contains("runtime.worker_threads"), "{err}");
+
+    let env = too_many.to_string();
+    let err = RuntimeConfig::default()
+        .build_with(Some(OsStr::new(&env)))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains(WORKER_THREADS_ENV), "{err}");
 }
 
 #[test]
