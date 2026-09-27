@@ -1,7 +1,3 @@
-// The tests of the JSON-returning wrapper exercise the message builder
-// through it, and pin the wrapper's own output.
-#![expect(deprecated)]
-
 use super::*;
 use prost_reflect::prost::Message;
 use prost_reflect::prost_types::{
@@ -73,11 +69,21 @@ fn pp(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         .collect()
 }
 
-fn qq(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-    pairs
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect()
+/// Build a `test.TestMsg` and return it as ProtoJSON.
+fn build_test_msg(
+    mapping: BodyMapping,
+    body: Body<'_>,
+    path: &[(&str, &str)],
+    query: &str,
+) -> Result<Value, String> {
+    build_request_message(
+        &test_msg(),
+        &mapping,
+        body,
+        &pp(path),
+        (!query.is_empty()).then_some(query),
+    )
+    .map(|message| json(&message))
 }
 
 #[test]
@@ -111,31 +117,25 @@ fn body_mapping_parse() {
 
 #[test]
 fn body_root_merges_path_and_query() {
-    let m = test_msg();
-    let body = serde_json::json!({ "name": "alice" });
-    let out = build_request_json(
-        &m,
-        &BodyMapping::Root,
-        body,
-        &pp(&[("age", "30")]),
-        &qq(&[("active", "true")]),
+    let out = build_test_msg(
+        BodyMapping::Root,
+        Body::Json(br#"{"name": "alice"}"#),
+        &[("age", "30")],
+        "active=true",
     )
     .unwrap();
     assert_eq!(out["name"], "alice");
-    assert_eq!(out["age"], 30); // Int32 coerced to a JSON number
-    assert_eq!(out["active"], true); // Bool coerced
+    assert_eq!(out["age"], 30); // Int32 from the path
+    assert_eq!(out["active"], true); // Bool from the query
 }
 
 #[test]
 fn body_field_nests_body_under_named_field() {
-    let m = test_msg();
-    let body = serde_json::json!({ "city": "berlin" });
-    let out = build_request_json(
-        &m,
-        &BodyMapping::Field("nested".into()),
-        body,
-        &pp(&[]),
-        &qq(&[("name", "bob")]),
+    let out = build_test_msg(
+        BodyMapping::Field("nested".into()),
+        Body::Json(br#"{"city": "berlin"}"#),
+        &[],
+        "name=bob",
     )
     .unwrap();
     assert_eq!(out["nested"]["city"], "berlin");
@@ -144,42 +144,23 @@ fn body_field_nests_body_under_named_field() {
 
 #[test]
 fn query_repeated_field_becomes_array() {
-    let m = test_msg();
-    let out = build_request_json(
-        &m,
-        &BodyMapping::None,
-        Value::Null,
-        &pp(&[]),
-        &qq(&[("tags", "a"), ("tags", "b")]),
-    )
-    .unwrap();
+    let out = build_test_msg(BodyMapping::None, Body::Absent, &[], "tags=a&tags=b").unwrap();
     assert_eq!(out["tags"], serde_json::json!(["a", "b"]));
 }
 
 #[test]
 fn query_dotted_path_sets_nested_field() {
-    let m = test_msg();
-    let out = build_request_json(
-        &m,
-        &BodyMapping::None,
-        Value::Null,
-        &pp(&[]),
-        &qq(&[("nested.city", "paris")]),
-    )
-    .unwrap();
+    let out = build_test_msg(BodyMapping::None, Body::Absent, &[], "nested.city=paris").unwrap();
     assert_eq!(out["nested"]["city"], "paris");
 }
 
 #[test]
 fn query_does_not_override_body_or_path() {
-    let m = test_msg();
-    let body = serde_json::json!({ "name": "from_body" });
-    let out = build_request_json(
-        &m,
-        &BodyMapping::Root,
-        body,
-        &pp(&[("age", "7")]),
-        &qq(&[("name", "from_query"), ("age", "99")]),
+    let out = build_test_msg(
+        BodyMapping::Root,
+        Body::Json(br#"{"name": "from_body"}"#),
+        &[("age", "7")],
+        "name=from_query&age=99",
     )
     .unwrap();
     assert_eq!(out["name"], "from_body"); // body wins over query
@@ -188,13 +169,11 @@ fn query_does_not_override_body_or_path() {
 
 #[test]
 fn int64_field_stays_string() {
-    let m = test_msg();
-    let out = build_request_json(
-        &m,
-        &BodyMapping::None,
-        Value::Null,
-        &pp(&[]),
-        &qq(&[("count", "9007199254740993")]),
+    let out = build_test_msg(
+        BodyMapping::None,
+        Body::Absent,
+        &[],
+        "count=9007199254740993",
     )
     .unwrap();
     // 64-bit ints serialize as JSON strings in canonical proto3 JSON.
@@ -203,57 +182,14 @@ fn int64_field_stays_string() {
 
 #[test]
 fn unknown_query_field_is_dropped() {
-    let m = test_msg();
-    let out = build_request_json(
-        &m,
-        &BodyMapping::None,
-        Value::Null,
-        &pp(&[]),
-        &qq(&[("does_not_exist", "x")]),
-    )
-    .unwrap();
+    let out = build_test_msg(BodyMapping::None, Body::Absent, &[], "does_not_exist=x").unwrap();
     assert_eq!(out.get("does_not_exist"), None);
 }
 
 #[test]
 fn root_body_must_be_object() {
-    let m = test_msg();
-    let err = build_request_json(
-        &m,
-        &BodyMapping::Root,
-        serde_json::json!("a string"),
-        &pp(&[]),
-        &qq(&[]),
-    );
+    let err = build_test_msg(BodyMapping::Root, Body::Json(br#""a string""#), &[], "");
     assert!(err.is_err());
-}
-
-#[test]
-fn extract_response_body_walks_dotted_path() {
-    let v = serde_json::json!({ "result": { "token": "abc" } });
-    assert_eq!(
-        extract_response_body(&v, "result.token"),
-        Some(serde_json::json!("abc"))
-    );
-    assert_eq!(
-        extract_response_body(&v, "result"),
-        Some(serde_json::json!({ "token": "abc" }))
-    );
-    // A missing path is None (caller can warn), distinct from a null field.
-    assert_eq!(extract_response_body(&v, "missing"), None);
-}
-
-#[test]
-fn parse_query_handles_empty_and_pairs() {
-    assert_eq!(parse_query(None).unwrap(), Vec::<(String, String)>::new());
-    assert_eq!(
-        parse_query(Some("")).unwrap(),
-        Vec::<(String, String)>::new()
-    );
-    assert_eq!(
-        parse_query(Some("a=1&b=2")).unwrap(),
-        vec![("a".into(), "1".into()), ("b".into(), "2".into())]
-    );
 }
 
 // ---- The message builder ----

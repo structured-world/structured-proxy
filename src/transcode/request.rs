@@ -12,8 +12,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use prost_reflect::{
-    DynamicMessage, FieldDescriptor, Kind, MessageDescriptor, ReflectMessage, SerializeOptions,
-    Value,
+    DynamicMessage, FieldDescriptor, Kind, MessageDescriptor, ReflectMessage, Value,
 };
 use serde::de::value::StrDeserializer;
 use serde::Deserializer;
@@ -162,85 +161,7 @@ pub fn build_request_message(
         Some(q) => url::form_urlencoded::parse(q.as_bytes()).collect(),
         None => Vec::new(),
     };
-    let source = match body {
-        Body::Absent => Source::Absent,
-        Body::Json(bytes) => Source::Json(bytes),
-        Body::Form(bytes) => Source::Form(bytes),
-    };
-    build(input, mapping, source, path_params, &query)
-}
-
-/// Build the request-message JSON from the body mapping, path params, and query.
-///
-/// The request message is built by [`build_request_message`], then serialized
-/// back to ProtoJSON (proto field names, 64-bit integers as strings, default
-/// values left out).
-///
-/// # Errors
-/// Returns an error string if `body` maps to the message root but is not a
-/// JSON object, or for any error of [`build_request_message`].
-#[deprecated(
-    note = "builds the message and serializes it back to JSON; use build_request_message, \
-            which returns the message"
-)]
-pub fn build_request_json(
-    input: &MessageDescriptor,
-    body_mapping: &BodyMapping,
-    body_json: JsonValue,
-    path_params: &HashMap<String, String>,
-    query: &[(String, String)],
-) -> Result<JsonValue, String> {
-    let source = match (body_mapping, body_json) {
-        (BodyMapping::Root, JsonValue::Null) => Source::Absent,
-        (BodyMapping::Root, body @ JsonValue::Object(_)) => Source::Value(body),
-        (BodyMapping::Root, _) => return Err("request body must be a JSON object".to_string()),
-        (_, body) => Source::Value(body),
-    };
-    let query: Vec<(Cow<'_, str>, Cow<'_, str>)> = query
-        .iter()
-        .map(|(k, v)| (Cow::Borrowed(k.as_str()), Cow::Borrowed(v.as_str())))
-        .collect();
-    let message = build(input, body_mapping, source, path_params, &query)?;
-    let options = SerializeOptions::new().use_proto_field_name(true);
-    message
-        .serialize_with_options(serde_json::value::Serializer, &options)
-        .map_err(|e| format!("failed to serialize request: {e}"))
-}
-
-/// Parse a raw query string into ordered key/value pairs.
-///
-/// `None` and the empty string yield no pairs. A non-empty string must be valid
-/// `application/x-www-form-urlencoded`.
-///
-/// # Errors
-/// Returns an error string when the query cannot be parsed, so the caller can
-/// reject the request rather than silently dropping every query-bound field.
-pub fn parse_query(raw: Option<&str>) -> Result<Vec<(String, String)>, String> {
-    match raw {
-        None | Some("") => Ok(Vec::new()),
-        Some(q) => serde_urlencoded::from_str(q).map_err(|e| format!("invalid query string: {e}")),
-    }
-}
-
-/// Extract a (possibly dotted) subfield of the response JSON for `response_body`.
-///
-/// Returns `None` when any path segment is missing, letting the caller
-/// distinguish a misconfigured path from a field that is legitimately null.
-pub fn extract_response_body(value: &JsonValue, path: &str) -> Option<JsonValue> {
-    let mut cur = value;
-    for seg in path.split('.') {
-        cur = cur.get(seg)?;
-    }
-    Some(cur.clone())
-}
-
-/// Where the body comes from.
-enum Source<'a> {
-    Absent,
-    Json(&'a [u8]),
-    Form(&'a [u8]),
-    /// An already parsed JSON value.
-    Value(JsonValue),
+    build(input, mapping, body, path_params, &query)
 }
 
 /// Which source a string value comes from, and so whether it overwrites.
@@ -255,41 +176,34 @@ enum Binding {
 fn build(
     input: &MessageDescriptor,
     mapping: &BodyMapping,
-    source: Source<'_>,
+    body: Body<'_>,
     path_params: &HashMap<String, String>,
     query: &[(Cow<'_, str>, Cow<'_, str>)],
 ) -> Result<DynamicMessage, String> {
     // What the body and the path set matters only when a query can fill.
-    let body_len = match &source {
-        Source::Json(bytes) | Source::Form(bytes) => bytes.len(),
-        Source::Absent | Source::Value(_) => 0,
+    let body_len = match body {
+        Body::Json(bytes) | Body::Form(bytes) => bytes.len(),
+        Body::Absent => 0,
     };
     let mut presence = (!query.is_empty()).then(|| Presence::for_body(body_len));
     // The fields of the path being bound, reused across keys.
     let mut path = Vec::new();
 
-    let mut message = match (mapping, source) {
+    let mut message = match (mapping, body) {
         (BodyMapping::None, _) => DynamicMessage::new(input.clone()),
-        (BodyMapping::Field(name), Source::Absent) => {
+        (BodyMapping::Field(name), Body::Absent) => {
             if let (Some(presence), Some(field)) = (&mut presence, input.get_field_by_name(name)) {
                 presence.record_path(&[field], false);
             }
             DynamicMessage::new(input.clone())
         }
-        (BodyMapping::Root, Source::Absent) => DynamicMessage::new(input.clone()),
+        (BodyMapping::Root, Body::Absent) => DynamicMessage::new(input.clone()),
         // An empty body is `{}`, whatever its media type.
-        (_, Source::Json(bytes) | Source::Form(bytes)) if bytes.is_empty() => {
+        (_, Body::Json(bytes) | Body::Form(bytes)) if bytes.is_empty() => {
             json_body(input, mapping, b"{}", path_params, presence.as_mut())?
         }
-        (_, Source::Json(bytes)) => {
-            json_body(input, mapping, bytes, path_params, presence.as_mut())?
-        }
-        (_, Source::Value(mut value)) => {
-            strip_path_fields(&mut value, input, mapping, path_params);
-            deserialize(input, mapping, value, presence.as_mut())
-                .map_err(|e| format!("failed to decode request body: {e}"))?
-        }
-        (_, Source::Form(bytes)) => {
+        (_, Body::Json(bytes)) => json_body(input, mapping, bytes, path_params, presence.as_mut())?,
+        (_, Body::Form(bytes)) => {
             let pairs: Vec<(Cow<'_, str>, Cow<'_, str>)> =
                 url::form_urlencoded::parse(bytes).collect();
             form_body(input, mapping, &pairs, presence.as_mut(), &mut path)?
