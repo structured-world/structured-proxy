@@ -131,6 +131,23 @@ async fn a_value_grpc_metadata_cannot_carry_is_refused() {
 }
 
 #[tokio::test]
+async fn a_forwarded_name_grpc_cannot_carry_is_a_config_error() {
+    // `+` is a valid HTTP field-name character but not a gRPC key one, so an
+    // upstream may reject the call: the proxy refuses to start instead.
+    let config = structured_proxy::config::ProxyConfig::from_yaml_str(
+        "upstream:\n  default: \"http://127.0.0.1:1\"\nforwarded_headers: [\"x+proof\"]\n",
+    )
+    .unwrap();
+    let Err(err) = structured_proxy::ProxyServer::from_config(config)
+        .with_descriptors(pool())
+        .router()
+    else {
+        panic!("a forwarded header outside the gRPC key grammar must be rejected");
+    };
+    assert!(err.to_string().contains("x+proof"), "{err}");
+}
+
+#[tokio::test]
 async fn a_single_value_is_unchanged() {
     let app = proxy().await;
     let request = http::Request::get("/v1/seen")

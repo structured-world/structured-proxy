@@ -8,7 +8,7 @@
 use std::convert::Infallible;
 use std::time::Duration;
 
-use axum::http::header::Entry;
+use axum::http::header::{Entry, OccupiedEntry};
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use tonic::metadata::MetadataMap;
 
@@ -78,19 +78,54 @@ fn forward<E>(
 ) -> Result<MetadataMap, E> {
     let mut forwarded = HeaderMap::new();
     for name in forwarded_headers {
-        let mut values = headers.get_all(name.as_str()).iter();
-        let Some(first) = values.next() else {
+        // Trace-context propagation owns these, listed or not.
+        if is_trace_context(name) {
             continue;
-        };
+        }
+        let values = headers.get_all(name.as_str());
+        if values.iter().next().is_none() {
+            continue;
+        }
         let name = HeaderName::from_bytes(name.as_bytes())
             .expect("a name the request carries a header under is a valid header name");
+        // A name gRPC metadata cannot carry is refused when the proxy is built;
+        // a direct caller that lists one gets nothing forwarded under it.
+        if !is_grpc_key(name.as_str()) {
+            continue;
+        }
         // A name listed twice is forwarded once, so its values are not doubled.
-        if let Entry::Vacant(entry) = forwarded.entry(name) {
-            check(entry.key(), first)?;
-            let mut entry = entry.insert_entry(first.clone());
-            for value in values {
-                check(entry.key(), value)?;
-                entry.append(value.clone());
+        let Entry::Vacant(vacant) = forwarded.entry(name) else {
+            continue;
+        };
+        let key = vacant.key().clone();
+        let binary = key.as_str().ends_with("-bin");
+        let mut vacant = Some(vacant);
+        let mut entry = None;
+        let mut push = |value: HeaderValue| match entry.as_mut() {
+            Some(entry) => {
+                OccupiedEntry::append(entry, value);
+            }
+            None => {
+                let vacant = vacant
+                    .take()
+                    .expect("only the first value finds the entry vacant");
+                entry = Some(vacant.insert_entry(value));
+            }
+        };
+        for value in values {
+            check(&key, value)?;
+            // gRPC PROTOCOL-HTTP2 lets binary values be joined by commas, and
+            // tonic does not split them before decoding: each part travels as
+            // its own value.
+            if binary && value.as_bytes().contains(&b',') {
+                for part in value.as_bytes().split(|&b| b == b',') {
+                    push(
+                        HeaderValue::from_bytes(part.trim_ascii())
+                            .expect("a trimmed part of a header value is a header value"),
+                    );
+                }
+            } else {
+                push(value.clone());
             }
         }
     }
@@ -112,6 +147,22 @@ fn carries(name: &HeaderName, value: &[u8]) -> bool {
     }
 }
 
+/// Whether `name` is a gRPC metadata key (gRPC PROTOCOL-HTTP2,
+/// "Header-Name → 1*( %x30-39 / %x61-7A / "_" / "-" / "." )"), compared the
+/// way HTTP compares field names, without case.
+pub(crate) fn is_grpc_key(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| {
+            let b = b.to_ascii_lowercase();
+            b.is_ascii_digit() || b.is_ascii_lowercase() || matches!(b, b'_' | b'-' | b'.')
+        })
+}
+
+/// Whether `name` is a W3C trace-context header, which propagation owns.
+fn is_trace_context(name: &str) -> bool {
+    name.eq_ignore_ascii_case("traceparent") || name.eq_ignore_ascii_case("tracestate")
+}
+
 /// `ASCII-Value → 1*( %x20-%x7E )`. An empty value is allowed: HTTP allows an
 /// empty field value, and dropping it would change the count.
 fn is_ascii_value(value: &[u8]) -> bool {
@@ -128,13 +179,40 @@ fn is_base64_value(value: &[u8]) -> bool {
             data.iter()
                 .all(|&b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
         };
-        match data {
+        let (data, well_formed) = match data {
             // Padding closes a four-digit group.
-            Some(data) => alphabet(data) && part.len() % 4 == 0,
+            Some(data) => (data, part.len() % 4 == 0),
             // A lone last digit cannot encode a byte (RFC 4648 §4).
-            None => alphabet(part) && part.len() % 4 != 1,
-        }
+            None => (part, part.len() % 4 != 1),
+        };
+        well_formed && alphabet(data) && canonical_tail(data)
     })
+}
+
+/// RFC 4648 §3.5: the bits of the last digit past the final byte are zero, as
+/// strict decoders (tonic's among them) require. `data` is unpadded base64.
+fn canonical_tail(data: &[u8]) -> bool {
+    let unused_bits_mask = match data.len() % 4 {
+        // Two digits carry one byte and four spare bits; three carry two bytes
+        // and two spare bits.
+        2 => 0b1111,
+        3 => 0b0011,
+        _ => return true,
+    };
+    data.last()
+        .is_some_and(|&digit| base64_digit(digit) & unused_bits_mask == 0)
+}
+
+/// The value of a base64 digit (RFC 4648 §4, Table 1); only called on digits
+/// already checked against the alphabet.
+fn base64_digit(digit: u8) -> u8 {
+    match digit {
+        b'A'..=b'Z' => digit - b'A',
+        b'a'..=b'z' => digit - b'a' + 26,
+        b'0'..=b'9' => digit - b'0' + 52,
+        b'+' => 62,
+        _ => 63,
+    }
 }
 
 /// Insert an ASCII metadata entry, silently skipping a key or value gRPC
@@ -168,9 +246,8 @@ fn append_ascii(metadata: &mut MetadataMap, key: &'static str, value: &[u8]) {
 /// well-formed per W3C §3.2.2; otherwise (missing or malformed) synthesizes a
 /// fresh one so the upstream always receives a single valid, joinable trace.
 fn inject_trace_context(metadata: &mut MetadataMap, headers: &HeaderMap) {
-    // tracestate only travels with the trace it annotates, so a forwarded one
-    // is replaced here in both branches.
-    metadata.remove("tracestate");
+    // `metadata` holds no trace-context header of its own: forwarding skips
+    // them, so tracestate travels only here, with the trace it annotates.
     if let Some(tp) = headers.get("traceparent").and_then(|v| v.to_str().ok()) {
         if is_valid_traceparent(tp) {
             insert_ascii(metadata, "traceparent", tp.as_bytes());

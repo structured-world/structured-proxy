@@ -275,6 +275,61 @@ fn a_binary_value_must_be_base64() {
 }
 
 #[test]
+fn a_binary_value_must_be_canonical_base64() {
+    // RFC 4648 §3.5: the bits past the last byte must be zero, and decoders
+    // (tonic's among them) reject a value where they are not.
+    for bad in ["AB==", "AB", "AAF=", "AAF"] {
+        assert!(!is_base64_value(bad.as_bytes()), "{bad:?}");
+    }
+    for good in ["AQ==", "AQ", "AAE=", "AAE", "/w==", "//8="] {
+        assert!(is_base64_value(good.as_bytes()), "{good:?}");
+    }
+}
+
+#[test]
+fn comma_joined_binary_values_reach_the_upstream_as_separate_values() {
+    // gRPC PROTOCOL-HTTP2 lets binary values be joined by commas; tonic does
+    // not split them, so each part is forwarded as its own value.
+    let mut headers = HeaderMap::new();
+    headers.insert("x-trace-bin", HeaderValue::from_static("AAEC, AA=="));
+    let meta = http_headers_to_grpc_metadata(&headers, &["x-trace-bin".to_string()]);
+    let decoded: Vec<Vec<u8>> = meta
+        .get_all_bin("x-trace-bin")
+        .iter()
+        .map(|v| v.to_bytes().unwrap().to_vec())
+        .collect();
+    assert_eq!(decoded, [vec![0u8, 1, 2], vec![0u8]]);
+}
+
+#[test]
+fn a_listed_trace_context_header_is_left_to_trace_propagation() {
+    // A malformed traceparent is replaced by a fresh one whether or not it is
+    // listed, rather than refusing the request.
+    let mut headers = HeaderMap::new();
+    headers.insert("traceparent", HeaderValue::from_static("00-bad\tvalue"));
+    headers.insert("tracestate", HeaderValue::from_bytes(b"caf\xe9").unwrap());
+    let listed = vec!["traceparent".to_string(), "tracestate".to_string()];
+    let meta = try_http_headers_to_grpc_metadata(&headers, &listed).unwrap();
+    let tp = meta.get("traceparent").unwrap().to_str().unwrap();
+    assert!(is_valid_traceparent(tp), "{tp}");
+    assert!(meta.get("tracestate").is_none());
+}
+
+#[test]
+fn a_name_outside_the_grpc_key_grammar_is_not_forwarded() {
+    // gRPC keys are lowercase letters, digits, `_`, `-` and `.`; `+` is a
+    // valid HTTP field-name character but not a gRPC one.
+    assert!(is_grpc_key("x-request-id"));
+    assert!(is_grpc_key("DPoP"));
+    assert!(!is_grpc_key("x+proof-bin"));
+    assert!(!is_grpc_key(""));
+    let mut headers = HeaderMap::new();
+    headers.insert("x+proof", HeaderValue::from_static("a"));
+    let meta = http_headers_to_grpc_metadata(&headers, &["x+proof".to_string()]);
+    assert!(meta.get("x+proof").is_none());
+}
+
+#[test]
 #[expect(deprecated, reason = "the forwarding-as-is API stays available")]
 fn the_unchecked_conversion_still_forwards_every_value() {
     let mut headers = HeaderMap::new();
