@@ -15,6 +15,8 @@ Works with **any** gRPC service via proto descriptor files. No code generation, 
 - **Dynamic REST routes** from proto descriptors using `google.api.http` annotations
 - **Full request mapping**: path params, query parameters (typed + repeated + nested), and `body` (`*` / named field / none)
 - **`response_body`** to return a single response subfield, and **`additional_bindings`** for multiple routes per RPC
+- **`custom` rules**: any HTTP method (`HEAD`, `OPTIONS`, extension methods), or `kind: "*"` for every method
+- **Upstream-controlled HTTP answers**: response metadata becomes response headers, `x-http-code` sets the status, and `google.api.HttpBody` carries a raw body and content type in either direction, so OAuth 2.0 / OIDC endpoints, redirects and file downloads work as gRPC (see [Upstream controls](#upstream-controls))
 - **Auto-generated OpenAPI** documentation from proto messages, served at `/openapi.json`
 - **Server-streaming** RPC → NDJSON by default, or Server-Sent Events via `Accept: text/event-stream` negotiation
 - **gRPC → HTTP status mapping** following the standard `google.rpc.Code` table
@@ -125,6 +127,11 @@ error_details:
       enabled: false
     - pattern: "/v1/partner/**"
       opaque: true
+
+# Optional: upstream response metadata keys kept off the HTTP response (see
+# "Upstream controls"). Every other application key is forwarded as a header.
+response_headers:
+  deny: ["x-debug-trace"]
 
 # Rate limiting (Shield)
 #
@@ -387,7 +394,9 @@ The same applies to a message the proxy cannot serialize mid-stream: the
 stream ends with an `INTERNAL` terminal frame.
 
 This is the HTTP/JSON transcoding format. It is not the Connect protocol's error
-format, and it is not an OAuth 2.0 token endpoint error body (RFC 6749 §5.2).
+format, and it is not an OAuth 2.0 token endpoint error body (RFC 6749 §5.2):
+an upstream that needs one answers successfully with that body instead (see
+[Upstream controls](#upstream-controls)).
 
 **Switching details off.** In the config file, `error_details:` (see
 [Configuration](#configuration)) is read by the standalone binary and by
@@ -418,6 +427,93 @@ Ok(ProxyServer::from_config(config).with_error_details(policy))
 # }
 ```
 
+## Upstream controls
+
+HTTP protocols served as gRPC (an OAuth 2.0 / OpenID Connect provider, a
+forward-auth endpoint, a file download) need more than a JSON body with `200`:
+a status of their choosing, response headers, bodies that are not JSON, and
+methods other than the five standard ones. The upstream RPC decides all of
+these; the proxy only carries them, as Envoy's `grpc_json_transcoder` and
+grpc-gateway do, so the same service works behind any of them.
+
+**Response metadata → response headers.** The upstream's response metadata is
+its HTTP response headers. Every ASCII entry becomes a header, in order, with
+repeated values as repeated fields; a key sent in both the initial metadata and
+the trailers keeps both values. This covers a successful unary call (initial
+metadata and trailers), a failed call (its trailers-only metadata, so a `401`
+carries its `WWW-Authenticate`), and the initial metadata of a server-streaming
+call (its trailers arrive after the headers are sent and are not forwarded).
+Never forwarded:
+
+- gRPC's own keys: `grpc-*`, binary `-bin` keys and `content-type` (the proxy
+  sets it for the body it writes);
+- hop-by-hop and framing fields, which describe the upstream connection:
+  `connection`, `keep-alive`, `proxy-connection`, `te`, `trailer`,
+  `transfer-encoding`, `upgrade`, `content-length`;
+- `x-http-code` (below);
+- anything the operator denies: `response_headers.deny` in the config file or
+  `ProxyServer::with_denied_response_headers`, e.g. to keep internal debugging
+  headers off a public edge. There is no allow-list: a header the upstream sets
+  is meant for its HTTP clients.
+
+A header the proxy writes for the body itself wins over the same upstream key
+(an SSE stream stays `Cache-Control: no-cache`). The metadata of an error whose
+details are malformed is dropped along with it (see
+[Error responses](#error-responses)). Browsers read only
+[CORS-safelisted](https://fetch.spec.whatwg.org/#cors-safelisted-response-header-name)
+response headers plus the exposed ones, so a browser client that must read a
+forwarded header needs a CORS setup that exposes it.
+
+**Status from `x-http-code`.** On a successful unary call, the response
+metadata `x-http-code` (grpc-gateway's convention) sets the HTTP status: one
+integer from 200 to 599. Anything else (a value that is not three digits, out
+of range, or given twice) turns the answer into
+`{"error": "INTERNAL", "code": 13, "message": "upstream returned a malformed response", "details": []}`
+(500), with nothing else of the upstream's answer. `204` and `304` are sent
+without a body or `Content-Type` (RFC 9110 §15.3.5, §15.4.5). Errors keep the
+`google.rpc.Code` mapping: a protocol-specific error body is a successful
+answer with `x-http-code` and that body. Server-streaming calls ignore the key.
+
+**Raw bodies with `google.api.HttpBody`.** An RPC whose response type is
+`google.api.HttpBody`, or whose `response_body` names a field of that type,
+answers with `content_type` as `Content-Type` (none when empty) and `data` as
+the raw body. An RPC whose request type is `HttpBody` with `body: "*"`, or
+whose `body` names a field of that type, receives the raw request body and its
+full `Content-Type` value there; the other fields still come from the path and
+query. A server-streaming `HttpBody` writes each message's `data` as it
+arrives, with `Content-Type` from the first message; as a raw body has no
+in-band error frame, a failure after the first message aborts the transfer so
+the client does not take a partial body for a complete one. An `HttpBody`
+content type that is not a valid header value is a malformed response (500).
+`google/api/httpbody.proto` is always resolvable for error details, like the
+`google/rpc` types.
+
+An RFC 6749 token endpoint, for example:
+
+```proto
+rpc Token(TokenRequest) returns (google.api.HttpBody) {
+  option (google.api.http) = { post: "/oauth2/token" body: "*" };
+}
+```
+
+answers a bad grant with `x-http-code: 400`, `cache-control: no-store` and an
+`HttpBody` of `application/json` holding `{"error": "invalid_grant"}`; the
+client gets exactly that `400`. An authorization endpoint answers
+`x-http-code: 302` with `location` and an empty `HttpBody`; a JWKS endpoint
+returns `application/jwk-set+json` (RFC 7517 §8.5).
+
+**`custom` rules.** `HttpRule.custom` (`{kind, path}`) binds any method token:
+`kind: "HEAD"`, `kind: "OPTIONS"`, an extension method such as `PROPFIND`
+(case-sensitive, RFC 9110 §9.1), or `kind: "*"` for every method, as
+`google/api/http.proto` defines. A forward-auth sub-request (nginx
+`auth_request`, Traefik `forwardAuth`) arrives with the original request's
+method, so a `*` rule answers it whatever that method is. `custom` works in
+`additional_bindings` too. A `*` rule takes its path for every method, so
+another binding on that path is rejected at startup. OpenAPI lists a `*` rule
+under every operation, and cannot describe an extension method. Only a real
+CORS preflight (an `OPTIONS` request with `Access-Control-Request-Method`) is
+answered by the CORS layer; any other `OPTIONS` request reaches its route.
+
 ## Library Usage
 
 ```rust
@@ -426,8 +522,9 @@ use structured_proxy::ProxyServer;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Reads the whole config file, including `error_details` and
-    // `streaming.ndjson_envelope`, which live outside `ProxyConfig`.
+    // Reads the whole config file, including `error_details`,
+    // `streaming.ndjson_envelope` and `response_headers`, which live outside
+    // `ProxyConfig`.
     let server = ProxyServer::from_file(Path::new("my-service.yaml"))?;
 
     // Run the proxy on the configured listen address.
@@ -501,6 +598,8 @@ The hooks are:
   framework-agnostic adapter (request parts in, response parts out).
 - **`with_error_details`** — chooses which transcoded routes return the
   upstream's `google.rpc.Status` details (see [Error responses](#error-responses)).
+- **`with_denied_response_headers`** — keeps upstream response metadata keys
+  off the HTTP responses (see [Upstream controls](#upstream-controls)).
 
 ## JWT verification
 

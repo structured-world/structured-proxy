@@ -76,8 +76,40 @@ pub fn status_to_response_with_details(
     status: &tonic::Status,
     details: Option<&StatusDetails>,
 ) -> Response {
-    let (code, body) = render(status, details);
-    (grpc_to_http_status(code), Json(body)).into_response()
+    render_response(status, details).0
+}
+
+/// [`status_to_response_with_details`], plus whether the response reports the
+/// upstream's own error: `false` when its details could not be rendered
+/// faithfully and the response is the generic `INTERNAL` instead, which then
+/// carries nothing else from the upstream either.
+pub(crate) fn render_response(
+    status: &tonic::Status,
+    details: Option<&StatusDetails>,
+) -> (Response, bool) {
+    let (code, body, faithful) = render(status, details);
+    (
+        (grpc_to_http_status(code), Json(body)).into_response(),
+        faithful,
+    )
+}
+
+/// Message of the `INTERNAL` a client gets instead of a successful upstream
+/// answer the proxy cannot turn into a faithful HTTP response (an invalid
+/// `x-http-code`, an `HttpBody` content type that is not a header value).
+const MALFORMED_RESPONSE_MESSAGE: &str = "upstream returned a malformed response";
+
+/// The `INTERNAL` (500) answering a successful upstream call whose response
+/// cannot be passed on faithfully, in the route's error body. Like a malformed
+/// error status, nothing of the upstream's answer reaches the client; the
+/// caller logs the cause.
+pub(crate) fn malformed_response(details: Option<&StatusDetails>) -> Response {
+    let body = body(
+        tonic::Code::Internal,
+        MALFORMED_RESPONSE_MESSAGE,
+        details.map(|_| RenderedDetails::default()),
+    );
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
 }
 
 /// The JSON error body for a failed call, shared by the unary response and the
@@ -95,16 +127,22 @@ pub fn error_body(status: &tonic::Status, details: Option<&StatusDetails>) -> Va
     render(status, details).1
 }
 
-/// The error body and the gRPC code it reports: the upstream's own, or
-/// `INTERNAL` when its details cannot be rendered faithfully.
-fn render(status: &tonic::Status, details: Option<&StatusDetails>) -> (tonic::Code, Value) {
+/// The error body, the gRPC code it reports and whether that is the
+/// upstream's own error: `false` when its details cannot be rendered
+/// faithfully and the body is the generic `INTERNAL`.
+fn render(status: &tonic::Status, details: Option<&StatusDetails>) -> (tonic::Code, Value, bool) {
     let Some(details) = details else {
-        return (status.code(), body(status.code(), status.message(), None));
+        return (
+            status.code(),
+            body(status.code(), status.message(), None),
+            true,
+        );
     };
     match details.render(status) {
         Ok(rendered) => (
             status.code(),
             body(status.code(), status.message(), Some(rendered)),
+            true,
         ),
         Err(MalformedStatus) => (
             tonic::Code::Internal,
@@ -113,6 +151,7 @@ fn render(status: &tonic::Status, details: Option<&StatusDetails>) -> (tonic::Co
                 MALFORMED_STATUS_MESSAGE,
                 Some(RenderedDetails::default()),
             ),
+            false,
         ),
     }
 }
@@ -526,6 +565,15 @@ impl StatusDetails {
         canonical
             .decode_file_descriptor_set(tonic_types::pb::FILE_DESCRIPTOR_SET)
             .expect("tonic-types ships a valid google.rpc descriptor set");
+        // The global pool is process-wide; another crate may have added it.
+        if canonical
+            .get_message_by_name(super::httpbody::HTTP_BODY)
+            .is_none()
+        {
+            canonical
+                .add_file_descriptor_proto(super::httpbody::file_descriptor())
+                .expect("google/api/httpbody.proto is a valid descriptor");
+        }
         let mut pool = product.clone();
         complete_with_canonical(&mut pool, &canonical);
         Self {
@@ -535,7 +583,9 @@ impl StatusDetails {
     }
 
     /// Whether a detail whose type no descriptor describes goes to
-    /// `opaqueDetails` (see [`opaque_entry`]) instead of being withheld. Its
+    /// `opaqueDetails` (`{"index", "typeUrl", "bytes"}` entries: its position
+    /// among the forwarded details, its type URL and the standard base64 of
+    /// its bytes) instead of being withheld. Its
     /// bytes cannot be inspected, so a DebugInfo it carries in a field would
     /// reach the client: switch it on only for upstreams trusted not to nest
     /// one in types the proxy has no descriptor for.

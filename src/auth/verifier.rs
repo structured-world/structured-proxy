@@ -1,4 +1,4 @@
-//! The built-in [`TokenVerifier`]: keys from config, verification via
+//! The built-in [`TokenVerifier`](crate::hooks::TokenVerifier): keys from config, verification via
 //! `jsonwebtoken`.
 //!
 //! Compiled only with the `builtin_jwt` feature (implied by `rust_crypto` /

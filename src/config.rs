@@ -138,6 +138,8 @@ impl Default for StreamingConfig {
 ///       opaque: true
 /// streaming:
 ///   ndjson_envelope: true
+/// response_headers:
+///   deny: ["x-debug-trace"]
 /// ```
 ///
 /// They live outside [`ProxyConfig`] so that embedders who build it as a
@@ -148,6 +150,18 @@ pub(crate) struct TranscodeFileConfig {
     error_details: Option<ErrorDetailsFileConfig>,
     #[serde(default)]
     streaming: StreamingFileConfig,
+    #[serde(default)]
+    response_headers: Option<ResponseHeadersFileConfig>,
+}
+
+/// `response_headers:`. A typo here would silently let an internal header
+/// reach clients, so unknown keys are rejected.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResponseHeadersFileConfig {
+    /// Upstream response metadata keys kept off the HTTP response.
+    #[serde(default)]
+    deny: Vec<String>,
 }
 
 /// `error_details:`. A typo here would silently change what clients learn
@@ -209,6 +223,7 @@ pub(crate) const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "forwarded_headers",
     "streaming",
     "error_details",
+    "response_headers",
 ];
 
 /// Every `streaming:` key: the [`StreamingConfig`] fields plus the ones
@@ -249,11 +264,24 @@ impl TranscodeFileConfig {
     /// # Errors
     ///
     /// An `error_details` route pattern that is relative or not a valid glob,
-    /// or a route rule that sets neither `enabled` nor `opaque`.
+    /// a route rule that sets neither `enabled` nor `opaque`, or a
+    /// `response_headers.deny` entry that is not a header name.
     pub(crate) fn options(&self) -> Result<crate::transcode::TranscodeOptions, String> {
         use crate::transcode::error::ErrorDetailsPolicy;
         let mut options = crate::transcode::TranscodeOptions::default()
             .with_ndjson_envelope(self.streaming.ndjson_envelope);
+        if let Some(cfg) = &self.response_headers {
+            let deny = cfg
+                .deny
+                .iter()
+                .map(|name| {
+                    http::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                        format!("response_headers.deny entry {name:?} is not a header name")
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            options = options.with_denied_response_headers(deny);
+        }
         if let Some(cfg) = &self.error_details {
             let base = if cfg.enabled {
                 ErrorDetailsPolicy::default()

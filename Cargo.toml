@@ -141,6 +141,9 @@ redis = ["dep:redis"]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# Trailer frames for the hand-written upstream response in
+# tests/upstream_controls.rs (tonic's server API cannot set success trailers).
+http-body = "1"
 # The embedding-hooks integration test (tests/hooks.rs) writes hook impls using
 # only these (the same crates a real embedder uses — none is an HTTP framework)
 # and drives the resulting router via axum + tower for assertions.

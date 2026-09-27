@@ -2,28 +2,44 @@
 //!
 //! Reads `google.api.http` annotations from proto service descriptors
 //! and builds axum routes that proxy JSON/form requests to gRPC upstream.
+//! The upstream decides the HTTP answer beyond the JSON body where it needs
+//! to: its response metadata becomes response headers, `x-http-code` sets the
+//! status of a successful unary call, and `google.api.HttpBody` carries a raw
+//! body in either direction.
 //!
 //! Generic: works with ANY proto descriptor set. No product-specific code.
 
 pub mod body;
 pub mod codec;
 pub mod error;
+pub(crate) mod httpbody;
 pub mod metadata;
 pub mod request;
+pub(crate) mod response;
+pub(crate) mod rule;
 
+use axum::body::{Body, Bytes};
 use axum::extract::{Path, RawQuery, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::header::{ALLOW, CONTENT_TYPE};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, patch, post, put, MethodRouter};
-use axum::{Json, Router};
-use futures::StreamExt;
-use prost_reflect::{DescriptorPool, DynamicMessage, MethodDescriptor, SerializeOptions};
+use axum::routing::{MethodFilter, MethodRouter};
+use axum::Router;
+use futures::{StreamExt, TryStreamExt};
+use prost_reflect::{
+    DescriptorPool, DynamicMessage, FieldDescriptor, MessageDescriptor, MethodDescriptor,
+    SerializeOptions,
+};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tonic::client::Grpc;
+use tonic::metadata::MetadataMap;
 
 use crate::config::AliasConfig;
 use error::{ErrorDetailsPolicy, StatusDetails};
+use response::UpstreamHeaders;
+use rule::RouteMethod;
 
 /// Trait for state types that support REST→gRPC transcoding.
 ///
@@ -50,22 +66,49 @@ impl TranscodeState for crate::ProxyState {
     }
 }
 
+/// Path parameters of a matched route.
+type PathParams = HashMap<String, String>;
+
+/// How the HTTP request body reaches the RPC's input message.
+#[derive(Debug, Clone)]
+enum RequestBody {
+    /// JSON or a form, mapped as the rule's `body` says.
+    Parsed(request::BodyMapping),
+    /// Raw bytes and `Content-Type` into the input message, a `google.api.HttpBody`.
+    RawRoot,
+    /// Raw bytes and `Content-Type` into the HttpBody field (of that type) `body`
+    /// names; the other fields still come from path and query.
+    RawField(FieldDescriptor, MessageDescriptor),
+}
+
+/// What the HTTP response body is made of.
+#[derive(Debug, Clone)]
+enum ResponseShape {
+    /// ProtoJSON of the response message, or of its `response_body` subfield.
+    Json(Option<String>),
+    /// The raw body of a `google.api.HttpBody`: the response message itself
+    /// (empty path) or the field chain `response_body` names.
+    HttpBody(Vec<FieldDescriptor>),
+}
+
 /// Route entry extracted from proto HTTP annotations.
 #[derive(Debug, Clone)]
 struct RouteEntry {
     /// HTTP path pattern (e.g., "/v1/auth/opaque/login/start").
     http_path: String,
-    /// HTTP method (GET, POST, PUT, PATCH, DELETE).
-    http_method: HttpMethod,
+    /// The HTTP method(s) the binding answers.
+    http_method: RouteMethod,
     /// gRPC path (e.g., "/sid.v1.AuthService/OpaqueLoginStart"), parsed once at
     /// route-build time so each request clones a cheap `Bytes` refcount.
     grpc_path: axum::http::uri::PathAndQuery,
     /// Method descriptor for input/output message resolution.
     method: MethodDescriptor,
+    /// Server-streaming RPC (NDJSON / SSE, or chunked HttpBody).
+    streaming: bool,
     /// How the request body maps onto the gRPC request message.
-    body: request::BodyMapping,
-    /// Optional response subfield to return as the HTTP body (`response_body`).
-    response_body: Option<String>,
+    request_body: RequestBody,
+    /// What the HTTP response body is made of.
+    response: ResponseShape,
     /// Renderer for the status details of this route's errors; `None` when the
     /// error-details policy switches them off for the route.
     error_details: Option<Arc<StatusDetails>>,
@@ -74,6 +117,23 @@ struct RouteEntry {
     /// [`codec::has_required_fields`] of the response type, computed once so a
     /// request does not walk the descriptor.
     response_has_required: bool,
+    /// Response metadata keys the operator keeps off the HTTP response, on top
+    /// of the ones that never go there.
+    denied_headers: Arc<[HeaderName]>,
+}
+
+impl RouteEntry {
+    fn codec(&self) -> codec::DynamicCodec {
+        codec::DynamicCodec::with_required_check(self.method.output(), self.response_has_required)
+    }
+
+    /// The raw body of `message`, on a route that answers with an HttpBody.
+    fn raw_body(&self, message: DynamicMessage) -> Option<httpbody::RawBody> {
+        match &self.response {
+            ResponseShape::HttpBody(path) => Some(httpbody::take(message, path)),
+            ResponseShape::Json(_) => None,
+        }
+    }
 }
 
 /// How [`routes_with_options`] builds the transcoded routes.
@@ -81,18 +141,21 @@ struct RouteEntry {
 /// # Examples
 ///
 /// ```
+/// use axum::http::HeaderName;
 /// use structured_proxy::transcode::error::ErrorDetailsPolicy;
 /// use structured_proxy::transcode::TranscodeOptions;
 ///
 /// let options = TranscodeOptions::default()
 ///     .with_error_details(ErrorDetailsPolicy::default().route("/v1/admin/**", false).unwrap())
-///     .with_ndjson_envelope(true);
+///     .with_ndjson_envelope(true)
+///     .with_denied_response_headers([HeaderName::from_static("x-debug-trace")]);
 /// # let _ = options;
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct TranscodeOptions {
     pub(crate) error_details: ErrorDetailsPolicy,
     pub(crate) ndjson_envelope: bool,
+    pub(crate) denied_response_headers: Arc<[HeaderName]>,
 }
 
 impl TranscodeOptions {
@@ -114,27 +177,18 @@ impl TranscodeOptions {
         self.ndjson_envelope = enabled;
         self
     }
-}
 
-#[derive(Debug, Clone, Copy)]
-enum HttpMethod {
-    Get,
-    Post,
-    Put,
-    Patch,
-    Delete,
-}
-
-impl HttpMethod {
-    /// The uppercase HTTP method token (e.g. `"GET"`).
-    fn as_str(self) -> &'static str {
-        match self {
-            HttpMethod::Get => "GET",
-            HttpMethod::Post => "POST",
-            HttpMethod::Put => "PUT",
-            HttpMethod::Patch => "PATCH",
-            HttpMethod::Delete => "DELETE",
-        }
+    /// Response metadata keys that never become HTTP response headers, on top
+    /// of gRPC's own keys, hop-by-hop fields and `x-http-code`, which never do.
+    /// Replaces any list set before. Use it to keep internal headers (debug
+    /// traces, backend names) off a public edge; an upstream key not listed
+    /// here reaches the client.
+    pub fn with_denied_response_headers(
+        mut self,
+        names: impl IntoIterator<Item = HeaderName>,
+    ) -> Self {
+        self.denied_response_headers = names.into_iter().collect();
+        self
     }
 }
 
@@ -149,6 +203,10 @@ pub fn routes<S: TranscodeState>(pool: &DescriptorPool, aliases: &[AliasConfig])
 }
 
 /// [`routes`], built as `options` describe.
+///
+/// A second binding for a method and path already taken (or any binding on a
+/// path a `custom` `*` rule takes, which answers every method) is skipped with
+/// an error in the log.
 pub fn routes_with_options<S: TranscodeState>(
     pool: &DescriptorPool,
     aliases: &[AliasConfig],
@@ -166,7 +224,10 @@ pub fn routes_with_options<S: TranscodeState>(
     // each shared by every route that uses it and built only when one does.
     // The second is a copy of the first: the descriptor pool inside is shared.
     let mut status_details: [Option<Arc<StatusDetails>>; 2] = [None, None];
-    let mut router: Router<S> = Router::new();
+    // Every binding of one path goes into the same method router, in binding
+    // order.
+    let mut paths: Vec<PathRoutes> = Vec::new();
+    let mut path_index: HashMap<String, usize> = HashMap::new();
     for mut binding in bindings {
         let policy = &options.error_details;
         if policy.enabled_for(&binding.axum_path) {
@@ -184,64 +245,131 @@ pub fn routes_with_options<S: TranscodeState>(
             binding.entry.error_details = status_details[slot].clone();
         }
         binding.entry.ndjson_envelope = options.ndjson_envelope;
-        let method = binding.entry.http_method;
-        let entry = Arc::new(binding.entry);
-        let method_router: MethodRouter<S> = if binding.streaming {
-            let handler = move |proxy_state: State<S>,
-                                headers: HeaderMap,
-                                path_params: Path<std::collections::HashMap<String, String>>,
-                                raw_query: RawQuery,
-                                body: axum::body::Bytes| {
-                streaming_handler(proxy_state, headers, path_params, raw_query, body, entry)
-            };
-            match method {
-                HttpMethod::Get => get(handler),
-                HttpMethod::Post => post(handler),
-                // route_bindings only yields GET/POST streaming bindings.
-                _ => unreachable!("streaming routes are GET/POST only"),
-            }
-        } else {
-            let handler = move |proxy_state: State<S>,
-                                headers: HeaderMap,
-                                path_params: Path<std::collections::HashMap<String, String>>,
-                                raw_query: RawQuery,
-                                body: axum::body::Bytes| {
-                transcode_handler(proxy_state, headers, path_params, raw_query, body, entry)
-            };
-            match method {
-                HttpMethod::Get => get(handler),
-                HttpMethod::Post => post(handler),
-                HttpMethod::Put => put(handler),
-                HttpMethod::Patch => patch(handler),
-                HttpMethod::Delete => delete(handler),
+        binding.entry.denied_headers = options.denied_response_headers.clone();
+        let index = match path_index.get(&binding.axum_path) {
+            Some(&index) => index,
+            None => {
+                path_index.insert(binding.axum_path.clone(), paths.len());
+                paths.push(PathRoutes {
+                    path: binding.axum_path,
+                    methods: Vec::new(),
+                });
+                paths.len() - 1
             }
         };
-        router = router.route(&binding.axum_path, method_router);
+        paths[index].add(Arc::new(binding.entry));
     }
 
+    let mut router: Router<S> = Router::new();
+    for path in &paths {
+        router = router.route(&path.path, path.method_router());
+    }
     router
 }
 
-/// One transcode route to mount: the RPC entry that serves it, the axum path to
-/// register it at, and whether it is the server-streaming variant.
+/// The axum handler serving the route entry `$entry`, for the state type `S`
+/// in scope. A macro because the closure's handler type cannot be named.
+macro_rules! endpoint {
+    ($entry:expr) => {{
+        let entry: Arc<RouteEntry> = $entry;
+        move |state: State<S>,
+              headers: HeaderMap,
+              path_params: Path<PathParams>,
+              raw_query: RawQuery,
+              body: Bytes| handle(state, headers, path_params, raw_query, body, entry)
+    }};
+}
+
+/// The bindings mounted at one axum path.
+struct PathRoutes {
+    path: String,
+    methods: Vec<Arc<RouteEntry>>,
+}
+
+impl PathRoutes {
+    /// Add `entry` unless its method is already answered on this path.
+    fn add(&mut self, entry: Arc<RouteEntry>) {
+        let taken = self.methods.iter().any(|existing| {
+            existing.http_method == entry.http_method
+                || existing.http_method == RouteMethod::Any
+                || entry.http_method == RouteMethod::Any
+        });
+        if taken {
+            tracing::error!(
+                method = entry.http_method.as_str(),
+                path = %self.path,
+                rpc = %entry.grpc_path,
+                "HTTP method and path already bound to another RPC; skipping this binding"
+            );
+            return;
+        }
+        self.methods.push(entry);
+    }
+
+    /// One method router for every binding of the path. Methods axum routes by
+    /// itself are registered directly; any other token (a `custom` rule such
+    /// as `PROPFIND`) is dispatched by a fallback that answers `405` with the
+    /// full `Allow` list (RFC 9110 §15.5.6) for a method nobody binds.
+    fn method_router<S: TranscodeState>(&self) -> MethodRouter<S> {
+        let mut router = MethodRouter::new();
+        let mut extension: Vec<(Method, Arc<RouteEntry>)> = Vec::new();
+        let mut allow: Vec<&str> = Vec::new();
+        for entry in &self.methods {
+            match &entry.http_method {
+                // `add` keeps a `*` binding alone on its path.
+                RouteMethod::Any => return axum::routing::any(endpoint!(entry.clone())),
+                RouteMethod::One(method) => {
+                    allow.push(method.as_str());
+                    match MethodFilter::try_from(method.clone()) {
+                        Ok(filter) => router = router.on(filter, endpoint!(entry.clone())),
+                        Err(_) => extension.push((method.clone(), entry.clone())),
+                    }
+                }
+            }
+        }
+        if extension.is_empty() {
+            return router;
+        }
+        // A GET route answers HEAD too.
+        if allow.contains(&"GET") && !allow.contains(&"HEAD") {
+            allow.push("HEAD");
+        }
+        let allow = HeaderValue::from_str(&allow.join(", "))
+            .expect("method tokens are valid header value characters");
+        let extension: Arc<[(Method, Arc<RouteEntry>)]> = extension.into();
+        router.fallback(
+            move |method: Method,
+                  state: State<S>,
+                  headers: HeaderMap,
+                  path_params: Path<PathParams>,
+                  raw_query: RawQuery,
+                  body: Bytes| async move {
+                match extension.iter().find(|(bound, _)| *bound == method) {
+                    Some((_, entry)) => {
+                        handle(state, headers, path_params, raw_query, body, entry.clone()).await
+                    }
+                    None => (StatusCode::METHOD_NOT_ALLOWED, [(ALLOW, allow)]).into_response(),
+                }
+            },
+        )
+    }
+}
+
+/// One transcode route to mount: the RPC entry that serves it and the axum path
+/// to register it at.
 struct RouteBinding {
     entry: RouteEntry,
     axum_path: String,
-    streaming: bool,
 }
 
-/// The single source of truth for what [`routes`] mounts: unary RPCs, their
-/// config aliases, and server-streaming RPCs. Both [`routes`] (to build handlers)
-/// and [`route_paths`] (to enumerate paths for collision checks) consume this, so
-/// the mounted set and the enumerated set cannot drift apart.
+/// The single source of truth for what [`routes`] mounts: every binding of
+/// every unary and server-streaming RPC, plus its config aliases. Both
+/// [`routes`] (to build handlers) and [`route_paths`] (to enumerate paths for
+/// collision checks) consume this, so the mounted set and the enumerated set
+/// cannot drift apart.
 fn route_bindings(pool: &DescriptorPool, aliases: &[AliasConfig]) -> Vec<RouteBinding> {
     let mut bindings = Vec::new();
     for entry in extract_routes(pool) {
-        bindings.push(RouteBinding {
-            axum_path: proto_path_to_axum(&entry.http_path),
-            entry: entry.clone(),
-            streaming: false,
-        });
         for alias in aliases {
             if let Some(suffix) = entry.http_path.strip_prefix(&alias.to) {
                 if alias.from.ends_with("/{path}") {
@@ -249,32 +377,28 @@ fn route_bindings(pool: &DescriptorPool, aliases: &[AliasConfig]) -> Vec<RouteBi
                     bindings.push(RouteBinding {
                         axum_path: format!("{prefix}{suffix}"),
                         entry: entry.clone(),
-                        streaming: false,
                     });
                 }
             }
         }
-    }
-    for entry in extract_streaming_routes(pool) {
-        if matches!(entry.http_method, HttpMethod::Get | HttpMethod::Post) {
-            bindings.push(RouteBinding {
-                axum_path: proto_path_to_axum(&entry.http_path),
-                entry,
-                streaming: true,
-            });
-        }
+        bindings.push(RouteBinding {
+            axum_path: proto_path_to_axum(&entry.http_path),
+            entry,
+        });
     }
     bindings
 }
 
 /// The axum paths [`routes`] would register for this pool and aliases.
 ///
-/// Mirrors the registration in [`routes`] (unary RPCs, their config aliases, and
-/// server-streaming RPCs) without building handlers, so callers can detect route
-/// collisions before mounting additional routes (e.g. a forward-auth endpoint).
+/// Mirrors the registration in [`routes`] (every binding of every unary and
+/// server-streaming RPC, and their config aliases) without building handlers,
+/// so callers can detect route collisions before mounting additional routes
+/// (e.g. a forward-auth endpoint).
 ///
-/// Each entry is `(method, path)` where `method` is the uppercase HTTP token, so
-/// callers can distinguish same-path/different-method routes from real conflicts.
+/// Each entry is `(method, path)` where `method` is the uppercase HTTP token,
+/// or `*` for a `custom` rule that answers every method, so callers can
+/// distinguish same-path/different-method routes from real conflicts.
 pub fn route_paths(pool: &DescriptorPool, aliases: &[AliasConfig]) -> Vec<(String, String)> {
     route_bindings(pool, aliases)
         .into_iter()
@@ -290,12 +414,50 @@ fn response_serialize_options() -> SerializeOptions {
         .stringify_64_bit_integers(true)
 }
 
+/// Serialize a message straight to JSON bytes, without an intermediate tree.
+fn message_to_json_bytes(
+    msg: &DynamicMessage,
+    opts: &SerializeOptions,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let mut buf = Vec::with_capacity(128);
+    msg.serialize_with_options(&mut serde_json::Serializer::new(&mut buf), opts)?;
+    Ok(buf)
+}
+
 /// Serialize one streamed gRPC message to a compact JSON string.
 fn message_to_json_string(msg: &DynamicMessage, opts: &SerializeOptions) -> Result<String, String> {
-    let value = msg
-        .serialize_with_options(serde_json::value::Serializer, opts)
-        .map_err(|e| e.to_string())?;
-    serde_json::to_string(&value).map_err(|e| e.to_string())
+    let buf = message_to_json_bytes(msg, opts).map_err(|e| e.to_string())?;
+    // SAFETY: serde_json's serializer writes only valid UTF-8, the same
+    // guarantee `serde_json::to_string` relies on.
+    Ok(unsafe { String::from_utf8_unchecked(buf) })
+}
+
+/// The unary response body as JSON: the whole message, or the subfield
+/// `response_body` names (JSON `null` when the path does not exist).
+fn json_body(
+    msg: &DynamicMessage,
+    response_body: Option<&str>,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let opts = response_serialize_options();
+    let Some(path) = response_body else {
+        return message_to_json_bytes(msg, &opts);
+    };
+    // Walk the tree by moving each subtree out, so nothing is copied.
+    let mut value = Some(msg.serialize_with_options(serde_json::value::Serializer, &opts)?);
+    for segment in path.split('.') {
+        value = match value {
+            Some(serde_json::Value::Object(mut fields)) => fields.remove(segment),
+            _ => None,
+        };
+    }
+    let value = value.unwrap_or_else(|| {
+        tracing::warn!(
+            response_body = %path,
+            "configured response_body path not found in response; returning null"
+        );
+        serde_json::Value::Null
+    });
+    serde_json::to_vec(&value)
 }
 
 /// Whether the client negotiated a Server-Sent Events response via `Accept`.
@@ -334,79 +496,299 @@ fn accept_range_selects_sse(range: &str) -> bool {
     true
 }
 
-/// Handler for server-streaming RPCs.
-///
-/// Returns Server-Sent Events when the client sends `Accept: text/event-stream`,
-/// otherwise newline-delimited JSON (NDJSON). In both formats a gRPC error
-/// mid-stream is delivered as an explicit terminal frame before the stream is
-/// closed cleanly, rather than truncating the HTTP body.
-async fn streaming_handler<S: TranscodeState>(
+/// Serve one request on a transcoded route.
+async fn handle<S: TranscodeState>(
     State(proxy_state): State<S>,
     headers: HeaderMap,
-    Path(path_params): Path<std::collections::HashMap<String, String>>,
+    Path(path_params): Path<PathParams>,
     RawQuery(raw_query): RawQuery,
-    body_bytes: axum::body::Bytes,
-    entry: std::sync::Arc<RouteEntry>,
+    body: Bytes,
+    entry: Arc<RouteEntry>,
 ) -> Response {
-    let channel = proxy_state.grpc_channel();
-
-    let request_msg = match decode_request(
-        &entry,
+    let prepared = prepare(
+        &proxy_state,
         &headers,
         &path_params,
         raw_query.as_deref(),
-        &body_bytes,
-    ) {
-        Ok(msg) => msg,
-        Err(message) => return bad_request(&entry, message),
+        body,
+        &entry,
+    )
+    .await;
+    let (client, request) = match prepared {
+        Ok(prepared) => prepared,
+        Err(rejection) => return rejection.into_response(&entry),
     };
-
-    let grpc_metadata =
-        metadata::http_headers_to_grpc_metadata(&headers, proxy_state.forwarded_headers());
-    let mut grpc_request = tonic::Request::new(request_msg);
-    *grpc_request.metadata_mut() = grpc_metadata;
-    metadata::apply_request_deadline(&mut grpc_request, &headers);
-
-    let output_desc = entry.method.output();
-    let grpc_codec =
-        codec::DynamicCodec::with_required_check(output_desc.clone(), entry.response_has_required);
-    let grpc_path = entry.grpc_path.clone();
-
-    let mut grpc_client = Grpc::new(channel);
-    if let Err(e) = grpc_client.ready().await {
-        let status = tonic::Status::unavailable(format!("gRPC upstream not ready: {e}"));
-        return error::status_to_response_with_details(&status, entry.error_details.as_deref());
+    if entry.streaming {
+        let keep_alive_secs = proxy_state.sse_keep_alive_secs();
+        streaming_call(client, request, entry, wants_sse(&headers), keep_alive_secs).await
+    } else {
+        unary_call(client, request, &entry).await
     }
+}
 
-    let use_sse = wants_sse(&headers);
+/// Why a request ends before the upstream is called.
+enum Rejection {
+    /// It cannot be mapped onto the RPC (`INVALID_ARGUMENT`, 400).
+    Unmappable(String),
+    /// The upstream channel is not ready (`UNAVAILABLE`, 503).
+    NotReady(String),
+}
 
-    match grpc_client
-        .server_streaming(grpc_request, grpc_path, grpc_codec)
-        .await
-    {
-        // Only a trailers-only rejection lands in `Err`. Once the upstream
-        // accepted the call, the response starts at once rather than waiting
-        // for the first item, so headers and SSE keep-alives are not held back;
-        // an error that comes before the first message is a terminal frame.
-        Ok(response) => {
-            let stream = response.into_inner();
-            // The terminal frame renders like the unary error body. The
-            // closure takes over this request's route handle, so the stream
-            // keeps it alive without another refcount.
-            let envelope = entry.ndjson_envelope;
-            let render_error = move |status: &tonic::Status| {
-                error::error_body(status, entry.error_details.as_deref())
-            };
-            if use_sse {
-                sse_response(stream, render_error, proxy_state.sse_keep_alive_secs())
-            } else {
-                ndjson_response(stream, render_error, envelope)
+impl Rejection {
+    /// The answer, in the error body the upstream's own errors get on the route.
+    fn into_response(self, entry: &RouteEntry) -> Response {
+        let status = match self {
+            Self::Unmappable(message) => tonic::Status::invalid_argument(message),
+            Self::NotReady(message) => tonic::Status::unavailable(message),
+        };
+        error::status_to_response_with_details(&status, entry.error_details.as_deref())
+    }
+}
+
+/// Map the request onto the RPC's input message and get a client whose
+/// channel is ready.
+async fn prepare<S: TranscodeState>(
+    proxy_state: &S,
+    headers: &HeaderMap,
+    path_params: &PathParams,
+    raw_query: Option<&str>,
+    body: Bytes,
+    entry: &RouteEntry,
+) -> Result<
+    (
+        Grpc<tonic::transport::Channel>,
+        tonic::Request<DynamicMessage>,
+    ),
+    Rejection,
+> {
+    let message = decode_request(entry, headers, path_params, raw_query, body)
+        .map_err(Rejection::Unmappable)?;
+    let mut request = tonic::Request::new(message);
+    *request.metadata_mut() =
+        metadata::http_headers_to_grpc_metadata(headers, proxy_state.forwarded_headers());
+    metadata::apply_request_deadline(&mut request, headers);
+
+    let mut client = Grpc::new(proxy_state.grpc_channel());
+    if let Err(e) = client.ready().await {
+        return Err(Rejection::NotReady(format!("gRPC upstream not ready: {e}")));
+    }
+    Ok((client, request))
+}
+
+/// A successful unary answer with its initial metadata and trailers kept
+/// apart.
+struct UnaryAnswer {
+    initial: MetadataMap,
+    message: DynamicMessage,
+    trailers: Option<MetadataMap>,
+}
+
+/// Call a unary RPC. tonic's `Grpc::unary` merges the trailers over the
+/// initial metadata, so a key sent in both keeps only its trailer value; the
+/// HTTP response carries both, so the call is made as a one-message stream
+/// instead, reading exactly what `Grpc::unary` reads.
+async fn call_unary(
+    client: &mut Grpc<tonic::transport::Channel>,
+    request: tonic::Request<DynamicMessage>,
+    entry: &RouteEntry,
+) -> Result<UnaryAnswer, tonic::Status> {
+    let response = client
+        .server_streaming(request, entry.grpc_path.clone(), entry.codec())
+        .await?;
+    let (initial, mut stream, _) = response.into_parts();
+    let message = stream
+        .message()
+        .await?
+        .ok_or_else(|| tonic::Status::internal("Missing response message."))?;
+    let trailers = stream.trailers().await?;
+    Ok(UnaryAnswer {
+        initial,
+        message,
+        trailers,
+    })
+}
+
+/// Serve a unary RPC.
+async fn unary_call(
+    mut client: Grpc<tonic::transport::Channel>,
+    request: tonic::Request<DynamicMessage>,
+    entry: &RouteEntry,
+) -> Response {
+    match call_unary(&mut client, request, entry).await {
+        Ok(answer) => unary_success(entry, answer),
+        Err(status) => upstream_error(status, entry),
+    }
+}
+
+/// The HTTP response to a successful unary call: the status `x-http-code`
+/// sets (200 otherwise), the forwarded response metadata, and the body.
+fn unary_success(entry: &RouteEntry, answer: UnaryAnswer) -> Response {
+    let mut upstream = UpstreamHeaders::default();
+    upstream.absorb(answer.initial, &entry.denied_headers);
+    if let Some(trailers) = answer.trailers {
+        upstream.absorb(trailers, &entry.denied_headers);
+    }
+    let status = match upstream.status() {
+        Ok(status) => status.unwrap_or(StatusCode::OK),
+        Err(response::InvalidHttpCode) => {
+            tracing::error!(
+                rpc = %entry.grpc_path,
+                "upstream set x-http-code to something other than one integer in 200-599"
+            );
+            return error::malformed_response(entry.error_details.as_deref());
+        }
+    };
+    let (content_type, body) = match &entry.response {
+        ResponseShape::HttpBody(path) => {
+            let raw = httpbody::take(answer.message, path);
+            match content_type_header(&raw.content_type) {
+                Ok(content_type) => (content_type, Body::from(raw.data)),
+                Err(()) => return invalid_content_type(entry),
             }
         }
-        Err(status) => {
-            error::status_to_response_with_details(&status, entry.error_details.as_deref())
+        ResponseShape::Json(response_body) => {
+            match json_body(&answer.message, response_body.as_deref()) {
+                Ok(json) => (
+                    Some(HeaderValue::from_static("application/json")),
+                    Body::from(json),
+                ),
+                Err(e) => {
+                    tracing::error!("Failed to serialize gRPC response: {e}");
+                    return error::status_to_response_with_details(
+                        &tonic::Status::internal("failed to serialize response"),
+                        entry.error_details.as_deref(),
+                    );
+                }
+            }
         }
+    };
+    response::build(status, upstream.into_headers(), content_type, body)
+}
+
+/// The `Content-Type` an HttpBody asks for: none when it left the field empty.
+fn content_type_header(content_type: &str) -> Result<Option<HeaderValue>, ()> {
+    if content_type.is_empty() {
+        return Ok(None);
     }
+    HeaderValue::from_str(content_type)
+        .map(Some)
+        .map_err(|_| ())
+}
+
+/// The answer to an HttpBody whose content type cannot be a header value.
+fn invalid_content_type(entry: &RouteEntry) -> Response {
+    tracing::error!(
+        rpc = %entry.grpc_path,
+        "upstream HttpBody content_type is not a valid header value"
+    );
+    error::malformed_response(entry.error_details.as_deref())
+}
+
+/// The HTTP response to a failed call, carrying the failure's metadata as
+/// headers unless its details were malformed and the answer is the generic
+/// `INTERNAL`. Only the failure's own metadata is used (a trailers-only
+/// response, or the trailers ending the call): a failure the proxy's client
+/// raises itself, such as an undecodable message, has none, so nothing of an
+/// answer the proxy rejected reaches the client.
+fn upstream_error(mut status: tonic::Status, entry: &RouteEntry) -> Response {
+    let (response, faithful) = error::render_response(&status, entry.error_details.as_deref());
+    let metadata = std::mem::take(status.metadata_mut());
+    if !faithful || metadata.is_empty() {
+        return response;
+    }
+    let mut upstream = UpstreamHeaders::default();
+    upstream.absorb(metadata, &entry.denied_headers);
+    response::with_upstream_headers(response, upstream.into_headers())
+}
+
+/// Serve a server-streaming RPC.
+///
+/// A JSON stream is Server-Sent Events when the client sends
+/// `Accept: text/event-stream`, otherwise newline-delimited JSON (NDJSON); a
+/// gRPC error mid-stream is delivered as an explicit terminal frame before the
+/// stream is closed cleanly, rather than truncating the HTTP body. An HttpBody
+/// stream is the concatenated `data` of its messages. The upstream's initial
+/// metadata becomes response headers; trailers arrive after the headers are
+/// sent and are not forwarded.
+async fn streaming_call(
+    mut client: Grpc<tonic::transport::Channel>,
+    request: tonic::Request<DynamicMessage>,
+    entry: Arc<RouteEntry>,
+    use_sse: bool,
+    keep_alive_secs: u64,
+) -> Response {
+    let response = match client
+        .server_streaming(request, entry.grpc_path.clone(), entry.codec())
+        .await
+    {
+        Ok(response) => response,
+        // Only a trailers-only rejection lands here.
+        Err(status) => return upstream_error(status, &entry),
+    };
+    let (initial, stream, _) = response.into_parts();
+    let mut upstream = UpstreamHeaders::default();
+    upstream.absorb(initial, &entry.denied_headers);
+    let headers = upstream.into_headers();
+
+    if matches!(entry.response, ResponseShape::HttpBody(_)) {
+        return http_body_stream(stream, entry, headers).await;
+    }
+    // Once the upstream accepted the call, the response starts at once rather
+    // than waiting for the first item, so headers and SSE keep-alives are not
+    // held back; an error that comes before the first message is a terminal
+    // frame. The terminal frame renders like the unary error body. The
+    // closure takes over this request's route handle, so the stream keeps it
+    // alive without another refcount.
+    let envelope = entry.ndjson_envelope;
+    let render_error =
+        move |status: &tonic::Status| error::error_body(status, entry.error_details.as_deref());
+    let response = if use_sse {
+        sse_response(stream, render_error, keep_alive_secs)
+    } else {
+        ndjson_response(stream, render_error, envelope)
+    };
+    response::with_upstream_headers(response, headers)
+}
+
+/// A server-streaming HttpBody response: `Content-Type` from the first
+/// message, so the headers wait for it, then every message's `data` as it
+/// arrives. An error before the first message is an ordinary error response;
+/// after it, the raw body has no in-band error frame, so the body is aborted
+/// and the client sees a truncated transfer instead of a clean end.
+async fn http_body_stream(
+    mut stream: tonic::Streaming<DynamicMessage>,
+    entry: Arc<RouteEntry>,
+    headers: HeaderMap,
+) -> Response {
+    let first = match stream.message().await {
+        Ok(Some(message)) => entry.raw_body(message).unwrap_or_default(),
+        Ok(None) => httpbody::RawBody::default(),
+        Err(status) => return upstream_error(status, &entry),
+    };
+    let content_type = match content_type_header(&first.content_type) {
+        Ok(content_type) => content_type,
+        Err(()) => return invalid_content_type(&entry),
+    };
+    let rest = stream.map(move |item| match item {
+        Ok(message) => Ok(entry.raw_body(message).unwrap_or_default().data),
+        Err(status) => {
+            tracing::error!(
+                rpc = %entry.grpc_path,
+                code = ?status.code(),
+                "server-streaming HttpBody failed after the response started; aborting the body"
+            );
+            Err(std::io::Error::other(status))
+        }
+    });
+    let chunks = futures::stream::once(futures::future::ready(Ok(first.data)))
+        .chain(rest)
+        .try_filter(|chunk| futures::future::ready(!chunk.is_empty()));
+    response::build(
+        StatusCode::OK,
+        headers,
+        content_type,
+        Body::from_stream(chunks),
+    )
 }
 
 /// One frame of a streaming response: a serialized message, or the error body
@@ -495,16 +877,16 @@ where
             }
         };
         line.push('\n');
-        Ok::<axum::body::Bytes, std::io::Error>(axum::body::Bytes::from(line))
+        Ok::<Bytes, std::io::Error>(Bytes::from(line))
     });
 
-    let body = axum::body::Body::from_stream(byte_stream);
+    let body = Body::from_stream(byte_stream);
     // Body framing (chunked on HTTP/1.1, DATA frames on HTTP/2) is chosen by
     // hyper from the protocol version; setting transfer-encoding by hand would
     // be redundant on HTTP/1.1 and illegal on HTTP/2.
     Response::builder()
         .status(StatusCode::OK)
-        .header("content-type", "application/x-ndjson")
+        .header(CONTENT_TYPE, "application/x-ndjson")
         .body(body)
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
@@ -533,21 +915,29 @@ where
         .into_response()
 }
 
+/// Request body mapping of the raw-body routes: nothing parsed.
+static NO_PARSED_BODY: request::BodyMapping = request::BodyMapping::None;
+
 /// Map the HTTP request onto the RPC's input message: path parameters, query
-/// parameters and the route's `body` rule. Unary and server-streaming routes
-/// share it, so both bind a request the same way. The error is the message of
-/// the 400 the caller answers with, before the upstream is called.
+/// parameters and the route's `body` rule, or the raw body for an HttpBody.
+/// Unary and server-streaming routes share it, so both bind a request the same
+/// way. The error is the message of the 400 the caller answers with, before
+/// the upstream is called.
 fn decode_request(
     entry: &RouteEntry,
     headers: &HeaderMap,
-    path_params: &std::collections::HashMap<String, String>,
+    path_params: &PathParams,
     raw_query: Option<&str>,
-    body_bytes: &[u8],
+    body_bytes: Bytes,
 ) -> Result<DynamicMessage, String> {
-    // Only read the body when the rule maps it onto the message.
-    let json_body = match entry.body {
+    let mapping = match &entry.request_body {
+        RequestBody::Parsed(mapping) => mapping,
+        RequestBody::RawRoot | RequestBody::RawField(..) => &NO_PARSED_BODY,
+    };
+    // Only parse the body when the rule maps it onto the message.
+    let json_body = match mapping {
         request::BodyMapping::None => serde_json::Value::Null,
-        _ => body::parse_body(body::content_type(headers), body_bytes)
+        _ => body::parse_body(body::content_type(headers), &body_bytes)
             .map_err(|e| format!("failed to parse request body: {e}"))?,
     };
 
@@ -557,105 +947,40 @@ fn decode_request(
     let query_pairs = request::parse_query(raw_query)?;
 
     let input_desc = entry.method.input();
-    let request_json = request::build_request_json(
-        &input_desc,
-        &entry.body,
-        json_body,
-        path_params,
-        &query_pairs,
-    )?;
+    let request_json =
+        request::build_request_json(&input_desc, mapping, json_body, path_params, &query_pairs)?;
 
-    DynamicMessage::deserialize(input_desc, request_json)
-        .map_err(|e| format!("failed to decode request: {e}"))
-}
-
-/// The 400 answer to a request [`decode_request`] could not map, in the same
-/// error body the upstream's own errors get on this route.
-fn bad_request(entry: &RouteEntry, message: String) -> Response {
-    error::status_to_response_with_details(
-        &tonic::Status::invalid_argument(message),
-        entry.error_details.as_deref(),
-    )
-}
-
-/// Generic transcoding handler.
-async fn transcode_handler<S: TranscodeState>(
-    State(proxy_state): State<S>,
-    headers: HeaderMap,
-    Path(path_params): Path<std::collections::HashMap<String, String>>,
-    RawQuery(raw_query): RawQuery,
-    body_bytes: axum::body::Bytes,
-    entry: std::sync::Arc<RouteEntry>,
-) -> Response {
-    let channel = proxy_state.grpc_channel();
-
-    let request_msg = match decode_request(
-        &entry,
-        &headers,
-        &path_params,
-        raw_query.as_deref(),
-        &body_bytes,
-    ) {
-        Ok(msg) => msg,
-        Err(message) => return bad_request(&entry, message),
-    };
-
-    let grpc_metadata =
-        metadata::http_headers_to_grpc_metadata(&headers, proxy_state.forwarded_headers());
-    let mut grpc_request = tonic::Request::new(request_msg);
-    *grpc_request.metadata_mut() = grpc_metadata;
-    metadata::apply_request_deadline(&mut grpc_request, &headers);
-
-    let output_desc = entry.method.output();
-    let grpc_codec =
-        codec::DynamicCodec::with_required_check(output_desc.clone(), entry.response_has_required);
-    let grpc_path = entry.grpc_path.clone();
-
-    let mut grpc_client = Grpc::new(channel);
-    if let Err(e) = grpc_client.ready().await {
-        let status = tonic::Status::unavailable(format!("gRPC upstream not ready: {e}"));
-        return error::status_to_response_with_details(&status, entry.error_details.as_deref());
+    let mut message = DynamicMessage::deserialize(input_desc, request_json)
+        .map_err(|e| format!("failed to decode request: {e}"))?;
+    match &entry.request_body {
+        RequestBody::Parsed(_) => {}
+        RequestBody::RawRoot => {
+            httpbody::fill(&mut message, request_content_type(headers)?, body_bytes);
+        }
+        RequestBody::RawField(field, http_body) => {
+            let mut inner = DynamicMessage::new(http_body.clone());
+            httpbody::fill(&mut inner, request_content_type(headers)?, body_bytes);
+            message.set_field(field, prost_reflect::Value::Message(inner));
+        }
     }
+    Ok(message)
+}
 
-    match grpc_client.unary(grpc_request, grpc_path, grpc_codec).await {
-        Ok(response) => {
-            let response_msg = response.into_inner();
-            let serialize_opts = response_serialize_options();
-            match response_msg
-                .serialize_with_options(serde_json::value::Serializer, &serialize_opts)
-            {
-                Ok(json_value) => {
-                    // `response_body` returns just that subfield as the HTTP body.
-                    let out = match &entry.response_body {
-                        Some(path) => request::extract_response_body(&json_value, path)
-                            .unwrap_or_else(|| {
-                                tracing::warn!(
-                                    response_body = %path,
-                                    "configured response_body path not found in response; \
-                                     returning null"
-                                );
-                                serde_json::Value::Null
-                            }),
-                        None => json_value,
-                    };
-                    (StatusCode::OK, Json(out)).into_response()
-                }
-                Err(e) => {
-                    tracing::error!("Failed to serialize gRPC response: {e}");
-                    error::status_to_response_with_details(
-                        &tonic::Status::internal("failed to serialize response"),
-                        entry.error_details.as_deref(),
-                    )
-                }
-            }
-        }
-        Err(status) => {
-            error::status_to_response_with_details(&status, entry.error_details.as_deref())
-        }
+/// The request's full `Content-Type` value (parameters included) for an
+/// HttpBody, empty when absent. `HttpBody.content_type` is a proto string, so
+/// a value that is not visible ASCII is rejected rather than altered.
+fn request_content_type(headers: &HeaderMap) -> Result<String, String> {
+    match headers.get(CONTENT_TYPE) {
+        None => Ok(String::new()),
+        Some(value) => value
+            .to_str()
+            .map(str::to_owned)
+            .map_err(|_| "request Content-Type is not a visible ASCII string".to_string()),
     }
 }
 
-/// Extract HTTP route entries from proto descriptors.
+/// Extract the route entries of every HTTP binding of every unary and
+/// server-streaming RPC. Client-streaming RPCs have no HTTP mapping.
 fn extract_routes(pool: &DescriptorPool) -> Vec<RouteEntry> {
     let http_ext = match pool.get_extension_by_name("google.api.http") {
         Some(ext) => ext,
@@ -669,7 +994,7 @@ fn extract_routes(pool: &DescriptorPool) -> Vec<RouteEntry> {
 
     for service in pool.services() {
         for method in service.methods() {
-            if method.is_client_streaming() || method.is_server_streaming() {
+            if method.is_client_streaming() {
                 continue;
             }
 
@@ -682,19 +1007,32 @@ fn extract_routes(pool: &DescriptorPool) -> Vec<RouteEntry> {
                 }
             };
 
-            let response_has_required = codec::has_required_fields(&method.output());
-            for binding in extract_http_bindings(&method, &http_ext) {
+            let input = method.input();
+            let output = method.output();
+            let streaming = method.is_server_streaming();
+            let response_has_required = codec::has_required_fields(&output);
+            for binding in rule::http_bindings(&method, &http_ext) {
+                if streaming {
+                    tracing::info!(
+                        "Registering streaming route: {} {} → {}",
+                        binding.method.as_str(),
+                        binding.path,
+                        grpc_path
+                    );
+                }
                 entries.push(RouteEntry {
-                    http_path: binding.http_path,
-                    http_method: binding.http_method,
+                    http_path: binding.path,
+                    http_method: binding.method,
                     grpc_path: grpc_path.clone(),
                     method: method.clone(),
-                    body: binding.body,
-                    response_body: binding.response_body,
+                    streaming,
+                    request_body: request_body(&input, binding.body),
+                    response: response_shape(&output, binding.response_body),
                     // Decided per mounted path in `routes_with_options`.
                     error_details: None,
                     ndjson_envelope: false,
                     response_has_required,
+                    denied_headers: Arc::default(),
                 });
             }
         }
@@ -703,152 +1041,31 @@ fn extract_routes(pool: &DescriptorPool) -> Vec<RouteEntry> {
     entries
 }
 
-/// Extract server-streaming HTTP route entries.
-fn extract_streaming_routes(pool: &DescriptorPool) -> Vec<RouteEntry> {
-    let http_ext = match pool.get_extension_by_name("google.api.http") {
-        Some(ext) => ext,
-        None => return Vec::new(),
-    };
-
-    let mut entries = Vec::new();
-
-    for service in pool.services() {
-        for method in service.methods() {
-            if !method.is_server_streaming() || method.is_client_streaming() {
-                continue;
-            }
-
-            let grpc_path = format!("/{}/{}", service.full_name(), method.name());
-            let grpc_path: axum::http::uri::PathAndQuery = match grpc_path.parse() {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::error!("skipping route with invalid gRPC path '{grpc_path}': {e}");
-                    continue;
-                }
-            };
-
-            let response_has_required = codec::has_required_fields(&method.output());
-            for binding in extract_http_bindings(&method, &http_ext) {
-                tracing::info!(
-                    "Registering streaming route: {} {} → {}",
-                    match binding.http_method {
-                        HttpMethod::Get => "GET",
-                        HttpMethod::Post => "POST",
-                        _ => "OTHER",
-                    },
-                    binding.http_path,
-                    grpc_path
-                );
-                entries.push(RouteEntry {
-                    http_path: binding.http_path,
-                    http_method: binding.http_method,
-                    grpc_path: grpc_path.clone(),
-                    method: method.clone(),
-                    body: binding.body,
-                    response_body: binding.response_body,
-                    // Decided per mounted path in `routes_with_options`.
-                    error_details: None,
-                    ndjson_envelope: false,
-                    response_has_required,
-                });
-            }
-        }
-    }
-
-    entries
-}
-
-/// A single HTTP binding parsed from a `google.api.http` rule.
-struct HttpBinding {
-    http_method: HttpMethod,
-    http_path: String,
-    body: request::BodyMapping,
-    response_body: Option<String>,
-}
-
-/// Extract all HTTP bindings (the primary rule plus any `additional_bindings`)
-/// from a method's `google.api.http` extension.
-fn extract_http_bindings(
-    method: &MethodDescriptor,
-    http_ext: &prost_reflect::ExtensionDescriptor,
-) -> Vec<HttpBinding> {
-    let options = method.options();
-    if !options.has_extension(http_ext) {
-        return Vec::new();
-    }
-
-    let prost_reflect::Value::Message(rule_msg) = options.get_extension(http_ext).into_owned()
-    else {
-        return Vec::new();
-    };
-
-    collect_bindings(&rule_msg)
-}
-
-/// Collect the primary binding plus every `additional_bindings` entry from an
-/// `HttpRule` message.
-fn collect_bindings(rule_msg: &DynamicMessage) -> Vec<HttpBinding> {
-    let mut bindings = Vec::new();
-    if let Some(binding) = parse_http_rule(rule_msg) {
-        bindings.push(binding);
-    }
-
-    // additional_bindings is a repeated HttpRule; each carries its own
-    // method/path/body. The proto forbids nesting them further.
-    if let Some(field) = rule_msg.get_field_by_name("additional_bindings") {
-        if let prost_reflect::Value::List(list) = field.into_owned() {
-            for item in list {
-                if let prost_reflect::Value::Message(sub) = item {
-                    if let Some(binding) = parse_http_rule(&sub) {
-                        bindings.push(binding);
-                    }
-                }
-            }
-        }
-    }
-
-    bindings
-}
-
-/// Parse a single `HttpRule` message into a binding (method+path required).
-fn parse_http_rule(rule_msg: &DynamicMessage) -> Option<HttpBinding> {
-    let (http_method, http_path) = [
-        ("get", HttpMethod::Get),
-        ("post", HttpMethod::Post),
-        ("put", HttpMethod::Put),
-        ("delete", HttpMethod::Delete),
-        ("patch", HttpMethod::Patch),
-    ]
-    .into_iter()
-    .find_map(
-        |(name, http_method)| match rule_msg.get_field_by_name(name)?.into_owned() {
-            prost_reflect::Value::String(path) if !path.is_empty() => Some((http_method, path)),
-            _ => None,
+/// How a binding's `body` rule reaches `input`: raw into an HttpBody (the
+/// input itself with `body: "*"`, or the HttpBody field `body` names), parsed
+/// otherwise.
+fn request_body(input: &MessageDescriptor, mapping: request::BodyMapping) -> RequestBody {
+    match &mapping {
+        request::BodyMapping::Root if httpbody::is_http_body(input) => RequestBody::RawRoot,
+        request::BodyMapping::Field(name) => match httpbody::http_body_field(input, name) {
+            Some((field, http_body)) => RequestBody::RawField(field, http_body),
+            None => RequestBody::Parsed(mapping),
         },
-    )?;
+        _ => RequestBody::Parsed(mapping),
+    }
+}
 
-    let body = rule_msg
-        .get_field_by_name("body")
-        .and_then(|v| match v.into_owned() {
-            prost_reflect::Value::String(s) => Some(request::BodyMapping::parse(&s)),
-            _ => None,
-        })
-        .unwrap_or(request::BodyMapping::None);
-
-    let response_body =
-        rule_msg
-            .get_field_by_name("response_body")
-            .and_then(|v| match v.into_owned() {
-                prost_reflect::Value::String(s) if !s.is_empty() => Some(s),
-                _ => None,
-            });
-
-    Some(HttpBinding {
-        http_method,
-        http_path,
-        body,
-        response_body,
-    })
+/// What a binding answers with: the raw body of an HttpBody (the output itself,
+/// or the HttpBody `response_body` names), JSON otherwise.
+fn response_shape(output: &MessageDescriptor, response_body: Option<String>) -> ResponseShape {
+    match response_body {
+        None if httpbody::is_http_body(output) => ResponseShape::HttpBody(Vec::new()),
+        None => ResponseShape::Json(None),
+        Some(path) => match httpbody::http_body_path(output, &path) {
+            Some(fields) => ResponseShape::HttpBody(fields),
+            None => ResponseShape::Json(Some(path)),
+        },
+    }
 }
 
 /// Convert a `google.api.http` path template to axum 0.8 path syntax.

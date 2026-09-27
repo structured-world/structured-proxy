@@ -156,6 +156,51 @@ async fn verify_endpoint_is_backed_by_the_decider() {
 }
 
 #[tokio::test]
+async fn options_verify_request_is_decided_not_answered_by_cors() {
+    // A forward-auth sub-request carries the original request's method. An
+    // OPTIONS without `Access-Control-Request-Method` is not a CORS preflight
+    // (Fetch standard, CORS-preflight request), so the CORS layer must not
+    // answer it with 200: that would let an unauthenticated OPTIONS through
+    // the gate. It reaches the decider, which denies it.
+    let app = server().router().unwrap();
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method(Method::OPTIONS)
+                .uri("/auth/verify")
+                .header("origin", "https://app.example.com")
+                .header("x-forwarded-method", "OPTIONS")
+                .header("x-forwarded-uri", "/v1/things")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    // Still a CORS response: the browser may read it.
+    assert!(resp.headers().contains_key("access-control-allow-origin"));
+
+    // A real preflight is still answered by the CORS layer.
+    let preflight = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(Method::OPTIONS)
+                .uri("/auth/verify")
+                .header("origin", "https://app.example.com")
+                .header("access-control-request-method", "POST")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preflight.status(), StatusCode::OK);
+    assert!(preflight
+        .headers()
+        .contains_key("access-control-allow-methods"));
+}
+
+#[tokio::test]
 async fn verify_redirect_becomes_401_with_location() {
     let app = server().router().unwrap();
     let resp = app
