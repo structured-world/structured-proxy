@@ -145,6 +145,10 @@ message Upload {
   string name = 1;
   google.api.HttpBody file = 2;
 }
+message Tree {
+  string name = 1;
+  Tree child = 2;
+}
 
 service Api {
   rpc Head(Item) returns (Item) {
@@ -162,7 +166,14 @@ service Api {
       body: "*"
       additional_bindings { put: "/v1/items/{name}" body: "note" }
       additional_bindings { post: "/v1/items:touch" }
+      additional_bindings { get: "/v1/items/{name}/note" response_body: "note" }
     };
+  }
+  rpc Walk(Tree) returns (Tree) {
+    option (google.api.http) = { get: "/v1/tree" };
+  }
+  rpc Plant(Tree) returns (Tree) {
+    option (google.api.http) = { post: "/v1/tree" body: "*" };
   }
   rpc Put(Upload) returns (google.api.HttpBody) {
     option (google.api.http) = { put: "/v1/uploads/{name}" body: "file" };
@@ -290,6 +301,49 @@ fn message_typed_query_parameter_schema_is_registered() {
         spec["components"]["schemas"].get("Filter").is_some(),
         "{}",
         spec["components"]["schemas"]
+    );
+}
+
+#[test]
+fn self_referencing_message_does_not_recurse_forever() {
+    // `Tree.child` is a `Tree`: in the query (GET) and in the body (POST) its
+    // schema is registered once and referenced, instead of being expanded
+    // until the stack overflows.
+    let spec = spec(&[]);
+    let tree = &spec["components"]["schemas"]["Tree"];
+    assert_eq!(
+        tree["properties"]["child"]["$ref"],
+        "#/components/schemas/Tree"
+    );
+    assert_eq!(
+        spec["paths"]["/v1/tree"]["get"]["parameters"][1]["schema"]["$ref"],
+        "#/components/schemas/Tree"
+    );
+    assert!(spec["paths"]["/v1/tree"]["post"]["requestBody"].is_object());
+}
+
+#[test]
+fn head_operations_describe_no_response_content() {
+    // A HEAD response has no content (RFC 9110 §9.3.2), whether the binding
+    // is a `HEAD` rule or the HEAD operation of a `*` rule.
+    let spec = spec(&[]);
+    for path in ["/v1/items/{name}", "/v1/verify"] {
+        let head = &spec["paths"][path]["head"]["responses"]["200"];
+        assert!(head.is_object(), "{path}");
+        assert!(head.get("content").is_none(), "{path}: {head}");
+    }
+    // The other operations of the `*` rule keep their content.
+    assert!(spec["paths"]["/v1/verify"]["get"]["responses"]["200"]["content"].is_object());
+}
+
+#[test]
+fn json_response_body_is_described_by_the_selected_field() {
+    // `response_body: "note"` answers with the `note` field only.
+    let spec = spec(&[]);
+    let content = &spec["paths"]["/v1/items/{name}/note"]["get"]["responses"]["200"]["content"];
+    assert_eq!(
+        content["application/json"]["schema"]["$ref"],
+        "#/components/schemas/Note"
     );
 }
 

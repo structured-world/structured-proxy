@@ -76,6 +76,9 @@ pub fn generate(pool: &DescriptorPool, config: &OpenApiConfig, aliases: &[AliasC
                     }
                     for path in targets {
                         let mut operation = operation.clone();
+                        if http_method == "head" {
+                            strip_response_content(&mut operation);
+                        }
                         operation["operationId"] = json!(unique_id(&mut operation_ids, &id));
                         add_path_operation(&mut paths, &path, http_method, operation);
                     }
@@ -151,6 +154,18 @@ fn operation_methods(method: &RouteMethod) -> Vec<&'static str> {
         _ => return Vec::new(),
     };
     vec![operation]
+}
+
+/// Drop the content of every response: a HEAD response carries none
+/// (RFC 9110 §9.3.2).
+fn strip_response_content(operation: &mut Value) {
+    if let Some(responses) = operation["responses"].as_object_mut() {
+        for response in responses.values_mut() {
+            if let Some(response) = response.as_object_mut() {
+                response.remove("content");
+            }
+        }
+    }
 }
 
 /// `base`, or `base_2`, `base_3`, ... when taken: OpenAPI requires every
@@ -308,6 +323,22 @@ fn build_operation(
                 },
             },
         })
+    } else if let Some(path) = &binding.response_body {
+        // The answer is only the field `response_body` names.
+        let schema = match response_field(&output, path) {
+            Some(field) => {
+                register_nested(&field, schemas);
+                field_to_schema(&field)
+            }
+            // The runtime answers JSON `null` for a path that names no field.
+            None => json!({ "nullable": true }),
+        };
+        json!({
+            "200": {
+                "description": "Success",
+                "content": { "application/json": { "schema": schema } },
+            },
+        })
     } else if output.full_name() == "google.protobuf.Empty" {
         json!({ "200": { "description": "Success (empty response)" } })
     } else {
@@ -350,10 +381,32 @@ fn build_operation(
     op
 }
 
-/// Register the schema of a message-typed field so its `$ref` resolves.
+/// The field a (possibly dotted) `response_body` path names in `output`,
+/// walking singular message fields.
+fn response_field(output: &MessageDescriptor, path: &str) -> Option<FieldDescriptor> {
+    let mut desc = output.clone();
+    let mut segments = path.split('.').peekable();
+    while let Some(segment) = segments.next() {
+        let field = desc.get_field_by_name(segment)?;
+        if segments.peek().is_none() {
+            return Some(field);
+        }
+        match field.kind() {
+            Kind::Message(inner) if !field.is_list() && !field.is_map() => desc = inner,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Register the schema of a message-typed field so its `$ref` resolves. A
+/// placeholder goes in before the fields are walked, so a message that
+/// contains itself (directly or through others) is referenced rather than
+/// expanded without end.
 fn register_nested(field: &FieldDescriptor, schemas: &mut Map<String, Value>) {
     if let Kind::Message(nested) = field.kind() {
         if !is_well_known(&nested) && !schemas.contains_key(nested.name()) {
+            schemas.insert(nested.name().to_string(), json!({ "type": "object" }));
             let nested_schema = message_to_schema(&nested, &[], schemas);
             schemas.insert(nested.name().to_string(), nested_schema);
         }

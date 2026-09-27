@@ -343,16 +343,16 @@ impl PathRoutes {
         let allow = HeaderValue::from_str(&allow.join(", "))
             .expect("method tokens are valid header value characters");
         let extension: Arc<[(Method, Arc<RouteEntry>)]> = extension.into();
+        // The method decides before anything is extracted, so a request no
+        // binding answers gets its 405 without its body being read.
         router.fallback(
-            move |method: Method,
-                  state: State<S>,
-                  headers: HeaderMap,
-                  path_params: Path<PathParams>,
-                  raw_query: RawQuery,
-                  body: Bytes| async move {
-                match extension.iter().find(|(bound, _)| *bound == method) {
+            move |State(state): State<S>, request: axum::extract::Request| async move {
+                match extension
+                    .iter()
+                    .find(|(bound, _)| bound == request.method())
+                {
                     Some((_, entry)) => {
-                        handle(state, headers, path_params, raw_query, body, entry.clone()).await
+                        axum::handler::Handler::call(endpoint!(entry.clone()), request, state).await
                     }
                     None => (StatusCode::METHOD_NOT_ALLOWED, [(ALLOW, allow)]).into_response(),
                 }
@@ -992,8 +992,13 @@ fn decode_request(
 
     // Query string → field bindings (fields not bound by path or body).
     // A malformed query is a client error: reject it rather than silently
-    // dropping every query-bound field.
-    let query_pairs = request::parse_query(raw_query)?;
+    // dropping every query-bound field. An HttpBody input with `body: "*"`
+    // takes every field from the raw body, so its query binds nothing
+    // (google/api/http.proto: with `*` there are no HTTP parameters).
+    let query_pairs = match entry.request_body {
+        RequestBody::RawRoot => Vec::new(),
+        _ => request::parse_query(raw_query)?,
+    };
 
     let input_desc = entry.method.input();
     let request_json =

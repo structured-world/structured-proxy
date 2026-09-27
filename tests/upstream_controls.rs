@@ -736,6 +736,22 @@ async fn http_body_request_receives_the_raw_body_and_content_type() {
 }
 
 #[tokio::test]
+async fn query_on_a_whole_message_http_body_route_is_ignored() {
+    // With `body: "*"` on an HttpBody input every field comes from the body
+    // (google/api/http.proto: no HTTP parameters with `*`), so a query that
+    // names an HttpBody field is ignored instead of failing the request.
+    let app = proxy().await;
+    let request = http::Request::post("/v1/echo?extensions=x&content_type=y&data=z")
+        .header("content-type", "text/plain")
+        .body(Body::from("raw"))
+        .unwrap();
+    let (status, headers, body) = send(&app, request).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(values(&headers, "content-type"), ["text/plain"]);
+    assert_eq!(&body[..], b"raw");
+}
+
+#[tokio::test]
 async fn http_body_request_without_a_body_is_empty() {
     let app = proxy().await;
     let request = http::Request::post("/v1/echo").body(Body::empty()).unwrap();
@@ -931,6 +947,21 @@ async fn extension_method_rule_routes_next_to_a_standard_one() {
     assert_eq!(values(&headers, "allow"), ["PROPFIND, GET, HEAD"]);
     let (status, _, _) = call(&app, Method::DELETE, "/v1/dav").await;
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
+async fn unbound_method_is_405_before_its_body_is_read() {
+    // The method decides first: a method nobody binds on the path is 405
+    // even with a body over the extractor limit, which is never buffered.
+    let app = proxy().await;
+    let request = http::Request::builder()
+        .method(Method::DELETE)
+        .uri("/v1/dav")
+        .body(Body::from(vec![b'x'; 3 * 1024 * 1024]))
+        .unwrap();
+    let (status, headers, _) = send(&app, request).await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(values(&headers, "allow"), ["PROPFIND, GET, HEAD"]);
 }
 
 #[tokio::test]

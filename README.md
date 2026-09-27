@@ -481,8 +481,10 @@ answer with `x-http-code` and that body. Server-streaming calls ignore the key.
 answers with `content_type` as `Content-Type` (none when empty) and `data` as
 the raw body. An RPC whose request type is `HttpBody` with `body: "*"`, or
 whose `body` names a field of that type, receives the raw request body and its
-full `Content-Type` value there; the other fields still come from the path and
-query. A server-streaming `HttpBody` writes each message's `data` as it
+full `Content-Type` value there. With a named field, the other fields still
+come from the path and query (a query key naming the body field is ignored);
+with `body: "*"`, the query binds nothing, since every field comes from the
+body. A server-streaming `HttpBody` writes each message's `data` as it
 arrives, with `Content-Type` from the first message; as a raw body has no
 in-band error frame, a failure after the first message aborts the transfer so
 the client does not take a partial body for a complete one. An `HttpBody`
