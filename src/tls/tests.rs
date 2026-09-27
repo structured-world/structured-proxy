@@ -1,5 +1,5 @@
-//! The outbound TLS client against a local HTTPS server over the pure-Rust
-//! provider: the handshake completes over TLS 1.3 and TLS 1.2 with ECDSA and
+//! The outbound TLS client against a local HTTPS server over the provider the
+//! build brings: the handshake completes over TLS 1.3 and TLS 1.2 with ECDSA and
 //! RSA server keys, and a certificate for another name or from an unknown CA
 //! is refused. Then which provider the client takes, and the errors when it
 //! has none. Fixtures come from `testdata/generate.sh`.
@@ -75,8 +75,12 @@ async fn serve(
 }
 
 /// A client trusting `trusted`, with `host` resolving to the test server.
+///
+/// It runs on the provider the build brings (aws-lc with `aws_lc_rs`), so the
+/// handshakes below cover the one production uses; a build without a backend
+/// falls back to RustCrypto, as an embedder would install one.
 fn client(trusted: &str, host: &str, addr: SocketAddr) -> reqwest::Client {
-    let provider = Arc::new(rustls_rustcrypto::provider());
+    let provider = Arc::new(builtin_provider().unwrap_or_else(rustls_rustcrypto::provider));
     reqwest::Client::builder()
         .tls_backend_preconfigured(client_config_with(provider, roots(trusted)).unwrap())
         .resolve(host, addr)

@@ -12,7 +12,7 @@ use rustls::crypto::CryptoProvider;
 ///
 /// # Errors
 ///
-/// No crypto provider is available (see [`provider`]), or the one installed
+/// No crypto provider is available (see [`select_provider`]), or the one installed
 /// for the process supports neither TLS 1.2 nor TLS 1.3.
 pub(crate) fn client_config() -> Result<rustls::ClientConfig, String> {
     let mut roots = rustls::RootCertStore::empty();
