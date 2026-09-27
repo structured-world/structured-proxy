@@ -115,9 +115,11 @@ jobs:
       - name: Doc tests
         run: cargo test --doc ${{ matrix.backend.flags }}
 
+      # With `cli`, so the packaged crate's binary compiles too: without the
+      # feature cargo verifies the library alone.
       - name: Publish dry-run
         if: matrix.backend.name == 'rust_crypto'
-        run: cargo publish --dry-run
+        run: cargo publish --dry-run --features cli
 
   security-audit:
     name: Security Audit
