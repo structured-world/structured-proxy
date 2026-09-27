@@ -5,40 +5,238 @@
 //! trace-context across the boundary, and carries a client deadline through as
 //! the upstream call timeout.
 
+use std::convert::Infallible;
 use std::time::Duration;
 
-use axum::http::HeaderMap;
+use axum::http::header::{Entry, OccupiedEntry};
+use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use tonic::metadata::MetadataMap;
 
-/// Extract HTTP headers into a gRPC `MetadataMap`.
+/// A forwarded request header whose value gRPC metadata cannot carry.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("header `{header}` has a value gRPC metadata cannot carry")]
+pub struct InvalidForwardedHeader {
+    /// The header, as the request named it.
+    pub header: HeaderName,
+}
+
+/// Extract HTTP headers into a gRPC `MetadataMap`, or refuse the request.
 ///
-/// Forwards the headers listed in `forwarded_headers`, then always propagates
-/// W3C trace-context (forwarding an incoming `traceparent` or synthesizing one
-/// so the upstream joins a single trace across the REST↔gRPC boundary).
+/// Forwards every value of each header listed in `forwarded_headers`, in
+/// order and byte for byte, as Envoy's gRPC-JSON transcoder and grpc-gateway
+/// do: the upstream sees how many times the client sent a header, which some
+/// checks depend on (RFC 9449 §4.3 rejects a request with more than one
+/// `DPoP`). Then always propagates W3C trace-context (forwarding an incoming
+/// `traceparent` or synthesizing one so the upstream joins a single trace
+/// across the REST↔gRPC boundary). That step owns `traceparent` and
+/// `tracestate` even when they are listed: the upstream gets exactly one
+/// valid `traceparent`, and every `tracestate` line only with the trace it
+/// belongs to.
+///
+/// # Errors
+/// A forwarded value gRPC metadata cannot carry: empty or outside visible
+/// ASCII and space for a text key, not base64 for a `-bin` key (gRPC PROTOCOL-HTTP2,
+/// "Custom-Metadata"). gRPC lets a receiver drop such a value, which would
+/// change how many values the upstream sees, so the request is refused
+/// rather than forwarded altered.
+pub fn try_http_headers_to_grpc_metadata(
+    headers: &HeaderMap,
+    forwarded_headers: &[String],
+) -> Result<MetadataMap, InvalidForwardedHeader> {
+    forward(headers, forwarded_headers, |name, value| {
+        if carries(name, value.as_bytes()) {
+            Ok(())
+        } else {
+            Err(InvalidForwardedHeader {
+                header: name.clone(),
+            })
+        }
+    })
+}
+
+/// Extract HTTP headers into a gRPC `MetadataMap`, forwarding every value as
+/// it arrived, including one gRPC metadata cannot carry.
+#[deprecated(
+    note = "forwards values gRPC metadata cannot carry, which a receiver may drop; \
+            use try_http_headers_to_grpc_metadata"
+)]
 pub fn http_headers_to_grpc_metadata(
     headers: &HeaderMap,
     forwarded_headers: &[String],
 ) -> MetadataMap {
-    let mut metadata = MetadataMap::new();
+    match forward::<Infallible>(headers, forwarded_headers, |_, _| Ok(())) {
+        Ok(metadata) => metadata,
+        Err(never) => match never {},
+    }
+}
 
-    for header_name in forwarded_headers {
-        if let Some(value) = headers.get(header_name.as_str()) {
-            insert_ascii(&mut metadata, header_name, value.as_bytes());
+/// The metadata for `headers`, with `check` deciding on each forwarded value.
+fn forward<E>(
+    headers: &HeaderMap,
+    forwarded_headers: &[String],
+    mut check: impl FnMut(&HeaderName, &HeaderValue) -> Result<(), E>,
+) -> Result<MetadataMap, E> {
+    let mut forwarded = HeaderMap::new();
+    for name in forwarded_headers {
+        // Trace-context propagation owns these, listed or not.
+        if is_trace_context(name) {
+            continue;
+        }
+        let values = headers.get_all(name.as_str());
+        if values.iter().next().is_none() {
+            continue;
+        }
+        let name = HeaderName::from_bytes(name.as_bytes())
+            .expect("a name the request carries a header under is a valid header name");
+        // A name gRPC metadata cannot carry is refused when the proxy is built;
+        // a direct caller that lists one gets nothing forwarded under it.
+        if !is_grpc_key(name.as_str()) {
+            continue;
+        }
+        // A name listed twice is forwarded once, so its values are not doubled.
+        let Entry::Vacant(vacant) = forwarded.entry(name) else {
+            continue;
+        };
+        let key = vacant.key().clone();
+        let binary = key.as_str().ends_with("-bin");
+        let mut vacant = Some(vacant);
+        let mut entry = None;
+        let mut push = |value: HeaderValue| match entry.as_mut() {
+            Some(entry) => {
+                OccupiedEntry::append(entry, value);
+            }
+            None => {
+                let vacant = vacant
+                    .take()
+                    .expect("only the first value finds the entry vacant");
+                entry = Some(vacant.insert_entry(value));
+            }
+        };
+        for value in values {
+            check(&key, value)?;
+            // gRPC PROTOCOL-HTTP2 lets binary values be joined by commas, and
+            // tonic does not split them before decoding: each part travels as
+            // its own value.
+            if binary && value.as_bytes().contains(&b',') {
+                for part in value.as_bytes().split(|&b| b == b',') {
+                    push(
+                        HeaderValue::from_bytes(part.trim_ascii())
+                            .expect("a trimmed part of a header value is a header value"),
+                    );
+                }
+            } else {
+                push(value.clone());
+            }
         }
     }
+    let mut metadata = MetadataMap::from_headers(forwarded);
 
     inject_trace_context(&mut metadata, headers);
 
-    metadata
+    Ok(metadata)
 }
 
-/// Insert an ASCII metadata entry, silently skipping non-ASCII keys/values.
+/// Whether gRPC metadata can carry `value` under `name` (gRPC PROTOCOL-HTTP2,
+/// "Custom-Metadata"): base64 for a `-bin` key, visible ASCII and space for a
+/// text key.
+fn carries(name: &HeaderName, value: &[u8]) -> bool {
+    if name.as_str().ends_with("-bin") {
+        is_base64_value(value)
+    } else {
+        is_ascii_value(value)
+    }
+}
+
+/// Whether `name` is a gRPC metadata key (gRPC PROTOCOL-HTTP2,
+/// "Header-Name → 1*( %x30-39 / %x61-7A / "_" / "-" / "." )"), compared the
+/// way HTTP compares field names, without case.
+pub(crate) fn is_grpc_key(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| {
+            let b = b.to_ascii_lowercase();
+            b.is_ascii_digit() || b.is_ascii_lowercase() || matches!(b, b'_' | b'-' | b'.')
+        })
+}
+
+/// Whether `name` is a W3C trace-context header, which propagation owns.
+fn is_trace_context(name: &str) -> bool {
+    name.eq_ignore_ascii_case("traceparent") || name.eq_ignore_ascii_case("tracestate")
+}
+
+/// `ASCII-Value → 1*( %x20-%x7E )`. An empty value is valid HTTP but not a
+/// gRPC value, so a receiver may drop it and change the count.
+fn is_ascii_value(value: &[u8]) -> bool {
+    !value.is_empty() && value.iter().all(|b| (0x20..=0x7e).contains(b))
+}
+
+/// A `-bin` value: base64 (RFC 4648 §4), padded or not, possibly several
+/// comma-separated values, which a receiver must split before decoding.
+fn is_base64_value(value: &[u8]) -> bool {
+    value.split(|&b| b == b',').all(|part| {
+        let part = part.trim_ascii();
+        let data = part.strip_suffix(b"==").or_else(|| part.strip_suffix(b"="));
+        let alphabet = |data: &[u8]| {
+            data.iter()
+                .all(|&b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+        };
+        let (data, well_formed) = match data {
+            // Padding closes a four-digit group.
+            Some(data) => (data, part.len() % 4 == 0),
+            // A lone last digit cannot encode a byte (RFC 4648 §4).
+            None => (part, part.len() % 4 != 1),
+        };
+        well_formed && alphabet(data) && canonical_tail(data)
+    })
+}
+
+/// RFC 4648 §3.5: the bits of the last digit past the final byte are zero, as
+/// strict decoders (tonic's among them) require. `data` is unpadded base64.
+fn canonical_tail(data: &[u8]) -> bool {
+    let unused_bits_mask = match data.len() % 4 {
+        // Two digits carry one byte and four spare bits; three carry two bytes
+        // and two spare bits.
+        2 => 0b1111,
+        3 => 0b0011,
+        _ => return true,
+    };
+    data.last()
+        .is_some_and(|&digit| base64_digit(digit) & unused_bits_mask == 0)
+}
+
+/// The value of a base64 digit (RFC 4648 §4, Table 1); only called on digits
+/// already checked against the alphabet.
+fn base64_digit(digit: u8) -> u8 {
+    match digit {
+        b'A'..=b'Z' => digit - b'A',
+        b'a'..=b'z' => digit - b'a' + 26,
+        b'0'..=b'9' => digit - b'0' + 52,
+        b'+' => 62,
+        _ => 63,
+    }
+}
+
+/// Insert an ASCII metadata entry, silently skipping a key or value gRPC
+/// metadata cannot carry.
 fn insert_ascii(metadata: &mut MetadataMap, key: &str, value: &[u8]) {
+    if !is_ascii_value(value) {
+        return;
+    }
     if let (Ok(k), Ok(v)) = (
         key.parse::<tonic::metadata::MetadataKey<tonic::metadata::Ascii>>(),
         tonic::metadata::AsciiMetadataValue::try_from(value),
     ) {
         metadata.insert(k, v);
+    }
+}
+
+/// Append an ASCII metadata entry, silently skipping a value gRPC metadata
+/// cannot carry; W3C Trace Context lets a vendor discard such a `tracestate`.
+fn append_ascii(metadata: &mut MetadataMap, key: &'static str, value: &[u8]) {
+    if !is_ascii_value(value) {
+        return;
+    }
+    if let Ok(v) = tonic::metadata::AsciiMetadataValue::try_from(value) {
+        metadata.append(key, v);
     }
 }
 
@@ -48,12 +246,15 @@ fn insert_ascii(metadata: &mut MetadataMap, key: &str, value: &[u8]) {
 /// well-formed per W3C §3.2.2; otherwise (missing or malformed) synthesizes a
 /// fresh one so the upstream always receives a single valid, joinable trace.
 fn inject_trace_context(metadata: &mut MetadataMap, headers: &HeaderMap) {
+    // `metadata` holds no trace-context header of its own: forwarding skips
+    // them, so tracestate travels only here, with the trace it annotates.
     if let Some(tp) = headers.get("traceparent").and_then(|v| v.to_str().ok()) {
         if is_valid_traceparent(tp) {
             insert_ascii(metadata, "traceparent", tp.as_bytes());
-            // tracestate only travels with the trace it annotates.
-            if let Some(ts) = headers.get("tracestate") {
-                insert_ascii(metadata, "tracestate", ts.as_bytes());
+            // Every line: W3C Trace Context §3.3 lets tracestate be split
+            // over several header lines that together form one list.
+            for ts in headers.get_all("tracestate") {
+                append_ascii(metadata, "tracestate", ts.as_bytes());
             }
             return;
         }
@@ -159,212 +360,4 @@ fn parse_grpc_timeout(value: &str) -> Option<Duration> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::http::HeaderValue;
-
-    fn default_headers() -> Vec<String> {
-        vec![
-            "authorization".into(),
-            "dpop".into(),
-            "x-request-id".into(),
-            "x-forwarded-for".into(),
-            "x-forwarded-proto".into(),
-            "x-real-ip".into(),
-            "accept-language".into(),
-            "user-agent".into(),
-            "idempotency-key".into(),
-        ]
-    }
-
-    #[test]
-    fn test_authorization_forwarded() {
-        let mut headers = HeaderMap::new();
-        headers.insert("authorization", HeaderValue::from_static("Bearer tok123"));
-        let meta = http_headers_to_grpc_metadata(&headers, &default_headers());
-        assert_eq!(
-            meta.get("authorization").unwrap().to_str().unwrap(),
-            "Bearer tok123"
-        );
-    }
-
-    #[test]
-    fn test_multiple_headers_forwarded() {
-        let mut headers = HeaderMap::new();
-        headers.insert("authorization", HeaderValue::from_static("Bearer tok"));
-        headers.insert("x-request-id", HeaderValue::from_static("req-42"));
-        headers.insert("accept-language", HeaderValue::from_static("en-US"));
-        let meta = http_headers_to_grpc_metadata(&headers, &default_headers());
-        assert_eq!(
-            meta.get("authorization").unwrap().to_str().unwrap(),
-            "Bearer tok"
-        );
-        assert_eq!(
-            meta.get("x-request-id").unwrap().to_str().unwrap(),
-            "req-42"
-        );
-        assert_eq!(
-            meta.get("accept-language").unwrap().to_str().unwrap(),
-            "en-US"
-        );
-    }
-
-    #[test]
-    fn test_unknown_headers_not_forwarded() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-custom-header", HeaderValue::from_static("value"));
-        let meta = http_headers_to_grpc_metadata(&headers, &default_headers());
-        assert!(meta.get("x-custom-header").is_none());
-    }
-
-    #[test]
-    fn test_custom_forwarded_headers() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-custom-header", HeaderValue::from_static("value"));
-        let forwarded = vec!["x-custom-header".to_string()];
-        let meta = http_headers_to_grpc_metadata(&headers, &forwarded);
-        assert_eq!(
-            meta.get("x-custom-header").unwrap().to_str().unwrap(),
-            "value"
-        );
-    }
-
-    #[test]
-    fn test_empty_headers_still_inject_traceparent() {
-        // No forwarded headers present, but a trace-context is synthesized so
-        // the upstream joins a single trace.
-        let headers = HeaderMap::new();
-        let meta = http_headers_to_grpc_metadata(&headers, &default_headers());
-        let tp = meta.get("traceparent").unwrap().to_str().unwrap();
-        assert!(is_valid_traceparent(tp), "bad traceparent: {tp}");
-        // Nothing else leaks in.
-        assert!(meta.get("authorization").is_none());
-    }
-
-    #[test]
-    fn traceparent_is_forwarded_when_present() {
-        let mut headers = HeaderMap::new();
-        let incoming = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
-        headers.insert("traceparent", HeaderValue::from_static(incoming));
-        headers.insert("tracestate", HeaderValue::from_static("vendor=value"));
-        let meta = http_headers_to_grpc_metadata(&headers, &default_headers());
-        assert_eq!(meta.get("traceparent").unwrap().to_str().unwrap(), incoming);
-        assert_eq!(
-            meta.get("tracestate").unwrap().to_str().unwrap(),
-            "vendor=value"
-        );
-    }
-
-    #[test]
-    fn synthesized_traceparent_is_unique_per_call() {
-        let headers = HeaderMap::new();
-        let a = http_headers_to_grpc_metadata(&headers, &[]);
-        let b = http_headers_to_grpc_metadata(&headers, &[]);
-        assert_ne!(
-            a.get("traceparent").unwrap().to_str().unwrap(),
-            b.get("traceparent").unwrap().to_str().unwrap()
-        );
-    }
-
-    #[test]
-    fn grpc_timeout_parses_each_unit() {
-        assert_eq!(parse_grpc_timeout("5S"), Some(Duration::from_secs(5)));
-        assert_eq!(parse_grpc_timeout("100m"), Some(Duration::from_millis(100)));
-        assert_eq!(parse_grpc_timeout("2M"), Some(Duration::from_secs(120)));
-        assert_eq!(parse_grpc_timeout("1H"), Some(Duration::from_secs(3600)));
-        assert_eq!(parse_grpc_timeout("250u"), Some(Duration::from_micros(250)));
-        assert_eq!(parse_grpc_timeout("9n"), Some(Duration::from_nanos(9)));
-    }
-
-    #[test]
-    fn grpc_timeout_rejects_malformed() {
-        assert_eq!(parse_grpc_timeout(""), None);
-        assert_eq!(parse_grpc_timeout("S"), None);
-        assert_eq!(parse_grpc_timeout("10X"), None);
-        assert_eq!(parse_grpc_timeout("abcS"), None);
-    }
-
-    #[test]
-    fn grpc_timeout_rejects_zero_duration() {
-        // A zero deadline would make tonic's timeout expire immediately, failing
-        // every such request with DEADLINE_EXCEEDED before it reaches upstream.
-        assert_eq!(parse_grpc_timeout("0S"), None);
-        assert_eq!(parse_grpc_timeout("0m"), None);
-        assert_eq!(parse_grpc_timeout("0n"), None);
-    }
-
-    #[test]
-    fn grpc_timeout_enforces_8_digit_limit() {
-        // The gRPC wire spec caps TimeoutValue at 8 digits.
-        assert_eq!(
-            parse_grpc_timeout("99999999S"),
-            Some(Duration::from_secs(99_999_999))
-        );
-        assert_eq!(parse_grpc_timeout("999999999S"), None); // 9 digits
-    }
-
-    #[test]
-    fn versioned_traceparent_is_forwarded() {
-        // W3C 3.2.1 requires accepting future versions (anything but ff); a
-        // valid version-01 header must be propagated, not dropped + resynthesized.
-        let incoming = "01-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
-        let mut headers = HeaderMap::new();
-        headers.insert("traceparent", HeaderValue::from_static(incoming));
-        let meta = http_headers_to_grpc_metadata(&headers, &[]);
-        assert_eq!(meta.get("traceparent").unwrap().to_str().unwrap(), incoming);
-    }
-
-    #[test]
-    fn ff_version_traceparent_is_rejected() {
-        // The reserved "ff" version is invalid per W3C and must be replaced.
-        let invalid = "ff-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
-        let mut headers = HeaderMap::new();
-        headers.insert("traceparent", HeaderValue::from_static(invalid));
-        let meta = http_headers_to_grpc_metadata(&headers, &[]);
-        let tp = meta.get("traceparent").unwrap().to_str().unwrap();
-        assert_ne!(tp, invalid);
-        assert!(is_valid_traceparent(tp));
-    }
-
-    #[test]
-    fn malformed_or_zero_traceparent_is_not_forwarded() {
-        // An all-zeros traceparent is invalid per W3C §3.2.2 and must not be
-        // propagated; a fresh one is synthesized instead.
-        let zeros = "00-00000000000000000000000000000000-0000000000000000-01";
-        let mut headers = HeaderMap::new();
-        headers.insert("traceparent", HeaderValue::from_static(zeros));
-        let meta = http_headers_to_grpc_metadata(&headers, &[]);
-        let tp = meta.get("traceparent").unwrap().to_str().unwrap();
-        assert_ne!(tp, zeros);
-        assert!(
-            is_valid_traceparent(tp),
-            "synthesized traceparent invalid: {tp}"
-        );
-    }
-
-    #[test]
-    fn apply_request_deadline_sets_timeout_from_header() {
-        let mut headers = HeaderMap::new();
-        headers.insert("grpc-timeout", HeaderValue::from_static("3S"));
-        let mut req = tonic::Request::new(());
-        assert_eq!(
-            apply_request_deadline(&mut req, &headers),
-            Some(Duration::from_secs(3))
-        );
-    }
-
-    #[test]
-    fn apply_request_deadline_noop_without_header() {
-        let headers = HeaderMap::new();
-        let mut req = tonic::Request::new(());
-        assert_eq!(apply_request_deadline(&mut req, &headers), None);
-    }
-
-    #[test]
-    fn test_dpop_forwarded() {
-        let mut headers = HeaderMap::new();
-        headers.insert("dpop", HeaderValue::from_static("eyJ0eXAiOiJkcG9wK2p3dCJ9"));
-        let meta = http_headers_to_grpc_metadata(&headers, &default_headers());
-        assert!(meta.get("dpop").is_some());
-    }
-}
+mod tests;

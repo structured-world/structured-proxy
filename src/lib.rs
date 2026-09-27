@@ -483,6 +483,20 @@ impl ProxyServer {
             maintenance_exempt.push(vp.clone());
         }
 
+        // A forwarded name gRPC metadata cannot carry would be rejected by a
+        // conforming upstream on every request; refuse it here instead.
+        if let Some(name) = self
+            .config
+            .forwarded_headers
+            .iter()
+            .find(|name| !transcode::metadata::is_grpc_key(name))
+        {
+            anyhow::bail!(
+                "forwarded_headers entry {name:?} is not a gRPC metadata key \
+                 (letters, digits, '_', '-' and '.')"
+            );
+        }
+
         let state = ProxyState {
             service_name: service_name.clone(),
             grpc_upstream,

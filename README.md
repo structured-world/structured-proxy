@@ -444,6 +444,22 @@ methods other than the five standard ones. The upstream RPC decides all of
 these; the proxy only carries them, as Envoy's `grpc_json_transcoder` and
 grpc-gateway do, so the same service works behind any of them.
 
+**Request headers → request metadata.** Each header named in
+`forwarded_headers` reaches the upstream as request metadata byte for byte,
+every value in the order the client sent it, so a check that depends on how
+often a header was sent (RFC 9449 §4.3 rejects a request with two `DPoP`
+headers) sees the same request behind the proxy. A `-bin` header keeps the
+base64 it arrived with, one metadata value per comma-separated part. A value
+gRPC metadata cannot carry (empty, or outside visible ASCII and space, such as
+a tab or obs-text, or not canonical base64 under a `-bin` key) is refused with
+`INVALID_ARGUMENT` (400) naming the header: gRPC lets a receiver drop such a
+value, which would change what the upstream counts. A `forwarded_headers` name
+must be a gRPC metadata key (letters, digits, `_`, `-`, `.`), or the proxy
+does not start. W3C trace-context is the exception, listed or
+not: the upstream always gets exactly one valid `traceparent` (the client's
+first, or a fresh one when it is missing or malformed), and every `tracestate`
+line only with the client's own trace.
+
 **Response metadata → response headers.** The upstream's response metadata is
 its HTTP response headers. Every ASCII entry becomes a header, in order, with
 repeated values as repeated fields; a key sent in both the initial metadata and
