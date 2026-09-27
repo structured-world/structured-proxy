@@ -617,7 +617,7 @@ from `auth.jwt` (an Ed25519 PEM file or a JWKS endpoint), verified with
 
 | Feature | Backend | Notes |
 |---------|---------|-------|
-| `rust_crypto` (default) | RustCrypto | Pure Rust. Pulls in `rsa`, which carries [RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071); the Marvin attack targets private-key timing, and this path only verifies with public keys (see `deny.toml`). |
+| `rust_crypto` (default) | RustCrypto | Pure Rust. Uses `rsa`, which carries [RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071); the Marvin attack targets private-key timing, and this path only verifies with public keys (see `deny.toml`). |
 | `aws_lc_rs` | aws-lc | Constant-time / FIPS-capable, advisory-free, links aws-lc through C FFI. |
 
 Both can be linked at once, as with any pair of Cargo features. `jsonwebtoken`
@@ -685,10 +685,27 @@ async-trait = "0.1"
 serde_json = "1"
 ```
 
-which links no JWT crypto (and therefore no `rsa`), and supplies the backend
-from its own binary. With no verifier injected and no backend feature, an
-`auth.mode: "jwt"` config is rejected at startup with that instruction, rather
-than silently accepting tokens.
+which links no JWT crypto, and supplies the backend from its own binary. With no
+verifier injected and no backend feature, an `auth.mode: "jwt"` config is
+rejected at startup with that instruction, rather than silently accepting
+tokens.
+
+## Outbound TLS
+
+The proxy's own HTTPS calls (JWKS fetches, the rate-limit service) use rustls
+with the pure-Rust RustCrypto provider (`rustls-rustcrypto`) and Mozilla's root
+store bundled from `webpki-roots`, so no system CA bundle is needed. Neither
+`ring` nor aws-lc is linked: the default build and the
+`default-features = false` build contain no C crypto, which CI checks. Only the
+opt-in `aws_lc_rs` JWT backend brings aws-lc in.
+
+The provider verifies RSA server signatures with `rsa`, so every build links
+that crate, under the same RUSTSEC-2023-0071 note as the `rust_crypto` backend:
+only public-key verification runs. The current provider release still names
+`rustls-webpki` 0.102, whose CRL and name-constraint advisories are listed in
+`deny.toml` with why they do not apply: the provider reads only algorithm
+identifiers from it, and rustls verifies certificates with its own patched
+`rustls-webpki`.
 
 ## How It Works
 

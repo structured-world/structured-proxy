@@ -89,15 +89,20 @@ redis = { version = "1.2", features = ["tokio-comp", "connection-manager"], opti
 jsonwebtoken = { version = "11", default-features = false, features = [
   "use_pem",
 ], optional = true }
-# reqwest 0.13's `rustls` feature hardwires the aws-lc-rs provider (C FFI, awkward
-# for the musl static build). We keep the pure-Rust `ring` provider instead:
-# `rustls-no-provider` builds rustls without a bundled provider, and auth/jwks.rs
-# hands reqwest a fully preconfigured rustls ClientConfig (ring provider + bundled
-# Mozilla roots from webpki-roots). Bundling the roots keeps the binary self-
-# contained, so it works on musl / scratch / distroless images with no system CA
-# bundle (matching reqwest 0.12's old `rustls-tls` behaviour).
+# Outbound HTTPS (JWKS fetches, the rate-limit service) links no C: reqwest 0.13's
+# `rustls` feature hardwires the aws-lc-rs provider (C FFI), and rustls' `ring`
+# provider compiles C and assembly. `rustls-no-provider` builds rustls without a
+# bundled provider; src/tls.rs hands reqwest a fully preconfigured ClientConfig
+# with the pure-Rust RustCrypto provider and the Mozilla roots from webpki-roots.
+# Bundling the roots keeps the binary self-contained, so it works on musl /
+# scratch / distroless images with no system CA bundle.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+# `0.0.2-alpha` still names its `rustls-webpki` 0.102 dependency, which carries
+# four CRL / name-constraint advisories; the provider only reads algorithm
+# identifier constants from it, while certificates are verified by rustls' own
+# (patched) webpki. See deny.toml.
+rustls-rustcrypto = "0.0.2-alpha"
 webpki-roots = "1"
 globset = "0.4"
 base64 = "0.23"
@@ -144,6 +149,9 @@ http-body-util = "0.1"
 # Trailer frames for the hand-written upstream response in
 # tests/upstream_controls.rs (tonic's server API cannot set success trailers).
 http-body = "1"
+# The local HTTPS server the outbound TLS client is tested against
+# (src/tls/tests.rs). Default features would pull in aws-lc.
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
 # The embedding-hooks integration test (tests/hooks.rs) writes hook impls using
 # only these (the same crates a real embedder uses — none is an HTTP framework)
 # and drives the resulting router via axum + tower for assertions.
