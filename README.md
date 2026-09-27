@@ -444,6 +444,13 @@ methods other than the five standard ones. The upstream RPC decides all of
 these; the proxy only carries them, as Envoy's `grpc_json_transcoder` and
 grpc-gateway do, so the same service works behind any of them.
 
+**Request headers → request metadata.** Each header named in
+`forwarded_headers` reaches the upstream as request metadata byte for byte,
+every value in the order the client sent it, so a check that depends on how
+often a header was sent (RFC 9449 §4.3 rejects a request with two `DPoP`
+headers) sees the same request behind the proxy. A `-bin` header keeps the
+base64 value it arrived with.
+
 **Response metadata → response headers.** The upstream's response metadata is
 its HTTP response headers. Every ASCII entry becomes a header, in order, with
 repeated values as repeated fields; a key sent in both the initial metadata and
