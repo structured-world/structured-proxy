@@ -92,20 +92,22 @@ redis = { version = "1.2", features = ["tokio-comp", "connection-manager"], opti
 jsonwebtoken = { version = "11", default-features = false, features = [
   "use_pem",
 ], optional = true }
-# Outbound HTTPS (JWKS fetches, the rate-limit service) links no C: reqwest 0.13's
-# `rustls` feature hardwires the aws-lc-rs provider (C FFI), and rustls' `ring`
-# provider compiles C and assembly. `rustls-no-provider` builds rustls without a
-# bundled provider; src/tls.rs hands reqwest a fully preconfigured ClientConfig
-# with the pure-Rust RustCrypto provider and the Mozilla roots from webpki-roots.
-# Bundling the roots keeps the binary self-contained, so it works on musl /
-# scratch / distroless images with no system CA bundle.
+# Outbound HTTPS (JWKS fetches, the rate-limit service). reqwest 0.13's `rustls`
+# feature hardwires the aws-lc-rs provider (C FFI), so `rustls-no-provider`
+# builds rustls without one; src/tls.rs hands reqwest a fully preconfigured
+# ClientConfig with the Mozilla roots from webpki-roots. Bundling the roots
+# keeps the binary self-contained, so it works on musl / scratch / distroless
+# images with no system CA bundle. The crypto provider follows the crypto
+# backend features below: none is linked without one, and the process-wide
+# rustls provider the embedder installs is used instead.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
-# `0.0.2-alpha` still names its `rustls-webpki` 0.102 dependency, which carries
-# four CRL / name-constraint advisories; the provider only reads algorithm
-# identifier constants from it, while certificates are verified by rustls' own
-# (patched) webpki. See deny.toml.
-rustls-rustcrypto = "0.0.2-alpha"
+# The pure-Rust provider of the `rust_crypto` backend. `0.0.2-alpha` still
+# names its `rustls-webpki` 0.102 dependency, which carries four CRL /
+# name-constraint advisories; the provider only reads algorithm identifier
+# constants from it, while certificates are verified by rustls' own (patched)
+# webpki. See deny.toml.
+rustls-rustcrypto = { version = "0.0.2-alpha", optional = true }
 webpki-roots = "1"
 globset = "0.4"
 base64 = "0.23"
@@ -125,20 +127,22 @@ default = ["rust_crypto"]
 # `ProxyServer::with_token_verifier`.
 builtin_jwt = ["dep:jsonwebtoken"]
 
-# Crypto backend for the BUILT-IN verifier. Additive, like every Cargo feature:
-# with both on, jsonwebtoken cannot infer a provider, so the built-in verifier
-# installs `aws_lc_rs` (constant-time, advisory-free) for the process. They no
-# longer decide for the whole dependency graph: a consumer that cannot accept
-# this crate's choice supplies its own verifier instead (see `builtin_jwt`).
+# Crypto backend for the BUILT-IN verifier and the outbound TLS client.
+# Additive, like every Cargo feature: with both on, jsonwebtoken cannot infer a
+# provider, so the built-in verifier installs `aws_lc_rs` (constant-time,
+# advisory-free) for the process, and TLS uses aws-lc too. They no longer
+# decide for the whole dependency graph: a consumer that cannot accept this
+# crate's choice supplies its own verifier (see `builtin_jwt`) and installs its
+# own rustls provider. With neither, the crate links no crypto backend at all.
 #
 # `rust_crypto` (default): pure-Rust RustCrypto backend. Pulls in `rsa`, which
 # carries RUSTSEC-2023-0071 (Marvin Attack). Not exploitable on our verify-only
 # path (public key, no private-key ops); see deny.toml / issue #48.
-rust_crypto = ["builtin_jwt", "jsonwebtoken/rust_crypto"]
+rust_crypto = ["builtin_jwt", "jsonwebtoken/rust_crypto", "dep:rustls-rustcrypto"]
 # `aws_lc_rs`: constant-time / FIPS-capable backend via aws-lc (C FFI),
 # advisory-free. Opt-in for consumers that allow FFI; enable with
 # `default-features = false, features = ["aws_lc_rs"]`.
-aws_lc_rs = ["builtin_jwt", "jsonwebtoken/aws_lc_rs"]
+aws_lc_rs = ["builtin_jwt", "jsonwebtoken/aws_lc_rs", "rustls/aws_lc_rs"]
 
 # Shared Redis-backed rate-limit store for multi-instance deployments.
 redis = ["dep:redis"]
@@ -151,8 +155,10 @@ http-body-util = "0.1"
 # tests/upstream_controls.rs (tonic's server API cannot set success trailers).
 http-body = "1"
 # The local HTTPS server the outbound TLS client is tested against
-# (src/tls/tests.rs). Default features would pull in aws-lc.
+# (src/tls/tests.rs), and the provider it runs on in every build. Default
+# features would pull in aws-lc.
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
+rustls-rustcrypto = "0.0.2-alpha"
 # benches/jwt_verify.rs. Plots and rayon are left out: numbers are enough.
 criterion = { version = "0.8", default-features = false, features = ["async_tokio", "cargo_bench_support"] }
 # The embedding-hooks integration test (tests/hooks.rs) writes hook impls using

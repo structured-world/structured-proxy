@@ -53,23 +53,28 @@ const JWKS_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 impl JwksCache {
     /// Create a cache for `uri` (keys are loaded lazily on first lookup), whose
     /// keys are refetched after [`DEFAULT_MAX_AGE`].
-    pub fn new(uri: String) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// The HTTPS client cannot be built: the rustls crypto provider installed
+    /// for the process supports neither TLS 1.2 nor TLS 1.3.
+    pub fn new(uri: String) -> Result<Self, String> {
         let client = reqwest::Client::builder()
             .timeout(JWKS_HTTP_TIMEOUT)
             // Hand reqwest a fully preconfigured rustls backend rather than
-            // relying on a process-global default provider: no install ordering
+            // relying on reqwest to find a provider: no install ordering
             // constraint, no global side effect, safe for library/test callers.
-            .tls_backend_preconfigured(crate::tls::client_config())
+            .tls_backend_preconfigured(crate::tls::client_config()?)
             .build()
-            .unwrap_or_default();
-        Self {
+            .map_err(|e| format!("invalid JWKS client: {e}"))?;
+        Ok(Self {
             uri,
             client,
             set: RwLock::new(KeySet::default()),
             last_refresh: Mutex::new(None),
             max_age: DEFAULT_MAX_AGE,
             min_refresh_interval: MIN_REFRESH_INTERVAL,
-        }
+        })
     }
 
     /// Refetch the keys once they are older than `max_age`. Refreshes stay

@@ -23,8 +23,9 @@
 #      (decrypt/sign), which never runs on a verify path.
 #      Revisit when RustCrypto ships a constant-time `rsa` stable release.
 #
-# The TLS provider has no per-algorithm features, so `rsa` is in every build,
-# including `default-features = false` with an injected `hooks::TokenVerifier`.
+# Both chains come with the `rust_crypto` feature: a `default-features = false`
+# build links neither, and CI checks that none of the crates ignored here is in
+# it.
 #
 # RUSTSEC-2026-0049 / -0098 / -0099 / -0104: `rustls-webpki` 0.102.
 # Chain: rustls-webpki 0.102.8 -> rustls-rustcrypto 0.0.2-alpha -> structured-proxy.

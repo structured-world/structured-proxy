@@ -58,7 +58,7 @@ impl ConfigVerifier {
                     MIN_REFRESH_INTERVAL.as_secs()
                 ));
             }
-            KeySource::Jwks(JwksCache::new(uri.clone()).with_max_age(max_age))
+            KeySource::Jwks(JwksCache::new(uri.clone())?.with_max_age(max_age))
         } else if let Some(pem_path) = &jwt.public_key_pem_file {
             let pem = std::fs::read(pem_path)
                 .map_err(|e| format!("failed to read auth.jwt.public_key_pem_file: {e}"))?;

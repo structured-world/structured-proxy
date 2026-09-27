@@ -111,7 +111,7 @@ async fn endpoint() -> (Arc<Endpoint>, String) {
 #[tokio::test]
 async fn fresh_keys_are_served_from_the_cache() {
     let (endpoint, uri) = endpoint().await;
-    let cache = JwksCache::new(uri);
+    let cache = JwksCache::new(uri).unwrap();
     assert!(cache.key_for("k1").await.is_some());
     assert!(cache.key_for("k1").await.is_some());
     assert_eq!(endpoint.fetches(), 1);
@@ -123,6 +123,7 @@ async fn a_key_removed_by_the_provider_stops_verifying_once_the_set_ages_out() {
     // aged set is refetched on the next lookup, and k1 is gone.
     let (endpoint, uri) = endpoint().await;
     let cache = JwksCache::new(uri)
+        .unwrap()
         .with_max_age(Duration::ZERO)
         .with_min_refresh_interval(Duration::ZERO);
     assert!(cache.key_for("k1").await.is_some());
@@ -135,6 +136,7 @@ async fn a_key_removed_by_the_provider_stops_verifying_once_the_set_ages_out() {
 async fn an_unreachable_provider_keeps_the_known_keys() {
     let (endpoint, uri) = endpoint().await;
     let cache = JwksCache::new(uri)
+        .unwrap()
         .with_max_age(Duration::ZERO)
         .with_min_refresh_interval(Duration::ZERO);
     assert!(cache.key_for("k1").await.is_some());
@@ -151,7 +153,7 @@ async fn aged_keys_refresh_no_more_often_than_the_minimum_interval() {
     // Aged out, but a refresh has just run: the known key is used without
     // another fetch.
     let (endpoint, uri) = endpoint().await;
-    let cache = JwksCache::new(uri).with_max_age(Duration::ZERO);
+    let cache = JwksCache::new(uri).unwrap().with_max_age(Duration::ZERO);
     assert!(cache.key_for("k1").await.is_some());
     assert!(cache.key_for("k1").await.is_some());
     assert_eq!(endpoint.fetches(), 1);
@@ -163,7 +165,7 @@ async fn a_lookup_overtaken_by_a_refresh_uses_the_refreshed_keys() {
     // slot; meanwhile another request's refresh replaces the set without k1.
     // The waiting lookup is throttled, and must not hand back its old k1.
     let (_endpoint, uri) = endpoint().await;
-    let cache = Arc::new(JwksCache::new(uri).with_max_age(Duration::ZERO));
+    let cache = Arc::new(JwksCache::new(uri).unwrap().with_max_age(Duration::ZERO));
     assert!(cache.key_for("k1").await.is_some());
 
     let mut slot = cache.last_refresh.lock().await;
@@ -192,7 +194,7 @@ async fn an_empty_key_set_is_throttled_like_any_other() {
     // loaded: lookups for a kid it lacks must not refetch every time.
     let (endpoint, uri) = endpoint().await;
     endpoint.answer(StatusCode::OK, serde_json::json!({ "keys": [] }));
-    let cache = JwksCache::new(uri);
+    let cache = JwksCache::new(uri).unwrap();
     for _ in 0..3 {
         assert!(cache.key_for("k1").await.is_none());
     }
@@ -208,6 +210,7 @@ async fn a_lookup_during_a_refresh_waits_for_its_keys() {
     let interval = Duration::from_millis(50);
     let cache = Arc::new(
         JwksCache::new(uri)
+            .unwrap()
             .with_max_age(Duration::ZERO)
             .with_min_refresh_interval(interval),
     );
