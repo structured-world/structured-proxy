@@ -4,6 +4,8 @@
 //! structured-proxy --config proxy.yaml
 //! ```
 
+mod runtime;
+
 use anyhow::Context as _;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
@@ -20,26 +22,34 @@ struct Cli {
     config: String,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
     let cli = Cli::parse();
-    // Reads the ProxyConfig and the transcoding settings kept outside it
-    // (error_details, streaming.ndjson_envelope) from the same file.
-    let server = structured_proxy::ProxyServer::from_file(std::path::Path::new(&cli.config))
+    let yaml = std::fs::read_to_string(&cli.config)
         .with_context(|| format!("loading config {}", cli.config))?;
-    let config = server.config();
+    // Reads the ProxyConfig and the transcoding settings kept outside it
+    // (error_details, streaming.ndjson_envelope) from the same file. Loading
+    // does no async work, so the runtime is built afterwards, from the same
+    // file's `runtime:` section.
+    let server = structured_proxy::ProxyServer::from_yaml_str(&yaml)
+        .with_context(|| format!("loading config {}", cli.config))?;
+    let file = runtime::FileConfig::from_yaml_str(&yaml)
+        .with_context(|| format!("loading config {}", cli.config))?;
+    let (rt, source) = file.runtime.build().context("starting the async runtime")?;
 
+    let config = server.config();
     tracing::info!(
         service = %config.service.name,
         listen = %config.listen.http,
         upstream = %config.upstream.default,
         descriptors = config.descriptors.len(),
+        worker_threads = rt.metrics().num_workers(),
+        worker_threads_from = %source,
         "Starting structured-proxy"
     );
 
-    server.serve().await
+    rt.block_on(server.serve())
 }
