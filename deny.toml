@@ -5,26 +5,46 @@
 # fall back to cargo-deny defaults.
 
 [advisories]
-# RUSTSEC-2023-0071 — "Marvin Attack" timing sidechannel in `rsa` 0.9.x.
-# Chain: rsa -> jsonwebtoken (rust_crypto backend) -> structured-proxy.
+# RUSTSEC-2023-0071: "Marvin Attack" timing sidechannel in `rsa` 0.9.x.
+# Chains: rsa -> jsonwebtoken (rust_crypto backend) -> structured-proxy, and
+#         rsa -> rustls-rustcrypto (outbound TLS provider) -> structured-proxy.
 #
 # Ignored deliberately. See https://github.com/structured-world/structured-proxy/issues/48
 #   1. No fix exists: the advisory has patched:[] / unaffected:[] in the RustSec
 #      DB, and it names both the latest stable `rsa` (0.9.10) and the latest
 #      pre-release (0.10.0-rc.18) as affected. There is nothing to upgrade to,
 #      release candidates included.
-#   2. We keep jsonwebtoken's pure-Rust `rust_crypto` backend over `aws_lc_rs`
-#      (C FFI), required by no-FFI consumers (e.g. CoordiNode ADR-013).
-#   3. RSA here is used for JWT *verification* (public key) only. Marvin targets
-#      private-key timing (decrypt/sign), which never runs on the verify path.
+#   2. We keep pure-Rust crypto over C: jsonwebtoken's `rust_crypto` backend over
+#      `aws_lc_rs`, and the RustCrypto rustls provider over `ring` / aws-lc,
+#      required by no-C consumers (e.g. CoordiNode ADR-013).
+#   3. RSA here only ever verifies signatures with public keys: JWTs, and the
+#      certificates and handshake signatures of the TLS servers the proxy calls
+#      (it presents no client certificate). Marvin targets private-key timing
+#      (decrypt/sign), which never runs on a verify path.
 #      Revisit when RustCrypto ships a constant-time `rsa` stable release.
 #
-# The ignore covers the DEFAULT build only. `rsa` arrives with jsonwebtoken's
-# whole `rust_crypto` bundle (it has no per-algorithm features), so it cannot be
-# dropped by a feature of ours while that backend is in use. A deployment that
-# will not carry the advisory at all builds with `default-features = false` and
-# injects its own `hooks::TokenVerifier`: no jsonwebtoken, no `rsa`, nothing to
-# ignore. The `injected_verifier` CI leg builds exactly that.
+# The TLS provider has no per-algorithm features, so `rsa` is in every build,
+# including `default-features = false` with an injected `hooks::TokenVerifier`.
+#
+# RUSTSEC-2026-0049 / -0098 / -0099 / -0104: `rustls-webpki` 0.102.
+# Chain: rustls-webpki 0.102.8 -> rustls-rustcrypto 0.0.2-alpha -> structured-proxy.
+#   The advisories are in CRL handling and name-constraint checks. The provider
+#   only reads algorithm identifier constants from that crate (`webpki::alg_id`,
+#   in its src/verify/*.rs); certificates are verified by rustls' own
+#   `rustls-webpki` 0.103.15, in which all four are patched, so the affected code
+#   never runs. Remove these entries with the first `rustls-rustcrypto` release
+#   after 0.0.2-alpha: upstream master has dropped the dependency
+#   (RustCrypto/rustls-rustcrypto#107). Tracking: structured-world/structured-proxy#98
+#
+# RUSTSEC-2024-0436: `paste` is unmaintained (no vulnerability).
+# Chain: paste -> rustls-rustcrypto 0.0.2-alpha -> structured-proxy.
+#   A proc-macro that only runs at build time. Upstream is replacing it
+#   (RustCrypto/rustls-rustcrypto#101); remove with the same release as above.
 ignore = [
-  { id = "RUSTSEC-2023-0071", reason = "No fixed `rsa` release exists: the advisory is patched:[] and names both the latest stable (0.9.10) and the latest pre-release (0.10.0-rc.18) as affected. We deliberately keep jsonwebtoken's pure-Rust `rust_crypto` backend over `aws_lc_rs` (C FFI). RSA is used for JWT verification (public key) only; Marvin targets private-key timing, not exploitable on the verify path. A build that must not link `rsa` at all takes default-features = false and injects its own TokenVerifier. Revisit when RustCrypto ships a constant-time `rsa` stable. Tracking: structured-world/structured-proxy#48" },
+  { id = "RUSTSEC-2023-0071", reason = "No fixed `rsa` release exists: the advisory is patched:[] and names both the latest stable (0.9.10) and the latest pre-release (0.10.0-rc.18) as affected. We deliberately keep pure-Rust crypto (jsonwebtoken's `rust_crypto` backend, the RustCrypto rustls provider) over C. RSA only verifies signatures with public keys (JWTs, TLS server certificates and handshake signatures); Marvin targets private-key timing, not exploitable on a verify path. Revisit when RustCrypto ships a constant-time `rsa` stable. Tracking: structured-world/structured-proxy#48" },
+  { id = "RUSTSEC-2026-0049", reason = "rustls-webpki 0.102 via rustls-rustcrypto 0.0.2-alpha, which only reads its `alg_id` constants; certificates (and CRLs) are verified by rustls' own rustls-webpki 0.103.15, which is patched. Remove with the next rustls-rustcrypto release. Tracking: structured-world/structured-proxy#98" },
+  { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.102 via rustls-rustcrypto 0.0.2-alpha, which only reads its `alg_id` constants; name constraints are checked by rustls' own rustls-webpki 0.103.15, which is patched. Remove with the next rustls-rustcrypto release. Tracking: structured-world/structured-proxy#98" },
+  { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.102 via rustls-rustcrypto 0.0.2-alpha, which only reads its `alg_id` constants; name constraints are checked by rustls' own rustls-webpki 0.103.15, which is patched. Remove with the next rustls-rustcrypto release. Tracking: structured-world/structured-proxy#98" },
+  { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.102 via rustls-rustcrypto 0.0.2-alpha, which only reads its `alg_id` constants; no CRL is parsed through it (the proxy configures no CRLs, and rustls uses its own rustls-webpki 0.103.15, which is patched). Remove with the next rustls-rustcrypto release. Tracking: structured-world/structured-proxy#98" },
+  { id = "RUSTSEC-2024-0436", reason = "`paste` is unmaintained, not vulnerable: a build-time proc-macro of rustls-rustcrypto 0.0.2-alpha, which upstream is replacing (RustCrypto/rustls-rustcrypto#101). Remove with the next rustls-rustcrypto release. Tracking: structured-world/structured-proxy#98" },
 ]
