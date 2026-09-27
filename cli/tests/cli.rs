@@ -36,7 +36,19 @@ fn version_names_the_binary_and_the_package_version() {
 
 #[test]
 fn a_missing_config_fails_and_names_the_file() {
-    let path = std::env::temp_dir().join("structured-proxy-cli-test-missing.yaml");
+    // Inside a directory named for this run and never created, so no file can
+    // be there: a config that existed would start the proxy instead.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir()
+        .join(format!(
+            "structured-proxy-cli-test-missing-{}-{nanos}",
+            std::process::id()
+        ))
+        .join("config.yaml");
+    assert!(!path.exists());
     let out = Command::new(BIN)
         .arg("--config")
         .arg(&path)
