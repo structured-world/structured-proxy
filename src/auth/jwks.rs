@@ -2,6 +2,9 @@
 //!
 //! Keys are fetched from the configured JWKS URI and cached by `kid`. An unknown
 //! `kid` triggers a refresh (throttled), which is how key rotation is picked up.
+//! The cached set also ages out: a lookup after [`JwksCache::with_max_age`]
+//! refetches it, so a key the provider has removed stops verifying tokens even
+//! when no request ever names an unknown `kid`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -18,23 +21,38 @@ pub struct VerifyingKey {
     pub algorithm: Algorithm,
 }
 
+/// The keys of the last successful fetch.
+#[derive(Default)]
+struct KeySet {
+    keys: HashMap<String, VerifyingKey>,
+    /// When they were fetched; `None` before the first fetch.
+    fetched: Option<Instant>,
+}
+
 /// Fetches and caches JWKS keys by `kid`.
 pub struct JwksCache {
     uri: String,
     client: reqwest::Client,
-    keys: RwLock<HashMap<String, VerifyingKey>>,
+    set: RwLock<KeySet>,
     last_refresh: Mutex<Option<Instant>>,
+    max_age: Duration,
+    min_refresh_interval: Duration,
 }
 
-/// Minimum spacing between refreshes triggered by an unknown `kid`, so a flood
-/// of bogus `kid`s cannot hammer the JWKS endpoint.
-const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+/// Minimum spacing between refreshes, so a flood of bogus `kid`s cannot hammer
+/// the JWKS endpoint.
+pub(crate) const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Default age after which the cached keys are refetched: the `cache_duration`
+/// Envoy's `remote_jwks` uses.
+pub const DEFAULT_MAX_AGE: Duration = Duration::from_secs(300);
 
 /// Bound the worst-case latency of a slow/stalled JWKS endpoint.
 const JWKS_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl JwksCache {
-    /// Create a cache for `uri` (keys are loaded lazily on first lookup).
+    /// Create a cache for `uri` (keys are loaded lazily on first lookup), whose
+    /// keys are refetched after [`DEFAULT_MAX_AGE`].
     pub fn new(uri: String) -> Self {
         let client = reqwest::Client::builder()
             .timeout(JWKS_HTTP_TIMEOUT)
@@ -47,51 +65,82 @@ impl JwksCache {
         Self {
             uri,
             client,
-            keys: RwLock::new(HashMap::new()),
+            set: RwLock::new(KeySet::default()),
             last_refresh: Mutex::new(None),
+            max_age: DEFAULT_MAX_AGE,
+            min_refresh_interval: MIN_REFRESH_INTERVAL,
         }
+    }
+
+    /// Refetch the keys once they are older than `max_age`. Refreshes stay
+    /// at least a minute apart, so a shorter age behaves as one minute.
+    pub fn with_max_age(mut self, max_age: Duration) -> Self {
+        self.max_age = max_age;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_min_refresh_interval(mut self, interval: Duration) -> Self {
+        self.min_refresh_interval = interval;
+        self
     }
 
     /// Resolve the verifying key for `kid`, refreshing from the JWKS endpoint
-    /// once (throttled) if it is not already cached.
+    /// once (throttled) if it is not cached or the cached keys are too old.
     pub async fn key_for(&self, kid: &str) -> Option<VerifyingKey> {
-        if let Some(k) = self.keys.read().await.get(kid).cloned() {
-            return Some(k);
-        }
-        if self.refresh().await.is_err() {
-            return None;
-        }
-        self.keys.read().await.get(kid).cloned()
-    }
-
-    /// Fetch the JWKS and replace the cache. Throttled by [`MIN_REFRESH_INTERVAL`]
-    /// unless the cache is still empty (first load).
-    async fn refresh(&self) -> Result<(), String> {
-        // Claim the refresh slot atomically: hold the lock across the throttle
-        // check and the timestamp update so concurrent callers cannot all pass.
         {
-            let mut last = self.last_refresh.lock().await;
-            if let Some(t) = *last {
-                let empty = self.keys.read().await.is_empty();
-                if !empty && t.elapsed() < MIN_REFRESH_INTERVAL {
-                    return Err("refresh throttled".to_string());
+            let set = self.set.read().await;
+            if set.fetched.is_some_and(|t| t.elapsed() < self.max_age) {
+                if let Some(key) = set.keys.get(kid) {
+                    return Some(key.clone());
                 }
             }
-            *last = Some(Instant::now());
         }
+        if let Err(reason) = self.refresh().await {
+            tracing::debug!(%reason, "JWKS not refetched; using the keys already known");
+        }
+        // Answer from the current set whatever the refresh did: another
+        // request may have replaced it meanwhile, and a key it dropped must
+        // not survive in an earlier copy. An unreachable endpoint leaves the
+        // set as it was, so the keys already known keep working: failing every
+        // token while the provider is down would turn its outage into ours.
+        self.set.read().await.keys.get(kid).cloned()
+    }
 
-        let set: JwkSet = self
+    /// Fetch the JWKS and replace the cache. Throttled by the minimum refresh
+    /// interval unless no fetch has succeeded yet (first load); a provider
+    /// that answered with no keys has been loaded.
+    async fn refresh(&self) -> Result<(), String> {
+        // The refresh slot is held until the new set is in place: a lookup
+        // that arrives meanwhile waits for it, then finds the refresh throttled
+        // and answers from the new set, never from the aged one a removed key
+        // may still sit in. Only lookups that need a refresh wait; a fresh key
+        // is served before the slot is touched.
+        let mut last = self.last_refresh.lock().await;
+        if let Some(t) = *last {
+            let loaded = self.set.read().await.fetched.is_some();
+            if loaded && t.elapsed() < self.min_refresh_interval {
+                return Err("refresh throttled".to_string());
+            }
+        }
+        *last = Some(Instant::now());
+
+        let response = self
             .client
             .get(&self.uri)
             .send()
             .await
-            .map_err(|e| format!("JWKS fetch failed: {e}"))?
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(|e| format!("JWKS fetch failed: {e}"))?;
+        let set: JwkSet = response
             .json()
             .await
             .map_err(|e| format!("JWKS decode failed: {e}"))?;
 
-        let new_keys = parse_jwks(&set);
-        *self.keys.write().await = new_keys;
+        *self.set.write().await = KeySet {
+            keys: parse_jwks(&set),
+            fetched: Some(Instant::now()),
+        };
         Ok(())
     }
 }
@@ -163,58 +212,4 @@ fn key_algorithm_to_alg(ka: KeyAlgorithm) -> Option<Algorithm> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_jwks_keeps_asymmetric_keys_and_maps_algorithms() {
-        // A minimal RSA JWK with a kid (values are a real test key from the
-        // jsonwebtoken test vectors).
-        let set: JwkSet = serde_json::from_value(serde_json::json!({
-            "keys": [{
-                "kty": "RSA",
-                "kid": "rsa-1",
-                "use": "sig",
-                "n": "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368Qen-JS7-zw04o6sJ9qjp6lFm5_T4nzcCqRfMOgRA_g_S0d7e9k7B0v0vqHr0e1V_o-z0ow5dWpql8-zKj4hQp8sg_Pn8O0R5ZQS4t8hUE-3-r3ftt1YzQ",
-                "e": "AQAB"
-            }]
-        })).unwrap();
-        let keys = parse_jwks(&set);
-        assert!(keys.contains_key("rsa-1"));
-        assert_eq!(keys["rsa-1"].algorithm, Algorithm::RS256);
-    }
-
-    #[test]
-    fn algorithm_prefers_explicit_jwk_alg() {
-        // An EC key that explicitly declares ES384 must not be pinned to ES256.
-        let jwk: Jwk = serde_json::from_value(serde_json::json!({
-            "kty": "EC", "crv": "P-384", "alg": "ES384", "kid": "k",
-            "x": "AAAA", "y": "AAAA"
-        }))
-        .unwrap();
-        assert_eq!(algorithm_for(&jwk), Some(Algorithm::ES384));
-    }
-
-    #[test]
-    fn algorithm_falls_back_to_curve_not_es256() {
-        // No alg field → infer from the curve, not a blanket ES256.
-        let jwk: Jwk = serde_json::from_value(serde_json::json!({
-            "kty": "EC", "crv": "P-384", "kid": "k", "x": "AAAA", "y": "AAAA"
-        }))
-        .unwrap();
-        assert_eq!(algorithm_for(&jwk), Some(Algorithm::ES384));
-    }
-
-    #[test]
-    fn parse_jwks_skips_symmetric_and_keyless() {
-        let set: JwkSet = serde_json::from_value(serde_json::json!({
-            "keys": [
-                { "kty": "oct", "kid": "hmac", "k": "c2VjcmV0" },
-                { "kty": "RSA", "n": "0vx7ag", "e": "AQAB" }
-            ]
-        }))
-        .unwrap();
-        // Symmetric key rejected; RSA without a kid skipped.
-        assert!(parse_jwks(&set).is_empty());
-    }
-}
+mod tests;

@@ -13,6 +13,8 @@
 
 pub mod authz;
 #[cfg(feature = "builtin_jwt")]
+mod cache;
+#[cfg(feature = "builtin_jwt")]
 pub mod crypto;
 pub mod forward;
 #[cfg(feature = "builtin_jwt")]
@@ -45,9 +47,10 @@ enum Verifier {
     /// The built-in one, called directly: the default path pays no dynamic
     /// dispatch and allocates no boxed future per verification. Boxed only to
     /// keep the enum small — it holds an inline JWKS cache, and this costs one
-    /// pointer hop at build time, not per request.
+    /// pointer hop at build time, not per request. The claims cache
+    /// (`auth.jwt.cache`) sits in front of it, `None` when switched off.
     #[cfg(feature = "builtin_jwt")]
-    Builtin(Box<verifier::ConfigVerifier>),
+    Builtin(Box<verifier::ConfigVerifier>, Option<cache::ClaimsCache>),
     /// The embedder's, behind the public hook.
     Injected(Arc<dyn TokenVerifier>),
 }
@@ -59,6 +62,10 @@ pub struct Auth {
     claims_headers: HashMap<String, String>,
     roles_claim: String,
     policies: Policies,
+    /// Signature checks the built-in verifier ran, so tests can tell a cache
+    /// hit from a second verification.
+    #[cfg(all(test, feature = "builtin_jwt"))]
+    builtin_verifications: std::sync::atomic::AtomicUsize,
 }
 
 impl Auth {
@@ -115,15 +122,46 @@ impl Auth {
             claims_headers,
             roles_claim,
             policies,
+            #[cfg(all(test, feature = "builtin_jwt"))]
+            builtin_verifications: std::sync::atomic::AtomicUsize::new(0),
         })))
     }
 
-    /// Verify a token and return its claims, or `None` if invalid.
-    async fn verify(&self, token: &str) -> Option<Value> {
+    /// Verify a token and return its claims, or `None` if invalid. The
+    /// built-in verifier answers a token it accepted before from its cache.
+    async fn verify(&self, token: &str) -> Option<Arc<Value>> {
         match &self.verifier {
             #[cfg(feature = "builtin_jwt")]
-            Verifier::Builtin(v) => v.verify(token).await,
-            Verifier::Injected(v) => v.verify(token).await,
+            Verifier::Builtin(v, Some(cache)) if cache.admits(token) => {
+                let key = cache::token_key(token);
+                let now = cache.now();
+                if let Some(claims) = cache.get(&key, now) {
+                    return Some(claims);
+                }
+                let claims = Arc::new(self.verify_builtin(v, token).await?);
+                cache.insert(key, &claims, now);
+                Some(claims)
+            }
+            #[cfg(feature = "builtin_jwt")]
+            Verifier::Builtin(v, _) => self.verify_builtin(v, token).await.map(Arc::new),
+            Verifier::Injected(v) => v.verify(token).await.map(Arc::new),
+        }
+    }
+
+    #[cfg(feature = "builtin_jwt")]
+    async fn verify_builtin(&self, v: &verifier::ConfigVerifier, token: &str) -> Option<Value> {
+        #[cfg(test)]
+        self.builtin_verifications
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        v.verify(token).await
+    }
+
+    /// Number of cached verifications, for tests.
+    #[cfg(all(test, feature = "builtin_jwt"))]
+    fn cached_tokens(&self) -> usize {
+        match &self.verifier {
+            Verifier::Builtin(_, Some(cache)) => cache.len(),
+            _ => 0,
         }
     }
 }
@@ -135,9 +173,10 @@ fn builtin_verifier(config: &AuthConfig) -> Result<Verifier, String> {
         .jwt
         .as_ref()
         .ok_or("auth.mode is \"jwt\" but auth.jwt is not set")?;
-    Ok(Verifier::Builtin(Box::new(
-        verifier::ConfigVerifier::build(jwt)?,
-    )))
+    Ok(Verifier::Builtin(
+        Box::new(verifier::ConfigVerifier::build(jwt)?),
+        cache::ClaimsCache::build(&jwt.cache)?,
+    ))
 }
 
 /// Without a crypto backend there is no built-in verifier to build: a JWT
@@ -157,7 +196,7 @@ pub(crate) enum AuthDecision {
     /// Allowed; forward these (verified) claim headers to the upstream, and the
     /// verified claims themselves (`None` for anonymous access) for downstream
     /// consumers such as per-principal rate limiting.
-    Allow(HeaderMap, Option<Value>),
+    Allow(HeaderMap, Option<Arc<Value>>),
     /// Rejected: no/invalid credentials (HTTP 401).
     Unauthenticated(&'static str),
     /// Rejected: authenticated but lacking a required role (HTTP 403).
@@ -240,9 +279,7 @@ pub async fn middleware(
             // Expose the verified claims to inner layers (e.g. per-principal rate
             // limiting) as a typed extension a client cannot forge.
             if let Some(claims) = claims {
-                request
-                    .extensions_mut()
-                    .insert(ValidatedClaims(std::sync::Arc::new(claims)));
+                request.extensions_mut().insert(ValidatedClaims(claims));
             }
             next.run(request).await
         }

@@ -6,14 +6,20 @@
 //! "jwt"` requires a verifier injected by the embedder instead.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde_json::Value;
 
-use super::jwks::JwksCache;
+use super::jwks::{JwksCache, MIN_REFRESH_INTERVAL};
 use crate::config::JwtConfig;
 
 /// Where verifying keys come from.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one instance per process, already inside Box<ConfigVerifier>; boxing \
+              the JWKS variant would add a pointer hop to every verification"
+)]
 enum KeySource {
     /// A single Ed25519 public key (EdDSA).
     Pem(Arc<DecodingKey>),
@@ -33,8 +39,9 @@ impl ConfigVerifier {
     /// Build from the `auth.jwt` block.
     ///
     /// # Errors
-    /// Returns an error string when no key source is configured, the PEM file
-    /// cannot be read, or it is not a valid Ed25519 public key.
+    /// Returns an error string when no key source is configured, the JWKS
+    /// max age is below the refresh interval, the PEM file cannot be read, or
+    /// it is not a valid Ed25519 public key.
     pub(crate) fn build(jwt: &JwtConfig) -> Result<Self, String> {
         // Normally settled in `ProxyServer::from_config` already; repeated here
         // because a verifier can also be built without going through the
@@ -42,7 +49,16 @@ impl ConfigVerifier {
         super::crypto::install_default_crypto_provider();
 
         let keys = if let Some(uri) = &jwt.jwks_uri {
-            KeySource::Jwks(JwksCache::new(uri.clone()))
+            let max_age = Duration::from_secs(jwt.jwks_max_age_secs);
+            // Refreshes are throttled to one per interval, so a shorter age
+            // would promise a key-removal bound the cache cannot keep.
+            if max_age < MIN_REFRESH_INTERVAL {
+                return Err(format!(
+                    "auth.jwt.jwks_max_age_secs must be at least {}",
+                    MIN_REFRESH_INTERVAL.as_secs()
+                ));
+            }
+            KeySource::Jwks(JwksCache::new(uri.clone()).with_max_age(max_age))
         } else if let Some(pem_path) = &jwt.public_key_pem_file {
             let pem = std::fs::read(pem_path)
                 .map_err(|e| format!("failed to read auth.jwt.public_key_pem_file: {e}"))?;

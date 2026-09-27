@@ -463,6 +463,11 @@ pub struct JwtConfig {
     /// JWKS URI for key discovery.
     #[serde(default)]
     pub jwks_uri: Option<String>,
+    /// Age in seconds after which the JWKS keys are fetched again, so a key
+    /// the provider removed stops verifying tokens. At least 60, the minimum
+    /// spacing of refreshes. Default: 300.
+    #[serde(default = "default_jwks_max_age_secs")]
+    pub jwks_max_age_secs: u64,
     /// Expected issuer.
     #[serde(default)]
     pub issuer: Option<String>,
@@ -479,6 +484,64 @@ pub struct JwtConfig {
     /// path for nested claims, e.g. "realm_access.roles". Default: "roles".
     #[serde(default = "default_roles_claim")]
     pub roles_claim: String,
+    /// Cache of verified tokens for the built-in verifier, so a client that
+    /// sends the same token on every request pays for one signature check.
+    #[serde(default)]
+    pub cache: JwtCacheConfig,
+}
+
+/// `auth.jwt.cache`: verified claims are reused until the earlier of the
+/// token's `exp` and `max_ttl_secs` after verification. Applies to the
+/// built-in verifier only; an injected `TokenVerifier` is called every time.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct JwtCacheConfig {
+    /// Cache verified tokens. Default: true.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Most tokens kept at once; once full with live entries, a new token is
+    /// verified but not stored. Default: 10000.
+    #[serde(default = "default_jwt_cache_max_entries")]
+    pub max_entries: usize,
+    /// Longest time a verification is reused, in seconds. With
+    /// `jwks_max_age_secs` it bounds how long a token keeps passing after its
+    /// signing key leaves the JWKS. Default: 60.
+    #[serde(default = "default_jwt_cache_max_ttl_secs")]
+    pub max_ttl_secs: u64,
+    /// Longest token cached, in bytes; a longer one is verified on every
+    /// request. With `max_entries` it bounds the memory the cache holds, since
+    /// the claims kept are decoded from the token. Default: 4096.
+    #[serde(default = "default_jwt_cache_max_token_bytes")]
+    pub max_token_bytes: usize,
+}
+
+/// Default for [`JwtConfig::jwks_max_age_secs`].
+pub(crate) fn default_jwks_max_age_secs() -> u64 {
+    300
+}
+
+fn default_jwt_cache_max_entries() -> usize {
+    10_000
+}
+
+fn default_jwt_cache_max_ttl_secs() -> u64 {
+    60
+}
+
+fn default_jwt_cache_max_token_bytes() -> usize {
+    4096
+}
+
+impl Default for JwtCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_entries: default_jwt_cache_max_entries(),
+            max_ttl_secs: default_jwt_cache_max_ttl_secs(),
+            max_token_bytes: default_jwt_cache_max_token_bytes(),
+        }
+    }
 }
 
 /// Default for [`JwtConfig::roles_claim`]. Also applied by the auth builder when

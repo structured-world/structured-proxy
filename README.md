@@ -173,11 +173,19 @@ auth:
   jwt:
     jwks_uri: "https://idp.example.com/.well-known/jwks.json"
     # OR a static key: public_key_pem_file: "/etc/proxy/idp-ed25519.pub.pem"
+    jwks_max_age_secs: 300 # refetch the keys after this age (default 300, at least 60)
     issuer: "https://idp.example.com"
     audience: "my-api"
     roles_claim: "roles" # array-of-strings claim used for required_roles
     claims_headers: # forward claims to the upstream as headers
       sub: "x-user-id"
+    # Verified tokens are reused until the earlier of their `exp` and
+    # max_ttl_secs (see "JWT verification"). Defaults shown.
+    cache:
+      enabled: true
+      max_entries: 10000
+      max_ttl_secs: 60
+      max_token_bytes: 4096
   # Route-level policies (require_auth + required_roles → 401 / 403)
   forward_auth:
     policies:
@@ -640,6 +648,37 @@ structured_proxy::install_default_crypto_provider();
 The call is idempotent, and installs the backend this crate was built with. It
 exists wherever the built-in verifier does, so a `default-features = false`
 build with an injected verifier neither has it nor needs it.
+
+**Verified-token cache.** A client sends the same token on every request until
+it expires, so the built-in verifier keeps the claims of each token it accepted
+(`auth.jwt.cache`, on by default) and skips the signature check on the next
+request with it; on an EdDSA token that turns ~41 µs into ~2 µs per request
+(`cargo bench --bench jwt_verify`). Route policies, the roles check and claim
+headers still run every time.
+
+- An entry is used until the earlier of the token's `exp` and `max_ttl_secs`
+  (default 60) after verification, timed on the monotonic clock, so setting
+  the system clock back cannot stretch it. A token not yet valid (`nbf` in the
+  future) is not cached.
+- A token whose signing key leaves the JWKS stops passing within
+  `jwks_max_age_secs + max_ttl_secs` (default 360 s): the keys are refetched
+  once older than `jwks_max_age_secs` (at least 60 s, since refreshes are at
+  least a minute apart), and a cached verification is reused for at most
+  `max_ttl_secs`. While the JWKS endpoint is unreachable the keys
+  already known stay in use, so the bound starts once it answers again.
+- Rejected tokens are never cached. The cache is keyed by the SHA-256 of the
+  token, so no bearer token is kept in memory.
+- It holds at most `max_entries` (default 10000) tokens; once full of live
+  entries, a new token is verified but not stored. No background task runs:
+  expired entries go when looked up, and an insert that finds the cache full
+  sweeps them at most once per second, so a full cache may pass a new token
+  through uncached until the next sweep frees room.
+  A token longer than `max_token_bytes` (default 4096) is verified every time
+  and never stored, so the memory the cache holds stays bounded.
+- It is per process and only skips repeated work, so replicas decide the same
+  way with or without it. Switch it off with `enabled: false`.
+- An injected verifier is not cached: it owns its policy (introspection,
+  revocation) and sees every request.
 
 **An injected verifier** is what you supply when neither of those is the right
 answer for your binary: a validated / FIPS crypto module, an HSM, or a verifier

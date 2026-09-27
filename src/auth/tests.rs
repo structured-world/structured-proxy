@@ -74,11 +74,13 @@ async fn body_string(resp: axum::response::Response) -> String {
 fn jwt_claims_only() -> JwtConfig {
     JwtConfig {
         jwks_uri: None,
+        jwks_max_age_secs: 300,
         issuer: None,
         audience: None,
         public_key_pem_file: None,
         claims_headers: HashMap::from([("sub".to_string(), "x-user".to_string())]),
         roles_claim: "roles".into(),
+        cache: Default::default(),
     }
 }
 
@@ -205,6 +207,44 @@ async fn injected_verifier_works_without_a_jwt_block() {
     // is injected because none was configured.
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(body_string(resp).await, "");
+}
+
+/// A verifier that accepts every token and counts its calls.
+struct CountingVerifier(std::sync::atomic::AtomicUsize);
+
+#[async_trait::async_trait]
+impl TokenVerifier for CountingVerifier {
+    async fn verify(&self, _token: &str) -> Option<Value> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(serde_json::json!({ "sub": "counted", "exp": 9_999_999_999u64 }))
+    }
+}
+
+#[tokio::test]
+async fn injected_verifier_is_called_on_every_request() {
+    // The claims cache belongs to the built-in verifier; an injected one owns
+    // its policy (introspection, revocation) and sees every request.
+    let verifier = Arc::new(CountingVerifier(Default::default()));
+    let cfg = AuthConfig {
+        mode: "jwt".into(),
+        jwt: Some(jwt_claims_only()),
+        forward_auth: Some(secure_policy(&[])),
+        authz: None,
+    };
+    let auth = Auth::build(&cfg, Some(verifier.clone())).unwrap().unwrap();
+    for _ in 0..3 {
+        let resp = app(auth.clone())
+            .oneshot(
+                HttpRequest::get("/secure")
+                    .header("authorization", "Bearer same-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    assert_eq!(verifier.0.load(std::sync::atomic::Ordering::Relaxed), 3);
 }
 
 #[test]
@@ -339,11 +379,13 @@ mod builtin {
             mode: "jwt".into(),
             jwt: Some(JwtConfig {
                 jwks_uri: None,
+                jwks_max_age_secs: 300,
                 issuer: None,
                 audience: None,
                 public_key_pem_file: Some(temp_pub_pem()),
                 claims_headers: HashMap::new(),
                 roles_claim: "roles".into(),
+                cache: Default::default(),
             }),
             forward_auth: Some(ForwardAuthConfig {
                 policies: vec![RoutePolicyConfig {
@@ -454,6 +496,177 @@ mod builtin {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    async fn request(app: &axum::Router, token: &str) -> (StatusCode, String) {
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::get("/secure")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        (status, body_string(resp).await)
+    }
+
+    #[tokio::test]
+    async fn repeated_token_is_verified_once_and_answers_the_same() {
+        // The second request is served from the cache: same user header, same
+        // status, and the signature checked only for the first.
+        let auth = auth_with_policy(&["admin"]);
+        let app = app(auth.clone());
+        let token = sign(serde_json::json!({
+            "iss": "test-iss", "aud": "test-aud", "exp": future_exp(),
+            "sub": "user-42", "roles": ["admin"]
+        }));
+        assert_eq!(
+            request(&app, &token).await,
+            (StatusCode::OK, "user-42".into())
+        );
+        assert_eq!(auth.cached_tokens(), 1);
+        assert_eq!(
+            request(&app, &token).await,
+            (StatusCode::OK, "user-42".into())
+        );
+        assert_eq!(auth.cached_tokens(), 1);
+        assert_eq!(verifications(&auth), 1);
+    }
+
+    fn verifications(auth: &Auth) -> usize {
+        auth.builtin_verifications.load(Ordering::Relaxed)
+    }
+
+    #[tokio::test]
+    async fn oversized_tokens_are_verified_every_time() {
+        let cfg = AuthConfig {
+            mode: "jwt".into(),
+            jwt: Some(JwtConfig {
+                issuer: Some("test-iss".into()),
+                audience: Some("test-aud".into()),
+                public_key_pem_file: Some(temp_pub_pem()),
+                cache: serde_yaml::from_str("max_token_bytes: 64").unwrap(),
+                ..jwt_claims_only()
+            }),
+            forward_auth: Some(secure_policy(&[])),
+            authz: None,
+        };
+        let auth = Auth::build(&cfg, None).unwrap().unwrap();
+        let app = app(auth.clone());
+        let token = sign(serde_json::json!({
+            "iss": "test-iss", "aud": "test-aud", "exp": future_exp(), "sub": "user-42"
+        }));
+        assert!(token.len() > 64);
+        for _ in 0..2 {
+            assert_eq!(
+                request(&app, &token).await,
+                (StatusCode::OK, "user-42".into())
+            );
+        }
+        assert_eq!(auth.cached_tokens(), 0);
+        assert_eq!(verifications(&auth), 2);
+    }
+
+    #[tokio::test]
+    async fn cached_claims_still_face_the_role_policy() {
+        // Caching skips the signature check, never the policy: a cached token
+        // without the role is refused every time.
+        let auth = auth_with_policy(&["admin"]);
+        let app = app(auth.clone());
+        let token = sign(serde_json::json!({
+            "iss": "test-iss", "aud": "test-aud", "exp": future_exp(),
+            "sub": "user-42", "roles": ["viewer"]
+        }));
+        assert_eq!(request(&app, &token).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(auth.cached_tokens(), 1);
+        assert_eq!(request(&app, &token).await.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn rejected_tokens_are_never_cached() {
+        let auth = auth_with_policy(&[]);
+        let app = app(auth.clone());
+        let expired = sign(serde_json::json!({
+            "iss": "test-iss", "aud": "test-aud", "exp": 1, "sub": "u"
+        }));
+        let wrong_issuer = sign(serde_json::json!({
+            "iss": "evil", "aud": "test-aud", "exp": future_exp(), "sub": "u"
+        }));
+        for token in [expired.as_str(), wrong_issuer.as_str(), "not.a.jwt"] {
+            assert_eq!(request(&app, token).await.0, StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(auth.cached_tokens(), 0);
+    }
+
+    #[tokio::test]
+    async fn cache_can_be_switched_off() {
+        let cfg = AuthConfig {
+            mode: "jwt".into(),
+            jwt: Some(JwtConfig {
+                issuer: Some("test-iss".into()),
+                audience: Some("test-aud".into()),
+                public_key_pem_file: Some(temp_pub_pem()),
+                cache: serde_yaml::from_str("enabled: false").unwrap(),
+                ..jwt_claims_only()
+            }),
+            forward_auth: Some(secure_policy(&[])),
+            authz: None,
+        };
+        let auth = Auth::build(&cfg, None).unwrap().unwrap();
+        let app = app(auth.clone());
+        let token = sign(serde_json::json!({
+            "iss": "test-iss", "aud": "test-aud", "exp": future_exp(), "sub": "user-42"
+        }));
+        for _ in 0..2 {
+            assert_eq!(
+                request(&app, &token).await,
+                (StatusCode::OK, "user-42".into())
+            );
+        }
+        assert_eq!(auth.cached_tokens(), 0);
+        assert_eq!(verifications(&auth), 2);
+    }
+
+    #[test]
+    fn jwks_max_age_below_the_refresh_interval_is_a_config_error() {
+        // Refreshes are at least 60 s apart, so a shorter age could not keep
+        // the removal bound it promises.
+        let jwks = |max_age| AuthConfig {
+            mode: "jwt".into(),
+            jwt: Some(JwtConfig {
+                jwks_uri: Some("http://127.0.0.1:1/jwks".into()),
+                jwks_max_age_secs: max_age,
+                ..jwt_claims_only()
+            }),
+            forward_auth: None,
+            authz: None,
+        };
+        let Err(err) = Auth::build(&jwks(59), None) else {
+            panic!("a JWKS age below 60 s must be rejected");
+        };
+        assert!(err.contains("jwks_max_age_secs"), "{err}");
+        assert!(Auth::build(&jwks(60), None).is_ok());
+    }
+
+    #[test]
+    fn zero_sized_cache_is_a_config_error() {
+        let cfg = AuthConfig {
+            mode: "jwt".into(),
+            jwt: Some(JwtConfig {
+                public_key_pem_file: Some(temp_pub_pem()),
+                cache: serde_yaml::from_str("max_entries: 0").unwrap(),
+                ..jwt_claims_only()
+            }),
+            forward_auth: None,
+            authz: None,
+        };
+        let Err(err) = Auth::build(&cfg, None) else {
+            panic!("a zero-sized cache must be rejected");
+        };
+        assert!(err.contains("max_entries"), "{err}");
     }
 
     #[test]
