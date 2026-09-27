@@ -29,8 +29,11 @@ structured-proxy = { path = "..", version = "4.3.0", default-features = false }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
 anyhow = "1"
+# The binary's own `runtime:` section of the config file.
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
 
 [features]
 # The binary the release packages ship: pure-Rust JWT crypto and the shared
