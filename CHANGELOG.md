@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.3.0](https://github.com/structured-world/structured-proxy/compare/v4.2.0...v4.3.0) - 2026-09-27
+
+### Added
+
+- *(tls)* drop ring for a pure-Rust provider ([#100](https://github.com/structured-world/structured-proxy/pull/100))
+
+### Fixed
+
+- *(transcode)* forward every value of a forwarded header ([#104](https://github.com/structured-world/structured-proxy/pull/104))
+
+### Other
+
+- *(auth)* cache verified JWT claims until expiry ([#102](https://github.com/structured-world/structured-proxy/pull/102))
+
 ## [4.2.0](https://github.com/structured-world/structured-proxy/compare/v4.1.0...v4.2.0) - 2026-09-27
 
 ### Added
