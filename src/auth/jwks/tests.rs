@@ -151,3 +151,45 @@ async fn aged_keys_refresh_no_more_often_than_the_minimum_interval() {
     assert!(cache.key_for("k1").await.is_some());
     assert_eq!(endpoint.fetches(), 1);
 }
+
+#[tokio::test]
+async fn a_lookup_overtaken_by_a_refresh_uses_the_refreshed_keys() {
+    // A lookup reads the aged set holding k1, then waits for the refresh
+    // slot; meanwhile another request's refresh replaces the set without k1.
+    // The waiting lookup is throttled, and must not hand back its old k1.
+    let (_endpoint, uri) = endpoint().await;
+    let cache = Arc::new(JwksCache::new(uri).with_max_age(Duration::ZERO));
+    assert!(cache.key_for("k1").await.is_some());
+
+    let mut slot = cache.last_refresh.lock().await;
+    let lookup = tokio::spawn({
+        let cache = cache.clone();
+        async move { cache.key_for("k1").await.is_some() }
+    });
+    // Let the lookup read the set and park on the refresh slot.
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    let refreshed: JwkSet = serde_json::from_value(key_set("k2")).unwrap();
+    *cache.set.write().await = KeySet {
+        keys: parse_jwks(&refreshed),
+        fetched: Some(Instant::now()),
+    };
+    *slot = Some(Instant::now());
+    drop(slot);
+
+    assert!(!lookup.await.unwrap(), "the removed key was returned");
+}
+
+#[tokio::test]
+async fn an_empty_key_set_is_throttled_like_any_other() {
+    // A provider that answers with no keys is not a cache that was never
+    // loaded: lookups for a kid it lacks must not refetch every time.
+    let (endpoint, uri) = endpoint().await;
+    endpoint.answer(StatusCode::OK, serde_json::json!({ "keys": [] }));
+    let cache = JwksCache::new(uri);
+    for _ in 0..3 {
+        assert!(cache.key_for("k1").await.is_none());
+    }
+    assert_eq!(endpoint.fetches(), 1);
+}

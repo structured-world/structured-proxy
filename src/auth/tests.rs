@@ -631,6 +631,27 @@ mod builtin {
     }
 
     #[test]
+    fn jwks_max_age_below_the_refresh_interval_is_a_config_error() {
+        // Refreshes are at least 60 s apart, so a shorter age could not keep
+        // the removal bound it promises.
+        let jwks = |max_age| AuthConfig {
+            mode: "jwt".into(),
+            jwt: Some(JwtConfig {
+                jwks_uri: Some("http://127.0.0.1:1/jwks".into()),
+                jwks_max_age_secs: max_age,
+                ..jwt_claims_only()
+            }),
+            forward_auth: None,
+            authz: None,
+        };
+        let Err(err) = Auth::build(&jwks(59), None) else {
+            panic!("a JWKS age below 60 s must be rejected");
+        };
+        assert!(err.contains("jwks_max_age_secs"), "{err}");
+        assert!(Auth::build(&jwks(60), None).is_ok());
+    }
+
+    #[test]
     fn zero_sized_cache_is_a_config_error() {
         let cfg = AuthConfig {
             mode: "jwt".into(),

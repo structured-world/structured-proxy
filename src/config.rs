@@ -464,8 +464,8 @@ pub struct JwtConfig {
     #[serde(default)]
     pub jwks_uri: Option<String>,
     /// Age in seconds after which the JWKS keys are fetched again, so a key
-    /// the provider removed stops verifying tokens. Refreshes stay at least 60
-    /// seconds apart. Default: 300.
+    /// the provider removed stops verifying tokens. At least 60, the minimum
+    /// spacing of refreshes. Default: 300.
     #[serde(default = "default_jwks_max_age_secs")]
     pub jwks_max_age_secs: u64,
     /// Expected issuer.

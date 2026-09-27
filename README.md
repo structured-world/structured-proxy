@@ -173,7 +173,7 @@ auth:
   jwt:
     jwks_uri: "https://idp.example.com/.well-known/jwks.json"
     # OR a static key: public_key_pem_file: "/etc/proxy/idp-ed25519.pub.pem"
-    jwks_max_age_secs: 300 # refetch the keys after this age (default 300)
+    jwks_max_age_secs: 300 # refetch the keys after this age (default 300, at least 60)
     issuer: "https://idp.example.com"
     audience: "my-api"
     roles_claim: "roles" # array-of-strings claim used for required_roles
@@ -662,8 +662,9 @@ headers still run every time.
   future) is not cached.
 - A token whose signing key leaves the JWKS stops passing within
   `jwks_max_age_secs + max_ttl_secs` (default 360 s): the keys are refetched
-  once older than `jwks_max_age_secs`, and a cached verification is reused for
-  at most `max_ttl_secs`. While the JWKS endpoint is unreachable the keys
+  once older than `jwks_max_age_secs` (at least 60 s, since refreshes are at
+  least a minute apart), and a cached verification is reused for at most
+  `max_ttl_secs`. While the JWKS endpoint is unreachable the keys
   already known stay in use, so the bound starts once it answers again.
 - Rejected tokens are never cached. The cache is keyed by the SHA-256 of the
   token, so no bearer token is kept in memory.

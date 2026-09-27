@@ -41,7 +41,7 @@ pub struct JwksCache {
 
 /// Minimum spacing between refreshes, so a flood of bogus `kid`s cannot hammer
 /// the JWKS endpoint.
-const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+pub(crate) const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Default age after which the cached keys are refetched: the `cache_duration`
 /// Envoy's `remote_jwks` uses.
@@ -88,34 +88,36 @@ impl JwksCache {
     /// Resolve the verifying key for `kid`, refreshing from the JWKS endpoint
     /// once (throttled) if it is not cached or the cached keys are too old.
     pub async fn key_for(&self, kid: &str) -> Option<VerifyingKey> {
-        let cached = {
+        {
             let set = self.set.read().await;
-            let key = set.keys.get(kid).cloned();
-            let fresh = set.fetched.is_some_and(|t| t.elapsed() < self.max_age);
-            if fresh && key.is_some() {
-                return key;
+            if set.fetched.is_some_and(|t| t.elapsed() < self.max_age) {
+                if let Some(key) = set.keys.get(kid) {
+                    return Some(key.clone());
+                }
             }
-            key
-        };
-        match self.refresh().await {
-            Ok(()) => self.set.read().await.keys.get(kid).cloned(),
-            // An unreachable endpoint, or a refresh another request has just
-            // made, keeps the key already known: failing every token while
-            // the provider is down would turn its outage into ours.
-            Err(_) => cached,
         }
+        if let Err(reason) = self.refresh().await {
+            tracing::debug!(%reason, "JWKS not refetched; using the keys already known");
+        }
+        // Answer from the current set whatever the refresh did: another
+        // request may have replaced it meanwhile, and a key it dropped must
+        // not survive in an earlier copy. An unreachable endpoint leaves the
+        // set as it was, so the keys already known keep working: failing every
+        // token while the provider is down would turn its outage into ours.
+        self.set.read().await.keys.get(kid).cloned()
     }
 
     /// Fetch the JWKS and replace the cache. Throttled by the minimum refresh
-    /// interval unless the cache is still empty (first load).
+    /// interval unless no fetch has succeeded yet (first load); a provider
+    /// that answered with no keys has been loaded.
     async fn refresh(&self) -> Result<(), String> {
         // Claim the refresh slot atomically: hold the lock across the throttle
         // check and the timestamp update so concurrent callers cannot all pass.
         {
             let mut last = self.last_refresh.lock().await;
             if let Some(t) = *last {
-                let empty = self.set.read().await.keys.is_empty();
-                if !empty && t.elapsed() < self.min_refresh_interval {
+                let loaded = self.set.read().await.fetched.is_some();
+                if loaded && t.elapsed() < self.min_refresh_interval {
                     return Err("refresh throttled".to_string());
                 }
             }
