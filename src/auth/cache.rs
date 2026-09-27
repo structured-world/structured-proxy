@@ -3,12 +3,13 @@
 //!
 //! Keyed by the SHA-256 of the token, so no bearer token is held in memory.
 //! An entry is reused until the earlier of the token's `exp` and a configured
-//! maximum age, which bounds how long a token keeps passing after its signing
-//! key has left the JWKS. Rejected tokens are never stored, so garbage cannot
-//! fill it, and tokens over a size limit are not stored either, so the memory
-//! held is bounded too. The size is capped without background work: expired
-//! entries are dropped when looked up, and swept when an insert finds the
-//! cache full.
+//! maximum age, which, with the JWKS key age, bounds how long a token keeps
+//! passing after its signing key has left the JWKS. Rejected tokens are never
+//! stored, so garbage cannot fill it, and tokens over a size limit are not
+//! stored either, so the memory held is bounded too. The size is capped
+//! without background work: expired entries are dropped when looked up, and an
+//! insert that finds the cache full sweeps them at most once per second, so it
+//! may leave a new token uncached until the next sweep frees room.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;

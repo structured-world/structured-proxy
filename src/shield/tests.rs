@@ -365,6 +365,7 @@ mod two_phase {
                 issuer: None,
                 audience: None,
                 jwks_uri: None,
+                jwks_max_age_secs: 300,
                 public_key_pem_file: Some(pem),
                 claims_headers: HashMap::new(),
                 roles_claim: "roles".into(),

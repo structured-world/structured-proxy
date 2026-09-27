@@ -17,6 +17,17 @@ upstream:
 }
 
 #[test]
+fn jwks_max_age_defaults_and_overrides() {
+    let yaml = "upstream:\n  default: \"grpc://x:1\"\nauth:\n  mode: jwt\n  jwt:\n    jwks_uri: \"https://idp/jwks\"\n";
+    let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+    assert_eq!(cfg.auth.unwrap().jwt.unwrap().jwks_max_age_secs, 300);
+
+    let yaml = "upstream:\n  default: \"grpc://x:1\"\nauth:\n  mode: jwt\n  jwt:\n    jwks_uri: \"https://idp/jwks\"\n    jwks_max_age_secs: 120\n";
+    let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+    assert_eq!(cfg.auth.unwrap().jwt.unwrap().jwks_max_age_secs, 120);
+}
+
+#[test]
 fn jwt_cache_defaults_and_overrides() {
     // Without a `cache:` block the cache is on with its defaults.
     let yaml = "upstream:\n  default: \"grpc://x:1\"\nauth:\n  mode: jwt\n  jwt:\n    jwks_uri: \"https://idp/jwks\"\n";

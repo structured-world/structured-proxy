@@ -173,6 +173,7 @@ auth:
   jwt:
     jwks_uri: "https://idp.example.com/.well-known/jwks.json"
     # OR a static key: public_key_pem_file: "/etc/proxy/idp-ed25519.pub.pem"
+    jwks_max_age_secs: 300 # refetch the keys after this age (default 300)
     issuer: "https://idp.example.com"
     audience: "my-api"
     roles_claim: "roles" # array-of-strings claim used for required_roles
@@ -656,15 +657,21 @@ request with it; on an EdDSA token that turns ~41 µs into ~2 µs per request
 headers still run every time.
 
 - An entry is used until the earlier of the token's `exp` and `max_ttl_secs`
-  (default 60) after verification; `max_ttl_secs` bounds how long a token keeps
-  passing after its signing key leaves the JWKS, and is timed on the monotonic
-  clock, so setting the system clock back cannot stretch it. A token not yet
-  valid (`nbf` in the future) is not cached.
+  (default 60) after verification, timed on the monotonic clock, so setting
+  the system clock back cannot stretch it. A token not yet valid (`nbf` in the
+  future) is not cached.
+- A token whose signing key leaves the JWKS stops passing within
+  `jwks_max_age_secs + max_ttl_secs` (default 360 s): the keys are refetched
+  once older than `jwks_max_age_secs`, and a cached verification is reused for
+  at most `max_ttl_secs`. While the JWKS endpoint is unreachable the keys
+  already known stay in use, so the bound starts once it answers again.
 - Rejected tokens are never cached. The cache is keyed by the SHA-256 of the
   token, so no bearer token is kept in memory.
 - It holds at most `max_entries` (default 10000) tokens; once full of live
   entries, a new token is verified but not stored. No background task runs:
-  expired entries go when looked up or when an insert finds the cache full.
+  expired entries go when looked up, and an insert that finds the cache full
+  sweeps them at most once per second, so a full cache may pass a new token
+  through uncached until the next sweep frees room.
   A token longer than `max_token_bytes` (default 4096) is verified every time
   and never stored, so the memory the cache holds stays bounded.
 - It is per process and only skips repeated work, so replicas decide the same

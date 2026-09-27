@@ -74,6 +74,7 @@ async fn body_string(resp: axum::response::Response) -> String {
 fn jwt_claims_only() -> JwtConfig {
     JwtConfig {
         jwks_uri: None,
+        jwks_max_age_secs: 300,
         issuer: None,
         audience: None,
         public_key_pem_file: None,
@@ -378,6 +379,7 @@ mod builtin {
             mode: "jwt".into(),
             jwt: Some(JwtConfig {
                 jwks_uri: None,
+                jwks_max_age_secs: 300,
                 issuer: None,
                 audience: None,
                 public_key_pem_file: Some(temp_pub_pem()),

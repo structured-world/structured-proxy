@@ -463,6 +463,11 @@ pub struct JwtConfig {
     /// JWKS URI for key discovery.
     #[serde(default)]
     pub jwks_uri: Option<String>,
+    /// Age in seconds after which the JWKS keys are fetched again, so a key
+    /// the provider removed stops verifying tokens. Refreshes stay at least 60
+    /// seconds apart. Default: 300.
+    #[serde(default = "default_jwks_max_age_secs")]
+    pub jwks_max_age_secs: u64,
     /// Expected issuer.
     #[serde(default)]
     pub issuer: Option<String>,
@@ -499,8 +504,9 @@ pub struct JwtCacheConfig {
     /// verified but not stored. Default: 10000.
     #[serde(default = "default_jwt_cache_max_entries")]
     pub max_entries: usize,
-    /// Longest time a verification is reused, in seconds. Bounds how long a
-    /// token keeps passing after its signing key leaves the JWKS. Default: 60.
+    /// Longest time a verification is reused, in seconds. With
+    /// `jwks_max_age_secs` it bounds how long a token keeps passing after its
+    /// signing key leaves the JWKS. Default: 60.
     #[serde(default = "default_jwt_cache_max_ttl_secs")]
     pub max_ttl_secs: u64,
     /// Longest token cached, in bytes; a longer one is verified on every
@@ -508,6 +514,11 @@ pub struct JwtCacheConfig {
     /// the claims kept are decoded from the token. Default: 4096.
     #[serde(default = "default_jwt_cache_max_token_bytes")]
     pub max_token_bytes: usize,
+}
+
+/// Default for [`JwtConfig::jwks_max_age_secs`].
+pub(crate) fn default_jwks_max_age_secs() -> u64 {
+    300
 }
 
 fn default_jwt_cache_max_entries() -> usize {

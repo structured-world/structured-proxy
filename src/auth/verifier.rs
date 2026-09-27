@@ -6,6 +6,7 @@
 //! "jwt"` requires a verifier injected by the embedder instead.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde_json::Value;
@@ -14,6 +15,11 @@ use super::jwks::JwksCache;
 use crate::config::JwtConfig;
 
 /// Where verifying keys come from.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one instance per process, already inside Box<ConfigVerifier>; boxing \
+              the JWKS variant would add a pointer hop to every verification"
+)]
 enum KeySource {
     /// A single Ed25519 public key (EdDSA).
     Pem(Arc<DecodingKey>),
@@ -42,7 +48,10 @@ impl ConfigVerifier {
         super::crypto::install_default_crypto_provider();
 
         let keys = if let Some(uri) = &jwt.jwks_uri {
-            KeySource::Jwks(JwksCache::new(uri.clone()))
+            KeySource::Jwks(
+                JwksCache::new(uri.clone())
+                    .with_max_age(Duration::from_secs(jwt.jwks_max_age_secs)),
+            )
         } else if let Some(pem_path) = &jwt.public_key_pem_file {
             let pem = std::fs::read(pem_path)
                 .map_err(|e| format!("failed to read auth.jwt.public_key_pem_file: {e}"))?;
