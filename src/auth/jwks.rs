@@ -111,18 +111,19 @@ impl JwksCache {
     /// interval unless no fetch has succeeded yet (first load); a provider
     /// that answered with no keys has been loaded.
     async fn refresh(&self) -> Result<(), String> {
-        // Claim the refresh slot atomically: hold the lock across the throttle
-        // check and the timestamp update so concurrent callers cannot all pass.
-        {
-            let mut last = self.last_refresh.lock().await;
-            if let Some(t) = *last {
-                let loaded = self.set.read().await.fetched.is_some();
-                if loaded && t.elapsed() < self.min_refresh_interval {
-                    return Err("refresh throttled".to_string());
-                }
+        // The refresh slot is held until the new set is in place: a lookup
+        // that arrives meanwhile waits for it, then finds the refresh throttled
+        // and answers from the new set, never from the aged one a removed key
+        // may still sit in. Only lookups that need a refresh wait; a fresh key
+        // is served before the slot is touched.
+        let mut last = self.last_refresh.lock().await;
+        if let Some(t) = *last {
+            let loaded = self.set.read().await.fetched.is_some();
+            if loaded && t.elapsed() < self.min_refresh_interval {
+                return Err("refresh throttled".to_string());
             }
-            *last = Some(Instant::now());
         }
+        *last = Some(Instant::now());
 
         let response = self
             .client

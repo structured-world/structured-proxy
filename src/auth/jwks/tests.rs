@@ -59,6 +59,9 @@ fn parse_jwks_skips_symmetric_and_keyless() {
 struct Endpoint {
     answer: std::sync::Mutex<(StatusCode, serde_json::Value)>,
     fetches: AtomicUsize,
+    /// Held by a test to keep a fetch in flight: the endpoint counts the
+    /// request, then answers only once it can take this lock.
+    hold: tokio::sync::Mutex<()>,
 }
 
 impl Endpoint {
@@ -84,6 +87,7 @@ async fn endpoint() -> (Arc<Endpoint>, String) {
     let endpoint = Arc::new(Endpoint {
         answer: std::sync::Mutex::new((StatusCode::OK, key_set("k1"))),
         fetches: AtomicUsize::new(0),
+        hold: tokio::sync::Mutex::new(()),
     });
     let served = endpoint.clone();
     let app = axum::Router::new().route(
@@ -92,6 +96,7 @@ async fn endpoint() -> (Arc<Endpoint>, String) {
             let served = served.clone();
             async move {
                 served.fetches.fetch_add(1, Ordering::Relaxed);
+                drop(served.hold.lock().await);
                 let (status, body) = served.answer.lock().unwrap().clone();
                 (status, axum::Json(body))
             }
@@ -192,4 +197,49 @@ async fn an_empty_key_set_is_throttled_like_any_other() {
         assert!(cache.key_for("k1").await.is_none());
     }
     assert_eq!(endpoint.fetches(), 1);
+}
+
+#[tokio::test]
+async fn a_lookup_during_a_refresh_waits_for_its_keys() {
+    // The aged set holds k1; the provider now serves only k2. One lookup's
+    // refresh is in flight when a second lookup arrives: the second must not
+    // answer from the aged set in the meantime.
+    let (endpoint, uri) = endpoint().await;
+    let interval = Duration::from_millis(50);
+    let cache = Arc::new(
+        JwksCache::new(uri)
+            .with_max_age(Duration::ZERO)
+            .with_min_refresh_interval(interval),
+    );
+    assert!(cache.key_for("k1").await.is_some());
+    endpoint.answer(StatusCode::OK, key_set("k2"));
+    // The next refresh may run; the one after it, within the interval, may not.
+    tokio::time::sleep(interval + Duration::from_millis(10)).await;
+
+    let hold = endpoint.hold.lock().await;
+    let lookup = |cache: &Arc<JwksCache>| {
+        let cache = cache.clone();
+        tokio::spawn(async move { cache.key_for("k1").await.is_some() })
+    };
+    let first = lookup(&cache);
+    for _ in 0..500 {
+        if endpoint.fetches() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        endpoint.fetches(),
+        2,
+        "the refresh never reached the provider"
+    );
+    let second = lookup(&cache);
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    drop(hold);
+
+    assert!(!first.await.unwrap());
+    assert!(!second.await.unwrap(), "answered from the aged set");
+    assert_eq!(endpoint.fetches(), 2);
 }
