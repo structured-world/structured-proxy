@@ -11,7 +11,6 @@ use std::task::{Context, Poll};
 use axum::extract::connect_info::ConnectInfo;
 use axum::response::IntoResponse;
 use axum::routing::future::RouteFuture;
-use axum::serve::IncomingStream;
 use bytes::Bytes;
 use pin_project_lite::pin_project;
 use rustls::pki_types::CertificateDer;
@@ -47,11 +46,13 @@ use crate::upstream::{
 /// only the guards whose scope names them (`grpc`, `fallback`); a guard's
 /// rejection of a gRPC call is a gRPC status.
 ///
-/// Serve it with [`serve`], or hand it to any server that takes a tower
-/// service of `http` types: your own TLS, a Unix socket, an existing hyper or
-/// axum server. Native gRPC needs HTTP/2 on that server (ALPN `h2` next to
-/// `http/1.1` behind TLS). Such a server tells the proxy which connection a
-/// request came on with [`for_connection`](Self::for_connection).
+/// Serve it with [`serve`](crate::serve) or
+/// [`serve_with`](crate::serve_with) (TLS, a connection limit), or hand it to
+/// any server that takes a tower service of `http` types: a Unix socket, an
+/// existing hyper or axum server. Native gRPC needs HTTP/2 on that server
+/// (ALPN `h2` next to `http/1.1` behind TLS). Such a server tells the proxy
+/// which connection a request came on with
+/// [`for_connection`](Self::for_connection).
 ///
 /// # Examples
 ///
@@ -286,7 +287,8 @@ impl<U: Upstream> ProxyService<U> {
     ///
     /// A server of your own calls it once per accepted connection, with what
     /// tonic's [`Connected`] trait
-    /// reports for the stream. [`serve`] does this itself.
+    /// reports for the stream. [`serve_with`](crate::serve_with) does this
+    /// itself.
     ///
     /// # Examples
     ///
@@ -467,54 +469,6 @@ impl<U: Upstream> Future for ResponseFuture<U> {
             InnerProj::GrpcWeb { future } => future.poll(cx),
             InnerProj::Guarded { future } => future.poll(cx),
         }
-    }
-}
-
-/// Serve `service` on `listener` until the listener fails: cleartext HTTP/1.1
-/// and HTTP/2 on the same port, so REST clients and native gRPC clients share
-/// it. Each connection's service gets its peer through
-/// [`ProxyService::for_connection`]. For TLS, run the service on a server of
-/// your own (see [`ProxyService`]).
-///
-/// # Errors
-///
-/// The listener's own I/O failure.
-///
-/// # Examples
-///
-/// ```no_run
-/// use structured_proxy::ProxyServer;
-///
-/// # async fn run() -> anyhow::Result<()> {
-/// let grpc = tonic::service::Routes::default();
-/// let service = ProxyServer::from_yaml_str("service:\n  name: demo\n")?.service(grpc)?;
-/// let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
-/// structured_proxy::serve(listener, service).await?;
-/// # Ok(())
-/// # }
-/// ```
-pub async fn serve<U: Upstream>(
-    listener: tokio::net::TcpListener,
-    service: ProxyService<U>,
-) -> std::io::Result<()> {
-    axum::serve(listener, PerConnection(service)).await
-}
-
-/// Makes the [`ProxyService`] of each accepted connection.
-struct PerConnection<U>(ProxyService<U>);
-
-impl<U: Upstream> Service<IncomingStream<'_, tokio::net::TcpListener>> for PerConnection<U> {
-    type Response = ProxyService<U>;
-    type Error = Infallible;
-    type Future = std::future::Ready<Result<ProxyService<U>, Infallible>>;
-
-    #[inline]
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, stream: IncomingStream<'_, tokio::net::TcpListener>) -> Self::Future {
-        std::future::ready(Ok(self.0.for_connection(stream.io().connect_info())))
     }
 }
 

@@ -21,7 +21,7 @@ Works with **any** gRPC service via proto descriptor files. No code generation, 
 - **Server-streaming** RPC → NDJSON by default, or Server-Sent Events via `Accept: text/event-stream` negotiation
 - **gRPC → HTTP status mapping** following the standard `google.rpc.Code` table
 - **Typed error details**: the upstream's `google.rpc.Status` details (`ErrorInfo`, `BadRequest`, `RetryInfo`, ...) reach the HTTP client as ProtoJSON, switchable globally and per route (see [Error responses](#error-responses))
-- **One port for REST and native gRPC**: HTTP/1.1 and HTTP/2 on the same listener, gRPC and gRPC-Web requests pass through to the upstream unchanged (an upstream that speaks gRPC-Web, e.g. behind tonic-web, answers it); behind your own TLS too, with the client's address and certificate reaching the upstream
+- **One port for REST and native gRPC**: HTTP/1.1 and HTTP/2 on the same listener, gRPC and gRPC-Web requests pass through to the upstream unchanged (an upstream that speaks gRPC-Web, e.g. behind tonic-web, answers it); behind the built-in TLS listener (mTLS with a client CA, a cap on open connections) or your own TLS, with the client's address and certificate reaching the upstream
 - **In-process upstream** for embedders: transcoded calls reach your own tonic services with no socket or loopback hop (see [Library Usage](#library-usage))
 - **Header forwarding** from HTTP requests to gRPC metadata (configurable allow-list)
 - **Context propagation**: W3C trace-context (`traceparent` forwarded or synthesized) and client deadlines (`grpc-timeout`) carried across the REST↔gRPC boundary
@@ -69,6 +69,17 @@ log line (`RUST_LOG=info`) states the count and where it came from.
 # my-service.yaml
 listen:
   http: "0.0.0.0:8080"
+  # Optional: most connections served at once; past it the next one waits in
+  # the listen backlog until a connection closes. Unset: no limit.
+  # max_connections: 10000
+  # Optional: TLS on the listener (REST and gRPC share the port; ALPN offers
+  # h2 and http/1.1). With client_ca_file, client certificates are verified
+  # (mTLS) and reach an in-process tonic upstream as Request::peer_certs.
+  # tls:
+  #   cert_file: "/etc/proxy/tls.crt"      # PEM chain, leaf first
+  #   key_file: "/etc/proxy/tls.key"       # PEM private key
+  #   client_ca_file: "/etc/proxy/ca.crt"
+  #   client_auth: required                # or `optional`
 
 # The gRPC service behind the proxy. Required by the standalone binary; an
 # embedder with an in-process upstream leaves it out.
@@ -744,9 +755,36 @@ structured_proxy::serve(listener, proxy).await?;
 config), or anything else that speaks gRPC over `http` types. The result is a
 tower service, so it can also run on a server of your own.
 
+### TLS and connection limits
+
+`listen.tls` and `listen.max_connections` configure the listener of
+`ProxyServer::serve`. An embedder with a listener of its own gets the same
+from `ProxyServer::serve_options`, or builds `ServeOptions` in code, and runs
+`structured_proxy::serve_with`:
+
+```rust
+use structured_proxy::{ProxyServer, ServeOptions};
+
+# async fn run(tls: rustls::ServerConfig, grpc: tonic::service::Routes) -> anyhow::Result<()> {
+let proxy = ProxyServer::from_file(std::path::Path::new("my-service.yaml"))?.service(grpc)?;
+let listener = tokio::net::TcpListener::bind("0.0.0.0:8443").await?;
+// Any rustls config: your own certificate resolver, client verifier, ...
+let options = ServeOptions::new().tls(tls).max_connections(10_000);
+structured_proxy::serve_with(listener, proxy, options).await?;
+# Ok(())
+# }
+```
+
+The TLS handshake runs in each connection's task with a ten-second limit, so
+a slow or stalled client holds up no one else. A client certificate the
+listener verified reaches a tonic handler in process as `Request::peer_certs`.
+TLS needs a rustls crypto provider: the one a crypto backend feature brings,
+or the one your process installed (see [TLS crypto](#tls-crypto)).
+
 ### Behind your own TLS
 
-`serve` speaks cleartext. For TLS, run the service on your own acceptor: one
+For a server of your own (another TLS stack, a Unix socket), run the service
+on your own acceptor: one
 `ProxyService::for_connection` call per accepted connection tells the proxy
 who is on the other end, so its middleware sees the client's address and a
 tonic handler in process reads it with `Request::remote_addr`, and the client
@@ -998,16 +1036,18 @@ async-trait = "0.1"
 serde_json = "1"
 ```
 
-which links no JWT or TLS crypto (see [Outbound TLS](#outbound-tls)), and
+which links no JWT or TLS crypto (see [TLS crypto](#tls-crypto)), and
 supplies the backend from its own binary. With no
 verifier injected and no backend feature, an `auth.mode: "jwt"` config is
 rejected at startup with that instruction, rather than silently accepting
 tokens.
 
-## Outbound TLS
+## TLS crypto
 
-The proxy's own HTTP calls (JWKS fetches, the rate-limit service) use rustls
-with Mozilla's root store bundled from `webpki-roots`, so no system CA bundle is
+All of the proxy's TLS is rustls: the listener (`listen.tls`, see
+[TLS and connection limits](#tls-and-connection-limits)) and its own outbound
+HTTP calls (JWKS fetches, the rate-limit service). Outbound calls trust
+Mozilla's root store bundled from `webpki-roots`, so no system CA bundle is
 needed. The rustls crypto provider is, in order:
 
 1. the one your process installed with
@@ -1016,13 +1056,12 @@ needed. The rustls crypto provider is, in order:
 2. aws-lc, with the `aws_lc_rs` feature;
 3. the pure-Rust RustCrypto provider (`rustls-rustcrypto`), with `rust_crypto`.
 
-Neither `ring` nor aws-lc is linked unless you ask: the default build contains
-no C crypto, which CI checks. A `default-features = false` build links no TLS
-crypto provider at all, so a crate that only transcodes pulls in neither `rsa`
-nor `rustls-rustcrypto`. If such a build configures a JWKS endpoint or the
-rate-limit service, install a provider before building the proxy (the client
-needs one even for an `http://` endpoint); otherwise startup fails with an error
-that says so.
+The default build is pure Rust; aws-lc (C) comes with `aws_lc_rs`. A
+`default-features = false` build brings no provider, so a crate that only
+transcodes stays free of crypto dependencies. Such a build that terminates TLS,
+or configures a JWKS endpoint or the rate-limit service, installs a provider
+before building the proxy (the outbound client needs one even for an
+`http://` endpoint); otherwise startup fails with an error that says so.
 
 The RustCrypto provider verifies RSA server signatures with `rsa`, under the same
 RUSTSEC-2023-0071 note as the `rust_crypto` JWT backend: only public-key

@@ -32,9 +32,8 @@ required-features = ["cli"]
 doc = false
 
 [dependencies]
-# HTTP framework. `http2`: `serve` answers HTTP/1.1 and HTTP/2 on one port,
-# so native gRPC clients share the listener with REST ones.
-axum = { version = "0.8", features = ["macros", "http2"] }
+# HTTP framework of the proxy's routes; `serve` runs connections on hyper-util.
+axum = { version = "0.8", features = ["macros"] }
 # `util`: the guarded gRPC and fallback paths are boxed services.
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["cors", "trace"] }
@@ -49,6 +48,9 @@ bytes = "1"
 http-body = "1"
 # The response futures of `ProxyService`, named without boxing each one.
 pin-project-lite = "0.2"
+# `serve_with`'s connections: HTTP/1.1 and HTTP/2 on one port, over TCP or
+# TLS. Already in the tree through axum and tonic.
+hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
 
 # gRPC client (to upstream service). `tls-connect-info` gives a rustls server
 # stream the connection record (client certificates) a tonic handler reads, so

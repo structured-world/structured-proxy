@@ -61,6 +61,7 @@ mod guard;
 pub mod hooks;
 pub mod oidc;
 pub mod openapi;
+mod serve;
 pub mod service;
 pub mod shield;
 mod tls;
@@ -71,7 +72,8 @@ pub mod upstream;
 /// [`install_default_crypto_provider`] for when a call is needed.
 #[cfg(feature = "builtin_jwt")]
 pub use auth::crypto::install_default_crypto_provider;
-pub use service::{serve, ConnectionInfo, ProxyService};
+pub use serve::{serve, serve_with, ServeOptions};
+pub use service::{ConnectionInfo, ProxyService};
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -949,21 +951,52 @@ impl ProxyServer {
         })
     }
 
-    /// Serve the proxy on the configured listen address in front of the
-    /// configured upstream address: REST and native gRPC on one port (see
-    /// [`service`](Self::service) and [`serve`]).
+    /// The [`ServeOptions`] of `listen:`: TLS from `listen.tls` (mTLS with its
+    /// `client_ca_file`) and the `listen.max_connections` cap, for
+    /// [`serve_with`] on a listener of your own.
     ///
     /// # Errors
     ///
-    /// What [`upstream`](Self::upstream) and [`service`](Self::service)
-    /// reject, an invalid listen address, or a listener that fails.
+    /// A `max_connections` of zero, or TLS files that cannot be loaded, or no
+    /// rustls crypto provider for TLS.
+    pub fn serve_options(&self) -> anyhow::Result<ServeOptions> {
+        let listen = &self.config.listen;
+        let mut options = ServeOptions::new();
+        if let Some(max) = listen.max_connections {
+            anyhow::ensure!(max > 0, "listen.max_connections must be at least 1");
+            options = options.max_connections(max);
+        }
+        if let Some(tls) = &listen.tls {
+            options = options.tls(
+                tls::server_config(tls).map_err(|e| anyhow::anyhow!("invalid listen.tls: {e}"))?,
+            );
+        }
+        Ok(options)
+    }
+
+    /// Serve the proxy on the configured listen address in front of the
+    /// configured upstream address: REST and native gRPC on one port, with
+    /// the TLS and connection limit of `listen:` (see
+    /// [`serve_options`](Self::serve_options) and [`serve_with`]).
+    ///
+    /// # Errors
+    ///
+    /// What [`upstream`](Self::upstream), [`service`](Self::service) and
+    /// [`serve_options`](Self::serve_options) reject, an invalid listen
+    /// address, or a listener that fails.
     pub async fn serve(&self) -> anyhow::Result<()> {
         let service = self.service(self.upstream()?)?;
+        let options = self.serve_options()?;
         let addr: SocketAddr = self.config.listen.http.parse()?;
         let listener = tokio::net::TcpListener::bind(addr).await?;
 
-        tracing::info!("{} listening on {}", self.config.service.name, addr);
-        serve(listener, service).await?;
+        tracing::info!(
+            tls = self.config.listen.tls.is_some(),
+            "{} listening on {}",
+            self.config.service.name,
+            addr
+        );
+        serve_with(listener, service, options).await?;
         Ok(())
     }
 }

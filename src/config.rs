@@ -364,12 +364,57 @@ where
     Ok(yaml_sources.into_iter().map(Into::into).collect())
 }
 
-/// Listen address configuration.
+/// The listener [`ProxyServer::serve`](crate::ProxyServer::serve) runs.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListenConfig {
-    /// HTTP listen address (default: "0.0.0.0:8080").
+    /// Listen address (default: "0.0.0.0:8080").
     #[serde(default = "default_http_listen")]
     pub http: String,
+    /// Most connections served at once; past it the next connection is
+    /// accepted when one closes. Unset: no limit.
+    #[serde(default)]
+    pub max_connections: Option<usize>,
+    /// TLS on the listener, mTLS with `client_ca_file`. Unset: cleartext.
+    #[serde(default)]
+    pub tls: Option<ListenTlsConfig>,
+}
+
+/// TLS for the listener.
+///
+/// ```yaml
+/// tls:
+///   cert_file: /etc/proxy/tls.crt      # PEM chain, leaf first
+///   key_file: /etc/proxy/tls.key       # PEM private key
+///   client_ca_file: /etc/proxy/ca.crt  # optional: verify client certificates
+///   client_auth: required              # or `optional`
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListenTlsConfig {
+    /// The server certificate chain, PEM, leaf first.
+    pub cert_file: PathBuf,
+    /// The server private key, PEM (PKCS#8, PKCS#1 or SEC1).
+    pub key_file: PathBuf,
+    /// CA certificates, PEM, that client certificates are verified against.
+    /// Unset: clients present none.
+    #[serde(default)]
+    pub client_ca_file: Option<PathBuf>,
+    /// Whether a client must present a certificate once `client_ca_file`
+    /// is set.
+    #[serde(default)]
+    pub client_auth: ClientAuth,
+}
+
+/// Whether a TLS client must present a certificate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientAuth {
+    /// A client without a valid certificate is refused in the handshake.
+    #[default]
+    Required,
+    /// A certificate is verified when presented; a client may present none.
+    Optional,
 }
 
 fn default_http_listen() -> String {
@@ -380,6 +425,8 @@ impl Default for ListenConfig {
     fn default() -> Self {
         Self {
             http: default_http_listen(),
+            max_connections: None,
+            tls: None,
         }
     }
 }

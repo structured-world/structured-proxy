@@ -24,6 +24,8 @@ fn embedded_config_is_constructible() {
         }],
         listen: ListenConfig {
             http: "0.0.0.0:8080".into(),
+            max_connections: None,
+            tls: None,
         },
         service: ServiceConfig {
             name: "embedded-test".into(),
