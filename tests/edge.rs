@@ -529,6 +529,88 @@ async fn cors_can_be_left_to_an_upstream_that_does_it_itself() {
 }
 
 #[tokio::test]
+async fn a_grpc_web_preflight_is_answered_by_the_proxy_despite_a_fallback() {
+    // The fallback takes what no route matches, but a gRPC-Web preflight
+    // belongs to the call it announces, which carries the proxy's policy.
+    let pool = pool();
+    let upstream = tower::ServiceBuilder::new()
+        .layer(tonic_web::GrpcWebLayer::new())
+        .service(tonic::service::Routes::new(Edge { pool: pool.clone() }));
+    let fallback = axum::Router::new().fallback(|| async { (StatusCode::IM_A_TEAPOT, "fallback") });
+    let service = ProxyServer::from_yaml_str(CORS_YAML)
+        .unwrap()
+        .with_descriptors(pool)
+        .service(upstream)
+        .unwrap()
+        .with_fallback(fallback);
+    let preflight = browser_grpc_web_preflight(common::App::new(service)).await;
+    assert_eq!(preflight["access-control-allow-origin"], ORIGIN);
+}
+
+/// An upstream that speaks gRPC-Web and sets its own CORS policy, allowing
+/// only [`UPSTREAM_ORIGIN`].
+fn upstream_with_its_own_cors() -> common::App {
+    let pool = pool();
+    let upstream = tower::ServiceBuilder::new()
+        .layer(
+            tower_http::cors::CorsLayer::new()
+                .allow_origin(http::HeaderValue::from_static(UPSTREAM_ORIGIN))
+                .allow_methods([http::Method::POST])
+                .allow_headers(tower_http::cors::Any),
+        )
+        .layer(tonic_web::GrpcWebLayer::new())
+        .service(tonic::service::Routes::new(Edge { pool: pool.clone() }));
+    let service = ProxyServer::from_yaml_str(
+        "cors:\n  origins: [\"https://app.example\"]\n  grpc_web: false\n",
+    )
+    .unwrap()
+    .with_descriptors(pool)
+    .service(upstream)
+    .unwrap();
+    common::App::new(service)
+}
+
+const UPSTREAM_ORIGIN: &str = "https://upstream-policy.example";
+
+#[tokio::test]
+async fn a_grpc_web_preflight_goes_to_an_upstream_that_owns_cors() {
+    // `grpc_web: false`: the preflight must get the policy the call will get,
+    // the upstream's, not the proxy's.
+    let request = http::Request::builder()
+        .method("OPTIONS")
+        .uri("/test.v1.Edge/Echo")
+        .header("origin", UPSTREAM_ORIGIN)
+        .header("access-control-request-method", "POST")
+        .header("access-control-request-headers", "content-type,x-grpc-web")
+        .body(Body::empty())
+        .unwrap();
+    let response = tower::ServiceExt::oneshot(upstream_with_its_own_cors(), request)
+        .await
+        .unwrap();
+    assert_eq!(
+        response.headers()["access-control-allow-origin"],
+        UPSTREAM_ORIGIN
+    );
+}
+
+#[tokio::test]
+async fn a_rest_preflight_stays_with_the_proxy_when_the_upstream_owns_grpc_web_cors() {
+    // Only gRPC-Web preflights follow their call upstream: a REST route's
+    // preflight keeps the proxy's policy.
+    let request = http::Request::builder()
+        .method("OPTIONS")
+        .uri("/v1/echo/rest")
+        .header("origin", ORIGIN)
+        .header("access-control-request-method", "GET")
+        .body(Body::empty())
+        .unwrap();
+    let response = tower::ServiceExt::oneshot(upstream_with_its_own_cors(), request)
+        .await
+        .unwrap();
+    assert_eq!(response.headers()["access-control-allow-origin"], ORIGIN);
+}
+
+#[tokio::test]
 async fn a_listed_origin_gets_its_cors_allowance_on_a_rest_route() {
     // A named origin list with credentials must not use `*` for methods or
     // headers (Fetch §3.2.5): such a policy used to stop the proxy at startup.

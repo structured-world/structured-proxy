@@ -97,9 +97,9 @@ cors:
   # How long a browser caches a preflight answer (seconds). Unset: the
   # browser's default.
   # max_age_secs: 600
-  # Apply this policy to gRPC-Web calls passed through to the upstream too
-  # (the proxy answers their preflight). Turn off only when the upstream sets
-  # CORS on its gRPC-Web answers itself.
+  # Apply this policy to gRPC-Web calls passed through to the upstream and to
+  # their preflights. Turn off only when the upstream sets CORS on gRPC-Web
+  # itself: its preflights then reach the upstream too.
   grpc_web: true
 
 # Optional: path aliases (rewrite before routing)
@@ -725,7 +725,11 @@ binary and text gRPC-Web alike. When the upstream cannot take a call at all,
 the proxy's own error answer keeps the request's protocol. Browsers get the
 proxy's CORS policy on these calls, the same one their preflight got
 (`cors.grpc_web`, on by default); a gRPC-Web client reads `grpc-status`,
-`grpc-message` and `grpc-status-details-bin`, which are always exposed.
+`grpc-message` and `grpc-status-details-bin`, which are always exposed. A
+browser's preflight for a gRPC-Web call (one announcing `x-grpc-web`) goes
+where the call goes: the proxy answers it under that policy, a fallback never
+sees it, and with `cors.grpc_web: false` it reaches the upstream, whose own
+CORS policy then covers preflight and call alike.
 
 **Deadlines.** Every call waits at most five seconds for the upstream's
 response headers, or less when the client's `grpc-timeout` says so; after that

@@ -1019,9 +1019,9 @@ pub struct CorsConfig {
     #[serde(default)]
     pub max_age_secs: Option<u64>,
     /// Apply this policy to gRPC-Web calls that pass through to the upstream
-    /// too, so a browser's call carries the policy its preflight got (on by
-    /// default). Off only for an upstream that sets CORS on its gRPC-Web
-    /// answers itself, where two policies would clash.
+    /// and to their preflights, so a browser gets one policy for both (on by
+    /// default). Off only for an upstream that sets CORS on gRPC-Web itself:
+    /// its preflights then reach the upstream as well.
     #[serde(default = "default_true")]
     pub grpc_web: bool,
 }

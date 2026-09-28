@@ -25,7 +25,9 @@ use tower_http::cors::{Cors, CorsLayer};
 pub type TlsConnectInfo =
     <tokio_rustls::server::TlsStream<tokio::net::TcpStream> as Connected>::ConnectInfo;
 
-use crate::upstream::{grpc_protocol, BoxError, GrpcProtocol, PassThrough, Upstream};
+use crate::upstream::{
+    grpc_protocol, is_grpc_web_preflight, BoxError, GrpcProtocol, PassThrough, Upstream,
+};
 
 /// The proxy as a tower service, built by
 /// [`ProxyServer::service`](crate::ProxyServer::service).
@@ -187,7 +189,8 @@ impl<U: Upstream> ProxyService<U> {
     /// tower service. The proxy's middleware does not see them.
     ///
     /// A request whose path a route answers but not with its method stays with
-    /// the proxy (`405`), as does every gRPC request.
+    /// the proxy (`405`), as does every gRPC request and every browser
+    /// preflight for a gRPC-Web call, which follows the call it announces.
     #[must_use]
     pub fn with_fallback<F>(mut self, fallback: F) -> Self
     where
@@ -272,7 +275,13 @@ where
     }
 
     fn call(&mut self, mut request: http::Request<B>) -> Self::Future {
-        let inner = if let Some(protocol) = grpc_protocol(request.headers()) {
+        // A gRPC-Web preflight goes where the call it announces goes, so both
+        // get one CORS policy: the proxy's, or the upstream's when it owns
+        // CORS. A fallback in between would answer it with neither.
+        let protocol = grpc_protocol(request.headers()).or_else(|| {
+            is_grpc_web_preflight(request.method(), request.headers()).then_some(GrpcProtocol::Web)
+        });
+        let inner = if let Some(protocol) = protocol {
             // A native call carries its connection the way tonic's server
             // hands it to a handler.
             if let Some(connection) = self.connection_of(&request) {
