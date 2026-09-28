@@ -93,6 +93,79 @@ pub struct ProxyConfig {
     /// How gRPC-Web calls reach the upstream.
     #[serde(default)]
     pub grpc_web: GrpcWebConfig,
+
+    /// Which annotated RPCs are transcoded.
+    #[serde(default)]
+    pub transcode: TranscodeConfig,
+}
+
+impl Default for ProxyConfig {
+    /// The configuration of an empty YAML file: health and metrics endpoints
+    /// on, everything else off.
+    fn default() -> Self {
+        Self {
+            upstream: None,
+            descriptors: Vec::new(),
+            listen: ListenConfig::default(),
+            service: ServiceConfig::default(),
+            aliases: Vec::new(),
+            openapi: None,
+            auth: None,
+            shield: None,
+            oidc_discovery: None,
+            health: HealthConfig::default(),
+            metrics: MetricsConfig::default(),
+            maintenance: MaintenanceConfig::default(),
+            cors: CorsConfig::default(),
+            logging: LoggingConfig::default(),
+            metrics_classes: Vec::new(),
+            forwarded_headers: default_forwarded_headers(),
+            streaming: StreamingConfig::default(),
+            concurrency: None,
+            grpc_web: GrpcWebConfig::default(),
+            transcode: TranscodeConfig::default(),
+        }
+    }
+}
+
+/// Which annotated RPCs are transcoded.
+///
+/// ```yaml
+/// transcode:
+///   only: ["acme.v1.Orders", "acme.v1.Users/GetUser"]
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TranscodeConfig {
+    /// Services (`package.Service`) and single methods
+    /// (`package.Service/Method`) whose `google.api.http` rules become REST
+    /// routes; empty transcodes every annotated RPC. A name the descriptors do
+    /// not hold stops the proxy at startup.
+    #[serde(default)]
+    pub only: Vec<String>,
+}
+
+/// One config section from YAML, the way the config file reads it: for the
+/// sections an embedder hands to a builder method, such as
+/// [`ProxyServer::with_rate_limits`](crate::ProxyServer::with_rate_limits).
+///
+/// # Errors
+///
+/// YAML that is not that section.
+///
+/// # Examples
+///
+/// ```
+/// use structured_proxy::config::{self, ShieldConfig};
+///
+/// let shield: ShieldConfig = config::from_yaml(
+///     "enabled: true\nprofiles:\n  anon: { rate: \"60/min\" }\nrules:\n  - pattern: \"/**\"\n    key: { type: ip }\n    profile: anon\n",
+/// )
+/// .unwrap();
+/// assert!(shield.enabled);
+/// ```
+pub fn from_yaml<T: serde::de::DeserializeOwned>(yaml: &str) -> anyhow::Result<T> {
+    Ok(serde_yaml::from_str(yaml)?)
 }
 
 /// How gRPC-Web calls reach the upstream.
@@ -253,6 +326,7 @@ pub(crate) const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "runtime",
     "concurrency",
     "grpc_web",
+    "transcode",
 ];
 
 /// Every `streaming:` key: the [`StreamingConfig`] fields plus the ones

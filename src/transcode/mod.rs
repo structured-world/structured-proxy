@@ -17,6 +17,9 @@ pub mod metadata;
 pub mod request;
 pub(crate) mod response;
 pub(crate) mod rule;
+mod select;
+
+pub use select::RpcSelection;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, RawQuery, State};
@@ -174,9 +177,17 @@ pub struct TranscodeOptions {
     pub(crate) error_details: ErrorDetailsPolicy,
     pub(crate) ndjson_envelope: bool,
     pub(crate) denied_response_headers: Arc<[HeaderName]>,
+    pub(crate) selection: RpcSelection,
 }
 
 impl TranscodeOptions {
+    /// Transcode only the RPCs `selection` names (every annotated one by
+    /// default).
+    pub fn with_selection(mut self, selection: RpcSelection) -> Self {
+        self.selection = selection;
+        self
+    }
+
     /// Which routes return `google.rpc.Status` details in their error bodies
     /// (all of them by default).
     pub fn with_error_details(mut self, policy: ErrorDetailsPolicy) -> Self {
@@ -230,7 +241,7 @@ pub fn routes_with_options<S: TranscodeState>(
     aliases: &[AliasConfig],
     options: &TranscodeOptions,
 ) -> Router<S> {
-    let bindings = route_bindings(pool, aliases);
+    let bindings = route_bindings(pool, aliases, &options.selection);
     if bindings.is_empty() {
         tracing::warn!("No HTTP-annotated RPCs found in proto descriptors");
         return Router::new();
@@ -392,9 +403,13 @@ struct RouteBinding {
 /// [`routes`] (to build handlers) and [`route_paths`] (to enumerate paths for
 /// collision checks) consume this, so the mounted set and the enumerated set
 /// cannot drift apart.
-fn route_bindings(pool: &DescriptorPool, aliases: &[AliasConfig]) -> Vec<RouteBinding> {
+fn route_bindings(
+    pool: &DescriptorPool,
+    aliases: &[AliasConfig],
+    selection: &RpcSelection,
+) -> Vec<RouteBinding> {
     let mut bindings = Vec::new();
-    for entry in extract_routes(pool) {
+    for entry in extract_routes(pool, selection) {
         for alias in aliases {
             if let Some(suffix) = entry.http_path.strip_prefix(&alias.to) {
                 if alias.from.ends_with("/{path}") {
@@ -414,9 +429,10 @@ fn route_bindings(pool: &DescriptorPool, aliases: &[AliasConfig]) -> Vec<RouteBi
     bindings
 }
 
-/// The axum paths [`routes`] would register for this pool and aliases.
+/// The axum paths [`routes_with_options`] would register for this pool,
+/// aliases and selection.
 ///
-/// Mirrors the registration in [`routes`] (every binding of every unary and
+/// Mirrors the registration (every binding of every selected unary and
 /// server-streaming RPC, and their config aliases) without building handlers,
 /// so callers can detect route collisions before mounting additional routes
 /// (e.g. a forward-auth endpoint).
@@ -424,8 +440,12 @@ fn route_bindings(pool: &DescriptorPool, aliases: &[AliasConfig]) -> Vec<RouteBi
 /// Each entry is `(method, path)` where `method` is the uppercase HTTP token,
 /// or `*` for a `custom` rule that answers every method, so callers can
 /// distinguish same-path/different-method routes from real conflicts.
-pub fn route_paths(pool: &DescriptorPool, aliases: &[AliasConfig]) -> Vec<(String, String)> {
-    route_bindings(pool, aliases)
+pub fn route_paths(
+    pool: &DescriptorPool,
+    aliases: &[AliasConfig],
+    selection: &RpcSelection,
+) -> Vec<(String, String)> {
+    route_bindings(pool, aliases, selection)
         .into_iter()
         .map(|b| (b.entry.http_method.as_str().to_string(), b.axum_path))
         .collect()
@@ -1089,9 +1109,9 @@ fn request_content_type(headers: &HeaderMap) -> Result<String, String> {
     }
 }
 
-/// Extract the route entries of every HTTP binding of every unary and
-/// server-streaming RPC. Client-streaming RPCs have no HTTP mapping.
-fn extract_routes(pool: &DescriptorPool) -> Vec<RouteEntry> {
+/// Extract the route entries of every HTTP binding of every selected unary
+/// and server-streaming RPC. Client-streaming RPCs have no HTTP mapping.
+fn extract_routes(pool: &DescriptorPool, selection: &RpcSelection) -> Vec<RouteEntry> {
     let http_ext = match pool.get_extension_by_name("google.api.http") {
         Some(ext) => ext,
         None => {
@@ -1104,7 +1124,7 @@ fn extract_routes(pool: &DescriptorPool) -> Vec<RouteEntry> {
 
     for service in pool.services() {
         for method in service.methods() {
-            if method.is_client_streaming() {
+            if method.is_client_streaming() || !selection.selects(&method) {
                 continue;
             }
 

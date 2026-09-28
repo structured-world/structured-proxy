@@ -460,6 +460,103 @@ async fn translating_proxy(upstream: common::Upstream, extra_yaml: &str) -> comm
     .await
 }
 
+// --- the capability builder ------------------------------------------------------
+
+/// Send a native gRPC `Echo` through `app`; returns the gRPC status code.
+async fn grpc_echo_status(app: common::App) -> String {
+    let request = http::Request::post("/test.v1.Edge/Echo")
+        .version(http::Version::HTTP_2)
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(Body::from(request_frame("native")))
+        .unwrap();
+    let response = tower::ServiceExt::oneshot(app, request).await.unwrap();
+    let (parts, body) = response.into_parts();
+    if let Some(status) = parts.headers.get("grpc-status") {
+        return status.to_str().unwrap().to_owned();
+    }
+    let collected = http_body_util::BodyExt::collect(body).await.unwrap();
+    collected.trailers().unwrap()["grpc-status"]
+        .to_str()
+        .unwrap()
+        .to_owned()
+}
+
+#[tokio::test]
+async fn a_new_proxy_passes_everything_through() {
+    // Nothing on: no transcoding, no health or metrics endpoints; native gRPC
+    // reaches the upstream and REST the fallback.
+    let fallback = axum::Router::new().fallback(|| async { (StatusCode::IM_A_TEAPOT, "yours") });
+    let service = ProxyServer::new()
+        .service(tonic::service::Routes::new(Edge { pool: pool() }))
+        .unwrap()
+        .with_fallback(fallback);
+    let app = common::App::new(service);
+    for path in ["/v1/echo/a", "/health", "/metrics"] {
+        let (status, body) =
+            common::send(&app, http::Request::get(path).body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::IM_A_TEAPOT, "{path}");
+        assert_eq!(body, "yours");
+    }
+    assert_eq!(grpc_echo_status(app).await, "0");
+}
+
+#[tokio::test]
+async fn only_the_selected_rpcs_are_transcoded() {
+    // `Hang` never answers: were it transcoded, its route would hang.
+    let service = ProxyServer::new()
+        .with_descriptors(pool())
+        .with_transcoded_rpcs(["test.v1.Edge/Echo"])
+        .service(tonic::service::Routes::new(Edge { pool: pool() }))
+        .unwrap();
+    let app = common::App::new(service);
+    let (status, seen) = get(&app, "/v1/echo/a", &[]).await;
+    assert_eq!(status, StatusCode::OK, "{seen}");
+    let (status, _) = common::send(
+        &app,
+        http::Request::get("/v1/hang").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[test]
+fn a_selection_the_descriptors_do_not_hold_fails_the_build() {
+    let server = ProxyServer::new()
+        .with_descriptors(pool())
+        .with_transcoded_rpcs(["test.v1.Edge/Missing"]);
+    let Err(err) = server.service(tonic::service::Routes::default()) else {
+        panic!("an unknown RPC must be refused");
+    };
+    assert!(err.to_string().contains("transcode.only"), "{err}");
+}
+
+#[tokio::test]
+async fn a_builder_section_behaves_as_its_yaml() {
+    let maintenance =
+        structured_proxy::config::from_yaml("enabled: true\nmessage: down\n").unwrap();
+    let service = ProxyServer::new()
+        .with_descriptors(pool())
+        .with_maintenance(maintenance)
+        .service(tonic::service::Routes::new(Edge { pool: pool() }))
+        .unwrap();
+    let (status, body) = get(&common::App::new(service), "/v1/echo/a", &[]).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["message"], "down");
+}
+
+#[tokio::test]
+async fn a_new_proxy_reaches_a_remote_upstream_by_address() {
+    let url = common::serve(Edge { pool: pool() }).await;
+    let server = ProxyServer::new()
+        .with_descriptors(pool())
+        .with_upstream_address(url);
+    let app = common::App::new(server.service(server.upstream().unwrap()).unwrap());
+    let (status, seen) = get(&app, "/v1/echo/remote", &[]).await;
+    assert_eq!(status, StatusCode::OK, "{seen}");
+    assert_eq!(seen["name"], "remote");
+}
+
 #[test]
 fn translation_needs_the_proxys_grpc_web_cors() {
     // The upstream cannot answer the preflight of a call it cannot read.

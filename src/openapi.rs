@@ -14,6 +14,7 @@ use crate::config::{AliasConfig, OpenApiConfig};
 use crate::transcode::httpbody;
 use crate::transcode::request::BodyMapping;
 use crate::transcode::rule::{self, HttpBinding, RouteMethod};
+use crate::transcode::RpcSelection;
 
 /// The operations an OpenAPI 3.0 path item can hold, in the order a `*` rule
 /// lists them.
@@ -21,8 +22,14 @@ const OPERATIONS: [&str; 8] = [
     "get", "put", "post", "delete", "options", "head", "patch", "trace",
 ];
 
-/// Generate OpenAPI 3.0 JSON spec from a descriptor pool.
-pub fn generate(pool: &DescriptorPool, config: &OpenApiConfig, aliases: &[AliasConfig]) -> Value {
+/// Generate OpenAPI 3.0 JSON spec from a descriptor pool: the RPCs
+/// `selection` transcodes, and their services as tags.
+pub fn generate(
+    pool: &DescriptorPool,
+    config: &OpenApiConfig,
+    aliases: &[AliasConfig],
+    selection: &RpcSelection,
+) -> Value {
     let title = config.title.as_deref().unwrap_or("API");
     let version = config.version.as_deref().unwrap_or("1.0.0");
 
@@ -33,6 +40,9 @@ pub fn generate(pool: &DescriptorPool, config: &OpenApiConfig, aliases: &[AliasC
     let http_ext = pool.get_extension_by_name("google.api.http");
 
     for service in pool.services() {
+        if !selection.is_all() && !service.methods().any(|m| selection.selects(&m)) {
+            continue;
+        }
         let service_name = service.name().to_string();
         let service_full = service.full_name().to_string();
 
@@ -48,8 +58,9 @@ pub fn generate(pool: &DescriptorPool, config: &OpenApiConfig, aliases: &[AliasC
             continue;
         };
         for method in service.methods() {
-            if method.is_client_streaming() {
-                continue; // No REST mapping for client-streaming.
+            // No REST mapping for client-streaming.
+            if method.is_client_streaming() || !selection.selects(&method) {
+                continue;
             }
 
             for binding in rule::http_bindings(&method, http_ext) {

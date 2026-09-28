@@ -124,6 +124,13 @@ pub struct ProxyServer {
     transcode: transcode::TranscodeOptions,
 }
 
+impl Default for ProxyServer {
+    /// [`ProxyServer::new`]: every capability off.
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProxyServer {
     /// Create from YAML config file.
     pub fn from_config(config: ProxyConfig) -> Self {
@@ -191,6 +198,150 @@ impl ProxyServer {
     /// The configuration this server was created with.
     pub fn config(&self) -> &ProxyConfig {
         &self.config
+    }
+
+    /// A proxy with every capability off: native gRPC and gRPC-Web pass to
+    /// the upstream, every other request to the fallback (`404` by default).
+    /// Turn on what you need with the methods below; each sets the config
+    /// section of the same name, so code and YAML describe one proxy.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use structured_proxy::config::{ConcurrencyConfig, ScopeConfig, Traffic};
+    /// use structured_proxy::ProxyServer;
+    ///
+    /// # fn build() -> anyhow::Result<()> {
+    /// // Your gRPC API, with at most 1000 calls in flight and nothing else.
+    /// let grpc = tonic::service::Routes::default();
+    /// let service = ProxyServer::new()
+    ///     .with_concurrency_limit(ConcurrencyConfig {
+    ///         max_in_flight: 1000,
+    ///         scope: Some(ScopeConfig::traffic([Traffic::Grpc])),
+    ///     })
+    ///     .service(grpc)?;
+    /// # let _ = service;
+    /// # Ok(())
+    /// # }
+    /// # build().unwrap();
+    /// ```
+    pub fn new() -> Self {
+        let mut config = ProxyConfig::default();
+        config.health.enabled = false;
+        config.metrics.enabled = false;
+        Self::from_config(config)
+    }
+
+    /// The remote gRPC upstream (`upstream.default`), for
+    /// [`upstream`](Self::upstream) and [`serve`](Self::serve).
+    pub fn with_upstream_address(mut self, address: impl Into<String>) -> Self {
+        self.config.upstream = Some(config::UpstreamConfig {
+            default: address.into(),
+        });
+        self
+    }
+
+    /// The listener of [`serve`](Self::serve): address, TLS, connection
+    /// limit (`listen:`).
+    pub fn with_listen(mut self, listen: config::ListenConfig) -> Self {
+        self.config.listen = listen;
+        self
+    }
+
+    /// Transcode only these services (`package.Service`) and methods
+    /// (`package.Service/Method`) of the descriptors (`transcode.only`); every
+    /// annotated RPC by default. A name the descriptors do not hold fails the
+    /// build.
+    pub fn with_transcoded_rpcs(
+        mut self,
+        names: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.config.transcode.only = names.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Path aliases rewritten before routing (`aliases:`).
+    pub fn with_aliases(mut self, aliases: impl IntoIterator<Item = config::AliasConfig>) -> Self {
+        self.config.aliases = aliases.into_iter().collect();
+        self
+    }
+
+    /// The request headers transcoded calls forward as gRPC metadata
+    /// (`forwarded_headers:`), replacing the default list.
+    pub fn with_forwarded_headers(
+        mut self,
+        names: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.config.forwarded_headers = names.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Health probe endpoints (`health:`).
+    pub fn with_health(mut self, health: config::HealthConfig) -> Self {
+        self.config.health = health;
+        self
+    }
+
+    /// The Prometheus metrics endpoint (`metrics:`).
+    pub fn with_metrics(mut self, metrics: config::MetricsConfig) -> Self {
+        self.config.metrics = metrics;
+        self
+    }
+
+    /// The OpenAPI spec and docs endpoints (`openapi:`).
+    pub fn with_openapi(mut self, openapi: config::OpenApiConfig) -> Self {
+        self.config.openapi = Some(openapi);
+        self
+    }
+
+    /// Static OIDC discovery and JWKS endpoints (`oidc_discovery:`).
+    pub fn with_oidc_discovery(mut self, oidc: config::OidcDiscoveryConfig) -> Self {
+        self.config.oidc_discovery = Some(oidc);
+        self
+    }
+
+    /// The CORS policy (`cors:`).
+    pub fn with_cors(mut self, cors: config::CorsConfig) -> Self {
+        self.config.cors = cors;
+        self
+    }
+
+    /// Translate gRPC-Web to gRPC for an upstream that speaks only gRPC
+    /// (`grpc_web.translate`).
+    pub fn with_grpc_web_translation(mut self, translate: bool) -> Self {
+        self.config.grpc_web.translate = translate;
+        self
+    }
+
+    /// Server-streaming behavior (`streaming:`).
+    pub fn with_streaming(mut self, streaming: config::StreamingConfig) -> Self {
+        self.config.streaming = streaming;
+        self
+    }
+
+    /// Maintenance mode (`maintenance:`).
+    pub fn with_maintenance(mut self, maintenance: config::MaintenanceConfig) -> Self {
+        self.config.maintenance = maintenance;
+        self
+    }
+
+    /// The limit on requests in flight (`concurrency:`).
+    pub fn with_concurrency_limit(mut self, concurrency: config::ConcurrencyConfig) -> Self {
+        self.config.concurrency = Some(concurrency);
+        self
+    }
+
+    /// Rate limits (`shield:`); build the section with [`config::from_yaml`].
+    pub fn with_rate_limits(mut self, shield: config::ShieldConfig) -> Self {
+        self.config.shield = Some(shield);
+        self
+    }
+
+    /// JWT auth, route policies, forward-auth and ext_authz (`auth:`); build
+    /// the section with [`config::from_yaml`].
+    pub fn with_auth(mut self, auth: config::AuthConfig) -> Self {
+        self.config.auth = Some(auth);
+        self
     }
 
     /// Create with an embedded descriptor pool (for sid-proxy backward compat).
@@ -398,7 +549,11 @@ impl ProxyServer {
     /// surface (injected backend or config-driven static discovery), embedder
     /// extra routes, and the transcoded REST routes. All built-in surfaces here
     /// are `GET`.
-    fn reserved_routes(&self, pool: &DescriptorPool) -> anyhow::Result<Vec<(String, String)>> {
+    fn reserved_routes(
+        &self,
+        pool: &DescriptorPool,
+        selection: &transcode::RpcSelection,
+    ) -> anyhow::Result<Vec<(String, String)>> {
         let mut routes = Vec::new();
         let mut get = |path: String| routes.push(("GET".to_string(), path));
         if self.config.health.enabled {
@@ -433,7 +588,11 @@ impl ProxyServer {
         for route in &self.extra_routes {
             routes.push((route.method.as_str().to_string(), route.path.clone()));
         }
-        routes.extend(transcode::route_paths(pool, &self.config.aliases));
+        routes.extend(transcode::route_paths(
+            pool,
+            &self.config.aliases,
+            selection,
+        ));
         Ok(routes)
     }
 
@@ -524,6 +683,8 @@ impl ProxyServer {
         // config is built directly instead of through `from_yaml_str`.
         self.config.validate()?;
         let pool = self.load_descriptors()?;
+        let selection = transcode::RpcSelection::new(&pool, &self.config.transcode.only)
+            .map_err(|e| anyhow::anyhow!("invalid transcode.only: {e}"))?;
 
         let service_name = self.config.service.name.clone();
 
@@ -538,7 +699,7 @@ impl ProxyServer {
         // routes with different methods are legal (they merge), so only a
         // repeated (method, path) — or any overlap with the verify endpoint,
         // which answers ALL methods (`*`) — is a real conflict.
-        let mut mounted = self.reserved_routes(&pool)?;
+        let mut mounted = self.reserved_routes(&pool, &selection)?;
         if let Some(vp) = &verify_path {
             mounted.push(("*".to_string(), vp.clone()));
         }
@@ -611,8 +772,11 @@ impl ProxyServer {
         let cors = self.build_cors()?;
 
         // Build transcoding routes from descriptor pool.
-        let transcode_routes =
-            transcode::routes_with_options(&pool, &self.config.aliases, &self.transcode);
+        let transcode_routes = transcode::routes_with_options(
+            &pool,
+            &self.config.aliases,
+            &self.transcode.clone().with_selection(selection.clone()),
+        );
 
         // JWT auth, if configured (auth.mode == "jwt").
         let auth = match &self.config.auth {
@@ -704,7 +868,7 @@ impl ProxyServer {
         };
 
         // OpenAPI + docs routes (if enabled).
-        let openapi_routes = self.build_openapi_routes(&pool);
+        let openapi_routes = self.build_openapi_routes(&pool, &selection);
 
         // OIDC routes (public, like the health endpoints). An injected
         // OidcBackend supersedes the config-driven static discovery: the proxy
@@ -848,7 +1012,11 @@ impl ProxyServer {
         Ok(guards)
     }
 
-    fn build_openapi_routes<S>(&self, pool: &DescriptorPool) -> Router<S>
+    fn build_openapi_routes<S>(
+        &self,
+        pool: &DescriptorPool,
+        selection: &transcode::RpcSelection,
+    ) -> Router<S>
     where
         S: Clone + Send + Sync + 'static,
     {
@@ -857,7 +1025,7 @@ impl ProxyServer {
             _ => return Router::new(),
         };
 
-        let spec = openapi::generate(pool, openapi_config, &self.config.aliases);
+        let spec = openapi::generate(pool, openapi_config, &self.config.aliases, selection);
         let spec_json = serde_json::to_string_pretty(&spec).unwrap_or_default();
         let openapi_path = openapi_config.path.clone();
         let docs_path = openapi_config.docs_path.clone();

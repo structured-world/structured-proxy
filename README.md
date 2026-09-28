@@ -57,6 +57,8 @@ tonic services.
 
 - Your own tonic services as the upstream, called in process
   ([Library Usage](#library-usage))
+- A builder that starts as a plain pass-through and turns on only the
+  capabilities you ask for ([Building the proxy in code](#building-the-proxy-in-code))
 - Requests the proxy does not serve go to your own fallback service
 - Hooks for auth decisions, token verification, OIDC and extra routes, with no
   HTTP framework in your code
@@ -145,6 +147,11 @@ cors:
 # through for the upstream to answer. Needs cors.grpc_web.
 grpc_web:
   translate: false
+
+# Optional: transcode only these services and methods; every annotated RPC
+# by default. A name the descriptors do not hold stops the proxy at startup.
+transcode:
+  only: ["my.package.v1.MyService", "my.package.v1.Admin/GetStatus"]
 
 # Optional: path aliases (rewrite before routing)
 aliases:
@@ -761,6 +768,44 @@ structured_proxy::serve(listener, proxy).await?;
 `tonic::transport::Channel` (what `ProxyServer::upstream` builds from the
 config), or anything else that speaks gRPC over `http` types. The result is a
 tower service, so it can also run on a server of your own.
+
+### Building the proxy in code
+
+`ProxyServer::new()` starts with every capability off: native gRPC goes to the
+upstream, every other request to your fallback. Turn on only what you need;
+each method sets the config section of the same name, so a proxy built in code
+and one read from YAML behave the same:
+
+```rust
+use structured_proxy::config::{self, ConcurrencyConfig, ScopeConfig, Traffic};
+use structured_proxy::ProxyServer;
+
+# fn build(pool: prost_reflect::DescriptorPool, grpc: tonic::service::Routes) -> anyhow::Result<()> {
+let service = ProxyServer::new()
+    // REST for two RPCs of your API.
+    .with_descriptors(pool)
+    .with_transcoded_rpcs(["acme.v1.Orders/GetOrder", "acme.v1.Orders/ListOrders"])
+    // At most 1000 native gRPC calls in flight.
+    .with_concurrency_limit(ConcurrencyConfig {
+        max_in_flight: 1000,
+        scope: Some(ScopeConfig::traffic([Traffic::Grpc])),
+    })
+    // Sections with many options come from YAML, the file's own syntax.
+    .with_rate_limits(config::from_yaml(
+        "enabled: true\nprofiles:\n  anon: { rate: \"600/min\" }\nrules:\n  - pattern: \"/**\"\n    key: { type: ip }\n    profile: anon\n",
+    )?)
+    .service(grpc)?;
+# let _ = service;
+# Ok(())
+# }
+```
+
+The methods are `with_upstream_address`, `with_listen`, `with_descriptors`,
+`with_transcoded_rpcs`, `with_aliases`, `with_forwarded_headers`,
+`with_health`, `with_metrics`, `with_openapi`, `with_oidc_discovery`,
+`with_cors`, `with_grpc_web_translation`, `with_streaming`,
+`with_maintenance`, `with_concurrency_limit`, `with_rate_limits` and
+`with_auth`, next to the hooks below.
 
 ### TLS and connection limits
 
