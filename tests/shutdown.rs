@@ -289,10 +289,18 @@ async fn read_until_closed(io: &mut (impl AsyncRead + Unpin)) -> Vec<u8> {
 }
 
 async fn get(channel: &tonic::transport::Channel, path: &str) -> http::Response<tonic::body::Body> {
+    send(channel, path).await.unwrap()
+}
+
+/// A call the server is expected to cut off: its outcome is left to the case.
+async fn send(
+    channel: &tonic::transport::Channel,
+    path: &str,
+) -> Result<http::Response<tonic::body::Body>, tonic::transport::Error> {
     let request = http::Request::get(path)
         .body(tonic::body::Body::empty())
         .unwrap();
-    channel.clone().oneshot(request).await.unwrap()
+    channel.clone().oneshot(request).await
 }
 
 #[tokio::test]
@@ -458,6 +466,29 @@ async fn the_drain_timeout_closes_connections_still_busy() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_drain_timeout_ends_http2_handlers_before_returning() {
+    // HTTP/2 serves each stream in a task of its own: when the serve future
+    // resolves, those have ended too, not only their connections.
+    for setup in SETUPS {
+        let mut proxy = Proxy::start(setup, |options| {
+            options.drain_timeout(Some(Duration::from_millis(300)))
+        })
+        .await;
+        let channel = proxy.channel().await;
+        let call = tokio::spawn(async move { send(&channel, "/hang").await });
+        proxy.entered(1).await;
+
+        proxy.signal();
+        proxy.served().await;
+        assert!(
+            proxy.dropped.try_recv().is_ok(),
+            "{setup:?}: a handler outlived serve_with_shutdown"
+        );
+        call.abort();
+    }
+}
+
 #[tokio::test]
 async fn dropping_the_serve_future_ends_every_connection_and_handler() {
     // Unlimited: this case opens two connections.
@@ -469,7 +500,7 @@ async fn dropping_the_serve_future_ends_every_connection_and_handler() {
             .await
             .unwrap();
         let channel = proxy.channel().await;
-        let http2 = tokio::spawn(async move { get(&channel, "/hang").await });
+        let http2 = tokio::spawn(async move { send(&channel, "/hang").await });
         proxy.entered(2).await;
 
         proxy.served.abort();

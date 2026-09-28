@@ -51,6 +51,11 @@ pin-project-lite = "0.2"
 # `serve_with`'s connections: HTTP/1.1 and HTTP/2 on one port, over TCP or
 # TLS. Already in the tree through axum and tonic.
 hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "service", "tokio"] }
+# The executor HTTP/2 connections spawn their stream tasks on: a
+# `TaskTracker` a shutdown waits on. Both already in the tree through
+# hyper-util and tonic.
+hyper = "1"
+tokio-util = { version = "0.7", features = ["rt"] }
 
 # gRPC client (to upstream service). `tls-connect-info` gives a rustls server
 # stream the connection record (client certificates) a tonic handler reads, so

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder;
 use hyper_util::server::graceful::GracefulConnection;
 use hyper_util::service::TowerToHyperService;
@@ -256,35 +256,41 @@ where
     // own tasks, so dropping it ends them too.
     let (stop, stopping) = watch::channel(false);
     let mut connections = JoinSet::new();
+    let streams = StreamExecutor::default();
     tokio::pin!(signal);
-    loop {
-        // Finished connections leave the set, which holds only open ones.
-        while connections.try_join_next().is_some() {}
+    // Every wait below also reaps finished connections, so the set holds only
+    // open ones even while no client arrives.
+    'serve: loop {
         // The slot is taken before the accept, so a full server leaves new
         // connections in the kernel's backlog instead of accepting and
         // dropping them.
-        let slot = tokio::select! {
-            biased;
-            () = &mut signal => break,
-            slot = take_slot(slots.as_ref()) => slot,
+        let slot = loop {
+            tokio::select! {
+                biased;
+                () = &mut signal => break 'serve,
+                Some(_) = connections.join_next() => {}
+                slot = take_slot(slots.as_ref()) => break slot,
+            }
         };
-        let tcp = tokio::select! {
-            biased;
-            () = &mut signal => break,
-            accepted = listener.accept() => match accepted {
-                Ok((tcp, _)) => tcp,
-                Err(error) => {
-                    tokio::select! {
+        let tcp = loop {
+            tokio::select! {
+                biased;
+                () = &mut signal => break 'serve,
+                Some(_) = connections.join_next() => {}
+                accepted = listener.accept() => match accepted {
+                    Ok((tcp, _)) => break tcp,
+                    Err(error) => tokio::select! {
                         biased;
-                        () = &mut signal => break,
-                        () = accept_failed(error) => continue,
-                    }
-                }
-            },
+                        () = &mut signal => break 'serve,
+                        () = accept_failed(error) => {}
+                    },
+                },
+            }
         };
         let service = service.clone();
         let acceptor = acceptor.clone();
         let stopping = stopping.clone();
+        let streams = streams.clone();
         connections.spawn(async move {
             // Small gRPC frames and REST answers are latency-bound.
             if let Err(error) = tcp.set_nodelay(true) {
@@ -293,7 +299,8 @@ where
             match acceptor {
                 None => {
                     let service = service.for_connection(tcp.connect_info());
-                    serve_connection(SlotIo { io: tcp, slot }, service, limits, stopping).await;
+                    let io = SlotIo { io: tcp, slot };
+                    serve_connection(io, service, limits, streams, stopping).await;
                 }
                 Some(acceptor) => {
                     // The slot is held through the handshake, then by the
@@ -316,7 +323,8 @@ where
                     };
                     let service =
                         service.for_connection(ConnectionInfo::tls(stream.connect_info()));
-                    serve_connection(SlotIo { io: stream, slot }, service, limits, stopping).await;
+                    let io = SlotIo { io: stream, slot };
+                    serve_connection(io, service, limits, streams, stopping).await;
                 }
             }
         });
@@ -325,7 +333,11 @@ where
     // open connections wind down.
     drop(listener);
     stop.send_replace(true);
-    let drained = async { while connections.join_next().await.is_some() {} };
+    streams.0.close();
+    let drained = async {
+        while connections.join_next().await.is_some() {}
+        streams.0.wait().await;
+    };
     match options.drain_timeout {
         None => drained.await,
         Some(timeout) => {
@@ -335,10 +347,29 @@ where
                     "shutdown drain timed out; closing the connections still open"
                 );
                 connections.shutdown().await;
+                // A closed HTTP/2 connection resets its streams, which ends
+                // their tasks; they are awaited so none outlives this future.
+                streams.0.wait().await;
             }
         }
     }
     Ok(())
+}
+
+/// Spawns the stream tasks of HTTP/2 connections (hyper runs each stream's
+/// service in a task of its own) under one tracker, so a shutdown can wait
+/// for them as it does for the connections.
+#[derive(Clone, Default)]
+struct StreamExecutor(tokio_util::task::TaskTracker);
+
+impl<F> hyper::rt::Executor<F> for StreamExecutor
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    fn execute(&self, future: F) {
+        self.0.spawn(future);
+    }
 }
 
 /// A `max_connections` slot, or none without a limit.
@@ -431,12 +462,13 @@ async fn serve_connection<U, I>(
     io: I,
     service: ProxyService<U>,
     limits: ConnectionLimits,
+    streams: StreamExecutor,
     stopping: watch::Receiver<bool>,
 ) where
     U: Upstream,
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let mut builder = Builder::new(TokioExecutor::new());
+    let mut builder = Builder::new(streams);
     // hyper times nothing without a timer: its own default header read
     // timeout is dropped with a warning.
     builder
