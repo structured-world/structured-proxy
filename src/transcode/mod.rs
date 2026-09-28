@@ -560,8 +560,7 @@ async fn handle<S: TranscodeState>(
         raw_query.as_deref(),
         body,
         &entry,
-    )
-    .await;
+    );
     let call = match prepared {
         Ok(call) => call,
         Err(rejection) => return rejection.into_response(&entry),
@@ -573,45 +572,54 @@ async fn handle<S: TranscodeState>(
     }
 }
 
-/// Why a request ends before the upstream is called.
-enum Rejection {
-    /// It cannot be mapped onto the RPC (`INVALID_ARGUMENT`, 400).
-    Unmappable(String),
-    /// The upstream channel is not ready (`UNAVAILABLE`, 503).
-    NotReady(String),
-}
+/// Why a request ends before the upstream is called: it cannot be mapped onto
+/// the RPC (`INVALID_ARGUMENT`, 400).
+struct Unmappable(String);
 
-impl Rejection {
+impl Unmappable {
     /// The answer, in the error body the upstream's own errors get on the route.
     fn into_response(self, entry: &RouteEntry) -> Response {
-        let status = match self {
-            Self::Unmappable(message) => tonic::Status::invalid_argument(message),
-            Self::NotReady(message) => tonic::Status::unavailable(message),
-        };
+        let status = tonic::Status::invalid_argument(self.0);
         error::status_to_response_with_details(&status, entry.error_details.as_deref())
     }
 }
 
-/// A call ready to be made: a client whose upstream is ready, the request, and
-/// how long the upstream may take to answer it.
+/// A call ready to be made: the upstream, the request, and how long the
+/// upstream may take to answer it.
 struct Call<U> {
-    client: Grpc<U>,
+    upstream: U,
     request: tonic::Request<DynamicMessage>,
     deadline: Duration,
 }
 
 impl<U: Upstream> Call<U> {
-    /// Start the call and wait for the upstream's response headers, within
-    /// the deadline. Every upstream gets the same deadline here, in process or
-    /// remote, rather than whatever its transport enforces.
+    /// Wait for the upstream to take the call, start it, and wait for its
+    /// response headers, all within the one deadline: an upstream under
+    /// backpressure that never frees a slot answers `DEADLINE_EXCEEDED` like
+    /// one that never answers. Every upstream gets the same deadline here, in
+    /// process or remote, rather than whatever its transport enforces.
     async fn open(
-        mut self,
+        self,
         entry: &RouteEntry,
     ) -> Result<tonic::Response<tonic::Streaming<DynamicMessage>>, tonic::Status> {
-        let call =
-            self.client
-                .server_streaming(self.request, entry.grpc_path.clone(), entry.codec());
-        match tokio::time::timeout(self.deadline, call).await {
+        let Self {
+            upstream,
+            request,
+            deadline,
+        } = self;
+        let call = async move {
+            let mut client = Grpc::new(upstream);
+            if let Err(e) = client.ready().await {
+                let e: crate::upstream::BoxError = e.into();
+                return Err(tonic::Status::unavailable(format!(
+                    "gRPC upstream not ready: {e}"
+                )));
+            }
+            client
+                .server_streaming(request, entry.grpc_path.clone(), entry.codec())
+                .await
+        };
+        match tokio::time::timeout(deadline, call).await {
             Ok(result) => result,
             Err(_) => Err(tonic::Status::deadline_exceeded(
                 "upstream did not answer within the deadline",
@@ -620,9 +628,8 @@ impl<U: Upstream> Call<U> {
     }
 }
 
-/// Map the request onto the RPC's input message and get a client whose
-/// upstream is ready.
-async fn prepare<S: TranscodeState>(
+/// Map the request onto the RPC's input message.
+fn prepare<S: TranscodeState>(
     proxy_state: S,
     headers: &HeaderMap,
     connection: Option<ConnectionInfo>,
@@ -630,12 +637,12 @@ async fn prepare<S: TranscodeState>(
     raw_query: Option<&str>,
     body: Bytes,
     entry: &RouteEntry,
-) -> Result<Call<S::Upstream>, Rejection> {
+) -> Result<Call<S::Upstream>, Unmappable> {
     let request_metadata =
         metadata::try_http_headers_to_grpc_metadata(headers, proxy_state.forwarded_headers())
-            .map_err(|e| Rejection::Unmappable(e.to_string()))?;
-    let message = decode_request(entry, headers, path_params, raw_query, body)
-        .map_err(Rejection::Unmappable)?;
+            .map_err(|e| Unmappable(e.to_string()))?;
+    let message =
+        decode_request(entry, headers, path_params, raw_query, body).map_err(Unmappable)?;
     let mut request = tonic::Request::new(message);
     *request.metadata_mut() = request_metadata;
     // An upstream in process reads the HTTP client's address and TLS
@@ -650,13 +657,8 @@ async fn prepare<S: TranscodeState>(
     let deadline = metadata::apply_request_deadline(&mut request, headers)
         .map_or(UPSTREAM_DEADLINE, |client| client.min(UPSTREAM_DEADLINE));
 
-    let mut client = Grpc::new(proxy_state.into_upstream());
-    if let Err(e) = client.ready().await {
-        let e: crate::upstream::BoxError = e.into();
-        return Err(Rejection::NotReady(format!("gRPC upstream not ready: {e}")));
-    }
     Ok(Call {
-        client,
+        upstream: proxy_state.into_upstream(),
         request,
         deadline,
     })

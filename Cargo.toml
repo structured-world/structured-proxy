@@ -184,6 +184,9 @@ rustls-rustcrypto = "0.0.2-alpha"
 # The embedder-owned TLS server of tests/tls.rs (HTTP/1.1 and HTTP/2 on one
 # connection type), and the TLS stream a tonic client dials through.
 hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
+# An upstream that speaks gRPC-Web, the way an embedder gives it that
+# protocol (tests/edge.rs).
+tonic-web = "0.14"
 # benches/jwt_verify.rs. Plots and rayon are left out: numbers are enough.
 criterion = { version = "0.8", default-features = false, features = ["async_tokio", "cargo_bench_support"] }
 # The embedding-hooks integration test (tests/hooks.rs) writes hook impls using

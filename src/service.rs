@@ -24,13 +24,15 @@ use tower::Service;
 pub type TlsConnectInfo =
     <tokio_rustls::server::TlsStream<tokio::net::TcpStream> as Connected>::ConnectInfo;
 
-use crate::upstream::{is_grpc, BoxError, PassThrough, Upstream};
+use crate::upstream::{grpc_protocol, BoxError, PassThrough, Upstream};
 
 /// The proxy as a tower service, built by
 /// [`ProxyServer::service`](crate::ProxyServer::service).
 ///
 /// A request with a gRPC or gRPC-Web content type goes to the upstream as it
-/// arrived, so one listener carries REST and native gRPC. Every other request
+/// arrived, so one listener carries REST and native gRPC; gRPC-Web is the
+/// upstream's to translate (tonic-web's `GrpcWebLayer` around its services),
+/// the proxy passes protocols through rather than converting them. Every other request
 /// goes to the proxy's routes (transcoded RPCs, health, metrics, OpenAPI, OIDC,
 /// forward-auth, extra routes) behind the proxy's middleware. A request no
 /// route matches is answered `404`, or handed to the service set with
@@ -174,6 +176,9 @@ impl<U: Upstream> ProxyService<U> {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// Without it, a request's peer comes from the `ConnectInfo` an outer
+    /// axum server recorded, when there is one.
     #[must_use]
     pub fn for_connection(&self, connection: impl Into<ConnectionInfo>) -> Self {
         Self {
@@ -181,6 +186,21 @@ impl<U: Upstream> ProxyService<U> {
             routes: self.routes.clone(),
             connection: Some(connection.into()),
         }
+    }
+
+    /// The connection `request` came on: the one given to
+    /// [`for_connection`](Self::for_connection), else the peer an outer axum
+    /// server recorded as `ConnectInfo`, so the upstream sees the same client
+    /// the proxy's middleware does.
+    fn connection_of<B>(&self, request: &http::Request<B>) -> Option<ConnectionInfo> {
+        if let Some(connection) = &self.connection {
+            return Some(connection.clone());
+        }
+        let ConnectInfo(remote) = request.extensions().get::<ConnectInfo<SocketAddr>>()?;
+        Some(ConnectionInfo::from(TcpConnectInfo {
+            local_addr: None,
+            remote_addr: Some(*remote),
+        }))
     }
 }
 
@@ -201,16 +221,18 @@ where
     }
 
     fn call(&mut self, mut request: http::Request<B>) -> Self::Future {
-        let inner = if is_grpc(request.headers()) {
+        let inner = if let Some(protocol) = grpc_protocol(request.headers()) {
             // A native call carries its connection the way tonic's server
             // hands it to a handler.
-            if let Some(connection) = &self.connection {
-                connection
-                    .clone()
-                    .into_tonic_extensions(request.extensions_mut());
+            if let Some(connection) = self.connection_of(&request) {
+                connection.into_tonic_extensions(request.extensions_mut());
             }
             Inner::Grpc {
-                call: PassThrough::new(self.upstream.clone(), request.map(tonic::body::Body::new)),
+                call: PassThrough::new(
+                    self.upstream.clone(),
+                    request.map(tonic::body::Body::new),
+                    protocol,
+                ),
             }
         } else {
             // The middleware reads the peer as axum's `ConnectInfo`; the
@@ -221,6 +243,8 @@ where
                     extensions.insert(ConnectInfo(remote));
                 }
                 extensions.insert(connection.clone());
+            } else if let Some(connection) = self.connection_of(&request) {
+                request.extensions_mut().insert(connection);
             }
             Inner::Routes {
                 future: self.routes.call(request),

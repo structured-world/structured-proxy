@@ -77,18 +77,28 @@ pin_project! {
         Ready {
             upstream: U,
             request: http::Request<tonic::body::Body>,
+            protocol: GrpcProtocol,
         },
         Call {
             #[pin]
             future: U::Future,
+            protocol: GrpcProtocol,
         },
         Done,
     }
 }
 
 impl<U: Upstream> PassThrough<U> {
-    pub(crate) fn new(upstream: U, request: http::Request<tonic::body::Body>) -> Self {
-        Self::Ready { upstream, request }
+    pub(crate) fn new(
+        upstream: U,
+        request: http::Request<tonic::body::Body>,
+        protocol: GrpcProtocol,
+    ) -> Self {
+        Self::Ready {
+            upstream,
+            request,
+            protocol,
+        }
     }
 }
 
@@ -98,14 +108,18 @@ impl<U: Upstream> Future for PassThrough<U> {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         loop {
             match self.as_mut().project() {
-                PassThroughProj::Ready { upstream, .. } => {
+                PassThroughProj::Ready {
+                    upstream, protocol, ..
+                } => {
+                    let protocol = *protocol;
                     if let Err(e) = ready!(upstream.poll_ready(cx)) {
                         self.set(Self::Done);
-                        return Poll::Ready(Ok(failure(e.into())));
+                        return Poll::Ready(Ok(failure(e.into(), protocol)));
                     }
                     let PassThroughReplace::Ready {
                         mut upstream,
                         request,
+                        ..
                     } = self.as_mut().project_replace(Self::Done)
                     else {
                         unreachable!("the state was just matched as Ready");
@@ -113,14 +127,15 @@ impl<U: Upstream> Future for PassThrough<U> {
                     // The returned future owns what it needs; the service
                     // handle is dropped, as tower's `Oneshot` does.
                     let future = upstream.call(request);
-                    self.set(Self::Call { future });
+                    self.set(Self::Call { future, protocol });
                 }
-                PassThroughProj::Call { future } => {
+                PassThroughProj::Call { future, protocol } => {
+                    let protocol = *protocol;
                     let result = ready!(future.poll(cx));
                     self.set(Self::Done);
                     return Poll::Ready(Ok(match result {
                         Ok(response) => response.map(axum::body::Body::new),
-                        Err(e) => failure(e.into()),
+                        Err(e) => failure(e.into(), protocol),
                     }));
                 }
                 PassThroughProj::Done => panic!("PassThrough polled after completion"),
@@ -129,51 +144,77 @@ impl<U: Upstream> Future for PassThrough<U> {
     }
 }
 
-/// The trailers-only gRPC answer to an upstream that failed to take the call.
-fn failure(error: BoxError) -> http::Response<axum::body::Body> {
-    tonic::Status::from_error(error).into_http()
+/// The trailers-only answer to an upstream that failed to take the call, in
+/// the request's protocol: gRPC-Web carries a trailers-only status in its
+/// headers too, but its client reads it only under a gRPC-Web content type
+/// (gRPC PROTOCOL-WEB).
+fn failure(error: BoxError, protocol: GrpcProtocol) -> http::Response<axum::body::Body> {
+    let mut response: http::Response<axum::body::Body> =
+        tonic::Status::from_error(error).into_http();
+    if protocol != GrpcProtocol::Grpc {
+        response.headers_mut().insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static(protocol.content_type()),
+        );
+    }
+    response
 }
 
-/// Whether `headers` announce a gRPC or gRPC-Web request: a media type of
+/// The gRPC protocol a request speaks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GrpcProtocol {
+    /// gRPC over HTTP/2 (gRPC PROTOCOL-HTTP2).
+    Grpc,
+    /// Binary gRPC-Web (gRPC PROTOCOL-WEB).
+    Web,
+    /// Base64 gRPC-Web, `-text` (gRPC PROTOCOL-WEB).
+    WebText,
+}
+
+impl GrpcProtocol {
+    /// The content type of an answer the proxy writes itself: the protocol
+    /// with gRPC's default protobuf codec.
+    fn content_type(self) -> &'static str {
+        match self {
+            Self::Grpc => "application/grpc",
+            Self::Web => "application/grpc-web+proto",
+            Self::WebText => "application/grpc-web-text+proto",
+        }
+    }
+}
+
+/// The gRPC protocol `headers` announce, if any: a media type of
 /// `application/grpc` or `application/grpc+<codec>` (gRPC PROTOCOL-HTTP2,
 /// "Content-Type"), or `application/grpc-web[-text][+<codec>]` (gRPC
 /// PROTOCOL-WEB). Media types compare without case (RFC 9110 §8.3.1).
-pub(crate) fn is_grpc(headers: &http::HeaderMap) -> bool {
-    let Some(value) = headers.get(http::header::CONTENT_TYPE) else {
-        return false;
-    };
-    let value = value.as_bytes();
+pub(crate) fn grpc_protocol(headers: &http::HeaderMap) -> Option<GrpcProtocol> {
+    let value = headers.get(http::header::CONTENT_TYPE)?.as_bytes();
     let media = match value.iter().position(|&b| b == b';') {
         Some(end) => &value[..end],
         None => value,
     }
     .trim_ascii();
-    const GRPC: &[u8] = b"application/grpc";
-    if media.len() < GRPC.len() || !media[..GRPC.len()].eq_ignore_ascii_case(GRPC) {
-        return false;
-    }
-    match &media[GRPC.len()..] {
-        [] => true,
-        [b'+', ..] => true,
-        rest => {
-            const WEB: &[u8] = b"-web";
-            rest.len() >= WEB.len()
-                && rest[..WEB.len()].eq_ignore_ascii_case(WEB)
-                && is_web_suffix(&rest[WEB.len()..])
-        }
+    let rest = strip_prefix_ignore_case(media, b"application/grpc")?;
+    match rest {
+        [] | [b'+', ..] => Some(GrpcProtocol::Grpc),
+        _ => web_protocol(strip_prefix_ignore_case(rest, b"-web")?),
     }
 }
 
-/// What may follow `application/grpc-web`: nothing, `+<codec>`, or `-text`
-/// with an optional `+<codec>`.
-fn is_web_suffix(rest: &[u8]) -> bool {
-    const TEXT: &[u8] = b"-text";
-    let rest = if rest.len() >= TEXT.len() && rest[..TEXT.len()].eq_ignore_ascii_case(TEXT) {
-        &rest[TEXT.len()..]
-    } else {
-        rest
+/// What follows `application/grpc-web`: nothing or `+<codec>` for binary,
+/// `-text` with an optional `+<codec>` for base64.
+fn web_protocol(rest: &[u8]) -> Option<GrpcProtocol> {
+    let (protocol, rest) = match strip_prefix_ignore_case(rest, b"-text") {
+        Some(rest) => (GrpcProtocol::WebText, rest),
+        None => (GrpcProtocol::Web, rest),
     };
-    matches!(rest, [] | [b'+', ..])
+    matches!(rest, [] | [b'+', ..]).then_some(protocol)
+}
+
+/// `bytes` after `prefix`, compared without ASCII case.
+fn strip_prefix_ignore_case<'a>(bytes: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
+    let (head, rest) = bytes.split_at_checked(prefix.len())?;
+    head.eq_ignore_ascii_case(prefix).then_some(rest)
 }
 
 #[cfg(test)]

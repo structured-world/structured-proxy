@@ -180,6 +180,55 @@ async fn an_upstream_that_cannot_take_the_call_answers_a_grpc_status() {
     assert_eq!(response.headers()["content-type"], "application/grpc");
 }
 
+/// The content type the proxy answers a failed pass-through call with, for a
+/// request of `content_type`.
+async fn failure_content_type(content_type: &'static str) -> String {
+    let upstream = Recorder {
+        unready: true,
+        ..Recorder::default()
+    };
+    let request = http::Request::post("/pkg.Svc/Method")
+        .header("content-type", content_type)
+        .body(Body::from("frame"))
+        .unwrap();
+    let response = service(upstream).oneshot(request).await.unwrap();
+    assert_eq!(response.headers()["grpc-status"], "14", "{content_type}");
+    response.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .to_owned()
+}
+
+#[tokio::test]
+async fn a_failed_call_answers_in_the_protocol_of_the_request() {
+    // A gRPC-Web client reads a status only from a gRPC-Web response (gRPC
+    // PROTOCOL-WEB): the failure keeps the protocol and its encoding.
+    assert_eq!(
+        failure_content_type("application/grpc").await,
+        "application/grpc"
+    );
+    assert_eq!(
+        failure_content_type("application/grpc+proto").await,
+        "application/grpc"
+    );
+    assert_eq!(
+        failure_content_type("application/grpc-web").await,
+        "application/grpc-web+proto"
+    );
+    assert_eq!(
+        failure_content_type("application/grpc-web+proto").await,
+        "application/grpc-web+proto"
+    );
+    assert_eq!(
+        failure_content_type("application/grpc-web-text").await,
+        "application/grpc-web-text+proto"
+    );
+    assert_eq!(
+        failure_content_type("application/GRPC-WEB-TEXT+proto").await,
+        "application/grpc-web-text+proto"
+    );
+}
+
 fn connection() -> TcpConnectInfo {
     TcpConnectInfo {
         local_addr: Some("10.0.0.1:8080".parse().unwrap()),
@@ -272,6 +321,52 @@ async fn an_http_request_without_a_connection_carries_none() {
         .await
         .unwrap();
     assert_eq!(body_text(response).await, "none");
+}
+
+#[tokio::test]
+async fn a_grpc_request_on_an_axum_server_carries_its_peer_to_the_upstream() {
+    // Hosted by an embedder's axum server that set `ConnectInfo`, with no
+    // `for_connection`: the upstream sees the peer the middleware sees.
+    let upstream = Recorder::default();
+    let mut request = grpc_request("/pkg.Svc/Method");
+    let peer: SocketAddr = "198.51.100.1:5000".parse().unwrap();
+    request.extensions_mut().insert(ConnectInfo(peer));
+    service(upstream.clone()).oneshot(request).await.unwrap();
+    let seen = upstream.seen.lock().unwrap();
+    assert_eq!(seen.remote, Some(peer));
+    assert_eq!(seen.local, None);
+}
+
+#[tokio::test]
+async fn an_http_request_on_an_axum_server_carries_its_peer_for_the_transcoder() {
+    let proxy = ProxyService::new(Recorder::default(), peer_routes());
+    let mut request = http::Request::get("/connection")
+        .body(Body::empty())
+        .unwrap();
+    request.extensions_mut().insert(ConnectInfo::<SocketAddr>(
+        "198.51.100.1:5000".parse().unwrap(),
+    ));
+    let response = proxy.oneshot(request).await.unwrap();
+    assert_eq!(body_text(response).await, "Some(198.51.100.1:5000)");
+}
+
+#[tokio::test]
+async fn the_connection_given_to_the_service_wins_over_an_outer_peer() {
+    // `for_connection` is the server's own statement of the connection.
+    let upstream = Recorder::default();
+    let mut request = grpc_request("/pkg.Svc/Method");
+    request.extensions_mut().insert(ConnectInfo::<SocketAddr>(
+        "198.51.100.1:5000".parse().unwrap(),
+    ));
+    service(upstream.clone())
+        .for_connection(connection())
+        .oneshot(request)
+        .await
+        .unwrap();
+    assert_eq!(
+        upstream.seen.lock().unwrap().remote,
+        Some("192.0.2.7:40000".parse().unwrap())
+    );
 }
 
 #[test]

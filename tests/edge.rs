@@ -375,6 +375,132 @@ async fn in_process_client_deadline_longer_than_the_default_is_capped() {
     );
 }
 
+/// An upstream under backpressure that never frees a slot: `poll_ready` stays
+/// pending, as behind a saturated concurrency limit.
+#[derive(Clone)]
+struct NeverReady;
+
+impl tower::Service<http::Request<tonic::body::Body>> for NeverReady {
+    type Response = http::Response<tonic::body::Body>;
+    type Error = Infallible;
+    type Future = std::future::Pending<Result<Self::Response, Infallible>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Pending
+    }
+
+    fn call(&mut self, _req: http::Request<tonic::body::Body>) -> Self::Future {
+        unreachable!("never ready, never called")
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn waiting_for_a_saturated_upstream_counts_against_the_deadline() {
+    // Readiness is part of the call: an upstream that never takes the call
+    // must not hold the request past its deadline.
+    let server = ProxyServer::from_yaml_str("")
+        .unwrap()
+        .with_descriptors(pool());
+    let app = common::App::new(server.service(NeverReady).unwrap());
+    let started = tokio::time::Instant::now();
+    let (status, body) = get(&app, "/v1/echo/a", &[("grpc-timeout", "250m")]).await;
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+    assert_eq!(body["error"], "DEADLINE_EXCEEDED");
+    assert_eq!(started.elapsed(), std::time::Duration::from_millis(250));
+}
+
+// --- gRPC-Web --------------------------------------------------------------------
+
+/// The proxy in front of the `Edge` service in process, made to speak gRPC-Web
+/// the way an embedder does it: tonic-web's layer around its services.
+fn grpc_web_proxy() -> common::App {
+    let pool = pool();
+    let upstream = tower::ServiceBuilder::new()
+        .layer(tonic_web::GrpcWebLayer::new())
+        .service(tonic::service::Routes::new(Edge { pool: pool.clone() }));
+    let server = ProxyServer::from_yaml_str("")
+        .unwrap()
+        .with_descriptors(pool);
+    common::App::new(server.service(upstream).unwrap())
+}
+
+/// One gRPC message frame (flag 0, big-endian length) holding `Req{name}`.
+fn request_frame(name: &str) -> Vec<u8> {
+    let pool = pool();
+    let mut req = DynamicMessage::new(pool.get_message_by_name("test.v1.Req").unwrap());
+    req.set_field_by_name("name", PbValue::String(name.into()));
+    let payload = prost::Message::encode_to_vec(&req);
+    let mut frame = vec![0];
+    frame.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
+    frame.extend_from_slice(&payload);
+    frame
+}
+
+/// The `name` of the `Seen` message in the first frame of a gRPC-Web body.
+fn seen_name(body: &[u8]) -> String {
+    assert_eq!(body[0], 0, "a message frame comes first");
+    let len = u32::from_be_bytes(body[1..5].try_into().unwrap()) as usize;
+    let seen = DynamicMessage::decode(
+        pool().get_message_by_name("test.v1.Seen").unwrap(),
+        &body[5..5 + len],
+    )
+    .unwrap();
+    field(&seen, "name")
+}
+
+/// Send a gRPC-Web `Echo` with `body` as `content_type`; returns the response
+/// content type and body.
+async fn grpc_web_echo(content_type: &str, body: Vec<u8>) -> (String, bytes::Bytes) {
+    // A gRPC-Web client names the encoding it reads back in `Accept`.
+    let request = http::Request::post("/test.v1.Edge/Echo")
+        .header("content-type", content_type)
+        .header("accept", content_type)
+        .header("x-grpc-web", "1")
+        .body(Body::from(body))
+        .unwrap();
+    let response = tower::ServiceExt::oneshot(grpc_web_proxy(), request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (content_type, body)
+}
+
+#[tokio::test]
+async fn binary_grpc_web_reaches_an_upstream_that_speaks_it() {
+    // gRPC-Web passes through unchanged; the upstream's own gRPC-Web layer
+    // answers it.
+    let (content_type, body) =
+        grpc_web_echo("application/grpc-web+proto", request_frame("web")).await;
+    assert_eq!(content_type, "application/grpc-web+proto");
+    assert_eq!(seen_name(&body), "web");
+}
+
+#[tokio::test]
+async fn text_grpc_web_reaches_an_upstream_that_speaks_it() {
+    use base64::Engine as _;
+    let engine = base64::engine::general_purpose::STANDARD;
+    let (content_type, body) = grpc_web_echo(
+        "application/grpc-web-text+proto",
+        engine.encode(request_frame("text")).into_bytes(),
+    )
+    .await;
+    assert_eq!(content_type, "application/grpc-web-text+proto");
+    // Each frame is its own base64 run, padded at its end (gRPC
+    // PROTOCOL-WEB), so the body decodes group by group.
+    let decoded: Vec<u8> = body
+        .chunks(4)
+        .flat_map(|group| engine.decode(group).unwrap())
+        .collect();
+    assert_eq!(seen_name(&decoded), "text");
+}
+
 // --- the client's address -------------------------------------------------------
 
 #[tokio::test]

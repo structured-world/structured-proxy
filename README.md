@@ -21,7 +21,7 @@ Works with **any** gRPC service via proto descriptor files. No code generation, 
 - **Server-streaming** RPC → NDJSON by default, or Server-Sent Events via `Accept: text/event-stream` negotiation
 - **gRPC → HTTP status mapping** following the standard `google.rpc.Code` table
 - **Typed error details**: the upstream's `google.rpc.Status` details (`ErrorInfo`, `BadRequest`, `RetryInfo`, ...) reach the HTTP client as ProtoJSON, switchable globally and per route (see [Error responses](#error-responses))
-- **One port for REST and native gRPC**: HTTP/1.1 and HTTP/2 on the same listener, gRPC and gRPC-Web requests pass through to the upstream unchanged; behind your own TLS too, with the client's address and certificate reaching the upstream
+- **One port for REST and native gRPC**: HTTP/1.1 and HTTP/2 on the same listener, gRPC and gRPC-Web requests pass through to the upstream unchanged (an upstream that speaks gRPC-Web, e.g. behind tonic-web, answers it); behind your own TLS too, with the client's address and certificate reaching the upstream
 - **In-process upstream** for embedders: transcoded calls reach your own tonic services with no socket or loopback hop (see [Library Usage](#library-usage))
 - **Header forwarding** from HTTP requests to gRPC metadata (configurable allow-list)
 - **Context propagation**: W3C trace-context (`traceparent` forwarded or synthesized) and client deadlines (`grpc-timeout`) carried across the REST↔gRPC boundary
@@ -703,6 +703,12 @@ gets `404`, or goes to a service of yours with
 `ProxyService::with_fallback(my_axum_app)`. The proxy's middleware (CORS,
 maintenance, rate limits, auth) sees neither those requests nor native gRPC
 ones; they reach your service untouched.
+
+gRPC-Web requests pass through unchanged as well, so the upstream answers
+them in that protocol: wrap your services in tonic-web's layer
+(`tower::ServiceBuilder::new().layer(tonic_web::GrpcWebLayer::new()).service(grpc)`),
+binary and text gRPC-Web alike. When the upstream cannot take a call at all,
+the proxy's own error answer keeps the request's protocol.
 
 **Deadlines.** Every call waits at most five seconds for the upstream's
 response headers, or less when the client's `grpc-timeout` says so; after that
