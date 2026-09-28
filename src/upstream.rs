@@ -71,6 +71,12 @@ pin_project! {
     /// failure of the upstream itself (a remote one that cannot be reached)
     /// becomes a trailers-only gRPC error, so the client gets a status rather
     /// than a broken connection.
+    ///
+    /// No proxy timer runs here and `grpc-timeout` travels unchanged: the
+    /// caller is a gRPC client, which enforces its own deadline (gRPC
+    /// PROTOCOL-HTTP2, "Timeout") by cancelling the stream, and that drops
+    /// this future wherever it waits, readiness included. A transcoded call is
+    /// different: there the proxy is the gRPC client and bounds the call itself.
     #[project = PassThroughProj]
     #[project_replace = PassThroughReplace]
     pub(crate) enum PassThrough<U: Upstream> {

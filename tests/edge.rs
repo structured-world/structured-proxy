@@ -414,14 +414,172 @@ async fn waiting_for_a_saturated_upstream_counts_against_the_deadline() {
 /// The proxy in front of the `Edge` service in process, made to speak gRPC-Web
 /// the way an embedder does it: tonic-web's layer around its services.
 fn grpc_web_proxy() -> common::App {
+    grpc_web_proxy_with("")
+}
+
+/// [`grpc_web_proxy`] configured by `yaml`.
+fn grpc_web_proxy_with(yaml: &str) -> common::App {
     let pool = pool();
     let upstream = tower::ServiceBuilder::new()
         .layer(tonic_web::GrpcWebLayer::new())
         .service(tonic::service::Routes::new(Edge { pool: pool.clone() }));
-    let server = ProxyServer::from_yaml_str("")
+    let server = ProxyServer::from_yaml_str(yaml)
         .unwrap()
         .with_descriptors(pool);
     common::App::new(server.service(upstream).unwrap())
+}
+
+const ORIGIN: &str = "https://app.example";
+
+/// A browser's cross-origin gRPC-Web call from [`ORIGIN`] through `app`;
+/// returns the response headers.
+async fn browser_grpc_web_call(app: common::App) -> http::HeaderMap {
+    let request = http::Request::post("/test.v1.Edge/Echo")
+        .header("origin", ORIGIN)
+        .header("content-type", "application/grpc-web+proto")
+        .header("x-grpc-web", "1")
+        .body(Body::from(request_frame("browser")))
+        .unwrap();
+    let response = tower::ServiceExt::oneshot(app, request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response.headers().clone()
+}
+
+/// The browser's preflight for that call; returns the response headers.
+async fn browser_grpc_web_preflight(app: common::App) -> http::HeaderMap {
+    let request = http::Request::builder()
+        .method("OPTIONS")
+        .uri("/test.v1.Edge/Echo")
+        .header("origin", ORIGIN)
+        .header("access-control-request-method", "POST")
+        .header(
+            "access-control-request-headers",
+            "content-type,x-grpc-web,x-user-agent",
+        )
+        .body(Body::empty())
+        .unwrap();
+    tower::ServiceExt::oneshot(app, request)
+        .await
+        .unwrap()
+        .headers()
+        .clone()
+}
+
+fn exposed(headers: &http::HeaderMap) -> Vec<String> {
+    headers
+        .get_all("access-control-expose-headers")
+        .iter()
+        .flat_map(|v| v.to_str().unwrap().split(','))
+        .map(|name| name.trim().to_ascii_lowercase())
+        .collect()
+}
+
+const CORS_YAML: &str = "cors:\n  origins: [\"https://app.example\"]\n";
+
+#[tokio::test]
+async fn a_browser_grpc_web_call_gets_the_cors_policy_its_preflight_got() {
+    // The proxy answers the preflight under its CORS policy, so the call must
+    // carry the same policy: without it the browser discards the response.
+    let preflight = browser_grpc_web_preflight(grpc_web_proxy_with(CORS_YAML)).await;
+    assert_eq!(preflight["access-control-allow-origin"], ORIGIN);
+    let call = browser_grpc_web_call(grpc_web_proxy_with(CORS_YAML)).await;
+    assert_eq!(call["access-control-allow-origin"], ORIGIN);
+    assert_eq!(call["access-control-allow-credentials"], "true");
+    // A gRPC-Web client reads the status and its details from these.
+    let exposed = exposed(&call);
+    for name in ["grpc-status", "grpc-message", "grpc-status-details-bin"] {
+        assert!(exposed.iter().any(|e| e == name), "{name}: {exposed:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_grpc_web_call_from_an_unlisted_origin_gets_no_allowance() {
+    let request = http::Request::post("/test.v1.Edge/Echo")
+        .header("origin", "https://evil.example")
+        .header("content-type", "application/grpc-web+proto")
+        .body(Body::from(request_frame("x")))
+        .unwrap();
+    let response = tower::ServiceExt::oneshot(grpc_web_proxy_with(CORS_YAML), request)
+        .await
+        .unwrap();
+    assert!(response
+        .headers()
+        .get("access-control-allow-origin")
+        .is_none());
+}
+
+#[tokio::test]
+async fn configured_expose_headers_and_max_age_reach_the_browser() {
+    // Upstream metadata a browser must read is exposed by name, and the
+    // preflight tells the browser how long to cache it.
+    let yaml = "cors:\n  origins: [\"https://app.example\"]\n  expose_headers: [\"x-request-id\"]\n  max_age_secs: 600\n";
+    let call = browser_grpc_web_call(grpc_web_proxy_with(yaml)).await;
+    assert!(exposed(&call).iter().any(|e| e == "x-request-id"));
+    let preflight = browser_grpc_web_preflight(grpc_web_proxy_with(yaml)).await;
+    assert_eq!(preflight["access-control-max-age"], "600");
+}
+
+#[tokio::test]
+async fn cors_can_be_left_to_an_upstream_that_does_it_itself() {
+    // `grpc_web: false`: the upstream's own CORS layer answers, and the proxy
+    // adds nothing that could clash with it.
+    let yaml = "cors:\n  origins: [\"https://app.example\"]\n  grpc_web: false\n";
+    let call = browser_grpc_web_call(grpc_web_proxy_with(yaml)).await;
+    assert!(call.get("access-control-allow-origin").is_none());
+}
+
+#[tokio::test]
+async fn a_listed_origin_gets_its_cors_allowance_on_a_rest_route() {
+    // A named origin list with credentials must not use `*` for methods or
+    // headers (Fetch §3.2.5): such a policy used to stop the proxy at startup.
+    let app = grpc_web_proxy_with(CORS_YAML);
+    let request = http::Request::get("/v1/echo/rest")
+        .header("origin", ORIGIN)
+        .body(Body::empty())
+        .unwrap();
+    let response = tower::ServiceExt::oneshot(app.clone(), request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["access-control-allow-origin"], ORIGIN);
+    // The preflight echoes what the browser asked for.
+    let preflight = http::Request::builder()
+        .method("OPTIONS")
+        .uri("/v1/echo/rest")
+        .header("origin", ORIGIN)
+        .header("access-control-request-method", "GET")
+        .header("access-control-request-headers", "authorization")
+        .body(Body::empty())
+        .unwrap();
+    let response = tower::ServiceExt::oneshot(app, preflight).await.unwrap();
+    assert_eq!(response.headers()["access-control-allow-methods"], "GET");
+    assert_eq!(
+        response.headers()["access-control-allow-headers"],
+        "authorization"
+    );
+}
+
+#[test]
+fn an_origin_that_is_not_a_header_value_is_a_config_error() {
+    // Dropping it would quietly narrow the policy.
+    let server = ProxyServer::from_yaml_str("cors:\n  origins: [\"https://a.example\\n\"]\n")
+        .unwrap()
+        .with_descriptors(pool());
+    let Err(err) = server.service(tonic::service::Routes::default()) else {
+        panic!("an invalid origin must be refused");
+    };
+    assert!(err.to_string().contains("cors.origins"), "{err}");
+}
+
+#[test]
+fn an_expose_header_that_is_not_a_header_name_is_a_config_error() {
+    let server = ProxyServer::from_yaml_str("cors:\n  expose_headers: [\"not a header\"]\n")
+        .unwrap()
+        .with_descriptors(pool());
+    let Err(err) = server.service(tonic::service::Routes::default()) else {
+        panic!("an invalid header name must be refused");
+    };
+    assert!(err.to_string().contains("not a header"), "{err}");
 }
 
 /// One gRPC message frame (flag 0, big-endian length) holding `Req{name}`.

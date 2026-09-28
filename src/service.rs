@@ -16,7 +16,8 @@ use bytes::Bytes;
 use pin_project_lite::pin_project;
 use rustls::pki_types::CertificateDer;
 use tonic::transport::server::{Connected, TcpConnectInfo};
-use tower::Service;
+use tower::{Layer, Service};
+use tower_http::cors::{Cors, CorsLayer};
 
 /// tonic's `TlsConnectInfo<TcpConnectInfo>`, the record its TLS server puts on
 /// a request and `Request::peer_certs` reads. tonic exports the name only with
@@ -24,7 +25,7 @@ use tower::Service;
 pub type TlsConnectInfo =
     <tokio_rustls::server::TlsStream<tokio::net::TcpStream> as Connected>::ConnectInfo;
 
-use crate::upstream::{grpc_protocol, BoxError, PassThrough, Upstream};
+use crate::upstream::{grpc_protocol, BoxError, GrpcProtocol, PassThrough, Upstream};
 
 /// The proxy as a tower service, built by
 /// [`ProxyServer::service`](crate::ProxyServer::service).
@@ -32,8 +33,10 @@ use crate::upstream::{grpc_protocol, BoxError, PassThrough, Upstream};
 /// A request with a gRPC or gRPC-Web content type goes to the upstream as it
 /// arrived, so one listener carries REST and native gRPC; gRPC-Web is the
 /// upstream's to translate (tonic-web's `GrpcWebLayer` around its services),
-/// the proxy passes protocols through rather than converting them. Every other request
-/// goes to the proxy's routes (transcoded RPCs, health, metrics, OpenAPI, OIDC,
+/// the proxy passes protocols through rather than converting them. A gRPC-Web
+/// answer gets the proxy's CORS policy (`cors.grpc_web`), since the proxy
+/// answers the browser's preflight for it. Every other request goes to the
+/// proxy's routes (transcoded RPCs, health, metrics, OpenAPI, OIDC,
 /// forward-auth, extra routes) behind the proxy's middleware. A request no
 /// route matches is answered `404`, or handed to the service set with
 /// [`with_fallback`](Self::with_fallback), untouched by that middleware.
@@ -62,9 +65,43 @@ use crate::upstream::{grpc_protocol, BoxError, PassThrough, Upstream};
 pub struct ProxyService<U> {
     upstream: U,
     routes: axum::Router,
+    /// Binary and text gRPC-Web to the upstream under the CORS policy, each
+    /// built once; `None` when the upstream owns CORS for gRPC-Web.
+    grpc_web: Option<GrpcWebCors<U>>,
     /// The connection the requests arrive on, set per connection by the
     /// server.
     connection: Option<ConnectionInfo>,
+}
+
+/// gRPC-Web pass-through, one CORS-wrapped path per encoding.
+#[derive(Clone, Debug)]
+struct GrpcWebCors<U> {
+    web: Cors<Forward<U>>,
+    web_text: Cors<Forward<U>>,
+}
+
+/// Hands a request to the upstream in a known protocol, as a tower service so
+/// a layer can wrap it.
+#[derive(Clone, Debug)]
+struct Forward<U> {
+    upstream: U,
+    protocol: GrpcProtocol,
+}
+
+impl<U: Upstream> Service<http::Request<tonic::body::Body>> for Forward<U> {
+    type Response = http::Response<axum::body::Body>;
+    type Error = Infallible;
+    type Future = PassThrough<U>;
+
+    #[inline]
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // The upstream's readiness is waited for per request, on its clone.
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
+        PassThrough::new(self.upstream.clone(), request, self.protocol)
+    }
 }
 
 /// The connection requests arrive on, in the form a tonic server records it:
@@ -124,10 +161,23 @@ impl ConnectionInfo {
 }
 
 impl<U: Upstream> ProxyService<U> {
-    pub(crate) fn new(upstream: U, routes: axum::Router) -> Self {
+    /// The service over `upstream` and `routes`; gRPC-Web answers carry
+    /// `grpc_web_cors` when set.
+    pub(crate) fn new(upstream: U, routes: axum::Router, grpc_web_cors: Option<CorsLayer>) -> Self {
+        let grpc_web = grpc_web_cors.map(|cors| {
+            let forward = |protocol| Forward {
+                upstream: upstream.clone(),
+                protocol,
+            };
+            GrpcWebCors {
+                web: cors.layer(forward(GrpcProtocol::Web)),
+                web_text: cors.layer(forward(GrpcProtocol::WebText)),
+            }
+        });
         Self {
             upstream,
             routes,
+            grpc_web,
             connection: None,
         }
     }
@@ -184,6 +234,7 @@ impl<U: Upstream> ProxyService<U> {
         Self {
             upstream: self.upstream.clone(),
             routes: self.routes.clone(),
+            grpc_web: self.grpc_web.clone(),
             connection: Some(connection.into()),
         }
     }
@@ -227,12 +278,22 @@ where
             if let Some(connection) = self.connection_of(&request) {
                 connection.into_tonic_extensions(request.extensions_mut());
             }
-            Inner::Grpc {
-                call: PassThrough::new(
-                    self.upstream.clone(),
-                    request.map(tonic::body::Body::new),
-                    protocol,
-                ),
+            let request = request.map(tonic::body::Body::new);
+            // A browser only speaks gRPC-Web, and the routes answered its
+            // preflight: its call gets the same CORS policy.
+            let cors = match (&mut self.grpc_web, protocol) {
+                (Some(cors), GrpcProtocol::Web) => Some(&mut cors.web),
+                (Some(cors), GrpcProtocol::WebText) => Some(&mut cors.web_text),
+                _ => None,
+            };
+            match cors {
+                // `Forward` is always ready, and so is CORS around it.
+                Some(cors) => Inner::GrpcWeb {
+                    future: cors.call(request),
+                },
+                None => Inner::Grpc {
+                    call: PassThrough::new(self.upstream.clone(), request, protocol),
+                },
             }
         } else {
             // The middleware reads the peer as axum's `ConnectInfo`; the
@@ -273,6 +334,10 @@ pin_project! {
             #[pin]
             call: PassThrough<U>,
         },
+        GrpcWeb {
+            #[pin]
+            future: tower_http::cors::ResponseFuture<PassThrough<U>>,
+        },
     }
 }
 
@@ -284,6 +349,7 @@ impl<U: Upstream> Future for ResponseFuture<U> {
         match self.project().inner.project() {
             InnerProj::Routes { future } => future.poll(cx),
             InnerProj::Grpc { call } => call.poll(cx),
+            InnerProj::GrpcWeb { future } => future.poll(cx),
         }
     }
 }

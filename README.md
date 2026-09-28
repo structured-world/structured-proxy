@@ -29,7 +29,7 @@ Works with **any** gRPC service via proto descriptor files. No code generation, 
 - **Maintenance mode** returning 503 with a configurable exempt-path list
 - **Health endpoints** `/health/live`, `/health/ready` (upstream gRPC health probe), `/health/startup`
 - **Prometheus metrics** at `/metrics`
-- **CORS** with a configurable origin allow-list
+- **CORS** with a configurable origin allow-list, exposed headers and preflight cache, applied to gRPC-Web pass-through too
 - **Rate limiting (Shield)**: local GCRA shaper (no blocking latency) keyed by client IP, header, or validated JWT claim; named limit tiers as config data; optional async cross-instance reconciliation for an approximate fleet-wide limit (requires both the `redis` feature and a configured `sync` block)
 - **JWT auth**: validate `Bearer` tokens via an Ed25519 PEM key or JWKS auto-discovery, enforce per-route `require_auth` / `required_roles`, and forward claims as headers — or hand the signature check to your own verifier (a validated / FIPS module, an HSM) without changing anything else
 - **OIDC discovery**: serve `/.well-known/openid-configuration` and a JWKS endpoint (Ed25519) built from config, to front an identity provider
@@ -83,10 +83,24 @@ service:
 
 cors:
   # Empty list = permissive CORS (dev mode, reflects any Origin).
-  # A non-empty list allows those exact origins; there is no "*" wildcard
-  # (browsers never send `Origin: *`, so listing "*" would block everything).
+  # A non-empty list allows those exact origins, with credentials; the
+  # preflight echoes the methods and headers the browser asks for. There is
+  # no "*" wildcard (browsers never send `Origin: *`, so listing "*" would
+  # block everything).
   origins: []
   # e.g. origins: ["https://app.example.com", "https://admin.example.com"]
+  # Response headers a browser script may read, on top of grpc-status,
+  # grpc-message, grpc-status-details-bin and the rate-limit headers:
+  # typically upstream metadata forwarded as a header.
+  expose_headers: []
+  # e.g. expose_headers: ["x-request-id"]
+  # How long a browser caches a preflight answer (seconds). Unset: the
+  # browser's default.
+  # max_age_secs: 600
+  # Apply this policy to gRPC-Web calls passed through to the upstream too
+  # (the proxy answers their preflight). Turn off only when the upstream sets
+  # CORS on its gRPC-Web answers itself.
+  grpc_web: true
 
 # Optional: path aliases (rewrite before routing)
 aliases:
@@ -534,7 +548,7 @@ details are malformed is dropped along with it (see
 [Error responses](#error-responses)). Browsers read only
 [CORS-safelisted](https://fetch.spec.whatwg.org/#cors-safelisted-response-header-name)
 response headers plus the exposed ones, so a browser client that must read a
-forwarded header needs a CORS setup that exposes it.
+forwarded header needs it listed in `cors.expose_headers`.
 
 **Status from `x-http-code`.** On a successful unary call, the response
 metadata `x-http-code` (grpc-gateway's convention) sets the HTTP status: one
@@ -708,7 +722,10 @@ gRPC-Web requests pass through unchanged as well, so the upstream answers
 them in that protocol: wrap your services in tonic-web's layer
 (`tower::ServiceBuilder::new().layer(tonic_web::GrpcWebLayer::new()).service(grpc)`),
 binary and text gRPC-Web alike. When the upstream cannot take a call at all,
-the proxy's own error answer keeps the request's protocol.
+the proxy's own error answer keeps the request's protocol. Browsers get the
+proxy's CORS policy on these calls, the same one their preflight got
+(`cors.grpc_web`, on by default); a gRPC-Web client reads `grpc-status`,
+`grpc-message` and `grpc-status-details-bin`, which are always exposed.
 
 **Deadlines.** Every call waits at most five seconds for the upstream's
 response headers, or less when the client's `grpc-timeout` says so; after that

@@ -61,7 +61,7 @@ impl Service<http::Request<tonic::body::Body>> for Recorder {
 /// A proxy with one HTTP route, `GET /route`, in front of `upstream`.
 fn service(upstream: Recorder) -> ProxyService<Recorder> {
     let routes = axum::Router::new().route("/route", get(|| async { "route" }));
-    ProxyService::new(upstream, routes)
+    ProxyService::new(upstream, routes, None)
 }
 
 fn grpc_request(path: &str) -> http::Request<Body> {
@@ -287,7 +287,8 @@ fn peer_routes() -> axum::Router {
 
 #[tokio::test]
 async fn an_http_request_carries_its_peer_for_the_middleware() {
-    let proxy = ProxyService::new(Recorder::default(), peer_routes()).for_connection(connection());
+    let proxy =
+        ProxyService::new(Recorder::default(), peer_routes(), None).for_connection(connection());
     let response = proxy
         .oneshot(http::Request::get("/peer").body(Body::empty()).unwrap())
         .await
@@ -297,7 +298,8 @@ async fn an_http_request_carries_its_peer_for_the_middleware() {
 
 #[tokio::test]
 async fn an_http_request_carries_its_connection_for_the_transcoder() {
-    let proxy = ProxyService::new(Recorder::default(), peer_routes()).for_connection(connection());
+    let proxy =
+        ProxyService::new(Recorder::default(), peer_routes(), None).for_connection(connection());
     let response = proxy
         .oneshot(
             http::Request::get("/connection")
@@ -311,7 +313,7 @@ async fn an_http_request_carries_its_connection_for_the_transcoder() {
 
 #[tokio::test]
 async fn an_http_request_without_a_connection_carries_none() {
-    let proxy = ProxyService::new(Recorder::default(), peer_routes());
+    let proxy = ProxyService::new(Recorder::default(), peer_routes(), None);
     let response = proxy
         .oneshot(
             http::Request::get("/connection")
@@ -339,7 +341,7 @@ async fn a_grpc_request_on_an_axum_server_carries_its_peer_to_the_upstream() {
 
 #[tokio::test]
 async fn an_http_request_on_an_axum_server_carries_its_peer_for_the_transcoder() {
-    let proxy = ProxyService::new(Recorder::default(), peer_routes());
+    let proxy = ProxyService::new(Recorder::default(), peer_routes(), None);
     let mut request = http::Request::get("/connection")
         .body(Body::empty())
         .unwrap();

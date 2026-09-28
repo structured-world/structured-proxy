@@ -80,7 +80,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use prost_reflect::DescriptorPool;
 use std::net::SocketAddr;
-use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use std::sync::Arc;
@@ -443,7 +443,8 @@ impl ProxyServer {
     /// No valid upstream address, or a configuration [`service`](Self::service)
     /// rejects.
     pub fn router(&self) -> anyhow::Result<Router> {
-        self.routes(self.upstream()?)
+        let (router, _) = self.routes(self.upstream()?)?;
+        Ok(router)
     }
 
     /// The whole proxy as one tower service in front of `upstream`: native
@@ -476,12 +477,16 @@ impl ProxyServer {
     /// # build().unwrap();
     /// ```
     pub fn service<U: Upstream>(&self, upstream: U) -> anyhow::Result<ProxyService<U>> {
-        let routes = self.routes(upstream.clone())?;
-        Ok(ProxyService::new(upstream, routes))
+        let (routes, cors) = self.routes(upstream.clone())?;
+        // The routes answer a browser's preflight for gRPC-Web too, so its
+        // call carries the same policy unless the upstream sets its own.
+        let grpc_web_cors = self.config.cors.grpc_web.then_some(cors);
+        Ok(ProxyService::new(upstream, routes, grpc_web_cors))
     }
 
-    /// Build the axum router with all endpoints, calling `upstream`.
-    fn routes<U: Upstream>(&self, upstream: U) -> anyhow::Result<Router> {
+    /// Build the axum router with all endpoints, calling `upstream`, and the
+    /// CORS policy it answers under.
+    fn routes<U: Upstream>(&self, upstream: U) -> anyhow::Result<(Router, CorsLayer)> {
         // Enforce cross-field invariants on the embedded path too, where the
         // config is built directly instead of through `from_yaml_str`.
         self.config.validate()?;
@@ -570,7 +575,7 @@ impl ProxyServer {
             sse_keep_alive_secs: self.config.streaming.sse_keep_alive_secs,
         };
 
-        let cors = self.build_cors();
+        let cors = self.build_cors()?;
 
         // Build transcoding routes from descriptor pool.
         let mut transcode_routes =
@@ -794,9 +799,9 @@ impl ProxyServer {
         let router = router.layer(TraceLayer::new_for_http());
         // Outermost: wraps every enforcement layer so short-circuited
         // responses keep CORS headers, and answers preflight before auth.
-        let router = cors::layer(router, cors).with_state(state);
+        let router = cors::layer(router, cors.clone()).with_state(state);
 
-        Ok(router)
+        Ok((router, cors))
     }
 
     fn build_openapi_routes<S>(&self, pool: &DescriptorPool) -> Router<S>
@@ -847,33 +852,65 @@ impl ProxyServer {
             )
     }
 
-    fn build_cors(&self) -> CorsLayer {
-        if self.config.cors.origins.is_empty() {
+    /// The CORS policy of `cors:`.
+    ///
+    /// # Errors
+    ///
+    /// An origin that is not a header value, or an `expose_headers` entry that
+    /// is not a header name: dropping either would quietly narrow the policy.
+    fn build_cors(&self) -> anyhow::Result<CorsLayer> {
+        let config = &self.config.cors;
+        // Checked in both modes, so a typo fails the same way whether or not
+        // origins are set.
+        let configured = config
+            .expose_headers
+            .iter()
+            .map(|name| {
+                http::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                    anyhow::anyhow!("cors.expose_headers entry {name:?} is not a header name")
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let layer = if config.origins.is_empty() {
             tracing::warn!("CORS origins not set — using permissive CORS (dev mode)");
+            // Exposes every header already.
             CorsLayer::permissive()
         } else {
-            let origins: Vec<_> = self
-                .config
-                .cors
+            let origins = config
                 .origins
                 .iter()
-                .filter_map(|o| o.parse().ok())
-                .collect();
+                .map(|origin| {
+                    http::HeaderValue::from_str(origin)
+                        .map_err(|_| anyhow::anyhow!("cors.origins entry {origin:?} is not valid"))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let exposed = [
+                // What a gRPC-Web client reads its status and details from.
+                http::HeaderName::from_static("grpc-status"),
+                http::HeaderName::from_static("grpc-message"),
+                http::HeaderName::from_static("grpc-status-details-bin"),
+                // Let browser clients read the rate-limit budget and back off.
+                http::HeaderName::from_static("ratelimit-limit"),
+                http::HeaderName::from_static("ratelimit-remaining"),
+                http::HeaderName::from_static("ratelimit-reset"),
+                http::HeaderName::from_static("retry-after"),
+            ]
+            .into_iter()
+            .chain(configured);
+            // With credentials the Fetch standard (§3.2.5) forbids `*` for
+            // methods and headers, so the preflight's own request is echoed
+            // back instead: what the browser asked for, from an allowed origin.
             CorsLayer::new()
                 .allow_origin(AllowOrigin::list(origins))
-                .allow_methods(tower_http::cors::Any)
-                .allow_headers(tower_http::cors::Any)
+                .allow_methods(AllowMethods::mirror_request())
+                .allow_headers(AllowHeaders::mirror_request())
                 .allow_credentials(true)
-                .expose_headers([
-                    "grpc-status".parse().unwrap(),
-                    "grpc-message".parse().unwrap(),
-                    // Let browser clients read the rate-limit budget and back off.
-                    "ratelimit-limit".parse().unwrap(),
-                    "ratelimit-remaining".parse().unwrap(),
-                    "ratelimit-reset".parse().unwrap(),
-                    "retry-after".parse().unwrap(),
-                ])
-        }
+                .expose_headers(exposed.collect::<Vec<_>>())
+        };
+        Ok(match config.max_age_secs {
+            Some(secs) => layer.max_age(std::time::Duration::from_secs(secs)),
+            None => layer,
+        })
     }
 
     /// Serve the proxy on the configured listen address in front of the

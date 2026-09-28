@@ -17,6 +17,29 @@ upstream:
 }
 
 #[test]
+fn cors_defaults_cover_grpc_web_and_nothing_extra() {
+    // Absent `cors:` and an empty one agree: permissive origins, gRPC-Web
+    // included, no extra exposed headers, the browser's own preflight cache.
+    for yaml in ["service:\n  name: demo\n", "cors: {}\n"] {
+        let cors = serde_yaml::from_str::<ProxyConfig>(yaml).unwrap().cors;
+        assert!(cors.origins.is_empty(), "{yaml}");
+        assert!(cors.expose_headers.is_empty(), "{yaml}");
+        assert_eq!(cors.max_age_secs, None, "{yaml}");
+        assert!(cors.grpc_web, "{yaml}");
+    }
+}
+
+#[test]
+fn cors_settings_are_read() {
+    let yaml = "cors:\n  origins: [\"https://app.example\"]\n  expose_headers: [\"x-request-id\"]\n  max_age_secs: 600\n  grpc_web: false\n";
+    let cors = serde_yaml::from_str::<ProxyConfig>(yaml).unwrap().cors;
+    assert_eq!(cors.origins, ["https://app.example"]);
+    assert_eq!(cors.expose_headers, ["x-request-id"]);
+    assert_eq!(cors.max_age_secs, Some(600));
+    assert!(!cors.grpc_web);
+}
+
+#[test]
 fn upstream_is_optional() {
     // An embedder whose upstream is in process names no address.
     let config: ProxyConfig = serde_yaml::from_str("service:\n  name: demo\n").unwrap();
