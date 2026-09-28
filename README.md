@@ -26,7 +26,9 @@ Works with **any** gRPC service via proto descriptor files. No code generation, 
 - **Header forwarding** from HTTP requests to gRPC metadata (configurable allow-list)
 - **Context propagation**: W3C trace-context (`traceparent` forwarded or synthesized) and client deadlines (`grpc-timeout`) carried across the REST↔gRPC boundary
 - **Path aliasing** for route remapping (e.g. `/oauth2/*` → `/v1/oauth2/*`)
+- **Scoped guards**: maintenance, rate limits, a concurrency limit, JWT, ext_authz and the auth decider each cover the traffic you name (transcoded, the proxy's own endpoints, native gRPC, the fallback), narrowed by path and method; a rejection answers in the request's protocol, a `google.rpc.Status` JSON body for REST and a gRPC status for gRPC (see [Guards and scopes](#guards-and-scopes))
 - **Maintenance mode** returning 503 with a configurable exempt-path list
+- **Concurrency limit**: requests past `max_in_flight` are shed at once with 503 instead of queueing; a stream holds its slot until its body ends
 - **Health endpoints** `/health/live`, `/health/ready` (upstream gRPC health probe), `/health/startup`
 - **Prometheus metrics** at `/metrics`
 - **CORS** with a configurable origin allow-list, exposed headers and preflight cache, applied to gRPC-Web pass-through too
@@ -133,6 +135,16 @@ runtime:
 maintenance:
   enabled: false
   message: "Service is under maintenance. Please try again later."
+  # Which traffic it turns away (see "Guards and scopes"). Default:
+  # [transcoded, endpoints].
+  # scope: { traffic: [all] }
+
+# Optional: request concurrency limit. Requests past max_in_flight get 503
+# UNAVAILABLE with `Retry-After: 1` at once; a request holds its slot until its
+# response body ends. Default scope: [transcoded, endpoints, grpc].
+concurrency:
+  max_in_flight: 512
+  # scope: { traffic: [grpc], paths: ["/acme.v1.Orders/*"] }
 
 # Optional: server-streaming response behavior.
 # Streaming RPCs return NDJSON by default; clients sending
@@ -177,6 +189,8 @@ response_headers:
 # the rest run before auth so anonymous floods are shed cheaply.
 shield:
   enabled: true
+  # Which traffic the rules apply to. Default: [transcoded, endpoints].
+  # scope: { traffic: [transcoded, endpoints, grpc] }
   # CIDR ranges of trusted proxies/LBs. X-Forwarded-For is honored only from
   # these peers; set this behind a load balancer for correct per-client limits.
   trusted_proxies: ["10.0.0.0/8"]
@@ -206,6 +220,10 @@ shield:
 # JWT auth
 auth:
   mode: "jwt"
+  # Which traffic needs a token. Default: [transcoded, endpoints]; the
+  # forward-auth endpoint is never behind it. `auth.authz` takes a `scope` too
+  # (default: [transcoded]).
+  # scope: { traffic: [transcoded, grpc] }
   jwt:
     jwks_uri: "https://idp.example.com/.well-known/jwks.json"
     # OR a static key: public_key_pem_file: "/etc/proxy/idp-ed25519.pub.pem"
@@ -339,6 +357,64 @@ there is no boundary burst on top of this lag.
 
 See the `shield:` block under [Configuration](#configuration) for the full
 schema.
+
+## Guards and scopes
+
+A guard is a check that may turn a request away: maintenance mode, the
+concurrency limit, the rate limits, JWT auth, ext_authz and the auth decider.
+Each one covers the traffic its `scope` names, and nothing else:
+
+| Traffic | What it is |
+|---------|------------|
+| `transcoded` | REST calls the proxy transcodes to gRPC |
+| `endpoints` | the proxy's own endpoints: health, metrics, OpenAPI, OIDC, extra routes, forward-auth |
+| `grpc` | native gRPC and gRPC-Web calls passed through to the upstream |
+| `fallback` | requests no route answers, handed to `ProxyService::with_fallback` |
+| `all` | every class above |
+
+```yaml
+scope:
+  traffic: [transcoded, grpc]
+  paths: ["/v1/orders/**", "/acme.v1.Orders/*"]   # optional, globs
+  methods: ["POST"]                                 # optional
+```
+
+`paths` and `methods` narrow the guard within its traffic; `*` stays within a
+path segment and `**` spans segments. A native gRPC call's path is
+`/<package>.<Service>/<Method>`. A scope whose `traffic` is empty, a relative
+or invalid glob, or an invalid method stops the proxy at startup.
+
+| Guard | Configured by | Default traffic |
+|-------|---------------|-----------------|
+| maintenance | `maintenance.scope` | `transcoded`, `endpoints` |
+| concurrency limit | `concurrency.scope` | `transcoded`, `endpoints`, `grpc` |
+| rate limits | `shield.scope` | `transcoded`, `endpoints` |
+| JWT | `auth.scope` | `transcoded`, `endpoints` |
+| ext_authz | `auth.authz.scope` | `transcoded` |
+| auth decider | `ProxyServer::with_auth_decider_scope` | `transcoded` |
+
+The forward-auth endpoint answers for JWT, ext_authz and the decider, so it is
+never behind them, whatever their scope. A request runs the guards of its own
+class only, in this order: maintenance, concurrency, rate limits keyed before
+auth, JWT, rate limits keyed by verified claims, ext_authz, the decider. A
+guard outside the request's class costs it nothing.
+
+**Rejections in the request's protocol.** A REST client gets the
+`google.rpc.Status` JSON body of [Error responses](#error-responses) with the
+mapped HTTP status and an empty `details`:
+
+```json
+{ "error": "RESOURCE_EXHAUSTED", "code": 8, "message": "rate limit exceeded", "details": [] }
+```
+
+A gRPC or gRPC-Web client gets a trailers-only response with the same code
+(`UNAUTHENTICATED`, `PERMISSION_DENIED`, `RESOURCE_EXHAUSTED`, `UNAVAILABLE`)
+and message, and the guard's headers (`Retry-After`, `RateLimit-*`,
+`WWW-Authenticate`, `Location`) as metadata. A gRPC-Web rejection keeps the
+proxy's CORS policy. An ext_authz denial carries the Check's own status code;
+a decider's `Deny` maps its HTTP status back to a code by the `google.rpc.Code`
+table, and its `Redirect` reaches a gRPC client as `UNAUTHENTICATED` with
+`Location` in the metadata, since a gRPC client cannot follow it.
 
 ## Error responses
 
@@ -714,9 +790,11 @@ A plain TCP connection passes `stream.connect_info()` directly
 
 What the proxy does not serve is not its business: a request no route matches
 gets `404`, or goes to a service of yours with
-`ProxyService::with_fallback(my_axum_app)`. The proxy's middleware (CORS,
-maintenance, rate limits, auth) sees neither those requests nor native gRPC
-ones; they reach your service untouched.
+`ProxyService::with_fallback(my_axum_app)`. By default no guard covers those
+requests or native gRPC ones, and they reach your service untouched; name
+`grpc` or `fallback` in a guard's scope to put them behind it (see
+[Guards and scopes](#guards-and-scopes)). CORS and tracing stay the fallback's
+own.
 
 gRPC-Web requests pass through unchanged as well, so the upstream answers
 them in that protocol: wrap your services in tonic-web's layer
@@ -793,20 +871,21 @@ ProxyServer::from_config(config)
 
 The hooks are:
 
-- **`with_auth_decider`** — an in-process forward-auth / PDP decision, run inline
-  on every proxied request and exposed at `/verify` (path configurable via
-  `with_verify_path`).
-- **`with_token_verifier`** — replaces the built-in JWT signature check
+- **`with_auth_decider`**: an in-process forward-auth / PDP decision, run inline
+  on transcoded requests (other traffic with `with_auth_decider_scope`, see
+  [Guards and scopes](#guards-and-scopes)) and exposed at `/verify` (path
+  configurable via `with_verify_path`).
+- **`with_token_verifier`**: replaces the built-in JWT signature check
   (see [JWT verification](#jwt-verification)) while keeping the route policies,
   the roles claim, and the claim→header forwarding.
-- **`with_oidc_backend`** — backs the stateless OIDC surface (discovery, JWKS,
+- **`with_oidc_backend`**: backs the stateless OIDC surface (discovery, JWKS,
   userinfo) with your key/client metadata; supersedes the config-driven static
   discovery.
-- **`with_extra_routes`** — registers extra stateless routes through a
+- **`with_extra_routes`**: registers extra stateless routes through a
   framework-agnostic adapter (request parts in, response parts out).
-- **`with_error_details`** — chooses which transcoded routes return the
+- **`with_error_details`**: chooses which transcoded routes return the
   upstream's `google.rpc.Status` details (see [Error responses](#error-responses)).
-- **`with_denied_response_headers`** — keeps upstream response metadata keys
+- **`with_denied_response_headers`**: keeps upstream response metadata keys
   off the HTTP responses (see [Upstream controls](#upstream-controls)).
 
 ## JWT verification
@@ -974,6 +1053,8 @@ Client (HTTP/JSON)
 │  │ CORS            │  │
 │  ├─────────────────┤  │
 │  │ Maintenance     │  │  503 gate (exempt paths)
+│  ├─────────────────┤  │
+│  │ Concurrency     │  │  in-flight limit (503)
 │  ├─────────────────┤  │
 │  │ Shield          │  │  rate limiting (429)
 │  ├─────────────────┤  │

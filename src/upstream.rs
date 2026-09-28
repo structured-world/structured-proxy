@@ -155,8 +155,15 @@ impl<U: Upstream> Future for PassThrough<U> {
 /// headers too, but its client reads it only under a gRPC-Web content type
 /// (gRPC PROTOCOL-WEB).
 fn failure(error: BoxError, protocol: GrpcProtocol) -> http::Response<axum::body::Body> {
-    let mut response: http::Response<axum::body::Body> =
-        tonic::Status::from_error(error).into_http();
+    trailers_only(tonic::Status::from_error(error), protocol)
+}
+
+/// `status` as a trailers-only gRPC answer in `protocol`.
+pub(crate) fn trailers_only(
+    status: tonic::Status,
+    protocol: GrpcProtocol,
+) -> http::Response<axum::body::Body> {
+    let mut response: http::Response<axum::body::Body> = status.into_http();
     if protocol != GrpcProtocol::Grpc {
         response.headers_mut().insert(
             http::header::CONTENT_TYPE,

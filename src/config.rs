@@ -85,6 +85,10 @@ pub struct ProxyConfig {
     /// Server-streaming response behavior.
     #[serde(default)]
     pub streaming: StreamingConfig,
+
+    /// Request concurrency limit.
+    #[serde(default)]
+    pub concurrency: Option<ConcurrencyConfig>,
 }
 
 fn default_forwarded_headers() -> Vec<String> {
@@ -230,6 +234,7 @@ pub(crate) const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "error_details",
     "response_headers",
     "runtime",
+    "concurrency",
 ];
 
 /// Every `streaming:` key: the [`StreamingConfig`] fields plus the ones
@@ -456,6 +461,89 @@ pub struct AuthConfig {
     /// AuthZ integration (optional gRPC call).
     #[serde(default)]
     pub authz: Option<AuthzConfig>,
+
+    /// The traffic JWT authentication covers. Default: `transcoded` and
+    /// `endpoints`; the forward-auth endpoint is never behind it.
+    #[serde(default)]
+    pub scope: Option<ScopeConfig>,
+}
+
+/// The traffic a guard covers, and optionally which paths and methods of it.
+///
+/// ```yaml
+/// scope:
+///   traffic: [transcoded, grpc]   # or [all]
+///   paths: ["/v1/**", "/acme.v1.Orders/*"]
+///   methods: ["POST"]
+/// ```
+///
+/// Omitted keys keep the guard's own default traffic and cover every path and
+/// method of it.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeConfig {
+    /// The classes of traffic covered; `all` names every class.
+    #[serde(default)]
+    pub traffic: Option<Vec<Traffic>>,
+    /// Path globs (`*` within a segment, `**` across segments) the guard is
+    /// narrowed to; empty covers every path. A native gRPC call's path is
+    /// `/<package>.<Service>/<Method>`.
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// Methods the guard is narrowed to; empty covers every method.
+    #[serde(default)]
+    pub methods: Vec<String>,
+}
+
+impl ScopeConfig {
+    /// A scope covering every path and method of `traffic`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use structured_proxy::config::{ScopeConfig, Traffic};
+    ///
+    /// let scope = ScopeConfig::traffic([Traffic::Transcoded, Traffic::Grpc]);
+    /// assert!(scope.paths.is_empty());
+    /// ```
+    pub fn traffic(traffic: impl IntoIterator<Item = Traffic>) -> Self {
+        Self {
+            traffic: Some(traffic.into_iter().collect()),
+            paths: Vec::new(),
+            methods: Vec::new(),
+        }
+    }
+}
+
+/// A class of traffic the proxy tells apart before any guard runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Traffic {
+    /// REST calls the proxy transcodes to gRPC.
+    Transcoded,
+    /// The proxy's own endpoints: health, metrics, OpenAPI, OIDC, extra
+    /// routes and forward-auth.
+    Endpoints,
+    /// Native gRPC and gRPC-Web calls passed through to the upstream.
+    Grpc,
+    /// Requests no route answers, handed to the fallback.
+    Fallback,
+    /// Every class above.
+    All,
+}
+
+/// Request concurrency limit: requests past `max_in_flight` are answered
+/// `UNAVAILABLE` (503) at once instead of queueing.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConcurrencyConfig {
+    /// Most requests in flight at once, counted until each response body
+    /// ends, so a stream holds its slot for its whole life. At least 1.
+    pub max_in_flight: usize,
+    /// The traffic the limit covers, one budget shared by all of it.
+    /// Default: `transcoded`, `endpoints` and `grpc`.
+    #[serde(default)]
+    pub scope: Option<ScopeConfig>,
 }
 
 fn default_auth_mode() -> String {
@@ -616,6 +704,9 @@ pub struct AuthzConfig {
     /// request through instead of denying. Defaults to false (fail closed).
     #[serde(default)]
     pub failure_mode_allow: bool,
+    /// The traffic the check covers. Default: `transcoded`.
+    #[serde(default)]
+    pub scope: Option<ScopeConfig>,
 }
 
 fn default_authz_timeout_ms() -> u64 {
@@ -667,6 +758,9 @@ pub struct ShieldConfig {
     /// trust forwarding headers; set this behind a load balancer.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
+    /// The traffic the rules apply to. Default: `transcoded` and `endpoints`.
+    #[serde(default)]
+    pub scope: Option<ScopeConfig>,
 }
 
 /// A named limit tier: a sustained rate plus an instantaneous burst capacity.
@@ -976,6 +1070,10 @@ pub struct MaintenanceConfig {
     pub exempt_paths: Vec<String>,
     #[serde(default = "default_maintenance_message")]
     pub message: String,
+    /// The traffic maintenance mode turns away. Default: `transcoded` and
+    /// `endpoints`.
+    #[serde(default)]
+    pub scope: Option<ScopeConfig>,
 }
 
 fn default_exempt_paths() -> Vec<String> {
@@ -997,6 +1095,7 @@ impl Default for MaintenanceConfig {
             enabled: false,
             exempt_paths: default_exempt_paths(),
             message: default_maintenance_message(),
+            scope: None,
         }
     }
 }

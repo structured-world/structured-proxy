@@ -70,6 +70,7 @@ fn forward_auth(pem_path: std::path::PathBuf, login_url: Option<String>) -> Arc<
             applications_path: None,
         }),
         authz: None,
+        scope: None,
     };
     let auth = Auth::build(&config, None).unwrap().unwrap();
     ForwardAuth::build(&config, auth).unwrap()

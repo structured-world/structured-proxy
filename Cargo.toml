@@ -35,7 +35,8 @@ doc = false
 # HTTP framework. `http2`: `serve` answers HTTP/1.1 and HTTP/2 on one port,
 # so native gRPC clients share the listener with REST ones.
 axum = { version = "0.8", features = ["macros", "http2"] }
-tower = "0.5"
+# `util`: the guarded gRPC and fallback paths are boxed services.
+tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["cors", "trace"] }
 # Foundational HTTP types, used directly by the framework-agnostic embedding
 # hooks (src/hooks.rs) so an embedder never names `axum`. Already in the tree

@@ -157,6 +157,16 @@ async fn listen(
     extra_yaml: &str,
     fallback: Option<axum::Router>,
 ) -> SocketAddr {
+    listen_configured(upstream, extra_yaml, fallback, |server| server).await
+}
+
+/// [`listen`], with `configure` applied to the server before it is built.
+async fn listen_configured(
+    upstream: common::Upstream,
+    extra_yaml: &str,
+    fallback: Option<axum::Router>,
+    configure: impl FnOnce(ProxyServer) -> ProxyServer,
+) -> SocketAddr {
     let pool = pool();
     let service = Edge { pool: pool.clone() };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -164,11 +174,13 @@ async fn listen(
     match upstream {
         common::Upstream::Remote => {
             let url = common::serve(service).await;
-            let server = ProxyServer::from_yaml_str(&format!(
-                "upstream:\n  default: \"{url}\"\n{extra_yaml}"
-            ))
-            .unwrap()
-            .with_descriptors(pool);
+            let server = configure(
+                ProxyServer::from_yaml_str(&format!(
+                    "upstream:\n  default: \"{url}\"\n{extra_yaml}"
+                ))
+                .unwrap()
+                .with_descriptors(pool),
+            );
             let mut proxy = server.service(server.upstream().unwrap()).unwrap();
             if let Some(fallback) = fallback {
                 proxy = proxy.with_fallback(fallback);
@@ -176,9 +188,11 @@ async fn listen(
             tokio::spawn(structured_proxy::serve(listener, proxy));
         }
         common::Upstream::InProcess => {
-            let server = ProxyServer::from_yaml_str(extra_yaml)
-                .unwrap()
-                .with_descriptors(pool);
+            let server = configure(
+                ProxyServer::from_yaml_str(extra_yaml)
+                    .unwrap()
+                    .with_descriptors(pool),
+            );
             let mut proxy = server
                 .service(tonic::service::Routes::new(service))
                 .unwrap();
@@ -321,6 +335,105 @@ async fn maintenance_gates_the_routes_but_not_the_fallback_or_native_grpc() {
     let seen = grpc_echo(addr, "native").await.unwrap();
     assert_eq!(field(&seen, "name"), "native");
 }
+
+// --- scoped guards ---------------------------------------------------------------
+
+async fn a_guard_scoped_to_grpc_answers_native_calls_with_a_status() {
+    // A gRPC client reads only a status: the guard's 503 reaches it as
+    // UNAVAILABLE with the guard's message, while the REST route it does not
+    // cover stays open.
+    let yaml = "maintenance:\n  enabled: true\n  message: \"back soon\"\n  scope:\n    traffic: [grpc]\n";
+    let addr = listen(UPSTREAM, yaml, None).await;
+    let status = grpc_echo(addr, "native").await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::Unavailable);
+    assert_eq!(status.message(), "back soon");
+    let (status, body, _) = http1_get(addr, "/v1/echo/rest").await;
+    assert_eq!(status, 200, "{body}");
+}
+
+async fn a_guard_scoped_to_the_fallback_covers_it_and_nothing_else() {
+    let fallback = axum::Router::new().route(
+        "/static/index.html",
+        axum::routing::get(|| async { "static" }),
+    );
+    let yaml = "maintenance:\n  enabled: true\n  scope:\n    traffic: [fallback]\n";
+    let addr = listen(UPSTREAM, yaml, Some(fallback)).await;
+    let (status, body, _) = http1_get(addr, "/static/index.html").await;
+    assert_eq!(status, 503, "{body}");
+    let body: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["error"], "UNAVAILABLE");
+    let (status, body, _) = http1_get(addr, "/v1/echo/rest").await;
+    assert_eq!(status, 200, "{body}");
+}
+
+async fn a_guard_narrowed_by_path_leaves_the_other_paths_alone() {
+    let yaml = "maintenance:\n  enabled: true\n  scope:\n    paths: [\"/v1/echo/closed\"]\n";
+    let addr = listen(UPSTREAM, yaml, None).await;
+    let (status, _, _) = http1_get(addr, "/v1/echo/closed").await;
+    assert_eq!(status, 503);
+    let (status, body, _) = http1_get(addr, "/v1/echo/open").await;
+    assert_eq!(status, 200, "{body}");
+}
+
+async fn the_auth_decider_scoped_to_grpc_gates_native_calls_by_the_client_address() {
+    // The decider sees the gRPC client's address, and its 403 reaches the
+    // client as PERMISSION_DENIED.
+    let decider = std::sync::Arc::new(PeerDecider::default());
+    let scope = structured_proxy::config::ScopeConfig::traffic([
+        structured_proxy::config::Traffic::Grpc,
+    ]);
+    let addr = listen_configured(UPSTREAM, "", None, {
+        let decider = decider.clone();
+        move |server| {
+            server
+                .with_auth_decider(decider)
+                .with_auth_decider_scope(scope)
+        }
+    })
+    .await;
+    let status = grpc_echo(addr, "native").await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    let peer = decider.peer.lock().unwrap().unwrap();
+    assert!(peer.ip().is_loopback(), "{peer}");
+    // Scoped to gRPC: the transcoded route is not behind it.
+    let (status, body, _) = http1_get(addr, "/v1/echo/rest").await;
+    assert_eq!(status, 200, "{body}");
+}
+}
+
+/// Denies every request with `403`, recording the peer it saw.
+#[derive(Default)]
+struct PeerDecider {
+    peer: std::sync::Mutex<Option<SocketAddr>>,
+}
+
+#[async_trait::async_trait]
+impl structured_proxy::hooks::AuthDecider for PeerDecider {
+    async fn decide(
+        &self,
+        req: &structured_proxy::hooks::RequestParts<'_>,
+    ) -> structured_proxy::hooks::Decision {
+        *self.peer.lock().unwrap() = Some(req.peer);
+        structured_proxy::hooks::Decision::Deny {
+            status: StatusCode::FORBIDDEN,
+            body: bytes::Bytes::from_static(br#"{"error":"denied"}"#),
+        }
+    }
+}
+
+#[test]
+fn a_scope_that_covers_no_traffic_fails_the_build() {
+    let server =
+        ProxyServer::from_yaml_str("maintenance:\n  enabled: true\n  scope:\n    traffic: []\n")
+            .unwrap()
+            .with_descriptors(pool());
+    let Err(err) = server.service(tonic::service::Routes::default()) else {
+        panic!("a scope with no traffic must be refused");
+    };
+    assert!(
+        err.to_string().contains("maintenance.scope.traffic"),
+        "{err}"
+    );
 }
 
 // --- deadlines ---------------------------------------------------------------

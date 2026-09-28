@@ -27,40 +27,6 @@ upstream:
     assert!(server.descriptor_pool.is_none());
 }
 
-fn maintenance() -> Maintenance {
-    Maintenance {
-        exempt: vec![
-            "/health/**".into(),
-            "/.well-known/**".into(),
-            "/metrics".into(),
-        ],
-        message: "Down".into(),
-    }
-}
-
-#[test]
-fn maintenance_exempts_exact_paths_and_subtrees() {
-    let maintenance = maintenance();
-    assert!(maintenance.exempts("/health"));
-    assert!(maintenance.exempts("/health/ready"));
-    assert!(maintenance.exempts("/.well-known/openid-configuration"));
-    assert!(maintenance.exempts("/metrics"));
-    assert!(!maintenance.exempts("/v1/auth/login"));
-    assert!(!maintenance.exempts("/oauth2/token"));
-    // An exact path covers nothing below it.
-    assert!(!maintenance.exempts("/metrics/extra"));
-}
-
-#[test]
-fn maintenance_subtree_stops_at_a_segment_boundary() {
-    // `/health/**` is the `/health` subtree: a sibling path that only shares
-    // the prefix (`/healthz`, `/health-admin`) stays behind the 503.
-    let maintenance = maintenance();
-    assert!(!maintenance.exempts("/healthz"));
-    assert!(!maintenance.exempts("/health-admin/drop"));
-    assert!(!maintenance.exempts("/.well-knownx"));
-}
-
 #[test]
 fn no_configured_upstream_is_an_error_naming_the_key() {
     // An embedder with an in-process upstream needs no address; asking for
