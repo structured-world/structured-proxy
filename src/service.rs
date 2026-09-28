@@ -5,6 +5,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use axum::extract::connect_info::ConnectInfo;
@@ -13,8 +14,15 @@ use axum::routing::future::RouteFuture;
 use axum::serve::IncomingStream;
 use bytes::Bytes;
 use pin_project_lite::pin_project;
-use tonic::transport::server::TcpConnectInfo;
+use rustls::pki_types::CertificateDer;
+use tonic::transport::server::{Connected, TcpConnectInfo};
 use tower::Service;
+
+/// tonic's `TlsConnectInfo<TcpConnectInfo>`, the record its TLS server puts on
+/// a request and `Request::peer_certs` reads. tonic exports the name only with
+/// a TLS backend feature, so it is reached through the stream it describes.
+pub type TlsConnectInfo =
+    <tokio_rustls::server::TlsStream<tokio::net::TcpStream> as Connected>::ConnectInfo;
 
 use crate::upstream::{is_grpc, BoxError, PassThrough, Upstream};
 
@@ -28,8 +36,11 @@ use crate::upstream::{is_grpc, BoxError, PassThrough, Upstream};
 /// route matches is answered `404`, or handed to the service set with
 /// [`with_fallback`](Self::with_fallback), untouched by that middleware.
 ///
-/// Serve it with [`serve`], or hand it to any server that takes
-/// a tower service of `http` types. Native gRPC needs HTTP/2 on that server.
+/// Serve it with [`serve`], or hand it to any server that takes a tower
+/// service of `http` types: your own TLS, a Unix socket, an existing hyper or
+/// axum server. Native gRPC needs HTTP/2 on that server (ALPN `h2` next to
+/// `http/1.1` behind TLS). Such a server tells the proxy which connection a
+/// request came on with [`for_connection`](Self::for_connection).
 ///
 /// # Examples
 ///
@@ -49,15 +60,65 @@ use crate::upstream::{is_grpc, BoxError, PassThrough, Upstream};
 pub struct ProxyService<U> {
     upstream: U,
     routes: axum::Router,
-    /// The connection a served request arrived on, set by [`serve`].
-    connection: Option<Connection>,
+    /// The connection the requests arrive on, set per connection by the
+    /// server.
+    connection: Option<ConnectionInfo>,
 }
 
-/// The two ends of an accepted connection.
-#[derive(Clone, Copy, Debug)]
-struct Connection {
-    local: Option<SocketAddr>,
-    remote: SocketAddr,
+/// The connection requests arrive on, in the form a tonic server records it:
+/// the TCP ends, and behind TLS the client's certificate chain.
+///
+/// Built from what [`Connected::connect_info`] returns for a
+/// `tokio::net::TcpStream` (`ConnectionInfo::from`) or a
+/// `tokio_rustls::server::TlsStream<TcpStream>` ([`ConnectionInfo::tls`]), so a
+/// tonic handler behind the proxy reads it as it would behind tonic's own
+/// server: `Request::remote_addr`, and `Request::peer_certs` for mTLS.
+///
+/// [`Connected::connect_info`]: tonic::transport::server::Connected::connect_info
+#[derive(Clone, Debug)]
+pub struct ConnectionInfo {
+    tcp: TcpConnectInfo,
+    tls: Option<TlsConnectInfo>,
+}
+
+impl ConnectionInfo {
+    /// The client's address.
+    pub fn remote_addr(&self) -> Option<SocketAddr> {
+        self.tcp.remote_addr
+    }
+
+    /// The certificate chain the client presented over TLS, if it did.
+    pub fn peer_certs(&self) -> Option<Arc<Vec<CertificateDer<'static>>>> {
+        self.tls.as_ref().and_then(|tls| tls.peer_certs())
+    }
+
+    /// Put the connection where tonic reads it: [`TcpConnectInfo`] for
+    /// `Request::remote_addr` and, behind TLS, [`TlsConnectInfo`] for
+    /// `Request::peer_certs`.
+    pub(crate) fn into_tonic_extensions(self, extensions: &mut http::Extensions) {
+        extensions.insert(self.tcp);
+        if let Some(tls) = self.tls {
+            extensions.insert(tls);
+        }
+    }
+}
+
+impl From<TcpConnectInfo> for ConnectionInfo {
+    fn from(tcp: TcpConnectInfo) -> Self {
+        Self { tcp, tls: None }
+    }
+}
+
+impl ConnectionInfo {
+    /// A TLS connection, from what `connect_info` reports for a
+    /// `tokio_rustls::server::TlsStream<TcpStream>`: the TCP ends and the
+    /// client's certificate chain.
+    pub fn tls(tls: TlsConnectInfo) -> Self {
+        Self {
+            tcp: tls.get_ref().clone(),
+            tls: Some(tls),
+        }
+    }
 }
 
 impl<U: Upstream> ProxyService<U> {
@@ -86,11 +147,39 @@ impl<U: Upstream> ProxyService<U> {
         self
     }
 
-    fn on_connection(&self, connection: Connection) -> Self {
+    /// This service for the requests of one connection: the proxy's
+    /// middleware sees its client's address (rate limits by IP, the auth
+    /// decider), and a tonic upstream in process reads it with
+    /// `Request::remote_addr`, and its TLS client certificates with
+    /// `Request::peer_certs`, for native and transcoded calls alike.
+    ///
+    /// A server of your own calls it once per accepted connection, with what
+    /// tonic's [`Connected`] trait
+    /// reports for the stream. [`serve`] does this itself.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use structured_proxy::ProxyServer;
+    /// use tonic::transport::server::Connected;
+    ///
+    /// # async fn run() -> anyhow::Result<()> {
+    /// let proxy = ProxyServer::from_yaml_str("service:\n  name: demo\n")?
+    ///     .service(tonic::service::Routes::default())?;
+    /// let listener = tokio::net::TcpListener::bind("0.0.0.0:8443").await?;
+    /// let (tcp, _) = listener.accept().await?;
+    /// // After a TLS handshake, the `TlsStream` reports the client's certificates too.
+    /// let service = proxy.for_connection(tcp.connect_info());
+    /// # let _ = service;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn for_connection(&self, connection: impl Into<ConnectionInfo>) -> Self {
         Self {
             upstream: self.upstream.clone(),
             routes: self.routes.clone(),
-            connection: Some(connection),
+            connection: Some(connection.into()),
         }
     }
 }
@@ -112,26 +201,27 @@ where
     }
 
     fn call(&mut self, mut request: http::Request<B>) -> Self::Future {
-        if let Some(connection) = self.connection {
-            // What axum extractors and a tonic handler read the peer from; a
-            // server that set them already (an embedder's own axum app) keeps
-            // its values.
-            let extensions = request.extensions_mut();
-            if extensions.get::<ConnectInfo<SocketAddr>>().is_none() {
-                extensions.insert(ConnectInfo(connection.remote));
-            }
-            if extensions.get::<TcpConnectInfo>().is_none() {
-                extensions.insert(TcpConnectInfo {
-                    local_addr: connection.local,
-                    remote_addr: Some(connection.remote),
-                });
-            }
-        }
         let inner = if is_grpc(request.headers()) {
+            // A native call carries its connection the way tonic's server
+            // hands it to a handler.
+            if let Some(connection) = &self.connection {
+                connection
+                    .clone()
+                    .into_tonic_extensions(request.extensions_mut());
+            }
             Inner::Grpc {
                 call: PassThrough::new(self.upstream.clone(), request.map(tonic::body::Body::new)),
             }
         } else {
+            // The middleware reads the peer as axum's `ConnectInfo`; the
+            // transcoder passes the whole connection on to the upstream.
+            if let Some(connection) = &self.connection {
+                let extensions = request.extensions_mut();
+                if let Some(remote) = connection.remote_addr() {
+                    extensions.insert(ConnectInfo(remote));
+                }
+                extensions.insert(connection.clone());
+            }
             Inner::Routes {
                 future: self.routes.call(request),
             }
@@ -174,11 +264,11 @@ impl<U: Upstream> Future for ResponseFuture<U> {
     }
 }
 
-/// Serve `service` on `listener` until the listener fails: HTTP/1.1 and
-/// HTTP/2 (with or without TLS in front, cleartext here) on the same port, so
-/// REST clients and native gRPC clients share it. Each request carries the
-/// connection's peer, for the proxy's own middleware (`ConnectInfo`) and for a
-/// tonic handler upstream (`Request::remote_addr`).
+/// Serve `service` on `listener` until the listener fails: cleartext HTTP/1.1
+/// and HTTP/2 on the same port, so REST clients and native gRPC clients share
+/// it. Each connection's service gets its peer through
+/// [`ProxyService::for_connection`]. For TLS, run the service on a server of
+/// your own (see [`ProxyService`]).
 ///
 /// # Errors
 ///
@@ -218,10 +308,7 @@ impl<U: Upstream> Service<IncomingStream<'_, tokio::net::TcpListener>> for PerCo
     }
 
     fn call(&mut self, stream: IncomingStream<'_, tokio::net::TcpListener>) -> Self::Future {
-        std::future::ready(Ok(self.0.on_connection(Connection {
-            local: stream.io().local_addr().ok(),
-            remote: *stream.remote_addr(),
-        })))
+        std::future::ready(Ok(self.0.for_connection(stream.io().connect_info())))
     }
 }
 

@@ -21,7 +21,7 @@ Works with **any** gRPC service via proto descriptor files. No code generation, 
 - **Server-streaming** RPC → NDJSON by default, or Server-Sent Events via `Accept: text/event-stream` negotiation
 - **gRPC → HTTP status mapping** following the standard `google.rpc.Code` table
 - **Typed error details**: the upstream's `google.rpc.Status` details (`ErrorInfo`, `BadRequest`, `RetryInfo`, ...) reach the HTTP client as ProtoJSON, switchable globally and per route (see [Error responses](#error-responses))
-- **One port for REST and native gRPC**: HTTP/1.1 and HTTP/2 on the same listener, gRPC and gRPC-Web requests pass through to the upstream unchanged
+- **One port for REST and native gRPC**: HTTP/1.1 and HTTP/2 on the same listener, gRPC and gRPC-Web requests pass through to the upstream unchanged; behind your own TLS too, with the client's address and certificate reaching the upstream
 - **In-process upstream** for embedders: transcoded calls reach your own tonic services with no socket or loopback hop (see [Library Usage](#library-usage))
 - **Header forwarding** from HTTP requests to gRPC metadata (configurable allow-list)
 - **Context propagation**: W3C trace-context (`traceparent` forwarded or synthesized) and client deadlines (`grpc-timeout`) carried across the REST↔gRPC boundary
@@ -653,6 +653,50 @@ structured_proxy::serve(listener, proxy).await?;
 `tonic::transport::Channel` (what `ProxyServer::upstream` builds from the
 config), or anything else that speaks gRPC over `http` types. The result is a
 tower service, so it can also run on a server of your own.
+
+### Behind your own TLS
+
+`serve` speaks cleartext. For TLS, run the service on your own acceptor: one
+`ProxyService::for_connection` call per accepted connection tells the proxy
+who is on the other end, so its middleware sees the client's address and a
+tonic handler in process reads it with `Request::remote_addr`, and the client
+certificate with `Request::peer_certs` (mTLS), for native and transcoded calls
+alike. Advertise `h2` next to `http/1.1` in ALPN so gRPC clients get HTTP/2.
+
+```rust
+use std::sync::Arc;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto::Builder;
+use hyper_util::service::TowerToHyperService;
+use structured_proxy::{ConnectionInfo, ProxyServer};
+use tonic::transport::server::Connected;
+
+# async fn run(mut tls: rustls::ServerConfig, grpc: tonic::service::Routes) -> anyhow::Result<()> {
+let proxy = ProxyServer::from_file(std::path::Path::new("my-service.yaml"))?.service(grpc)?;
+tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+let listener = tokio::net::TcpListener::bind("0.0.0.0:8443").await?;
+loop {
+    let (tcp, _) = listener.accept().await?;
+    let (acceptor, proxy) = (acceptor.clone(), proxy.clone());
+    tokio::spawn(async move {
+        // The handshake runs in the connection's task, so a slow client
+        // does not hold up the others.
+        let Ok(stream) = acceptor.accept(tcp).await else { return };
+        let service = proxy.for_connection(ConnectionInfo::tls(stream.connect_info()));
+        let served = Builder::new(TokioExecutor::new())
+            .serve_connection(TokioIo::new(stream), TowerToHyperService::new(service))
+            .await;
+        if let Err(error) = served {
+            tracing::debug!(%error, "connection ended");
+        }
+    });
+}
+# }
+```
+
+A plain TCP connection passes `stream.connect_info()` directly
+(`ConnectionInfo` converts from tonic's `TcpConnectInfo`).
 
 What the proxy does not serve is not its business: a request no route matches
 gets `404`, or goes to a service of yours with

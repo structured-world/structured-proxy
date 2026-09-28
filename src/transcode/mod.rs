@@ -37,9 +37,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tonic::client::Grpc;
 use tonic::metadata::MetadataMap;
-use tonic::transport::server::TcpConnectInfo;
 
 use crate::config::AliasConfig;
+use crate::service::ConnectionInfo;
 use crate::upstream::Upstream;
 use error::{ErrorDetailsPolicy, StatusDetails};
 use response::UpstreamHeaders;
@@ -294,7 +294,7 @@ macro_rules! endpoint {
               headers: HeaderMap,
               path_params: Path<PathParams>,
               raw_query: RawQuery,
-              connection: Option<Extension<TcpConnectInfo>>,
+              connection: Option<Extension<ConnectionInfo>>,
               body: Bytes| {
             let client = Client {
                 headers,
@@ -535,7 +535,7 @@ fn accept_range_selects_sse(range: &str) -> bool {
 /// on when the server recorded one.
 struct Client {
     headers: HeaderMap,
-    connection: Option<TcpConnectInfo>,
+    connection: Option<ConnectionInfo>,
 }
 
 /// Serve one request on a transcoded route.
@@ -625,7 +625,7 @@ impl<U: Upstream> Call<U> {
 async fn prepare<S: TranscodeState>(
     proxy_state: S,
     headers: &HeaderMap,
-    connection: Option<TcpConnectInfo>,
+    connection: Option<ConnectionInfo>,
     path_params: &PathParams,
     raw_query: Option<&str>,
     body: Bytes,
@@ -638,10 +638,11 @@ async fn prepare<S: TranscodeState>(
         .map_err(Rejection::Unmappable)?;
     let mut request = tonic::Request::new(message);
     *request.metadata_mut() = request_metadata;
-    // An upstream in process reads the HTTP client's address with
-    // `Request::remote_addr`; a remote one never sees request extensions.
+    // An upstream in process reads the HTTP client's address and TLS
+    // certificates with `Request::remote_addr` / `peer_certs`; a remote one
+    // never sees request extensions.
     if let Some(connection) = connection {
-        request.extensions_mut().insert(connection);
+        connection.into_tonic_extensions(request.extensions_mut());
     }
     // Only the client's own deadline travels upstream: a default one would
     // cut a long server stream short on an upstream that applies

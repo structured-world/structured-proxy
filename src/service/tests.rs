@@ -180,19 +180,19 @@ async fn an_upstream_that_cannot_take_the_call_answers_a_grpc_status() {
     assert_eq!(response.headers()["content-type"], "application/grpc");
 }
 
-fn connection() -> Connection {
-    Connection {
-        local: Some("10.0.0.1:8080".parse().unwrap()),
-        remote: "192.0.2.7:40000".parse().unwrap(),
+fn connection() -> TcpConnectInfo {
+    TcpConnectInfo {
+        local_addr: Some("10.0.0.1:8080".parse().unwrap()),
+        remote_addr: Some("192.0.2.7:40000".parse().unwrap()),
     }
 }
 
 #[tokio::test]
-async fn a_served_grpc_request_carries_its_connection_to_the_upstream() {
+async fn a_grpc_request_carries_its_connection_to_the_upstream() {
     // A tonic handler behind the proxy reads the client's address with
     // `Request::remote_addr`, as it would behind tonic's own server.
     let upstream = Recorder::default();
-    let proxy = service(upstream.clone()).on_connection(connection());
+    let proxy = service(upstream.clone()).for_connection(connection());
     proxy
         .oneshot(grpc_request("/pkg.Svc/Method"))
         .await
@@ -203,12 +203,42 @@ async fn a_served_grpc_request_carries_its_connection_to_the_upstream() {
 }
 
 #[tokio::test]
-async fn a_served_http_request_carries_its_peer_for_the_middleware() {
-    let routes = axum::Router::new().route(
-        "/peer",
-        get(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move { peer.to_string() }),
-    );
-    let proxy = ProxyService::new(Recorder::default(), routes).on_connection(connection());
+async fn a_grpc_request_without_a_connection_carries_none() {
+    // A service no server told about its connection invents no peer.
+    let upstream = Recorder::default();
+    service(upstream.clone())
+        .oneshot(grpc_request("/pkg.Svc/Method"))
+        .await
+        .unwrap();
+    let seen = upstream.seen.lock().unwrap();
+    assert_eq!(seen.remote, None);
+    assert_eq!(seen.local, None);
+}
+
+/// Routes answering with the peer the middleware sees (`/peer`) and with the
+/// connection the transcoder gets (`/connection`).
+fn peer_routes() -> axum::Router {
+    axum::Router::new()
+        .route(
+            "/peer",
+            get(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move { peer.to_string() }),
+        )
+        .route(
+            "/connection",
+            get(
+                |connection: Option<axum::Extension<ConnectionInfo>>| async move {
+                    match connection {
+                        Some(axum::Extension(c)) => format!("{:?}", c.remote_addr()),
+                        None => "none".to_owned(),
+                    }
+                },
+            ),
+        )
+}
+
+#[tokio::test]
+async fn an_http_request_carries_its_peer_for_the_middleware() {
+    let proxy = ProxyService::new(Recorder::default(), peer_routes()).for_connection(connection());
     let response = proxy
         .oneshot(http::Request::get("/peer").body(Body::empty()).unwrap())
         .await
@@ -217,17 +247,39 @@ async fn a_served_http_request_carries_its_peer_for_the_middleware() {
 }
 
 #[tokio::test]
-async fn a_peer_set_by_an_outer_server_is_kept() {
-    // An embedder's own server may have set the peer already (behind its own
-    // proxy protocol handling, say); the proxy does not overwrite it.
-    let routes = axum::Router::new().route(
-        "/peer",
-        get(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move { peer.to_string() }),
+async fn an_http_request_carries_its_connection_for_the_transcoder() {
+    let proxy = ProxyService::new(Recorder::default(), peer_routes()).for_connection(connection());
+    let response = proxy
+        .oneshot(
+            http::Request::get("/connection")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(body_text(response).await, "Some(192.0.2.7:40000)");
+}
+
+#[tokio::test]
+async fn an_http_request_without_a_connection_carries_none() {
+    let proxy = ProxyService::new(Recorder::default(), peer_routes());
+    let response = proxy
+        .oneshot(
+            http::Request::get("/connection")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(body_text(response).await, "none");
+}
+
+#[test]
+fn a_tcp_connection_has_no_certificates() {
+    let connection = ConnectionInfo::from(connection());
+    assert_eq!(
+        connection.remote_addr(),
+        Some("192.0.2.7:40000".parse().unwrap())
     );
-    let proxy = ProxyService::new(Recorder::default(), routes).on_connection(connection());
-    let mut request = http::Request::get("/peer").body(Body::empty()).unwrap();
-    let outer: SocketAddr = "198.51.100.1:1".parse().unwrap();
-    request.extensions_mut().insert(ConnectInfo(outer));
-    let response = proxy.oneshot(request).await.unwrap();
-    assert_eq!(body_text(response).await, "198.51.100.1:1");
+    assert!(connection.peer_certs().is_none());
 }

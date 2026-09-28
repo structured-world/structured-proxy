@@ -70,7 +70,7 @@ pub mod upstream;
 /// [`install_default_crypto_provider`] for when a call is needed.
 #[cfg(feature = "builtin_jwt")]
 pub use auth::crypto::install_default_crypto_provider;
-pub use service::{serve, ProxyService};
+pub use service::{serve, ConnectionInfo, ProxyService};
 
 use axum::extract::State;
 use axum::http::{Request, StatusCode};
