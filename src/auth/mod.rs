@@ -32,10 +32,9 @@ use std::sync::Arc;
 
 use axum::extract::State;
 use axum::http::header::{HeaderName, HeaderValue};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::HeaderMap;
 use axum::middleware::Next;
-use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::response::Response;
 use serde_json::Value;
 
 use crate::config::{default_roles_claim, AuthConfig};
@@ -356,18 +355,10 @@ fn inject_claim_headers(
     }
 }
 
-fn unauthorized(message: &str) -> Response {
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(serde_json::json!({ "error": "UNAUTHENTICATED", "message": message })),
-    )
-        .into_response()
+fn unauthorized(message: &'static str) -> Response {
+    crate::guard::reject(tonic::Code::Unauthenticated, message)
 }
 
-fn forbidden(message: &str) -> Response {
-    (
-        StatusCode::FORBIDDEN,
-        Json(serde_json::json!({ "error": "PERMISSION_DENIED", "message": message })),
-    )
-        .into_response()
+fn forbidden(message: &'static str) -> Response {
+    crate::guard::reject(tonic::Code::PermissionDenied, message)
 }

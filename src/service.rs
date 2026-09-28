@@ -11,13 +11,14 @@ use std::task::{Context, Poll};
 use axum::extract::connect_info::ConnectInfo;
 use axum::response::IntoResponse;
 use axum::routing::future::RouteFuture;
-use axum::serve::IncomingStream;
 use bytes::Bytes;
 use pin_project_lite::pin_project;
 use rustls::pki_types::CertificateDer;
 use tonic::transport::server::{Connected, TcpConnectInfo};
-use tower::{Layer, Service};
+use tower::{Layer, Service, ServiceExt};
 use tower_http::cors::{Cors, CorsLayer};
+
+use crate::guard::{BoxedService, Class, GrpcRejections, Guards};
 
 /// tonic's `TlsConnectInfo<TcpConnectInfo>`, the record its TLS server puts on
 /// a request and `Request::peer_certs` reads. tonic exports the name only with
@@ -33,21 +34,26 @@ use crate::upstream::{
 /// [`ProxyServer::service`](crate::ProxyServer::service).
 ///
 /// A request with a gRPC or gRPC-Web content type goes to the upstream as it
-/// arrived, so one listener carries REST and native gRPC; gRPC-Web is the
+/// arrived, so one listener carries REST and native gRPC. gRPC-Web is the
 /// upstream's to translate (tonic-web's `GrpcWebLayer` around its services),
-/// the proxy passes protocols through rather than converting them. A gRPC-Web
+/// or the proxy's with `grpc_web.translate` for an upstream that speaks only
+/// gRPC. A gRPC-Web
 /// answer gets the proxy's CORS policy (`cors.grpc_web`), since the proxy
 /// answers the browser's preflight for it. Every other request goes to the
 /// proxy's routes (transcoded RPCs, health, metrics, OpenAPI, OIDC,
 /// forward-auth, extra routes) behind the proxy's middleware. A request no
 /// route matches is answered `404`, or handed to the service set with
-/// [`with_fallback`](Self::with_fallback), untouched by that middleware.
+/// [`with_fallback`](Self::with_fallback). Native gRPC and the fallback pass
+/// only the guards whose scope names them (`grpc`, `fallback`); a guard's
+/// rejection of a gRPC call is a gRPC status.
 ///
-/// Serve it with [`serve`], or hand it to any server that takes a tower
-/// service of `http` types: your own TLS, a Unix socket, an existing hyper or
-/// axum server. Native gRPC needs HTTP/2 on that server (ALPN `h2` next to
-/// `http/1.1` behind TLS). Such a server tells the proxy which connection a
-/// request came on with [`for_connection`](Self::for_connection).
+/// Serve it with [`serve`](crate::serve) or
+/// [`serve_with`](crate::serve_with) (TLS, a connection limit), or hand it to
+/// any server that takes a tower service of `http` types: a Unix socket, an
+/// existing hyper or axum server. Native gRPC needs HTTP/2 on that server
+/// (ALPN `h2` next to `http/1.1` behind TLS). Such a server tells the proxy
+/// which connection a request came on with
+/// [`for_connection`](Self::for_connection).
 ///
 /// # Examples
 ///
@@ -63,16 +69,101 @@ use crate::upstream::{
 /// # }
 /// # build().unwrap();
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ProxyService<U> {
     upstream: U,
     routes: axum::Router,
     /// Binary and text gRPC-Web to the upstream under the CORS policy, each
     /// built once; `None` when the upstream owns CORS for gRPC-Web.
     grpc_web: Option<GrpcWebCors<U>>,
+    /// The gRPC paths behind guards or through gRPC-Web translation; a
+    /// protocol that needs neither passes through with nothing in between.
+    boxed: BoxedGrpc,
+    /// The guards, for the fallback an embedder sets later.
+    guards: Arc<Guards>,
     /// The connection the requests arrive on, set per connection by the
     /// server.
     connection: Option<ConnectionInfo>,
+}
+
+impl<U> std::fmt::Debug for ProxyService<U> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyService")
+            .field("boxed_grpc", &self.boxed.grpc.is_some())
+            .field("boxed_grpc_web", &self.boxed.web.is_some())
+            .field("connection", &self.connection)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The gRPC paths that need more than a pass-through (guards, gRPC-Web
+/// translation), each protocol's stack built once; `None` for a protocol that
+/// passes through as it is.
+#[derive(Clone, Default)]
+struct BoxedGrpc {
+    grpc: Option<BoxedService>,
+    web: Option<BoxedService>,
+    web_text: Option<BoxedService>,
+}
+
+/// Hands a gRPC-Web call, translated to gRPC by tonic-web, to an upstream
+/// that speaks only gRPC.
+#[derive(Clone, Debug)]
+struct Translated<U> {
+    upstream: U,
+}
+
+impl<U: Upstream> Service<http::Request<tonic::body::Body>> for Translated<U> {
+    type Response = http::Response<axum::body::Body>;
+    type Error = Infallible;
+    type Future = PassThrough<U>;
+
+    #[inline]
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
+        let (mut parts, body) = request.into_parts();
+        // A browser's call arrives over HTTP/1.1; as gRPC it is an HTTP/2
+        // request (gRPC PROTOCOL-HTTP2).
+        parts.version = http::Version::HTTP_2;
+        // tonic-web reports the size of the base64 text body for the decoded
+        // one, and an HTTP/2 client would announce that as its length; the
+        // gRPC body goes without one.
+        let body = tonic::body::Body::new(Unsized { body });
+        PassThrough::new(
+            self.upstream.clone(),
+            http::Request::from_parts(parts, body),
+            GrpcProtocol::Grpc,
+        )
+    }
+}
+
+pin_project! {
+    /// `body` without its size hint.
+    struct Unsized {
+        #[pin]
+        body: tonic::body::Body,
+    }
+}
+
+impl http_body::Body for Unsized {
+    type Data = Bytes;
+    type Error = tonic::Status;
+
+    #[inline]
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Bytes>, tonic::Status>>> {
+        self.project().body.poll_frame(cx)
+    }
+
+    #[inline]
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
 }
 
 /// gRPC-Web pass-through, one CORS-wrapped path per encoding.
@@ -102,6 +193,23 @@ impl<U: Upstream> Service<http::Request<tonic::body::Body>> for Forward<U> {
     }
 
     fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
+        PassThrough::new(self.upstream.clone(), request, self.protocol)
+    }
+}
+
+/// The guarded path's end: the guards run on axum's request type.
+impl<U: Upstream> Service<axum::extract::Request> for Forward<U> {
+    type Response = http::Response<axum::body::Body>;
+    type Error = Infallible;
+    type Future = PassThrough<U>;
+
+    #[inline]
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: axum::extract::Request) -> Self::Future {
+        let request = request.map(tonic::body::Body::new);
         PassThrough::new(self.upstream.clone(), request, self.protocol)
     }
 }
@@ -164,29 +272,70 @@ impl ConnectionInfo {
 
 impl<U: Upstream> ProxyService<U> {
     /// The service over `upstream` and `routes`; gRPC-Web answers carry
-    /// `grpc_web_cors` when set.
-    pub(crate) fn new(upstream: U, routes: axum::Router, grpc_web_cors: Option<CorsLayer>) -> Self {
-        let grpc_web = grpc_web_cors.map(|cors| {
-            let forward = |protocol| Forward {
-                upstream: upstream.clone(),
-                protocol,
+    /// `grpc_web_cors` when set, and gRPC-Web calls are translated to gRPC
+    /// when `translate_grpc_web`.
+    pub(crate) fn new(
+        upstream: U,
+        routes: axum::Router,
+        grpc_web_cors: Option<CorsLayer>,
+        guards: Arc<Guards>,
+        translate_grpc_web: bool,
+    ) -> Self {
+        let forward = |protocol| Forward {
+            upstream: upstream.clone(),
+            protocol,
+        };
+        let guard_grpc = guards.cover(Class::Grpc);
+        let stack = |protocol: GrpcProtocol| {
+            let web = protocol != GrpcProtocol::Grpc;
+            let mut service = if web && translate_grpc_web {
+                let translator = tonic_web::GrpcWebLayer::new().layer(Translated {
+                    upstream: upstream.clone(),
+                });
+                BoxedService::new(ServiceExt::<axum::extract::Request>::map_response(
+                    translator,
+                    |response| response.map(axum::body::Body::new),
+                ))
+            } else {
+                BoxedService::new(forward(protocol))
             };
-            GrpcWebCors {
-                web: cors.layer(forward(GrpcProtocol::Web)),
-                web_text: cors.layer(forward(GrpcProtocol::WebText)),
+            if guard_grpc {
+                service = BoxedService::new(GrpcRejections {
+                    inner: guards.service(service, Class::Grpc),
+                    protocol,
+                });
             }
+            // CORS outermost, so a rejected gRPC-Web call still carries it.
+            match &grpc_web_cors {
+                Some(cors) if web => BoxedService::new(cors.layer(service)),
+                _ => service,
+            }
+        };
+        let boxed_web = guard_grpc || translate_grpc_web;
+        let boxed = BoxedGrpc {
+            grpc: guard_grpc.then(|| stack(GrpcProtocol::Grpc)),
+            web: boxed_web.then(|| stack(GrpcProtocol::Web)),
+            web_text: boxed_web.then(|| stack(GrpcProtocol::WebText)),
+        };
+        // The pass-through of gRPC-Web, and the answer to its preflights.
+        let grpc_web = grpc_web_cors.map(|cors| GrpcWebCors {
+            web: cors.layer(forward(GrpcProtocol::Web)),
+            web_text: cors.layer(forward(GrpcProtocol::WebText)),
         });
         Self {
             upstream,
             routes,
             grpc_web,
+            boxed,
+            guards,
             connection: None,
         }
     }
 
     /// Hand the requests no route matches to `fallback` instead of answering
     /// `404`: an embedder's own REST routes, a static site, anything that is a
-    /// tower service. The proxy's middleware does not see them.
+    /// tower service. Only the guards whose scope names `fallback` traffic see
+    /// them; CORS and tracing are the fallback's own.
     ///
     /// A request whose path a route answers but not with its method stays with
     /// the proxy (`405`), as does every gRPC request and every browser
@@ -198,7 +347,13 @@ impl<U: Upstream> ProxyService<U> {
         F::Response: IntoResponse,
         F::Future: Send + 'static,
     {
-        self.routes = self.routes.fallback_service(fallback);
+        self.routes = if self.guards.cover(Class::Fallback) {
+            let fallback = BoxedService::new(fallback.map_response(IntoResponse::into_response));
+            self.routes
+                .fallback_service(self.guards.service(fallback, Class::Fallback))
+        } else {
+            self.routes.fallback_service(fallback)
+        };
         self
     }
 
@@ -210,7 +365,8 @@ impl<U: Upstream> ProxyService<U> {
     ///
     /// A server of your own calls it once per accepted connection, with what
     /// tonic's [`Connected`] trait
-    /// reports for the stream. [`serve`] does this itself.
+    /// reports for the stream. [`serve_with`](crate::serve_with) does this
+    /// itself.
     ///
     /// # Examples
     ///
@@ -238,24 +394,29 @@ impl<U: Upstream> ProxyService<U> {
             upstream: self.upstream.clone(),
             routes: self.routes.clone(),
             grpc_web: self.grpc_web.clone(),
+            boxed: self.boxed.clone(),
+            guards: self.guards.clone(),
             connection: Some(connection.into()),
         }
     }
+}
 
-    /// The connection `request` came on: the one given to
-    /// [`for_connection`](Self::for_connection), else the peer an outer axum
-    /// server recorded as `ConnectInfo`, so the upstream sees the same client
-    /// the proxy's middleware does.
-    fn connection_of<B>(&self, request: &http::Request<B>) -> Option<ConnectionInfo> {
-        if let Some(connection) = &self.connection {
-            return Some(connection.clone());
-        }
-        let ConnectInfo(remote) = request.extensions().get::<ConnectInfo<SocketAddr>>()?;
-        Some(ConnectionInfo::from(TcpConnectInfo {
-            local_addr: None,
-            remote_addr: Some(*remote),
-        }))
+/// The connection `request` came on: `connection`, the one given to
+/// [`ProxyService::for_connection`], else the peer an outer axum server
+/// recorded as `ConnectInfo`, so the upstream sees the same client the proxy's
+/// middleware does. A free function, so the caller keeps its other fields.
+fn connection_of<B>(
+    connection: Option<&ConnectionInfo>,
+    request: &http::Request<B>,
+) -> Option<ConnectionInfo> {
+    if let Some(connection) = connection {
+        return Some(connection.clone());
     }
+    let ConnectInfo(remote) = request.extensions().get::<ConnectInfo<SocketAddr>>()?;
+    Some(ConnectionInfo::from(TcpConnectInfo {
+        local_addr: None,
+        remote_addr: Some(*remote),
+    }))
 }
 
 impl<U, B> Service<http::Request<B>> for ProxyService<U>
@@ -278,13 +439,37 @@ where
         // A gRPC-Web preflight goes where the call it announces goes, so both
         // get one CORS policy: the proxy's, or the upstream's when it owns
         // CORS. A fallback in between would answer it with neither.
-        let protocol = grpc_protocol(request.headers()).or_else(|| {
+        let call = grpc_protocol(request.headers());
+        let protocol = call.or_else(|| {
             is_grpc_web_preflight(request.method(), request.headers()).then_some(GrpcProtocol::Web)
         });
-        let inner = if let Some(protocol) = protocol {
+        // A preflight is not a call: it skips the guards and the translation.
+        let boxed = match call {
+            Some(GrpcProtocol::Grpc) => self.boxed.grpc.as_mut(),
+            Some(GrpcProtocol::Web) => self.boxed.web.as_mut(),
+            Some(GrpcProtocol::WebText) => self.boxed.web_text.as_mut(),
+            None => None,
+        };
+        let inner = if let Some(service) = boxed {
+            // The guards read the peer as axum's `ConnectInfo`, the upstream
+            // as tonic records it.
+            if let Some(connection) = connection_of(self.connection.as_ref(), &request) {
+                let extensions = request.extensions_mut();
+                if let Some(remote) = connection.remote_addr() {
+                    extensions.insert(ConnectInfo(remote));
+                }
+                connection.into_tonic_extensions(extensions);
+            }
+            // Every service on these paths is ready at once: guards and the
+            // translator are middleware, and `Forward` waits for the upstream
+            // per request.
+            Inner::Boxed {
+                future: service.call(request.map(axum::body::Body::new)),
+            }
+        } else if let Some(protocol) = protocol {
             // A native call carries its connection the way tonic's server
             // hands it to a handler.
-            if let Some(connection) = self.connection_of(&request) {
+            if let Some(connection) = connection_of(self.connection.as_ref(), &request) {
                 connection.into_tonic_extensions(request.extensions_mut());
             }
             let request = request.map(tonic::body::Body::new);
@@ -313,7 +498,7 @@ where
                     extensions.insert(ConnectInfo(remote));
                 }
                 extensions.insert(connection.clone());
-            } else if let Some(connection) = self.connection_of(&request) {
+            } else if let Some(connection) = connection_of(None, &request) {
                 request.extensions_mut().insert(connection);
             }
             Inner::Routes {
@@ -347,6 +532,10 @@ pin_project! {
             #[pin]
             future: tower_http::cors::ResponseFuture<PassThrough<U>>,
         },
+        Boxed {
+            #[pin]
+            future: <BoxedService as Service<axum::extract::Request>>::Future,
+        },
     }
 }
 
@@ -359,55 +548,8 @@ impl<U: Upstream> Future for ResponseFuture<U> {
             InnerProj::Routes { future } => future.poll(cx),
             InnerProj::Grpc { call } => call.poll(cx),
             InnerProj::GrpcWeb { future } => future.poll(cx),
+            InnerProj::Boxed { future } => future.poll(cx),
         }
-    }
-}
-
-/// Serve `service` on `listener` until the listener fails: cleartext HTTP/1.1
-/// and HTTP/2 on the same port, so REST clients and native gRPC clients share
-/// it. Each connection's service gets its peer through
-/// [`ProxyService::for_connection`]. For TLS, run the service on a server of
-/// your own (see [`ProxyService`]).
-///
-/// # Errors
-///
-/// The listener's own I/O failure.
-///
-/// # Examples
-///
-/// ```no_run
-/// use structured_proxy::ProxyServer;
-///
-/// # async fn run() -> anyhow::Result<()> {
-/// let grpc = tonic::service::Routes::default();
-/// let service = ProxyServer::from_yaml_str("service:\n  name: demo\n")?.service(grpc)?;
-/// let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
-/// structured_proxy::serve(listener, service).await?;
-/// # Ok(())
-/// # }
-/// ```
-pub async fn serve<U: Upstream>(
-    listener: tokio::net::TcpListener,
-    service: ProxyService<U>,
-) -> std::io::Result<()> {
-    axum::serve(listener, PerConnection(service)).await
-}
-
-/// Makes the [`ProxyService`] of each accepted connection.
-struct PerConnection<U>(ProxyService<U>);
-
-impl<U: Upstream> Service<IncomingStream<'_, tokio::net::TcpListener>> for PerConnection<U> {
-    type Response = ProxyService<U>;
-    type Error = Infallible;
-    type Future = std::future::Ready<Result<ProxyService<U>, Infallible>>;
-
-    #[inline]
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, stream: IncomingStream<'_, tokio::net::TcpListener>) -> Self::Future {
-        std::future::ready(Ok(self.0.for_connection(stream.io().connect_info())))
     }
 }
 

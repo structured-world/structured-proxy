@@ -33,6 +33,7 @@ fn config(profiles: Vec<(&str, &str, Option<u64>)>, rules: Vec<RateRuleConfig>) 
         limit_service: None,
         sync: None,
         trusted_proxies: Vec::new(),
+        scope: None,
     }
 }
 
@@ -373,6 +374,7 @@ mod two_phase {
             }),
             forward_auth: None,
             authz: None,
+            scope: None,
         };
         Auth::build(&cfg, None).unwrap().unwrap()
     }

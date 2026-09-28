@@ -85,6 +85,100 @@ pub struct ProxyConfig {
     /// Server-streaming response behavior.
     #[serde(default)]
     pub streaming: StreamingConfig,
+
+    /// Request concurrency limit.
+    #[serde(default)]
+    pub concurrency: Option<ConcurrencyConfig>,
+
+    /// How gRPC-Web calls reach the upstream.
+    #[serde(default)]
+    pub grpc_web: GrpcWebConfig,
+
+    /// Which annotated RPCs are transcoded.
+    #[serde(default)]
+    pub transcode: TranscodeConfig,
+}
+
+impl Default for ProxyConfig {
+    /// The configuration of an empty YAML file: health and metrics endpoints
+    /// on, everything else off.
+    fn default() -> Self {
+        Self {
+            upstream: None,
+            descriptors: Vec::new(),
+            listen: ListenConfig::default(),
+            service: ServiceConfig::default(),
+            aliases: Vec::new(),
+            openapi: None,
+            auth: None,
+            shield: None,
+            oidc_discovery: None,
+            health: HealthConfig::default(),
+            metrics: MetricsConfig::default(),
+            maintenance: MaintenanceConfig::default(),
+            cors: CorsConfig::default(),
+            logging: LoggingConfig::default(),
+            metrics_classes: Vec::new(),
+            forwarded_headers: default_forwarded_headers(),
+            streaming: StreamingConfig::default(),
+            concurrency: None,
+            grpc_web: GrpcWebConfig::default(),
+            transcode: TranscodeConfig::default(),
+        }
+    }
+}
+
+/// Which annotated RPCs are transcoded.
+///
+/// ```yaml
+/// transcode:
+///   only: ["acme.v1.Orders", "acme.v1.Users/GetUser"]
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TranscodeConfig {
+    /// Services (`package.Service`) and single methods
+    /// (`package.Service/Method`) whose `google.api.http` rules become REST
+    /// routes; empty transcodes every annotated RPC. A name the descriptors do
+    /// not hold stops the proxy at startup.
+    #[serde(default)]
+    pub only: Vec<String>,
+}
+
+/// One config section from YAML, the way the config file reads it: for the
+/// sections an embedder hands to a builder method, such as
+/// [`ProxyServer::with_rate_limits`](crate::ProxyServer::with_rate_limits).
+///
+/// # Errors
+///
+/// YAML that is not that section.
+///
+/// # Examples
+///
+/// ```
+/// use structured_proxy::config::{self, ShieldConfig};
+///
+/// let shield: ShieldConfig = config::from_yaml(
+///     "enabled: true\nprofiles:\n  anon: { rate: \"60/min\" }\nrules:\n  - pattern: \"/**\"\n    key: { type: ip }\n    profile: anon\n",
+/// )
+/// .unwrap();
+/// assert!(shield.enabled);
+/// ```
+pub fn from_yaml<T: serde::de::DeserializeOwned>(yaml: &str) -> anyhow::Result<T> {
+    Ok(serde_yaml::from_str(yaml)?)
+}
+
+/// How gRPC-Web calls reach the upstream.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrpcWebConfig {
+    /// Translate gRPC-Web (binary and text, over HTTP/1.1 too) to gRPC for an
+    /// upstream that speaks only gRPC. Off: gRPC-Web passes through, for an
+    /// upstream that translates it itself. Needs the proxy's CORS policy on
+    /// gRPC-Web (`cors.grpc_web`), since the upstream then cannot answer a
+    /// browser's preflight.
+    #[serde(default)]
+    pub translate: bool,
 }
 
 fn default_forwarded_headers() -> Vec<String> {
@@ -230,6 +324,9 @@ pub(crate) const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "error_details",
     "response_headers",
     "runtime",
+    "concurrency",
+    "grpc_web",
+    "transcode",
 ];
 
 /// Every `streaming:` key: the [`StreamingConfig`] fields plus the ones
@@ -359,12 +456,83 @@ where
     Ok(yaml_sources.into_iter().map(Into::into).collect())
 }
 
-/// Listen address configuration.
+/// The listener [`ProxyServer::serve`](crate::ProxyServer::serve) runs.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListenConfig {
-    /// HTTP listen address (default: "0.0.0.0:8080").
+    /// Listen address (default: "0.0.0.0:8080").
     #[serde(default = "default_http_listen")]
     pub http: String,
+    /// Most connections served at once; past it the next connection is
+    /// accepted when one closes. Unset: no limit.
+    #[serde(default)]
+    pub max_connections: Option<usize>,
+    /// TLS on the listener, mTLS with `client_ca_file`. Unset: cleartext.
+    #[serde(default)]
+    pub tls: Option<ListenTlsConfig>,
+    /// Seconds a connection may go without a request in flight before it is
+    /// closed (HTTP/2 gets a GOAWAY), so idle clients do not hold
+    /// `max_connections` slots. 0 keeps idle connections open. Default: 60.
+    #[serde(default = "default_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+    /// Seconds an HTTP/1.1 client has to send a request's headers. At least
+    /// 1. Default: 30.
+    #[serde(default = "default_header_read_timeout_secs")]
+    pub header_read_timeout_secs: u64,
+}
+
+fn default_idle_timeout_secs() -> u64 {
+    60
+}
+
+fn default_header_read_timeout_secs() -> u64 {
+    30
+}
+
+fn default_tls_handshake_timeout_secs() -> u64 {
+    10
+}
+
+/// TLS for the listener.
+///
+/// ```yaml
+/// tls:
+///   cert_file: /etc/proxy/tls.crt      # PEM chain, leaf first
+///   key_file: /etc/proxy/tls.key       # PEM private key
+///   client_ca_file: /etc/proxy/ca.crt  # optional: verify client certificates
+///   client_auth: required              # or `optional`
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListenTlsConfig {
+    /// The server certificate chain, PEM, leaf first.
+    pub cert_file: PathBuf,
+    /// The server private key, PEM (PKCS#8, PKCS#1 or SEC1).
+    pub key_file: PathBuf,
+    /// CA certificates, PEM, that client certificates are verified against.
+    /// Unset: clients present none.
+    #[serde(default)]
+    pub client_ca_file: Option<PathBuf>,
+    /// Whether a client must present a certificate; `required` when
+    /// `client_ca_file` is set and this is not. Setting it without
+    /// `client_ca_file` is an error: nothing could verify the certificate.
+    #[serde(default)]
+    pub client_auth: Option<ClientAuth>,
+    /// Seconds a client has to finish the TLS handshake. At least 1.
+    /// Default: 10.
+    #[serde(default = "default_tls_handshake_timeout_secs")]
+    pub handshake_timeout_secs: u64,
+}
+
+/// Whether a TLS client must present a certificate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientAuth {
+    /// A client without a valid certificate is refused in the handshake.
+    #[default]
+    Required,
+    /// A certificate is verified when presented; a client may present none.
+    Optional,
 }
 
 fn default_http_listen() -> String {
@@ -375,6 +543,10 @@ impl Default for ListenConfig {
     fn default() -> Self {
         Self {
             http: default_http_listen(),
+            max_connections: None,
+            tls: None,
+            idle_timeout_secs: default_idle_timeout_secs(),
+            header_read_timeout_secs: default_header_read_timeout_secs(),
         }
     }
 }
@@ -456,6 +628,92 @@ pub struct AuthConfig {
     /// AuthZ integration (optional gRPC call).
     #[serde(default)]
     pub authz: Option<AuthzConfig>,
+
+    /// The traffic JWT authentication covers. Default: `transcoded` and
+    /// `endpoints`; the forward-auth endpoint is never behind it.
+    #[serde(default)]
+    pub scope: Option<ScopeConfig>,
+}
+
+/// The traffic a guard covers, and optionally which paths and methods of it.
+///
+/// ```yaml
+/// scope:
+///   traffic: [transcoded, grpc]   # or [all]
+///   paths: ["/v1/**", "/acme.v1.Orders/*"]
+///   methods: ["POST"]
+/// ```
+///
+/// Omitted keys keep the guard's own default traffic and cover every path and
+/// method of it.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeConfig {
+    /// The classes of traffic covered; `all` names every class.
+    #[serde(default)]
+    pub traffic: Option<Vec<Traffic>>,
+    /// Path globs (`*` within a segment, `**` across segments) the guard is
+    /// narrowed to; empty covers every path. A native gRPC call's path is
+    /// `/<package>.<Service>/<Method>`.
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// Methods the guard is narrowed to; empty covers every method. Each is a
+    /// standard method or one a route answers (a `custom` rule, an extra
+    /// route); a scope covering the fallback takes any method token.
+    #[serde(default)]
+    pub methods: Vec<String>,
+}
+
+impl ScopeConfig {
+    /// A scope covering every path and method of `traffic`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use structured_proxy::config::{ScopeConfig, Traffic};
+    ///
+    /// let scope = ScopeConfig::traffic([Traffic::Transcoded, Traffic::Grpc]);
+    /// assert!(scope.paths.is_empty());
+    /// ```
+    pub fn traffic(traffic: impl IntoIterator<Item = Traffic>) -> Self {
+        Self {
+            traffic: Some(traffic.into_iter().collect()),
+            paths: Vec::new(),
+            methods: Vec::new(),
+        }
+    }
+}
+
+/// A class of traffic the proxy tells apart before any guard runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Traffic {
+    /// REST calls the proxy transcodes to gRPC.
+    Transcoded,
+    /// The proxy's own endpoints: health, metrics, OpenAPI, OIDC, extra
+    /// routes and forward-auth.
+    Endpoints,
+    /// Native gRPC and gRPC-Web calls passed through to the upstream.
+    Grpc,
+    /// Requests no route answers, handed to the fallback.
+    Fallback,
+    /// Every class above.
+    All,
+}
+
+/// Request concurrency limit: requests past `max_in_flight` are answered
+/// `UNAVAILABLE` (503) at once instead of queueing.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConcurrencyConfig {
+    /// Most requests in flight at once, counted until each response body
+    /// ends, so a stream holds its slot for its whole life. At least 1.
+    pub max_in_flight: usize,
+    /// The traffic the limit covers, one budget shared by all of it.
+    /// Default: `transcoded` and `grpc`; the proxy's own endpoints stay out,
+    /// so health probes answer while the proxy is saturated.
+    #[serde(default)]
+    pub scope: Option<ScopeConfig>,
 }
 
 fn default_auth_mode() -> String {
@@ -616,6 +874,9 @@ pub struct AuthzConfig {
     /// request through instead of denying. Defaults to false (fail closed).
     #[serde(default)]
     pub failure_mode_allow: bool,
+    /// The traffic the check covers. Default: `transcoded`.
+    #[serde(default)]
+    pub scope: Option<ScopeConfig>,
 }
 
 fn default_authz_timeout_ms() -> u64 {
@@ -667,6 +928,9 @@ pub struct ShieldConfig {
     /// trust forwarding headers; set this behind a load balancer.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
+    /// The traffic the rules apply to. Default: `transcoded` and `endpoints`.
+    #[serde(default)]
+    pub scope: Option<ScopeConfig>,
 }
 
 /// A named limit tier: a sustained rate plus an instantaneous burst capacity.
@@ -976,6 +1240,10 @@ pub struct MaintenanceConfig {
     pub exempt_paths: Vec<String>,
     #[serde(default = "default_maintenance_message")]
     pub message: String,
+    /// The traffic maintenance mode turns away. Default: `transcoded` and
+    /// `endpoints`.
+    #[serde(default)]
+    pub scope: Option<ScopeConfig>,
 }
 
 fn default_exempt_paths() -> Vec<String> {
@@ -997,6 +1265,7 @@ impl Default for MaintenanceConfig {
             enabled: false,
             exempt_paths: default_exempt_paths(),
             message: default_maintenance_message(),
+            scope: None,
         }
     }
 }
@@ -1097,6 +1366,12 @@ impl ProxyConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.streaming.sse_keep_alive_secs == 0 {
             anyhow::bail!("streaming.sse_keep_alive_secs must be greater than 0");
+        }
+        if self.grpc_web.translate && !self.cors.grpc_web {
+            anyhow::bail!(
+                "grpc_web.translate needs cors.grpc_web: an upstream that speaks only \
+                 gRPC cannot answer a browser's preflight for a gRPC-Web call"
+            );
         }
         self.validate_edge_paths()?;
         Ok(())

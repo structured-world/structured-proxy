@@ -1,7 +1,8 @@
-//! An embedder serves the proxy behind its own TLS: a rustls acceptor and
-//! hyper's HTTP/1.1 + HTTP/2 connection, with the proxy as the service. REST
-//! and native gRPC share the TLS port, and a tonic upstream in process reads
-//! the client's address and TLS certificate as behind tonic's own server.
+//! The proxy behind TLS, an embedder's own (a rustls acceptor and hyper's
+//! HTTP/1.1 + HTTP/2 connection, with the proxy as the service) or its
+//! built-in listener (`listen.tls`, mTLS with a client CA). REST and native
+//! gRPC share the TLS port, and a tonic upstream in process reads the client's
+//! address and TLS certificate as behind tonic's own server.
 
 #[path = "common/protos.rs"]
 mod protos;
@@ -236,14 +237,82 @@ async fn listen() -> SocketAddr {
     addr
 }
 
+/// The directory of the test PKI.
+const TESTDATA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/tls/testdata");
+
+/// Serve the proxy in front of `Who` with the proxy's own TLS listener,
+/// configured by the `listen:` of `listen_yaml` (its `tls:` and its limits).
+async fn listen_builtin(listen_yaml: &str) -> SocketAddr {
+    // Builds without a crypto backend feature take the process's provider.
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider())
+            .expect("each test runs in its own process");
+    }
+    let pool = pool();
+    let server = ProxyServer::from_yaml_str(&format!("listen:\n{listen_yaml}"))
+        .unwrap()
+        .with_descriptors(pool.clone());
+    let proxy = server
+        .service(tonic::service::Routes::new(Who { pool }))
+        .unwrap();
+    let options = server.serve_options().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(structured_proxy::serve_with(listener, proxy, options));
+    addr
+}
+
+/// `listen.tls` for the test server certificate, verifying client
+/// certificates against the client CA with `client_auth` when given.
+fn tls_yaml(client_auth: Option<&str>) -> String {
+    let mut yaml = format!(
+        "  tls:\n    cert_file: {TESTDATA}/ecdsa.pem\n    key_file: {TESTDATA}/ecdsa.key.pem\n"
+    );
+    if let Some(client_auth) = client_auth {
+        yaml.push_str(&format!(
+            "    client_ca_file: {TESTDATA}/client-ca.pem\n    client_auth: {client_auth}\n"
+        ));
+    }
+    yaml
+}
+
 // --- clients --------------------------------------------------------------------
 
+/// The certificate a test client presents.
+#[derive(Clone, Copy)]
+enum Identity {
+    /// None.
+    Anonymous,
+    /// The server's own leaf, which a verifier that checks usage refuses.
+    ServerLeaf,
+    /// A client leaf of the client CA.
+    Client,
+}
+
+impl Identity {
+    fn cert(self) -> Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+        let client = || {
+            let chain = CertificateDer::pem_file_iter(format!("{TESTDATA}/client.pem"))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let key = PrivateKeyDer::from_pem_file(format!("{TESTDATA}/client.key.pem")).unwrap();
+            (chain, key)
+        };
+        match self {
+            Self::Anonymous => None,
+            Self::ServerLeaf => Some((chain(), key())),
+            Self::Client => Some(client()),
+        }
+    }
+}
+
 /// A TLS connection to `addr` trusting the test CA, offering `alpn`, and
-/// presenting the test certificate when `with_cert`.
+/// presenting `identity`'s certificate.
 async fn connect(
     addr: SocketAddr,
     alpn: &[u8],
-    with_cert: bool,
+    identity: Identity,
 ) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
     let mut roots = rustls::RootCertStore::empty();
     for cert in CertificateDer::pem_slice_iter(CA.as_bytes()) {
@@ -253,10 +322,9 @@ async fn connect(
         .with_safe_default_protocol_versions()
         .unwrap()
         .with_root_certificates(roots);
-    let mut config = if with_cert {
-        builder.with_client_auth_cert(chain(), key()).unwrap()
-    } else {
-        builder.with_no_client_auth()
+    let mut config = match identity.cert() {
+        Some((chain, key)) => builder.with_client_auth_cert(chain, key).unwrap(),
+        None => builder.with_no_client_auth(),
     };
     config.alpn_protocols = vec![alpn.to_vec()];
     let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -268,8 +336,8 @@ async fn connect(
 
 /// `GET /v1/me` over HTTP/1.1 and TLS; returns the status, the JSON body and
 /// the client's own address.
-async fn rest_me(addr: SocketAddr, with_cert: bool) -> (u16, Value, SocketAddr) {
-    let mut tls = connect(addr, b"http/1.1", with_cert).await;
+async fn rest_me(addr: SocketAddr, identity: Identity) -> (u16, Value, SocketAddr) {
+    let mut tls = connect(addr, b"http/1.1", identity).await;
     let client = tls.get_ref().0.local_addr().unwrap();
     tls.write_all(b"GET /v1/me HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         .await
@@ -290,12 +358,12 @@ async fn rest_me(addr: SocketAddr, with_cert: bool) -> (u16, Value, SocketAddr) 
 
 /// A native `Me` call over HTTP/2 and TLS; returns what the upstream saw and
 /// the client's own address.
-async fn grpc_me(addr: SocketAddr, with_cert: bool) -> (DynamicMessage, SocketAddr) {
+async fn grpc_me(addr: SocketAddr, identity: Identity) -> (DynamicMessage, SocketAddr) {
     let (sender, mut client_addr) = tokio::sync::mpsc::channel(1);
     let connector = tower::service_fn(move |_: http::Uri| {
         let sender = sender.clone();
         async move {
-            let tls = connect(addr, b"h2", with_cert).await;
+            let tls = connect(addr, b"h2", identity).await;
             sender
                 .send(tls.get_ref().0.local_addr().unwrap())
                 .await
@@ -333,7 +401,7 @@ fn leaf_der() -> Vec<u8> {
 #[tokio::test]
 async fn rest_over_tls_reaches_the_upstream_with_the_client_address() {
     let addr = listen().await;
-    let (status, seen, client) = rest_me(addr, false).await;
+    let (status, seen, client) = rest_me(addr, Identity::Anonymous).await;
     assert_eq!(status, 200, "{seen}");
     assert_eq!(seen["peer"], client.to_string());
     // No certificate presented, none reported.
@@ -343,7 +411,7 @@ async fn rest_over_tls_reaches_the_upstream_with_the_client_address() {
 #[tokio::test]
 async fn native_grpc_shares_the_tls_port() {
     let addr = listen().await;
-    let (seen, client) = grpc_me(addr, false).await;
+    let (seen, client) = grpc_me(addr, Identity::Anonymous).await;
     let peer = match seen.get_field_by_name("peer").as_deref() {
         Some(PbValue::String(peer)) => peer.clone(),
         _ => String::new(),
@@ -356,7 +424,7 @@ async fn a_client_certificate_reaches_a_transcoded_call() {
     // mTLS: the upstream authorizes on the certificate as behind tonic's own
     // TLS server, although the call came in as REST.
     let addr = listen().await;
-    let (status, seen, _) = rest_me(addr, true).await;
+    let (status, seen, _) = rest_me(addr, Identity::ServerLeaf).await;
     assert_eq!(status, 200, "{seen}");
     let cert = base64::engine::general_purpose::STANDARD
         .decode(seen["cert"].as_str().unwrap())
@@ -367,10 +435,91 @@ async fn a_client_certificate_reaches_a_transcoded_call() {
 #[tokio::test]
 async fn a_client_certificate_reaches_a_native_call() {
     let addr = listen().await;
-    let (seen, _) = grpc_me(addr, true).await;
+    let (seen, _) = grpc_me(addr, Identity::ServerLeaf).await;
     let cert = match seen.get_field_by_name("cert").as_deref() {
         Some(PbValue::Bytes(cert)) => cert.to_vec(),
         _ => Vec::new(),
     };
     assert_eq!(cert, leaf_der());
+}
+
+// --- the proxy's own TLS listener -----------------------------------------------
+
+fn seen_cert(seen: &DynamicMessage) -> Vec<u8> {
+    match seen.get_field_by_name("cert").as_deref() {
+        Some(PbValue::Bytes(cert)) => cert.to_vec(),
+        _ => Vec::new(),
+    }
+}
+
+fn client_leaf_der() -> Vec<u8> {
+    Identity::Client.cert().unwrap().0[0].as_ref().to_vec()
+}
+
+#[tokio::test]
+async fn the_builtin_tls_listener_serves_rest_and_native_grpc() {
+    let addr = listen_builtin(&tls_yaml(None)).await;
+    let (status, seen, client) = rest_me(addr, Identity::Anonymous).await;
+    assert_eq!(status, 200, "{seen}");
+    assert_eq!(seen["peer"], client.to_string());
+    let (seen, client) = grpc_me(addr, Identity::Anonymous).await;
+    let peer = match seen.get_field_by_name("peer").as_deref() {
+        Some(PbValue::String(peer)) => peer.clone(),
+        _ => String::new(),
+    };
+    assert_eq!(peer, client.to_string());
+}
+
+#[tokio::test]
+async fn builtin_mtls_passes_a_verified_client_certificate_to_the_upstream() {
+    let addr = listen_builtin(&tls_yaml(Some("required"))).await;
+    let (status, seen, _) = rest_me(addr, Identity::Client).await;
+    assert_eq!(status, 200, "{seen}");
+    let cert = base64::engine::general_purpose::STANDARD
+        .decode(seen["cert"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(cert, client_leaf_der());
+    let (seen, _) = grpc_me(addr, Identity::Client).await;
+    assert_eq!(seen_cert(&seen), client_leaf_der());
+}
+
+/// Whether a request on a TLS connection presenting `identity` gets any
+/// answer: a refused client certificate ends the connection instead (in TLS
+/// 1.3 after the client's side of the handshake completed).
+async fn answered(addr: SocketAddr, identity: Identity) -> bool {
+    let mut tls = connect(addr, b"http/1.1", identity).await;
+    let written = tls
+        .write_all(b"GET /v1/me HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await;
+    let mut response = Vec::new();
+    let read = tls.read_to_end(&mut response).await;
+    written.is_ok() && read.is_ok() && response.starts_with(b"HTTP/1.1 200")
+}
+
+#[tokio::test]
+async fn builtin_mtls_required_refuses_a_client_without_a_valid_certificate() {
+    let addr = listen_builtin(&tls_yaml(Some("required"))).await;
+    assert!(!answered(addr, Identity::Anonymous).await);
+    // Signed by a CA the listener does not trust for clients.
+    assert!(!answered(addr, Identity::ServerLeaf).await);
+    assert!(answered(addr, Identity::Client).await);
+}
+
+#[tokio::test]
+async fn a_client_ca_alone_requires_a_client_certificate() {
+    let yaml = format!(
+        "{}    client_ca_file: {TESTDATA}/client-ca.pem\n",
+        tls_yaml(None)
+    );
+    let addr = listen_builtin(&yaml).await;
+    assert!(!answered(addr, Identity::Anonymous).await);
+    assert!(answered(addr, Identity::Client).await);
+}
+
+#[tokio::test]
+async fn builtin_mtls_optional_serves_a_client_without_a_certificate() {
+    let addr = listen_builtin(&tls_yaml(Some("optional"))).await;
+    let (status, seen, _) = rest_me(addr, Identity::Anonymous).await;
+    assert_eq!(status, 200, "{seen}");
+    assert_eq!(seen["cert"], "");
 }

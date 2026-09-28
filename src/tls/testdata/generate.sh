@@ -1,6 +1,7 @@
 #!/bin/sh
 # Test PKI for src/tls/tests.rs: a CA, an ECDSA and an RSA leaf for
-# `localhost`, and an unrelated CA. Valid for 100 years.
+# `localhost`, and an unrelated CA; for mTLS, a client CA and a client leaf
+# (tests/serve.rs). Valid for 100 years.
 set -eu
 out="$1"
 cd "$out"
@@ -42,4 +43,18 @@ leaf ecdsa
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out rsa.key.pem
 leaf rsa
 
-rm -f ca.srl ca.key.pem
+# A client certificate, which a verifier of client certificates accepts only
+# with the clientAuth extended key usage (RFC 5280 4.2.1.12).
+ca client-ca "structured-proxy test client CA"
+openssl ecparam -name prime256v1 -genkey -noout -out client.key.tmp
+openssl pkcs8 -topk8 -nocrypt -in client.key.tmp -out client.key.pem
+rm client.key.tmp
+printf '%s\n' "basicConstraints=CA:FALSE
+keyUsage=digitalSignature
+extendedKeyUsage=clientAuth" > client.ext
+openssl req -new -key client.key.pem -subj "/CN=test client" -out client.csr
+openssl x509 -req -in client.csr -CA client-ca.pem -CAkey client-ca.key.pem -CAcreateserial \
+  -days "$days" -extfile client.ext -out client.pem
+rm client.csr client.ext
+
+rm -f ca.srl ca.key.pem client-ca.srl client-ca.key.pem

@@ -57,9 +57,12 @@ pub mod auth;
 pub mod config;
 mod cors;
 mod embed;
+mod guard;
+mod held;
 pub mod hooks;
 pub mod oidc;
 pub mod openapi;
+mod serve;
 pub mod service;
 pub mod shield;
 mod tls;
@@ -70,12 +73,12 @@ pub mod upstream;
 /// [`install_default_crypto_provider`] for when a call is needed.
 #[cfg(feature = "builtin_jwt")]
 pub use auth::crypto::install_default_crypto_provider;
-pub use service::{serve, ConnectionInfo, ProxyService};
+pub use serve::{serve, serve_with, ServeOptions};
+pub use service::{ConnectionInfo, ProxyService};
 
 use axum::extract::State;
-use axum::http::{Request, StatusCode};
-use axum::middleware::Next;
-use axum::response::{IntoResponse, Response};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use prost_reflect::DescriptorPool;
@@ -85,7 +88,7 @@ use tower_http::trace::TraceLayer;
 
 use std::sync::Arc;
 
-use config::{DescriptorSource, ProxyConfig};
+use config::{DescriptorSource, ProxyConfig, ScopeConfig};
 use hooks::{AuthDecider, ExtraRoute, OidcBackend, TokenVerifier};
 use upstream::Upstream;
 
@@ -101,13 +104,6 @@ pub(crate) struct ProxyState<U> {
     pub(crate) sse_keep_alive_secs: u64,
 }
 
-/// Maintenance mode: every request outside the exempt paths gets a `503`.
-#[derive(Debug)]
-struct Maintenance {
-    exempt: Vec<String>,
-    message: String,
-}
-
 /// Universal proxy server.
 pub struct ProxyServer {
     config: ProxyConfig,
@@ -115,6 +111,8 @@ pub struct ProxyServer {
     descriptor_pool: Option<DescriptorPool>,
     /// Optional in-process forward-auth/PDP gate (embedded Tier-2 hook).
     auth_decider: Option<Arc<dyn AuthDecider>>,
+    /// The traffic the injected decider gates; `transcoded` when unset.
+    auth_decider_scope: Option<ScopeConfig>,
     /// Optional stateless OIDC surface backing (embedded Tier-2 hook).
     oidc_backend: Option<Arc<dyn OidcBackend>>,
     /// Embedder-supplied extra stateless routes (embedded Tier-2 hook).
@@ -125,6 +123,13 @@ pub struct ProxyServer {
     token_verifier: Option<Arc<dyn TokenVerifier>>,
     /// How the transcoded routes render errors and frame NDJSON streams.
     transcode: transcode::TranscodeOptions,
+}
+
+impl Default for ProxyServer {
+    /// [`ProxyServer::new`]: every capability off.
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ProxyServer {
@@ -141,6 +146,7 @@ impl ProxyServer {
             config,
             descriptor_pool: None,
             auth_decider: None,
+            auth_decider_scope: None,
             oidc_backend: None,
             extra_routes: Vec::new(),
             verify_path: None,
@@ -195,6 +201,150 @@ impl ProxyServer {
         &self.config
     }
 
+    /// A proxy with every capability off: native gRPC and gRPC-Web pass to
+    /// the upstream, every other request to the fallback (`404` by default).
+    /// Turn on what you need with the methods below; each sets the config
+    /// section of the same name, so code and YAML describe one proxy.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use structured_proxy::config::{ConcurrencyConfig, ScopeConfig, Traffic};
+    /// use structured_proxy::ProxyServer;
+    ///
+    /// # fn build() -> anyhow::Result<()> {
+    /// // Your gRPC API, with at most 1000 calls in flight and nothing else.
+    /// let grpc = tonic::service::Routes::default();
+    /// let service = ProxyServer::new()
+    ///     .with_concurrency_limit(ConcurrencyConfig {
+    ///         max_in_flight: 1000,
+    ///         scope: Some(ScopeConfig::traffic([Traffic::Grpc])),
+    ///     })
+    ///     .service(grpc)?;
+    /// # let _ = service;
+    /// # Ok(())
+    /// # }
+    /// # build().unwrap();
+    /// ```
+    pub fn new() -> Self {
+        let mut config = ProxyConfig::default();
+        config.health.enabled = false;
+        config.metrics.enabled = false;
+        Self::from_config(config)
+    }
+
+    /// The remote gRPC upstream (`upstream.default`), for
+    /// [`upstream`](Self::upstream) and [`serve`](Self::serve).
+    pub fn with_upstream_address(mut self, address: impl Into<String>) -> Self {
+        self.config.upstream = Some(config::UpstreamConfig {
+            default: address.into(),
+        });
+        self
+    }
+
+    /// The listener of [`serve`](Self::serve): address, TLS, connection
+    /// limit (`listen:`).
+    pub fn with_listen(mut self, listen: config::ListenConfig) -> Self {
+        self.config.listen = listen;
+        self
+    }
+
+    /// Transcode only these services (`package.Service`) and methods
+    /// (`package.Service/Method`) of the descriptors (`transcode.only`); every
+    /// annotated RPC by default. A name the descriptors do not hold fails the
+    /// build.
+    pub fn with_transcoded_rpcs(
+        mut self,
+        names: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.config.transcode.only = names.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Path aliases rewritten before routing (`aliases:`).
+    pub fn with_aliases(mut self, aliases: impl IntoIterator<Item = config::AliasConfig>) -> Self {
+        self.config.aliases = aliases.into_iter().collect();
+        self
+    }
+
+    /// The request headers transcoded calls forward as gRPC metadata
+    /// (`forwarded_headers:`), replacing the default list.
+    pub fn with_forwarded_headers(
+        mut self,
+        names: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.config.forwarded_headers = names.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Health probe endpoints (`health:`).
+    pub fn with_health(mut self, health: config::HealthConfig) -> Self {
+        self.config.health = health;
+        self
+    }
+
+    /// The Prometheus metrics endpoint (`metrics:`).
+    pub fn with_metrics(mut self, metrics: config::MetricsConfig) -> Self {
+        self.config.metrics = metrics;
+        self
+    }
+
+    /// The OpenAPI spec and docs endpoints (`openapi:`).
+    pub fn with_openapi(mut self, openapi: config::OpenApiConfig) -> Self {
+        self.config.openapi = Some(openapi);
+        self
+    }
+
+    /// Static OIDC discovery and JWKS endpoints (`oidc_discovery:`).
+    pub fn with_oidc_discovery(mut self, oidc: config::OidcDiscoveryConfig) -> Self {
+        self.config.oidc_discovery = Some(oidc);
+        self
+    }
+
+    /// The CORS policy (`cors:`).
+    pub fn with_cors(mut self, cors: config::CorsConfig) -> Self {
+        self.config.cors = cors;
+        self
+    }
+
+    /// Translate gRPC-Web to gRPC for an upstream that speaks only gRPC
+    /// (`grpc_web.translate`).
+    pub fn with_grpc_web_translation(mut self, translate: bool) -> Self {
+        self.config.grpc_web.translate = translate;
+        self
+    }
+
+    /// Server-streaming behavior (`streaming:`).
+    pub fn with_streaming(mut self, streaming: config::StreamingConfig) -> Self {
+        self.config.streaming = streaming;
+        self
+    }
+
+    /// Maintenance mode (`maintenance:`).
+    pub fn with_maintenance(mut self, maintenance: config::MaintenanceConfig) -> Self {
+        self.config.maintenance = maintenance;
+        self
+    }
+
+    /// The limit on requests in flight (`concurrency:`).
+    pub fn with_concurrency_limit(mut self, concurrency: config::ConcurrencyConfig) -> Self {
+        self.config.concurrency = Some(concurrency);
+        self
+    }
+
+    /// Rate limits (`shield:`); build the section with [`config::from_yaml`].
+    pub fn with_rate_limits(mut self, shield: config::ShieldConfig) -> Self {
+        self.config.shield = Some(shield);
+        self
+    }
+
+    /// JWT auth, route policies, forward-auth and ext_authz (`auth:`); build
+    /// the section with [`config::from_yaml`].
+    pub fn with_auth(mut self, auth: config::AuthConfig) -> Self {
+        self.config.auth = Some(auth);
+        self
+    }
+
     /// Create with an embedded descriptor pool (for sid-proxy backward compat).
     pub fn with_descriptors(mut self, pool: DescriptorPool) -> Self {
         self.descriptor_pool = Some(pool);
@@ -203,11 +353,37 @@ impl ProxyServer {
 
     /// Inject an in-process forward-auth / PDP decision (embedded Tier-2 hook).
     ///
-    /// The decider gates every proxied request inline and also backs the
-    /// `/verify` forward-auth endpoint. Its signature is `axum`-free (see
-    /// [`hooks::AuthDecider`]), so the embedder never names an HTTP framework.
+    /// The decider gates the transcoded requests inline (other traffic with
+    /// [`with_auth_decider_scope`](Self::with_auth_decider_scope)) and also
+    /// backs the `/verify` forward-auth endpoint. Its signature is `axum`-free
+    /// (see [`hooks::AuthDecider`]), so the embedder never names an HTTP
+    /// framework.
     pub fn with_auth_decider(mut self, decider: Arc<dyn AuthDecider>) -> Self {
         self.auth_decider = Some(decider);
+        self
+    }
+
+    /// Choose the traffic the injected [`AuthDecider`] gates, `transcoded`
+    /// by default; the `/verify` endpoint is never behind it, since it answers
+    /// for the decider.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use structured_proxy::config::{ScopeConfig, Traffic};
+    /// use structured_proxy::ProxyServer;
+    ///
+    /// # fn build() -> anyhow::Result<()> {
+    /// // Gate native gRPC calls as well as the transcoded ones.
+    /// let server = ProxyServer::from_yaml_str("service:\n  name: demo\n")?
+    ///     .with_auth_decider_scope(ScopeConfig::traffic([Traffic::Transcoded, Traffic::Grpc]));
+    /// # let _ = server;
+    /// # Ok(())
+    /// # }
+    /// # build().unwrap();
+    /// ```
+    pub fn with_auth_decider_scope(mut self, scope: ScopeConfig) -> Self {
+        self.auth_decider_scope = Some(scope);
         self
     }
 
@@ -374,7 +550,11 @@ impl ProxyServer {
     /// surface (injected backend or config-driven static discovery), embedder
     /// extra routes, and the transcoded REST routes. All built-in surfaces here
     /// are `GET`.
-    fn reserved_routes(&self, pool: &DescriptorPool) -> anyhow::Result<Vec<(String, String)>> {
+    fn reserved_routes(
+        &self,
+        pool: &DescriptorPool,
+        selection: &transcode::RpcSelection,
+    ) -> anyhow::Result<Vec<(String, String)>> {
         let mut routes = Vec::new();
         let mut get = |path: String| routes.push(("GET".to_string(), path));
         if self.config.health.enabled {
@@ -409,7 +589,11 @@ impl ProxyServer {
         for route in &self.extra_routes {
             routes.push((route.method.as_str().to_string(), route.path.clone()));
         }
-        routes.extend(transcode::route_paths(pool, &self.config.aliases));
+        routes.extend(transcode::route_paths(
+            pool,
+            &self.config.aliases,
+            selection,
+        ));
         Ok(routes)
     }
 
@@ -443,7 +627,7 @@ impl ProxyServer {
     /// No valid upstream address, or a configuration [`service`](Self::service)
     /// rejects.
     pub fn router(&self) -> anyhow::Result<Router> {
-        let (router, _) = self.routes(self.upstream()?)?;
+        let (router, _, _) = self.routes(self.upstream()?)?;
         Ok(router)
     }
 
@@ -477,20 +661,31 @@ impl ProxyServer {
     /// # build().unwrap();
     /// ```
     pub fn service<U: Upstream>(&self, upstream: U) -> anyhow::Result<ProxyService<U>> {
-        let (routes, cors) = self.routes(upstream.clone())?;
+        let (routes, cors, guards) = self.routes(upstream.clone())?;
         // The routes answer a browser's preflight for gRPC-Web too, so its
         // call carries the same policy unless the upstream sets its own.
         let grpc_web_cors = self.config.cors.grpc_web.then_some(cors);
-        Ok(ProxyService::new(upstream, routes, grpc_web_cors))
+        Ok(ProxyService::new(
+            upstream,
+            routes,
+            grpc_web_cors,
+            guards,
+            self.config.grpc_web.translate,
+        ))
     }
 
-    /// Build the axum router with all endpoints, calling `upstream`, and the
-    /// CORS policy it answers under.
-    fn routes<U: Upstream>(&self, upstream: U) -> anyhow::Result<(Router, CorsLayer)> {
+    /// Build the axum router with all endpoints, calling `upstream`, the CORS
+    /// policy it answers under, and the guards, for the traffic outside it.
+    fn routes<U: Upstream>(
+        &self,
+        upstream: U,
+    ) -> anyhow::Result<(Router, CorsLayer, Arc<guard::Guards>)> {
         // Enforce cross-field invariants on the embedded path too, where the
         // config is built directly instead of through `from_yaml_str`.
         self.config.validate()?;
         let pool = self.load_descriptors()?;
+        let selection = transcode::RpcSelection::new(&pool, &self.config.transcode.only)
+            .map_err(|e| anyhow::anyhow!("invalid transcode.only: {e}"))?;
 
         let service_name = self.config.service.name.clone();
 
@@ -505,7 +700,7 @@ impl ProxyServer {
         // routes with different methods are legal (they merge), so only a
         // repeated (method, path) — or any overlap with the verify endpoint,
         // which answers ALL methods (`*`) — is a real conflict.
-        let mut mounted = self.reserved_routes(&pool)?;
+        let mut mounted = self.reserved_routes(&pool, &selection)?;
         if let Some(vp) = &verify_path {
             mounted.push(("*".to_string(), vp.clone()));
         }
@@ -578,36 +773,23 @@ impl ProxyServer {
         let cors = self.build_cors()?;
 
         // Build transcoding routes from descriptor pool.
-        let mut transcode_routes =
-            transcode::routes_with_options(&pool, &self.config.aliases, &self.transcode);
+        let transcode_routes = transcode::routes_with_options(
+            &pool,
+            &self.config.aliases,
+            &self.transcode.clone().with_selection(selection.clone()),
+        );
 
-        // External authorization (Envoy ext_authz) gates only the proxied API
-        // routes, never health / metrics / discovery. It runs inside the auth
-        // layer below, so the Check call sees the identity headers the JWT
-        // middleware injected.
-        let authz = match self.config.auth.as_ref().and_then(|a| a.authz.as_ref()) {
-            Some(cfg) => auth::authz::Authz::build(cfg)
-                .map_err(|e| anyhow::anyhow!("invalid authz config: {e}"))?,
+        // JWT auth, if configured (auth.mode == "jwt").
+        let auth = match &self.config.auth {
+            Some(cfg) => auth::Auth::build(cfg, self.token_verifier.clone())
+                .map_err(|e| anyhow::anyhow!("invalid auth config: {e}"))?,
             None => None,
         };
-
-        // Order matters: in axum the LAST-added layer is outermost and runs
-        // FIRST. We want `authz -> AuthDecider -> handler`, so add the decider
-        // layer first (inner) and the authz layer second (outer). That way, when
-        // both are configured, ext_authz runs first and the in-process decider
-        // sees any headers the authz Check injected.
-        if let Some(decider) = &self.auth_decider {
-            transcode_routes = transcode_routes.layer(axum::middleware::from_fn_with_state(
-                decider.clone(),
-                embed::auth_decider_gate,
-            ));
-        }
-        if let Some(authz) = authz {
-            transcode_routes = transcode_routes.layer(axum::middleware::from_fn_with_state(
-                authz,
-                auth::authz::middleware,
-            ));
-        }
+        // Forward-auth verification endpoint, sharing the built Auth.
+        let forward_auth = auth.as_ref().and_then(|built| {
+            auth::forward::ForwardAuth::build(self.config.auth.as_ref()?, built.clone())
+        });
+        let guards = self.guards(auth, maintenance_exempt, &mounted)?;
 
         // Health routes. Paths are configurable; the whole group is skippable.
         let health_routes = if self.config.health.enabled {
@@ -687,7 +869,7 @@ impl ProxyServer {
         };
 
         // OpenAPI + docs routes (if enabled).
-        let openapi_routes = self.build_openapi_routes(&pool);
+        let openapi_routes = self.build_openapi_routes(&pool, &selection);
 
         // OIDC routes (public, like the health endpoints). An injected
         // OidcBackend supersedes the config-driven static discovery: the proxy
@@ -703,108 +885,144 @@ impl ProxyServer {
             },
         };
 
-        // Rate limiting (Shield), if configured and enabled.
-        let shield = match &self.config.shield {
-            Some(cfg) => shield::Shield::build(cfg)
-                .map_err(|e| anyhow::anyhow!("invalid shield config: {e}"))?,
-            None => None,
-        };
-
-        // JWT auth, if configured (auth.mode == "jwt").
-        let auth = match &self.config.auth {
-            Some(cfg) => auth::Auth::build(cfg, self.token_verifier.clone())
-                .map_err(|e| anyhow::anyhow!("invalid auth config: {e}"))?,
-            None => None,
-        };
-
-        let mut router = Router::new()
+        let endpoints = Router::new()
             .merge(health_routes)
             .merge(metrics_routes)
             .merge(openapi_routes)
             .merge(oidc_routes)
-            .merge(embed::extra_routes_router(&self.extra_routes))
-            .merge(transcode_routes);
-        // CORS is applied as the outermost layer below, so it wraps the auth and
-        // rate-limit enforcement: a short-circuited 401/429/503 still carries CORS
-        // headers, and preflight OPTIONS is answered before auth can reject it.
-
-        // Forward-auth verification endpoint, sharing the built Auth. Mounted
-        // after the auth layer below so the endpoint itself is not gated by the
-        // JWT middleware (it answers the gate, it isn't behind it).
-        let forward_auth = auth.as_ref().and_then(|built| {
-            auth::forward::ForwardAuth::build(self.config.auth.as_ref()?, built.clone())
-        });
-
-        // Duplicate-route collisions (including the verify path) were already
-        // rejected up front, before any router was built.
-
-        // Two-phase rate limiting around auth. The post-auth phase (rules keyed
-        // by a validated JWT claim) is layered first so it sits *inside* auth and
-        // sees the verified claims; the pre-auth phase (IP / header keys) is
-        // layered after auth below so it runs *first* and sheds anonymous floods
-        // before any signature verification.
-        if let Some(shield) = &shield {
-            router = router.layer(axum::middleware::from_fn_with_state(
-                shield.clone(),
-                shield::post_auth_middleware,
-            ));
-        }
-
-        if let Some(auth) = auth {
-            router = router.layer(axum::middleware::from_fn_with_state(auth, auth::middleware));
-        }
+            .merge(embed::extra_routes_router(&self.extra_routes));
 
         // Forward-auth `/verify` endpoint. An injected AuthDecider owns it when
         // present (in-process PDP); otherwise the config-driven JWT ForwardAuth
-        // backs it. Mounted after the auth layer so it is not itself JWT-gated.
-        if let Some(decider) = &self.auth_decider {
-            // Collision / shape of this path was already validated above.
+        // backs it. Its path was validated above.
+        let verify = if let Some(decider) = &self.auth_decider {
             let decider = decider.clone();
-            let path = self.decider_verify_path();
-            router = router.route(
-                &path,
+            Router::new().route(
+                &self.decider_verify_path(),
                 axum::routing::any(move |req: axum::extract::Request| {
                     let decider = decider.clone();
                     async move { embed::verify_via_decider(decider, req).await }
                 }),
-            );
+            )
         } else if let Some(forward_auth) = &forward_auth {
-            router = router.merge(forward_auth.routes());
-        }
+            forward_auth.routes()
+        } else {
+            Router::new()
+        };
 
-        // Pre-auth phase, added before maintenance so maintenance wraps it (outer
-        // layers run first): a request rejected by the maintenance gate must not
-        // be charged against its rate-limit budget. Placed after the auth layer
-        // so it runs before auth, and after the verify route so that endpoint is
-        // rate-limited too (but not JWT-gated).
-        if let Some(shield) = &shield {
-            router = router.layer(axum::middleware::from_fn_with_state(
-                shield.clone(),
-                shield::pre_auth_middleware,
-            ));
-        }
-
-        // Mounted only while maintenance is on, so normal traffic pays nothing
-        // for it.
-        if self.config.maintenance.enabled {
-            let maintenance = Arc::new(Maintenance {
-                exempt: maintenance_exempt,
-                message: self.config.maintenance.message.clone(),
-            });
-            router = router.layer(axum::middleware::from_fn_with_state(
-                maintenance,
-                maintenance_middleware,
-            ));
-        }
-        let router = router.layer(TraceLayer::new_for_http());
+        // Each class of traffic behind the guards that cover it, so a request
+        // runs only the guards of its own class. A path no route answers
+        // reaches the plain 404 (or the fallback's own guards).
+        let router = Router::new()
+            .merge(guards.router(transcode_routes, guard::Class::Transcoded))
+            .merge(guards.router(endpoints, guard::Class::Endpoints))
+            .merge(guards.router(verify, guard::Class::Verify))
+            .layer(TraceLayer::new_for_http());
         // Outermost: wraps every enforcement layer so short-circuited
         // responses keep CORS headers, and answers preflight before auth.
         let router = cors::layer(router, cors.clone()).with_state(state);
 
-        Ok((router, cors))
+        Ok((router, cors, Arc::new(guards)))
     }
 
-    fn build_openapi_routes<S>(&self, pool: &DescriptorPool) -> Router<S>
+    /// The guards the configuration and the hooks turn on, each with its
+    /// scope; `maintenance_exempt` lists the paths maintenance mode leaves
+    /// reachable, `mounted` the `(method, path)` of every route.
+    ///
+    /// # Errors
+    ///
+    /// A malformed shield, authz or concurrency section, or a scope that
+    /// covers no traffic, names an invalid path glob or an invalid method.
+    fn guards(
+        &self,
+        auth: Option<Arc<auth::Auth>>,
+        maintenance_exempt: Vec<String>,
+        mounted: &[(String, String)],
+    ) -> anyhow::Result<guard::Guards> {
+        use config::Traffic::{Endpoints, Grpc, Transcoded};
+        // `*` marks a route that answers every method, not a method.
+        let routed: Vec<http::Method> = mounted
+            .iter()
+            .filter(|(method, _)| method != "*")
+            .filter_map(|(method, _)| http::Method::from_bytes(method.as_bytes()).ok())
+            .collect();
+        let scope = |config: Option<&ScopeConfig>, default: &[config::Traffic], what: &str| {
+            guard::Scope::compile(config, default, what, &routed).map_err(anyhow::Error::msg)
+        };
+        let mut guards = guard::Guards::default();
+        // Mounted only while maintenance is on, so normal traffic pays nothing
+        // for it.
+        let maintenance = &self.config.maintenance;
+        if maintenance.enabled {
+            guards.maintenance = Some((
+                Arc::new(guard::Maintenance {
+                    exempt: maintenance_exempt,
+                    message: maintenance.message.clone(),
+                }),
+                scope(
+                    maintenance.scope.as_ref(),
+                    &[Transcoded, Endpoints],
+                    "maintenance",
+                )?,
+            ));
+        }
+        if let Some(cfg) = &self.config.concurrency {
+            guards.concurrency = Some((
+                guard::Concurrency::build(cfg).map_err(anyhow::Error::msg)?,
+                // The proxy's own endpoints stay out by default: a health
+                // probe refused under load gets a busy instance restarted.
+                scope(cfg.scope.as_ref(), &[Transcoded, Grpc], "concurrency")?,
+            ));
+        }
+        if let Some(cfg) = &self.config.shield {
+            if let Some(shield) = shield::Shield::build(cfg)
+                .map_err(|e| anyhow::anyhow!("invalid shield config: {e}"))?
+            {
+                guards.shield = Some((
+                    shield,
+                    scope(cfg.scope.as_ref(), &[Transcoded, Endpoints], "shield")?,
+                ));
+            }
+        }
+        let auth_config = self.config.auth.as_ref();
+        if let Some(auth) = auth {
+            guards.auth = Some((
+                auth,
+                scope(
+                    auth_config.and_then(|a| a.scope.as_ref()),
+                    &[Transcoded, Endpoints],
+                    "auth",
+                )?,
+            ));
+        }
+        if let Some(cfg) = auth_config.and_then(|a| a.authz.as_ref()) {
+            if let Some(authz) = auth::authz::Authz::build(cfg)
+                .map_err(|e| anyhow::anyhow!("invalid authz config: {e}"))?
+            {
+                guards.authz = Some((
+                    authz,
+                    scope(cfg.scope.as_ref(), &[Transcoded], "auth.authz")?,
+                ));
+            }
+        }
+        if let Some(decider) = &self.auth_decider {
+            guards.decider = Some((
+                decider.clone(),
+                scope(
+                    self.auth_decider_scope.as_ref(),
+                    &[Transcoded],
+                    "auth_decider",
+                )?,
+            ));
+        }
+        Ok(guards)
+    }
+
+    fn build_openapi_routes<S>(
+        &self,
+        pool: &DescriptorPool,
+        selection: &transcode::RpcSelection,
+    ) -> Router<S>
     where
         S: Clone + Send + Sync + 'static,
     {
@@ -813,7 +1031,7 @@ impl ProxyServer {
             _ => return Router::new(),
         };
 
-        let spec = openapi::generate(pool, openapi_config, &self.config.aliases);
+        let spec = openapi::generate(pool, openapi_config, &self.config.aliases, selection);
         let spec_json = serde_json::to_string_pretty(&spec).unwrap_or_default();
         let openapi_path = openapi_config.path.clone();
         let docs_path = openapi_config.docs_path.clone();
@@ -913,21 +1131,70 @@ impl ProxyServer {
         })
     }
 
-    /// Serve the proxy on the configured listen address in front of the
-    /// configured upstream address: REST and native gRPC on one port (see
-    /// [`service`](Self::service) and [`serve`]).
+    /// The [`ServeOptions`] of `listen:`: TLS from `listen.tls` (mTLS with its
+    /// `client_ca_file`), the `listen.max_connections` cap and the connection
+    /// timeouts, for [`serve_with`] on a listener of your own.
     ///
     /// # Errors
     ///
-    /// What [`upstream`](Self::upstream) and [`service`](Self::service)
-    /// reject, an invalid listen address, or a listener that fails.
+    /// A `max_connections`, `header_read_timeout_secs` or
+    /// `tls.handshake_timeout_secs` of zero, TLS files that cannot be loaded,
+    /// or no rustls crypto provider for TLS.
+    pub fn serve_options(&self) -> anyhow::Result<ServeOptions> {
+        use std::time::Duration;
+        let listen = &self.config.listen;
+        anyhow::ensure!(
+            listen.header_read_timeout_secs > 0,
+            "listen.header_read_timeout_secs must be at least 1"
+        );
+        let mut options = ServeOptions::new()
+            .idle_timeout(
+                (listen.idle_timeout_secs > 0)
+                    .then(|| Duration::from_secs(listen.idle_timeout_secs)),
+            )
+            .header_read_timeout(Duration::from_secs(listen.header_read_timeout_secs));
+        if let Some(max) = listen.max_connections {
+            anyhow::ensure!(max > 0, "listen.max_connections must be at least 1");
+            options = options.max_connections(max);
+        }
+        if let Some(tls) = &listen.tls {
+            anyhow::ensure!(
+                tls.handshake_timeout_secs > 0,
+                "listen.tls.handshake_timeout_secs must be at least 1"
+            );
+            options = options
+                .tls(
+                    tls::server_config(tls)
+                        .map_err(|e| anyhow::anyhow!("invalid listen.tls: {e}"))?,
+                )
+                .tls_handshake_timeout(Duration::from_secs(tls.handshake_timeout_secs));
+        }
+        Ok(options)
+    }
+
+    /// Serve the proxy on the configured listen address in front of the
+    /// configured upstream address: REST and native gRPC on one port, with
+    /// the TLS and connection limit of `listen:` (see
+    /// [`serve_options`](Self::serve_options) and [`serve_with`]).
+    ///
+    /// # Errors
+    ///
+    /// What [`upstream`](Self::upstream), [`service`](Self::service) and
+    /// [`serve_options`](Self::serve_options) reject, an invalid listen
+    /// address, or a listener that fails.
     pub async fn serve(&self) -> anyhow::Result<()> {
         let service = self.service(self.upstream()?)?;
+        let options = self.serve_options()?;
         let addr: SocketAddr = self.config.listen.http.parse()?;
         let listener = tokio::net::TcpListener::bind(addr).await?;
 
-        tracing::info!("{} listening on {}", self.config.service.name, addr);
-        serve(listener, service).await?;
+        tracing::info!(
+            tls = self.config.listen.tls.is_some(),
+            "{} listening on {}",
+            self.config.service.name,
+            addr
+        );
+        serve_with(listener, service, options).await?;
         Ok(())
     }
 }
@@ -950,39 +1217,6 @@ fn normalize_route_shape(path: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("/")
-}
-
-impl Maintenance {
-    /// Whether `path` stays reachable: an exact exempt path, or `prefix` and
-    /// what lies below it for a `prefix/**` one (a sibling that only shares
-    /// the prefix, `/healthz` for `/health/**`, does not).
-    fn exempts(&self, path: &str) -> bool {
-        self.exempt
-            .iter()
-            .any(|pattern| match pattern.strip_suffix("/**") {
-                Some(prefix) => path
-                    .strip_prefix(prefix)
-                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('/')),
-                None => path == pattern,
-            })
-    }
-}
-
-/// Maintenance mode middleware.
-async fn maintenance_middleware(
-    State(maintenance): State<Arc<Maintenance>>,
-    request: Request<axum::body::Body>,
-    next: Next,
-) -> Response {
-    if maintenance.exempts(request.uri().path()) {
-        return next.run(request).await;
-    }
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        [("retry-after", "300")],
-        maintenance.message.clone(),
-    )
-        .into_response()
 }
 
 /// A [`ProxyState`] for tests whose routers never call the upstream: a lazy

@@ -19,6 +19,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, on, MethodFilter, MethodRouter};
 use axum::{Json, Router};
 
+use crate::guard::{http_to_grpc_code, mark_rejection};
 use crate::hooks::{AuthDecider, Decision, ExtraRoute, OidcBackend, RequestParts, RouteRequest};
 
 /// Cap on the body an extra-route handler will buffer (16 MiB). Extra routes are
@@ -69,9 +70,21 @@ pub(crate) async fn auth_decider_gate(
             strip_then_insert(dst, &inject_headers);
             next.run(request).await
         }
-        Decision::Deny { status, body } => deny_response(status, body),
-        // Inline (browser-facing) path: drive a real redirect.
-        Decision::Redirect { location } => redirect_response(StatusCode::FOUND, &location),
+        // The decider owns the HTTP answer; a gRPC caller gets the code its
+        // status maps to.
+        Decision::Deny { status, body } => mark_rejection(
+            deny_response(status, body),
+            http_to_grpc_code(status),
+            "denied by the auth decider",
+        ),
+        // Inline (browser-facing) path: drive a real redirect. A gRPC client
+        // cannot follow one; it is told to authenticate, `Location` in its
+        // metadata.
+        Decision::Redirect { location } => mark_rejection(
+            redirect_response(StatusCode::FOUND, &location),
+            tonic::Code::Unauthenticated,
+            "authentication required",
+        ),
     }
 }
 

@@ -112,6 +112,12 @@ pub(crate) fn malformed_response(details: Option<&StatusDetails>) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
 }
 
+/// The error body of a request a guard turned away: the shape of the
+/// transcoder's own errors, with empty `details`.
+pub(crate) fn guard_error_body(code: tonic::Code, message: &str) -> Value {
+    body(code, message, Some(RenderedDetails::default()))
+}
+
 /// The JSON error body for a failed call, shared by the unary response and the
 /// terminal frame of a stream so a client parses one shape everywhere.
 ///

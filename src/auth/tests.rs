@@ -5,6 +5,7 @@ use super::*;
 
 use crate::config::{AuthConfig, ForwardAuthConfig, JwtConfig, RoutePolicyConfig};
 use axum::http::Request as HttpRequest;
+use axum::http::StatusCode;
 use tower::ServiceExt;
 
 #[test]
@@ -122,6 +123,7 @@ fn auth_with_stub(roles: &[&str], jwt: Option<JwtConfig>) -> Arc<Auth> {
         jwt,
         forward_auth: Some(secure_policy(roles)),
         authz: None,
+        scope: None,
     };
     let stub = StubVerifier {
         accepts: "good-token",
@@ -230,6 +232,7 @@ async fn injected_verifier_is_called_on_every_request() {
         jwt: Some(jwt_claims_only()),
         forward_auth: Some(secure_policy(&[])),
         authz: None,
+        scope: None,
     };
     let auth = Auth::build(&cfg, Some(verifier.clone())).unwrap().unwrap();
     for _ in 0..3 {
@@ -259,6 +262,7 @@ fn injected_verifier_supersedes_a_configured_key_source() {
         }),
         forward_auth: None,
         authz: None,
+        scope: None,
     };
     let stub = StubVerifier {
         accepts: "good-token",
@@ -274,6 +278,7 @@ fn no_auth_when_mode_is_not_jwt() {
         jwt: None,
         forward_auth: None,
         authz: None,
+        scope: None,
     };
     assert!(Auth::build(&cfg, None).unwrap().is_none());
 }
@@ -288,6 +293,7 @@ fn jwt_mode_without_a_verifier_is_rejected() {
         jwt: Some(jwt_claims_only()),
         forward_auth: None,
         authz: None,
+        scope: None,
     };
     let Err(err) = Auth::build(&cfg, None) else {
         panic!("a jwt config with no verifier must not build");
@@ -349,6 +355,7 @@ mod builtin {
             }),
             forward_auth: Some(secure_policy(roles)),
             authz: None,
+            scope: None,
         };
         Auth::build(&cfg, None).unwrap().unwrap()
     }
@@ -397,6 +404,7 @@ mod builtin {
                 ..secure_policy(&[])
             }),
             authz: None,
+            scope: None,
         };
         let auth = Auth::build(&cfg, None).unwrap().unwrap();
         let resp = app(auth)
@@ -553,6 +561,7 @@ mod builtin {
             }),
             forward_auth: Some(secure_policy(&[])),
             authz: None,
+            scope: None,
         };
         let auth = Auth::build(&cfg, None).unwrap().unwrap();
         let app = app(auth.clone());
@@ -614,6 +623,7 @@ mod builtin {
             }),
             forward_auth: Some(secure_policy(&[])),
             authz: None,
+            scope: None,
         };
         let auth = Auth::build(&cfg, None).unwrap().unwrap();
         let app = app(auth.clone());
@@ -643,6 +653,7 @@ mod builtin {
             }),
             forward_auth: None,
             authz: None,
+            scope: None,
         };
         let Err(err) = Auth::build(&jwks(59), None) else {
             panic!("a JWKS age below 60 s must be rejected");
@@ -662,6 +673,7 @@ mod builtin {
             }),
             forward_auth: None,
             authz: None,
+            scope: None,
         };
         let Err(err) = Auth::build(&cfg, None) else {
             panic!("a zero-sized cache must be rejected");
@@ -678,6 +690,7 @@ mod builtin {
             jwt: Some(jwt_claims_only()),
             forward_auth: None,
             authz: None,
+            scope: None,
         };
         let Err(err) = Auth::build(&cfg, None) else {
             panic!("a built-in verifier with no key source must not build");

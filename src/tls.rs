@@ -1,5 +1,5 @@
-//! The rustls client configuration for the proxy's own outbound HTTPS calls
-//! (JWKS fetches, the rate-limit service).
+//! The rustls configurations: the client of the proxy's own outbound HTTPS
+//! calls (JWKS fetches, the rate-limit service) and the server of its listener.
 
 use std::sync::Arc;
 
@@ -36,7 +36,70 @@ pub(crate) fn client_config_with(
         .with_no_client_auth())
 }
 
-/// The crypto provider for outbound TLS: the one the process `installed`, else
+/// The rustls server config `config` describes: its certificate and key, and
+/// with `client_ca_file` a verifier for client certificates. ALPN offers `h2`
+/// and `http/1.1`, so gRPC clients get HTTP/2 on the same port as REST ones.
+///
+/// # Errors
+///
+/// `client_auth` without `client_ca_file`, no crypto provider (see
+/// [`select_provider`]), a file that cannot be read or holds no certificate /
+/// key, or a certificate rustls refuses.
+pub(crate) fn server_config(
+    config: &crate::config::ListenTlsConfig,
+) -> Result<rustls::ServerConfig, String> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    // A client policy with nothing to verify against would leave the listener
+    // accepting every client while the config reads as mTLS.
+    if config.client_auth.is_some() && config.client_ca_file.is_none() {
+        return Err("client_auth needs client_ca_file to verify the certificates against".into());
+    }
+    let provider = select_provider(CryptoProvider::get_default(), builtin_provider)?;
+    let certs = |path: &std::path::Path| {
+        let certs = CertificateDer::pem_file_iter(path)
+            .and_then(|certs| certs.collect::<Result<Vec<_>, _>>())
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        if certs.is_empty() {
+            return Err(format!("{}: no PEM certificate", path.display()));
+        }
+        Ok(certs)
+    };
+    let chain = certs(&config.cert_file)?;
+    let key = PrivateKeyDer::from_pem_file(&config.key_file)
+        .map_err(|e| format!("{}: {e}", config.key_file.display()))?;
+    let builder = rustls::ServerConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("the rustls crypto provider cannot do TLS 1.2 or 1.3: {e}"))?;
+    let builder = match &config.client_ca_file {
+        None => builder.with_no_client_auth(),
+        Some(path) => {
+            let mut roots = rustls::RootCertStore::empty();
+            for cert in certs(path)? {
+                roots
+                    .add(cert)
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
+            }
+            let verifier =
+                rustls::server::WebPkiClientVerifier::builder_with_provider(roots.into(), provider);
+            let verifier = match config.client_auth.unwrap_or_default() {
+                crate::config::ClientAuth::Required => verifier,
+                crate::config::ClientAuth::Optional => verifier.allow_unauthenticated(),
+            }
+            .build()
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+            builder.with_client_cert_verifier(verifier)
+        }
+    };
+    let mut server = builder
+        .with_single_cert(chain, key)
+        .map_err(|e| format!("{}: {e}", config.cert_file.display()))?;
+    server.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(server)
+}
+
+/// The crypto provider for the proxy's TLS: the one the process `installed`, else
 /// the `builtin` one this crate's crypto backend brings.
 ///
 /// An installed provider is the application's explicit choice and wins, the
@@ -56,7 +119,7 @@ fn select_provider(
         return Ok(Arc::clone(installed));
     }
     builtin().map(Arc::new).ok_or_else(|| {
-        "the outbound HTTP client needs a rustls crypto provider: enable the \
+        "TLS (the listener, the outbound HTTP client) needs a rustls crypto provider: enable the \
          `rust_crypto` or `aws_lc_rs` feature, or install one with \
          `rustls::crypto::CryptoProvider::install_default` before building the proxy"
             .to_string()

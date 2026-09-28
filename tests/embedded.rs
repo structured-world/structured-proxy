@@ -24,6 +24,10 @@ fn embedded_config_is_constructible() {
         }],
         listen: ListenConfig {
             http: "0.0.0.0:8080".into(),
+            max_connections: None,
+            tls: None,
+            idle_timeout_secs: 60,
+            header_read_timeout_secs: 30,
         },
         service: ServiceConfig {
             name: "embedded-test".into(),
@@ -45,6 +49,9 @@ fn embedded_config_is_constructible() {
         // the config via from_file / from_yaml_str, where the default list applies).
         forwarded_headers: vec!["authorization".into()],
         streaming: Default::default(),
+        concurrency: None,
+        grpc_web: Default::default(),
+        transcode: Default::default(),
     };
     // The server accepts a programmatically-built config (the embedded path).
     let _server = ProxyServer::from_config(config);

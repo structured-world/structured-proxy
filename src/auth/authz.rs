@@ -14,7 +14,6 @@ use axum::http::header::{HeaderName, HeaderValue, HOST};
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use tonic::transport::Channel;
 
 use envoy_types::pb::envoy::config::core::v3::HeaderValueOption;
@@ -25,8 +24,8 @@ use envoy_types::pb::envoy::service::auth::v3::{
     AttributeContext, CheckRequest, CheckResponse, DeniedHttpResponse,
 };
 
-use super::forbidden;
 use crate::config::AuthzConfig;
+use crate::guard::{http_to_grpc_code, mark_rejection, reject};
 
 /// A configured ext_authz client.
 pub struct Authz {
@@ -82,7 +81,10 @@ pub async fn middleware(
         }
         Err(status) => {
             tracing::warn!(error = %status, "authz check failed; failing closed");
-            service_unavailable("authorization service unavailable")
+            reject(
+                tonic::Code::Unavailable,
+                "authorization service unavailable",
+            )
         }
     }
 }
@@ -148,12 +150,29 @@ fn evaluate(resp: CheckResponse) -> Decision {
     } else {
         let response = match resp.http_response {
             Some(EnvoyHttpResponse::DeniedResponse(denied))
-            | Some(EnvoyHttpResponse::ErrorResponse(denied)) => denied_to_response(denied),
-            _ => forbidden("forbidden by authorization policy"),
+            | Some(EnvoyHttpResponse::ErrorResponse(denied)) => {
+                let response = denied_to_response(denied);
+                // A gRPC caller gets the Check's own status, the decision in
+                // gRPC terms; a Check that sets no code maps the HTTP one.
+                let code = match resp.status.as_ref().map(|s| s.code) {
+                    Some(code) if code != 0 => tonic::Code::from_i32(code),
+                    _ => http_to_grpc_code(response.status()),
+                };
+                let message = resp
+                    .status
+                    .map(|s| s.message)
+                    .filter(|m| !m.is_empty())
+                    .unwrap_or_else(|| DENIED.to_string());
+                mark_rejection(response, code, message)
+            }
+            _ => reject(tonic::Code::PermissionDenied, DENIED),
         };
         Decision::Deny(response)
     }
 }
+
+/// The message of a denial that carries none of its own.
+const DENIED: &str = "forbidden by authorization policy";
 
 /// Append authz-supplied headers, preserving multiple values for the same name
 /// (e.g. several `Set-Cookie`) instead of overwriting all but the last.
@@ -185,14 +204,6 @@ fn denied_to_response(denied: DeniedHttpResponse) -> Response {
         denied.headers.into_iter().filter_map(header_kv).collect(),
     );
     (status, headers, denied.body).into_response()
-}
-
-fn service_unavailable(message: &str) -> Response {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(serde_json::json!({ "error": "UNAVAILABLE", "message": message })),
-    )
-        .into_response()
 }
 
 #[cfg(test)]
@@ -332,6 +343,7 @@ mod tests {
             endpoint: "http://127.0.0.1:1".into(),
             timeout_ms: 100,
             failure_mode_allow: false,
+            scope: None,
         })
         .unwrap()
         .unwrap();
@@ -360,6 +372,7 @@ mod tests {
             endpoint: "http://127.0.0.1:1".into(),
             timeout_ms: 100,
             failure_mode_allow: true,
+            scope: None,
         })
         .unwrap()
         .unwrap();

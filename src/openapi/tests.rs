@@ -53,7 +53,7 @@ fn config() -> OpenApiConfig {
 #[test]
 fn test_generate_empty_pool() {
     let pool = DescriptorPool::new();
-    let spec = generate(&pool, &config(), &[]);
+    let spec = generate(&pool, &config(), &[], &RpcSelection::default());
 
     assert_eq!(spec["openapi"], "3.0.3");
     assert_eq!(spec["info"]["title"], "Test API");
@@ -203,11 +203,17 @@ impl protox::file::FileResolver for TestProtos {
 }
 
 fn spec(aliases: &[AliasConfig]) -> Value {
+    spec_of(aliases, &[])
+}
+
+/// [`spec`] documenting only the RPCs `only` selects.
+fn spec_of(aliases: &[AliasConfig], only: &[&str]) -> Value {
     let pool = protox::Compiler::with_file_resolver(TestProtos)
         .open_file("test/v1/api.proto")
         .unwrap()
         .descriptor_pool();
-    generate(&pool, &config(), aliases)
+    let selection = RpcSelection::new(&pool, only).unwrap();
+    generate(&pool, &config(), aliases, &selection)
 }
 
 #[test]
@@ -370,4 +376,29 @@ fn aliases_get_their_own_operation_ids() {
     let aliased = &spec["paths"]["/api/items"]["post"]["operationId"];
     assert!(aliased.is_string());
     assert_ne!(aliased, "Api.Create");
+}
+
+#[test]
+fn a_selection_documents_only_the_rpcs_it_transcodes() {
+    // The spec describes what is mounted: an RPC left out of `transcode.only`
+    // has no route, so it has no operation either.
+    let spec = spec_of(&[], &["test.v1.Api/Find"]);
+    let paths = spec["paths"].as_object().unwrap();
+    assert_eq!(paths.keys().collect::<Vec<_>>(), ["/v1/find"]);
+    assert_eq!(spec["tags"][0]["name"], "Api");
+    // A whole service selects all of its RPCs.
+    let spec = spec_of(&[], &["test.v1.Api"]);
+    assert!(spec["paths"]["/v1/items"]["post"].is_object());
+}
+
+#[test]
+fn a_selection_naming_nothing_in_the_descriptors_is_an_error() {
+    let pool = protox::Compiler::with_file_resolver(TestProtos)
+        .open_file("test/v1/api.proto")
+        .unwrap()
+        .descriptor_pool();
+    for name in ["test.v1.Nope", "test.v1.Api/Nope", "Api"] {
+        let err = RpcSelection::new(&pool, [name]).unwrap_err();
+        assert!(err.contains(name), "{err}");
+    }
 }

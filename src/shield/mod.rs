@@ -24,10 +24,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::Request;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::HeaderMap;
 use axum::middleware::Next;
-use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::response::Response;
 
 use crate::config::ShieldConfig;
 use gcra::Verdict;
@@ -530,14 +529,7 @@ fn attach_rate_headers(headers: &mut HeaderMap, limit: u64, remaining: u64, verd
 
 /// A `429` response carrying the rate-limit headers plus `Retry-After`.
 fn too_many_requests(limit: u64, remaining: u64, verdict: &Verdict) -> Response {
-    let mut response = (
-        StatusCode::TOO_MANY_REQUESTS,
-        Json(serde_json::json!({
-            "error": "RESOURCE_EXHAUSTED",
-            "message": "rate limit exceeded",
-        })),
-    )
-        .into_response();
+    let mut response = crate::guard::reject(tonic::Code::ResourceExhausted, "rate limit exceeded");
     let headers = response.headers_mut();
     attach_rate_headers(headers, limit, remaining, verdict);
     if let Ok(v) = secs_ceil(verdict.retry_after).to_string().parse() {
