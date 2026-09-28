@@ -52,10 +52,11 @@ pin-project-lite = "0.2"
 # TLS. Already in the tree through axum and tonic.
 hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "service", "tokio"] }
 # The executor HTTP/2 connections spawn their stream tasks on: a
-# `TaskTracker` a shutdown waits on. Both already in the tree through
-# hyper-util and tonic.
+# `TaskTracker` a shutdown waits on, and a `CancellationToken` that ends
+# them (0.7.16: `run_until_cancelled` checks the token first). Both already
+# in the tree through hyper-util and tonic.
 hyper = "1"
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util = { version = "0.7.16", features = ["rt"] }
 
 # gRPC client (to upstream service). `tls-connect-info` gives a rustls server
 # stream the connection record (client certificates) a tonic handler reads, so

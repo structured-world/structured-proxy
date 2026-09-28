@@ -185,6 +185,24 @@ async fn without_a_limit_connections_are_served_together() {
     assert_eq!(status_line(&mut first).await, "HTTP/1.1 200 OK");
 }
 
+#[tokio::test]
+async fn stopping_the_streams_ends_one_that_never_finishes() {
+    // A stream task that does not end when its connection closes (a service
+    // or body that never wakes) must still not hold the shutdown open.
+    let streams = StreamExecutor::default();
+    let (dropped, gone) = tokio::sync::oneshot::channel::<()>();
+    hyper::rt::Executor::execute(&streams, async move {
+        let _dropped = dropped;
+        std::future::pending::<()>().await;
+    });
+    streams.close();
+    tokio::time::timeout(Duration::from_secs(5), streams.stop())
+        .await
+        .expect("stopping ends the stream task");
+    // The sender went with the task's future: the future was dropped.
+    assert!(gone.await.is_err());
+}
+
 #[test]
 #[should_panic(expected = "max_connections must be at least 1")]
 fn a_limit_of_zero_is_refused() {

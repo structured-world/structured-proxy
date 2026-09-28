@@ -257,6 +257,7 @@ where
     let (stop, stopping) = watch::channel(false);
     let mut connections = JoinSet::new();
     let streams = StreamExecutor::default();
+    let _streams_end_with_this_future = streams.cancel_on_drop();
     tokio::pin!(signal);
     // Every wait below also reaps finished connections, so the set holds only
     // open ones even while no client arrives.
@@ -333,10 +334,10 @@ where
     // open connections wind down.
     drop(listener);
     stop.send_replace(true);
-    streams.0.close();
+    streams.close();
     let drained = async {
         while connections.join_next().await.is_some() {}
-        streams.0.wait().await;
+        streams.finished().await;
     };
     match options.drain_timeout {
         None => drained.await,
@@ -347,9 +348,7 @@ where
                     "shutdown drain timed out; closing the connections still open"
                 );
                 connections.shutdown().await;
-                // A closed HTTP/2 connection resets its streams, which ends
-                // their tasks; they are awaited so none outlives this future.
-                streams.0.wait().await;
+                streams.stop().await;
             }
         }
     }
@@ -359,8 +358,39 @@ where
 /// Spawns the stream tasks of HTTP/2 connections (hyper runs each stream's
 /// service in a task of its own) under one tracker, so a shutdown can wait
 /// for them as it does for the connections.
+///
+/// Each task also ends when [`stop`](Self::stop) cancels them: a closed
+/// connection resets its streams, but a stream ending on that reset is
+/// hyper's behaviour, not something a bounded shutdown should rest on.
 #[derive(Clone, Default)]
-struct StreamExecutor(tokio_util::task::TaskTracker);
+struct StreamExecutor {
+    tasks: tokio_util::task::TaskTracker,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+impl StreamExecutor {
+    /// No new stream after this; the ones running may finish.
+    fn close(&self) {
+        self.tasks.close();
+    }
+
+    /// Resolves once every stream task has finished on its own.
+    async fn finished(&self) {
+        self.tasks.wait().await;
+    }
+
+    /// Ends every stream task still running and waits for them.
+    async fn stop(&self) {
+        self.cancel.cancel();
+        self.tasks.wait().await;
+    }
+
+    /// Cancels every stream task when dropped, so they end with the future
+    /// that owns the server even if it is dropped mid-shutdown.
+    fn cancel_on_drop(&self) -> tokio_util::sync::DropGuard {
+        self.cancel.clone().drop_guard()
+    }
+}
 
 impl<F> hyper::rt::Executor<F> for StreamExecutor
 where
@@ -368,7 +398,8 @@ where
     F::Output: Send + 'static,
 {
     fn execute(&self, future: F) {
-        self.0.spawn(future);
+        self.tasks
+            .spawn(self.cancel.clone().run_until_cancelled_owned(future));
     }
 }
 
