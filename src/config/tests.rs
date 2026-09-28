@@ -7,13 +7,51 @@ upstream:
   default: "grpc://localhost:4180"
 "#;
     let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
-    assert_eq!(config.upstream.default, "grpc://localhost:4180");
+    assert_eq!(config.upstream.unwrap().default, "grpc://localhost:4180");
     assert_eq!(config.listen.http, "0.0.0.0:8080");
     assert_eq!(config.service.name, "structured-proxy");
     assert_eq!(config.streaming.sse_keep_alive_secs, 15);
     assert!(config.descriptors.is_empty());
     assert!(config.auth.is_none());
     assert!(config.shield.is_none());
+}
+
+#[test]
+fn cors_defaults_cover_grpc_web_and_nothing_extra() {
+    // Absent `cors:` and an empty one agree: permissive origins, gRPC-Web
+    // included, no extra exposed headers, the browser's own preflight cache.
+    for yaml in ["service:\n  name: demo\n", "cors: {}\n"] {
+        let cors = serde_yaml::from_str::<ProxyConfig>(yaml).unwrap().cors;
+        assert!(cors.origins.is_empty(), "{yaml}");
+        assert!(cors.expose_headers.is_empty(), "{yaml}");
+        assert_eq!(cors.max_age_secs, None, "{yaml}");
+        assert!(cors.grpc_web, "{yaml}");
+    }
+}
+
+#[test]
+fn cors_settings_are_read() {
+    let yaml = "cors:\n  origins: [\"https://app.example\"]\n  expose_headers: [\"x-request-id\"]\n  max_age_secs: 600\n  grpc_web: false\n";
+    let cors = serde_yaml::from_str::<ProxyConfig>(yaml).unwrap().cors;
+    assert_eq!(cors.origins, ["https://app.example"]);
+    assert_eq!(cors.expose_headers, ["x-request-id"]);
+    assert_eq!(cors.max_age_secs, Some(600));
+    assert!(!cors.grpc_web);
+}
+
+#[test]
+fn upstream_is_optional() {
+    // An embedder whose upstream is in process names no address.
+    let config: ProxyConfig = serde_yaml::from_str("service:\n  name: demo\n").unwrap();
+    assert!(config.upstream.is_none());
+}
+
+#[test]
+fn upstream_without_its_address_is_rejected() {
+    // A present `upstream:` block must say where: an empty one is a mistake,
+    // not a request for an in-process upstream.
+    let err = serde_yaml::from_str::<ProxyConfig>("upstream: {}\n").unwrap_err();
+    assert!(err.to_string().contains("default"), "{err}");
 }
 
 #[test]
@@ -231,7 +269,10 @@ forwarded_headers:
   - "x-request-id"
 "#;
     let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
-    assert_eq!(config.upstream.default, "grpc://sid-identity:4180");
+    assert_eq!(
+        config.upstream.as_ref().unwrap().default,
+        "grpc://sid-identity:4180"
+    );
     assert_eq!(config.listen.http, "0.0.0.0:9090");
     assert_eq!(config.service.name, "sid-proxy");
     assert_eq!(config.aliases.len(), 1);

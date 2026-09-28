@@ -2,8 +2,10 @@
 //! like unary routes: path parameters, query parameters and the `body` rule.
 //!
 //! The upstream echoes the request it received as the only stream message, so
-//! each test sees what actually reached the service.
+//! each test sees what actually reached the service. Every case runs against
+//! a remote and an in-process upstream.
 
+#[macro_use]
 mod common;
 
 use std::convert::Infallible;
@@ -84,11 +86,10 @@ impl tower::Service<http::Request<tonic::body::Body>> for Things {
     }
 }
 
-async fn proxy() -> axum::Router {
+async fn proxy(upstream: common::Upstream) -> common::App {
     let pool: DescriptorPool = common::compile("test/v1/things.proto", THINGS_PROTO);
     let item = pool.get_message_by_name("test.v1.Item").unwrap();
-    let upstream = common::serve(Things { item }).await;
-    common::proxy(&upstream, pool, Default::default())
+    common::proxy(upstream, Things { item }, pool, Default::default()).await
 }
 
 /// The NDJSON lines of a streaming response, parsed.
@@ -98,11 +99,11 @@ fn ndjson(body: &str) -> Vec<Value> {
         .collect()
 }
 
-#[tokio::test]
+upstream_tests! {
 async fn get_stream_binds_path_and_query_parameters() {
     // `{name}` comes from the path and `count` from the query string; before
     // the fix the upstream received an empty request.
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let (status, body) = common::send(
         &app,
         http::Request::get("/v1/things/alpha/watch?count=7")
@@ -114,10 +115,9 @@ async fn get_stream_binds_path_and_query_parameters() {
     assert_eq!(ndjson(&body), vec![json!({"name": "alpha", "count": "7"})]);
 }
 
-#[tokio::test]
 async fn sse_stream_binds_the_request_too() {
     // The request mapping does not depend on the negotiated stream format.
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let (status, body) = common::send(
         &app,
         http::Request::get("/v1/things/alpha/watch?count=7")
@@ -135,9 +135,8 @@ async fn sse_stream_binds_the_request_too() {
     assert_eq!(data, vec![json!({"name": "alpha", "count": "7"})]);
 }
 
-#[tokio::test]
 async fn post_stream_maps_the_whole_body() {
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let (status, body) = common::send(
         &app,
         http::Request::post("/v1/things:watch")
@@ -150,11 +149,10 @@ async fn post_stream_maps_the_whole_body() {
     assert_eq!(ndjson(&body), vec![json!({"name": "beta", "count": "3"})]);
 }
 
-#[tokio::test]
 async fn post_stream_with_malformed_body_is_rejected_before_the_upstream() {
     // A body that is not JSON is the client's error, answered with 400 like on
     // a unary route, instead of opening a stream with an empty request.
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let (status, body) = common::send(
         &app,
         http::Request::post("/v1/things:watch")
@@ -170,10 +168,9 @@ async fn post_stream_with_malformed_body_is_rejected_before_the_upstream() {
     assert_eq!(error["details"], json!([]));
 }
 
-#[tokio::test]
 async fn get_stream_with_ill_typed_query_is_rejected_before_the_upstream() {
     // `count` is an int64: a non-numeric value cannot build the request.
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let (status, body) = common::send(
         &app,
         http::Request::get("/v1/things/alpha/watch?count=many")
@@ -186,4 +183,5 @@ async fn get_stream_with_ill_typed_query_is_rejected_before_the_upstream() {
     assert_eq!(error["error"], "INVALID_ARGUMENT");
     assert_eq!(error["code"], 3);
     assert_eq!(error["details"], json!([]));
+}
 }

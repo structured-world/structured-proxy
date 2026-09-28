@@ -21,13 +21,15 @@ Works with **any** gRPC service via proto descriptor files. No code generation, 
 - **Server-streaming** RPC → NDJSON by default, or Server-Sent Events via `Accept: text/event-stream` negotiation
 - **gRPC → HTTP status mapping** following the standard `google.rpc.Code` table
 - **Typed error details**: the upstream's `google.rpc.Status` details (`ErrorInfo`, `BadRequest`, `RetryInfo`, ...) reach the HTTP client as ProtoJSON, switchable globally and per route (see [Error responses](#error-responses))
+- **One port for REST and native gRPC**: HTTP/1.1 and HTTP/2 on the same listener, gRPC and gRPC-Web requests pass through to the upstream unchanged (an upstream that speaks gRPC-Web, e.g. behind tonic-web, answers it); behind your own TLS too, with the client's address and certificate reaching the upstream
+- **In-process upstream** for embedders: transcoded calls reach your own tonic services with no socket or loopback hop (see [Library Usage](#library-usage))
 - **Header forwarding** from HTTP requests to gRPC metadata (configurable allow-list)
 - **Context propagation**: W3C trace-context (`traceparent` forwarded or synthesized) and client deadlines (`grpc-timeout`) carried across the REST↔gRPC boundary
 - **Path aliasing** for route remapping (e.g. `/oauth2/*` → `/v1/oauth2/*`)
 - **Maintenance mode** returning 503 with a configurable exempt-path list
 - **Health endpoints** `/health/live`, `/health/ready` (upstream gRPC health probe), `/health/startup`
 - **Prometheus metrics** at `/metrics`
-- **CORS** with a configurable origin allow-list
+- **CORS** with a configurable origin allow-list, exposed headers and preflight cache, applied to gRPC-Web pass-through too
 - **Rate limiting (Shield)**: local GCRA shaper (no blocking latency) keyed by client IP, header, or validated JWT claim; named limit tiers as config data; optional async cross-instance reconciliation for an approximate fleet-wide limit (requires both the `redis` feature and a configured `sync` block)
 - **JWT auth**: validate `Bearer` tokens via an Ed25519 PEM key or JWKS auto-discovery, enforce per-route `require_auth` / `required_roles`, and forward claims as headers — or hand the signature check to your own verifier (a validated / FIPS module, an HSM) without changing anything else
 - **OIDC discovery**: serve `/.well-known/openid-configuration` and a JWKS endpoint (Ed25519) built from config, to front an identity provider
@@ -66,6 +68,8 @@ log line (`RUST_LOG=info`) states the count and where it came from.
 listen:
   http: "0.0.0.0:8080"
 
+# The gRPC service behind the proxy. Required by the standalone binary; an
+# embedder with an in-process upstream leaves it out.
 upstream:
   default: "http://127.0.0.1:50051"
 
@@ -79,10 +83,24 @@ service:
 
 cors:
   # Empty list = permissive CORS (dev mode, reflects any Origin).
-  # A non-empty list allows those exact origins; there is no "*" wildcard
-  # (browsers never send `Origin: *`, so listing "*" would block everything).
+  # A non-empty list allows those exact origins, with credentials; the
+  # preflight echoes the methods and headers the browser asks for. There is
+  # no "*" wildcard (browsers never send `Origin: *`, so listing "*" would
+  # block everything).
   origins: []
   # e.g. origins: ["https://app.example.com", "https://admin.example.com"]
+  # Response headers a browser script may read, on top of grpc-status,
+  # grpc-message, grpc-status-details-bin and the rate-limit headers:
+  # typically upstream metadata forwarded as a header.
+  expose_headers: []
+  # e.g. expose_headers: ["x-request-id"]
+  # How long a browser caches a preflight answer (seconds). Unset: the
+  # browser's default.
+  # max_age_secs: 600
+  # Apply this policy to gRPC-Web calls passed through to the upstream and to
+  # their preflights. Turn off only when the upstream sets CORS on gRPC-Web
+  # itself: its preflights then reach the upstream too.
+  grpc_web: true
 
 # Optional: path aliases (rewrite before routing)
 aliases:
@@ -530,7 +548,7 @@ details are malformed is dropped along with it (see
 [Error responses](#error-responses)). Browsers read only
 [CORS-safelisted](https://fetch.spec.whatwg.org/#cors-safelisted-response-header-name)
 response headers plus the exposed ones, so a browser client that must read a
-forwarded header needs a CORS setup that exposes it.
+forwarded header needs it listed in `cors.expose_headers`.
 
 **Status from `x-http-code`.** On a successful unary call, the response
 metadata `x-http-code` (grpc-gateway's convention) sets the HTTP status: one
@@ -613,7 +631,117 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-Or build the axum `Router` yourself for custom serving / embedding:
+`serve` answers HTTP/1.1 and HTTP/2 on one port: REST requests go to the
+proxy's routes, and requests with a gRPC or gRPC-Web content type go to the
+upstream as they arrived, so native gRPC clients can use the same address.
+
+### Your own gRPC services as the upstream
+
+A gRPC service that embeds the proxy to add REST (a forward-auth decision
+service, an API that also speaks gRPC) hands its own services to the proxy
+instead of an address. Transcoded calls then reach them in process: no
+socket, no loopback connection, no second HTTP/2 round, and they pass through
+the service's whole tonic stack (interceptors, layers) like a native gRPC
+call. `Request::remote_addr` in a handler gives the HTTP client's address.
+
+```rust
+use structured_proxy::ProxyServer;
+
+# async fn run() -> anyhow::Result<()> {
+// Your services, exactly as you would give them to tonic's server.
+let grpc = tonic::service::Routes::default(); // .add_service(MyServer::new(...))
+
+// No `upstream:` in the config: the upstream is `grpc`.
+let proxy = ProxyServer::from_file(std::path::Path::new("my-service.yaml"))?
+    .service(grpc)?;
+
+// REST and native gRPC on one port.
+let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
+structured_proxy::serve(listener, proxy).await?;
+# Ok(())
+# }
+```
+
+`ProxyServer::service` takes any gRPC tower service
+(`structured_proxy::upstream::Upstream`): `tonic::service::Routes`, a remote
+`tonic::transport::Channel` (what `ProxyServer::upstream` builds from the
+config), or anything else that speaks gRPC over `http` types. The result is a
+tower service, so it can also run on a server of your own.
+
+### Behind your own TLS
+
+`serve` speaks cleartext. For TLS, run the service on your own acceptor: one
+`ProxyService::for_connection` call per accepted connection tells the proxy
+who is on the other end, so its middleware sees the client's address and a
+tonic handler in process reads it with `Request::remote_addr`, and the client
+certificate with `Request::peer_certs` (mTLS), for native and transcoded calls
+alike. Advertise `h2` next to `http/1.1` in ALPN so gRPC clients get HTTP/2.
+
+```rust
+use std::sync::Arc;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto::Builder;
+use hyper_util::service::TowerToHyperService;
+use structured_proxy::{ConnectionInfo, ProxyServer};
+use tonic::transport::server::Connected;
+
+# async fn run(mut tls: rustls::ServerConfig, grpc: tonic::service::Routes) -> anyhow::Result<()> {
+let proxy = ProxyServer::from_file(std::path::Path::new("my-service.yaml"))?.service(grpc)?;
+tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+let listener = tokio::net::TcpListener::bind("0.0.0.0:8443").await?;
+loop {
+    let (tcp, _) = listener.accept().await?;
+    let (acceptor, proxy) = (acceptor.clone(), proxy.clone());
+    tokio::spawn(async move {
+        // The handshake runs in the connection's task, so a slow client
+        // does not hold up the others.
+        let Ok(stream) = acceptor.accept(tcp).await else { return };
+        let service = proxy.for_connection(ConnectionInfo::tls(stream.connect_info()));
+        let served = Builder::new(TokioExecutor::new())
+            .serve_connection(TokioIo::new(stream), TowerToHyperService::new(service))
+            .await;
+        if let Err(error) = served {
+            tracing::debug!(%error, "connection ended");
+        }
+    });
+}
+# }
+```
+
+A plain TCP connection passes `stream.connect_info()` directly
+(`ConnectionInfo` converts from tonic's `TcpConnectInfo`).
+
+What the proxy does not serve is not its business: a request no route matches
+gets `404`, or goes to a service of yours with
+`ProxyService::with_fallback(my_axum_app)`. The proxy's middleware (CORS,
+maintenance, rate limits, auth) sees neither those requests nor native gRPC
+ones; they reach your service untouched.
+
+gRPC-Web requests pass through unchanged as well, so the upstream answers
+them in that protocol: wrap your services in tonic-web's layer
+(`tower::ServiceBuilder::new().layer(tonic_web::GrpcWebLayer::new()).service(grpc)`),
+binary and text gRPC-Web alike. When the upstream cannot take a call at all,
+the proxy's own error answer keeps the request's protocol. Browsers get the
+proxy's CORS policy on these calls, the same one their preflight got
+(`cors.grpc_web`, on by default); a gRPC-Web client reads `grpc-status`,
+`grpc-message` and `grpc-status-details-bin`, which are always exposed. A
+browser's preflight for a gRPC-Web call (one announcing `x-grpc-web`) goes
+where the call goes: the proxy answers it under that policy, a fallback never
+sees it, and with `cors.grpc_web: false` it reaches the upstream, whose own
+CORS policy then covers preflight and call alike.
+
+**Deadlines.** Every call waits at most five seconds for the upstream's
+response headers, or less when the client's `grpc-timeout` says so; after that
+the client gets `504` `DEADLINE_EXCEEDED`. The proxy enforces this itself, in
+process and remote alike. The client's `grpc-timeout` travels to the upstream;
+the five-second default does not, so an upstream that applies `grpc-timeout`
+to a whole call does not cut a long server stream short.
+
+### Merging into an axum application
+
+`ProxyServer::router` returns the proxy's HTTP routes in front of the
+configured upstream address, to serve or to merge into your own axum `Router`:
 
 ```rust
 use std::path::Path;

@@ -4,9 +4,11 @@
 //! any method.
 //!
 //! Runs the proxy (through its public `ProxyServer`) in front of a real tonic
-//! gRPC server, so metadata, trailers and trailers-only errors go over the
-//! actual HTTP/2 stream.
+//! gRPC service, reached over an actual HTTP/2 stream and in process, so every
+//! case holds for both kinds of upstream: metadata, trailers and trailers-only
+//! errors included.
 
+#[macro_use]
 mod common;
 
 use std::convert::Infallible;
@@ -439,36 +441,59 @@ impl tower::Service<http::Request<tonic::body::Body>> for Controls {
 
 // --- proxy harness ----------------------------------------------------------
 
-/// The proxy router in front of a fresh upstream, built by `configure`.
-async fn proxy_with(configure: impl FnOnce(ProxyServer) -> ProxyServer) -> axum::Router {
+/// The proxy in front of a fresh upstream, built by `configure`.
+async fn proxy_with(
+    upstream: common::Upstream,
+    configure: impl FnOnce(ProxyServer) -> ProxyServer,
+) -> common::App {
     let pool = pool();
-    let upstream = common::serve(Controls { pool: pool.clone() }).await;
-    let server = ProxyServer::from_yaml_str(&format!("upstream:\n  default: \"{upstream}\"\n"))
-        .unwrap()
-        .with_descriptors(pool);
-    configure(server).router().unwrap()
+    common::app(upstream, Controls { pool: pool.clone() }, |yaml| {
+        configure(
+            ProxyServer::from_yaml_str(yaml)
+                .unwrap()
+                .with_descriptors(pool),
+        )
+    })
+    .await
 }
 
-/// The proxy router in front of a fresh upstream, with default settings.
-async fn proxy() -> axum::Router {
+/// The proxy in front of a fresh upstream, with default settings.
+async fn proxy(upstream: common::Upstream) -> common::App {
     let pool = pool();
-    let upstream = common::serve(Controls { pool: pool.clone() }).await;
-    common::proxy(&upstream, pool, ErrorDetailsPolicy::default())
+    common::proxy(
+        upstream,
+        Controls { pool: pool.clone() },
+        pool,
+        ErrorDetailsPolicy::default(),
+    )
+    .await
 }
 
 /// Send `request`; returns the status, the headers and the raw body.
-async fn send(app: &axum::Router, request: http::Request<Body>) -> (StatusCode, HeaderMap, Bytes) {
+async fn send(app: &common::App, request: http::Request<Body>) -> (StatusCode, HeaderMap, Bytes) {
     let resp = app.clone().oneshot(request).await.unwrap();
     let (parts, body) = resp.into_parts();
     let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
     (parts.status, parts.headers, body)
 }
 
-async fn call(app: &axum::Router, method: Method, path: &str) -> (StatusCode, HeaderMap, Bytes) {
+async fn call(app: &common::App, method: Method, path: &str) -> (StatusCode, HeaderMap, Bytes) {
     let request = http::Request::builder()
         .method(method)
         .uri(path)
         .body(Body::empty())
+        .unwrap();
+    send(app, request).await
+}
+
+async fn post_form(
+    app: &common::App,
+    path: &str,
+    form: &'static str,
+) -> (StatusCode, HeaderMap, Bytes) {
+    let request = http::Request::post(path)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(Body::from(form))
         .unwrap();
     send(app, request).await
 }
@@ -485,11 +510,11 @@ fn json_body(body: &Bytes) -> Value {
     serde_json::from_slice(body).unwrap()
 }
 
+upstream_tests! {
 // --- response metadata → headers ---------------------------------------------
 
-#[tokio::test]
 async fn unary_metadata_becomes_response_headers() {
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let (status, headers, body) = call(&app, Method::GET, "/v1/things/meta").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json_body(&body), json!({"name": "meta"}));
@@ -505,9 +530,8 @@ async fn unary_metadata_becomes_response_headers() {
     assert_eq!(values(&headers, "content-type"), ["application/json"]);
 }
 
-#[tokio::test]
 async fn plain_answer_adds_no_upstream_headers() {
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let (status, headers, body) = call(&app, Method::GET, "/v1/things/plain").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json_body(&body), json!({"name": "plain"}));
@@ -515,11 +539,10 @@ async fn plain_answer_adds_no_upstream_headers() {
     assert!(headers.get("x-http-code").is_none());
 }
 
-#[tokio::test]
 async fn trailers_of_a_successful_call_become_headers_after_initial_metadata() {
     // A key in both the initial metadata and the trailers keeps both values,
     // initial first; gRPC's trailer keys stay behind.
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let (status, headers, body) = call(&app, Method::GET, "/v1/trailers").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json_body(&body), json!({"name": "trailed"}));
@@ -528,9 +551,8 @@ async fn trailers_of_a_successful_call_become_headers_after_initial_metadata() {
     assert!(headers.get("grpc-status").is_none());
 }
 
-#[tokio::test]
 async fn deny_list_from_the_builder_drops_its_keys() {
-    let app = proxy_with(|server| {
+    let app = proxy_with(UPSTREAM, |server| {
         server.with_denied_response_headers([HeaderName::from_static("x-debug")])
     })
     .await;
@@ -539,27 +561,25 @@ async fn deny_list_from_the_builder_drops_its_keys() {
     assert_eq!(values(&headers, "cache-control"), ["no-store"]);
 }
 
-#[tokio::test]
 async fn deny_list_from_yaml_drops_its_keys() {
     let pool = pool();
-    let upstream = common::serve(Controls { pool: pool.clone() }).await;
-    let app = ProxyServer::from_yaml_str(&format!(
-        "upstream:\n  default: \"{upstream}\"\nresponse_headers:\n  deny: [\"X-Debug\", \"set-cookie\"]\n"
-    ))
-    .unwrap()
-    .with_descriptors(pool)
-    .router()
-    .unwrap();
+    let app = common::app(UPSTREAM, Controls { pool: pool.clone() }, |yaml| {
+        ProxyServer::from_yaml_str(&format!(
+            "{yaml}response_headers:\n  deny: [\"X-Debug\", \"set-cookie\"]\n"
+        ))
+        .unwrap()
+        .with_descriptors(pool)
+    })
+    .await;
     let (_, headers, _) = call(&app, Method::GET, "/v1/things/meta").await;
     assert!(headers.get("x-debug").is_none());
     assert!(headers.get("set-cookie").is_none());
     assert_eq!(values(&headers, "cache-control"), ["no-store"]);
 }
 
-#[tokio::test]
 async fn trailers_only_error_carries_its_metadata() {
     // RFC 6750 §3: the 401 carries the upstream's `WWW-Authenticate`.
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let (status, headers, body) = call(&app, Method::GET, "/v1/things/unauth").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(
@@ -570,12 +590,11 @@ async fn trailers_only_error_carries_its_metadata() {
     assert_eq!(values(&headers, "content-type"), ["application/json"]);
 }
 
-#[tokio::test]
 async fn unary_error_after_headers_carries_initial_metadata_and_trailers() {
     // The upstream sent response headers, then failed in its trailers: the
     // error keeps both, initial metadata first, as tonic's own unary call
     // does.
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let (status, headers, body) = call(&app, Method::GET, "/v1/late-error").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(values(&headers, "x-initial"), ["1"]);
@@ -586,11 +605,10 @@ async fn unary_error_after_headers_carries_initial_metadata_and_trailers() {
     assert_eq!(json_body(&body)["message"], "expired");
 }
 
-#[tokio::test]
 async fn http_body_stream_failing_before_its_first_message_keeps_initial_metadata() {
     // Headers were sent before the failure, so they belong to the error
     // response, next to the failure's own metadata.
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let (status, headers, _) = call(&app, Method::GET, "/v1/files/late-denied").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(values(&headers, "x-stream"), ["1"]);
@@ -598,11 +616,10 @@ async fn http_body_stream_failing_before_its_first_message_keeps_initial_metadat
     assert!(values(&headers, "www-authenticate")[0].starts_with("Bearer error="));
 }
 
-#[tokio::test]
 async fn malformed_error_status_carries_no_upstream_metadata() {
     // The answer is the generic INTERNAL, so nothing of the broken error,
     // headers included, reaches the client.
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let (status, headers, body) = call(&app, Method::GET, "/v1/things/corrupt-unauth").await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(json_body(&body)["error"], "INTERNAL");
@@ -611,9 +628,8 @@ async fn malformed_error_status_carries_no_upstream_metadata() {
 
 // --- x-http-code ------------------------------------------------------------
 
-#[tokio::test]
 async fn http_code_sets_the_status_of_a_successful_call() {
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let (status, headers, body) = call(&app, Method::GET, "/v1/things/created").await;
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(values(&headers, "location"), ["/v1/things/created"]);
@@ -621,19 +637,17 @@ async fn http_code_sets_the_status_of_a_successful_call() {
     assert_eq!(json_body(&body), json!({"name": "created"}));
 }
 
-#[tokio::test]
 async fn http_code_204_answers_without_content() {
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let (status, headers, body) = call(&app, Method::GET, "/v1/things/no-content").await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert!(body.is_empty());
     assert!(headers.get("content-type").is_none());
 }
 
-#[tokio::test]
 async fn invalid_http_code_is_a_malformed_upstream_internal() {
     // Never a partial response: no other upstream header rides along.
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let (status, headers, body) = call(&app, Method::GET, "/v1/things/bad-code").await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(
@@ -649,10 +663,9 @@ async fn invalid_http_code_is_a_malformed_upstream_internal() {
     assert!(headers.get("x-http-code").is_none());
 }
 
-#[tokio::test]
 async fn redirect_with_location_and_an_empty_body() {
     // RFC 6749 §4.1.2: the authorization endpoint answers 302 + Location.
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let (status, headers, body) = call(&app, Method::GET, "/v1/authorize").await;
     assert_eq!(status, StatusCode::FOUND);
     assert_eq!(
@@ -665,23 +678,10 @@ async fn redirect_with_location_and_an_empty_body() {
 
 // --- google.api.HttpBody ----------------------------------------------------
 
-async fn post_form(
-    app: &axum::Router,
-    path: &str,
-    form: &'static str,
-) -> (StatusCode, HeaderMap, Bytes) {
-    let request = http::Request::post(path)
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(Body::from(form))
-        .unwrap();
-    send(app, request).await
-}
-
-#[tokio::test]
 async fn token_error_is_the_rfc_6749_body_with_400_and_no_store() {
     // RFC 6749 §5.2: 400, the upstream's own JSON body, `Cache-Control:
     // no-store` (§5.1). Not the transcoder's error body.
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let (status, headers, body) = post_form(&app, "/v1/token", "grant_type=refresh_token").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(values(&headers, "cache-control"), ["no-store"]);
@@ -696,9 +696,8 @@ async fn token_error_is_the_rfc_6749_body_with_400_and_no_store() {
     );
 }
 
-#[tokio::test]
 async fn token_success_is_the_raw_json_with_no_store() {
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let (status, headers, body) =
         post_form(&app, "/v1/token", "grant_type=authorization_code").await;
     assert_eq!(status, StatusCode::OK);
@@ -706,10 +705,9 @@ async fn token_success_is_the_raw_json_with_no_store() {
     assert_eq!(&body[..], br#"{"access_token":"at","token_type":"Bearer"}"#);
 }
 
-#[tokio::test]
 async fn http_body_response_keeps_the_content_type_and_bytes() {
     // RFC 7517 §8.5: a JWK Set is served as application/jwk-set+json.
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let (status, headers, body) = call(&app, Method::GET, "/v1/jwks").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
@@ -719,11 +717,10 @@ async fn http_body_response_keeps_the_content_type_and_bytes() {
     assert_eq!(&body[..], br#"{"keys":[]}"#);
 }
 
-#[tokio::test]
 async fn http_body_request_receives_the_raw_body_and_content_type() {
     // Bytes that are neither JSON nor UTF-8 arrive untouched, with the full
     // Content-Type value (parameters included).
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let raw: &'static [u8] = b"\x89PNG\r\n\x1a\n\x00\xff";
     let request = http::Request::post("/v1/echo")
         .header("content-type", "image/png; name=x")
@@ -735,12 +732,11 @@ async fn http_body_request_receives_the_raw_body_and_content_type() {
     assert_eq!(&body[..], raw);
 }
 
-#[tokio::test]
 async fn query_on_a_whole_message_http_body_route_is_ignored() {
     // With `body: "*"` on an HttpBody input every field comes from the body
     // (google/api/http.proto: no HTTP parameters with `*`), so a query that
     // names an HttpBody field is ignored instead of failing the request.
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let request = http::Request::post("/v1/echo?extensions=x&content_type=y&data=z")
         .header("content-type", "text/plain")
         .body(Body::from("raw"))
@@ -751,9 +747,8 @@ async fn query_on_a_whole_message_http_body_route_is_ignored() {
     assert_eq!(&body[..], b"raw");
 }
 
-#[tokio::test]
 async fn http_body_request_without_a_body_is_empty() {
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let request = http::Request::post("/v1/echo").body(Body::empty()).unwrap();
     let (status, headers, body) = send(&app, request).await;
     assert_eq!(status, StatusCode::OK);
@@ -761,9 +756,8 @@ async fn http_body_request_without_a_body_is_empty() {
     assert!(headers.get("content-type").is_none());
 }
 
-#[tokio::test]
 async fn http_body_field_receives_the_raw_body_next_to_path_fields() {
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let request = http::Request::put("/v1/uploads/report")
         .header("content-type", "text/csv")
         .body(Body::from("a,b"))
@@ -776,12 +770,11 @@ async fn http_body_field_receives_the_raw_body_next_to_path_fields() {
     );
 }
 
-#[tokio::test]
 async fn query_key_naming_the_raw_body_field_does_not_break_the_upload() {
     // The body binds `file`, and the body wins over the query: a `file`
     // query parameter (or one under it) is ignored rather than bound into
     // the HttpBody field before the raw body replaces it.
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let request = http::Request::put("/v1/uploads/report?file=x&file.content_type=y")
         .header("content-type", "text/csv")
         .body(Body::from("a,b"))
@@ -791,11 +784,10 @@ async fn query_key_naming_the_raw_body_field_does_not_break_the_upload() {
     assert_eq!(json_body(&body), json!({"name": "report|text/csv|a,b"}));
 }
 
-#[tokio::test]
 async fn http_body_request_with_a_non_ascii_content_type_is_rejected() {
     // HttpBody.content_type is a proto string; bytes that are not visible
     // ASCII are refused before the upstream is called.
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let request = http::Request::post("/v1/echo")
         .header(
             "content-type",
@@ -810,9 +802,8 @@ async fn http_body_request_with_a_non_ascii_content_type_is_rejected() {
 
 // --- server streaming -------------------------------------------------------
 
-#[tokio::test]
 async fn streaming_initial_metadata_becomes_headers() {
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let (status, headers, body) = call(&app, Method::GET, "/v1/things/x/watch").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(values(&headers, "x-stream"), ["1"]);
@@ -825,11 +816,10 @@ async fn streaming_initial_metadata_becomes_headers() {
     assert_eq!(lines, [json!({"name": "one"}), json!({"name": "two"})]);
 }
 
-#[tokio::test]
 async fn sse_keeps_its_own_cache_control_over_the_upstream_one() {
     // What the proxy writes describes the body it writes: SSE must not be
     // cached, whatever the upstream asked for.
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let request = http::Request::get("/v1/things/x/watch")
         .header("accept", "text/event-stream")
         .body(Body::empty())
@@ -841,18 +831,16 @@ async fn sse_keeps_its_own_cache_control_over_the_upstream_one() {
     assert_eq!(values(&headers, "x-stream"), ["1"]);
 }
 
-#[tokio::test]
 async fn refused_stream_carries_its_metadata() {
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let (status, headers, _) = call(&app, Method::GET, "/v1/things/denied/watch").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert!(values(&headers, "www-authenticate")[0].starts_with("Bearer error=\"invalid_token\""));
 }
 
-#[tokio::test]
 async fn streaming_http_body_is_chunked_raw_data() {
     // Content type from the first message; every message's data in order.
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let (status, headers, body) = call(&app, Method::GET, "/v1/files/report").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(values(&headers, "content-type"), ["text/csv"]);
@@ -860,9 +848,8 @@ async fn streaming_http_body_is_chunked_raw_data() {
     assert_eq!(&body[..], b"a,b\n1,2\n3,4\n");
 }
 
-#[tokio::test]
 async fn streaming_http_body_ignores_sse_negotiation() {
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let request = http::Request::get("/v1/files/report")
         .header("accept", "text/event-stream")
         .body(Body::empty())
@@ -872,20 +859,18 @@ async fn streaming_http_body_ignores_sse_negotiation() {
     assert_eq!(&body[..], b"a,b\n1,2\n3,4\n");
 }
 
-#[tokio::test]
 async fn empty_streaming_http_body_is_an_empty_ok() {
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let (status, headers, body) = call(&app, Method::GET, "/v1/files/empty").await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.is_empty());
     assert!(headers.get("content-type").is_none());
 }
 
-#[tokio::test]
 async fn streaming_http_body_failing_mid_stream_aborts_the_body() {
     // A raw body has no in-band error frame: the transfer is cut short so the
     // client cannot take the partial file for a complete one.
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let request = http::Request::get("/v1/files/broken")
         .body(Body::empty())
         .unwrap();
@@ -898,9 +883,8 @@ async fn streaming_http_body_failing_mid_stream_aborts_the_body() {
 
 // --- custom rules ------------------------------------------------------------
 
-#[tokio::test]
 async fn custom_head_rule_routes_head_to_the_rpc() {
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let (status, headers, body) = call(&app, Method::HEAD, "/v1/probe/disk").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(values(&headers, "x-probe"), ["disk"]);
@@ -910,10 +894,9 @@ async fn custom_head_rule_routes_head_to_the_rpc() {
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
 }
 
-#[tokio::test]
 async fn star_rule_routes_every_method_to_the_rpc() {
     // A forward-auth sub-request arrives with the original request's method.
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     for method in [
         Method::GET,
         Method::POST,
@@ -930,9 +913,8 @@ async fn star_rule_routes_every_method_to_the_rpc() {
     }
 }
 
-#[tokio::test]
 async fn extension_method_rule_routes_next_to_a_standard_one() {
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let propfind = Method::from_bytes(b"PROPFIND").unwrap();
     let (status, _, body) = call(&app, propfind, "/v1/dav").await;
     assert_eq!(status, StatusCode::OK);
@@ -949,11 +931,10 @@ async fn extension_method_rule_routes_next_to_a_standard_one() {
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
 }
 
-#[tokio::test]
 async fn unbound_method_is_405_before_its_body_is_read() {
     // The method decides first: a method nobody binds on the path is 405
     // even with a body over the extractor limit, which is never buffered.
-    let app = proxy().await;
+    let app = proxy(UPSTREAM).await;
     let request = http::Request::builder()
         .method(Method::DELETE)
         .uri("/v1/dav")
@@ -962,6 +943,7 @@ async fn unbound_method_is_405_before_its_body_is_read() {
     let (status, headers, _) = send(&app, request).await;
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
     assert_eq!(values(&headers, "allow"), ["PROPFIND, GET, HEAD"]);
+}
 }
 
 #[tokio::test]

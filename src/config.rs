@@ -15,8 +15,12 @@ use std::path::PathBuf;
 /// `#[non_exhaustive]` instead, since those are deserialized, not hand-built.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProxyConfig {
-    /// Upstream gRPC service(s).
-    pub upstream: UpstreamConfig,
+    /// The remote gRPC upstream. Required by the standalone proxy and by
+    /// [`ProxyServer::upstream`](crate::ProxyServer::upstream); an embedder
+    /// whose upstream is in process
+    /// ([`ProxyServer::service`](crate::ProxyServer::service)) leaves it out.
+    #[serde(default)]
+    pub upstream: Option<UpstreamConfig>,
 
     /// Proto descriptor sources.
     #[serde(default, deserialize_with = "deserialize_descriptor_sources")]
@@ -998,12 +1002,39 @@ impl Default for MaintenanceConfig {
 }
 
 /// CORS configuration.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[non_exhaustive]
 pub struct CorsConfig {
     /// Allowed origins. Empty = permissive (dev mode).
     #[serde(default)]
     pub origins: Vec<String>,
+    /// Response headers a browser script may read on top of the ones the
+    /// proxy always exposes (`grpc-status`, `grpc-message`,
+    /// `grpc-status-details-bin` and the rate-limit headers): typically
+    /// upstream metadata forwarded as a header, such as `x-request-id`.
+    #[serde(default)]
+    pub expose_headers: Vec<String>,
+    /// How long a browser may cache a preflight answer, in seconds. Unset,
+    /// the browser's own default applies.
+    #[serde(default)]
+    pub max_age_secs: Option<u64>,
+    /// Apply this policy to gRPC-Web calls that pass through to the upstream
+    /// and to their preflights, so a browser gets one policy for both (on by
+    /// default). Off only for an upstream that sets CORS on gRPC-Web itself:
+    /// its preflights then reach the upstream as well.
+    #[serde(default = "default_true")]
+    pub grpc_web: bool,
+}
+
+impl Default for CorsConfig {
+    fn default() -> Self {
+        Self {
+            origins: Vec::new(),
+            expose_headers: Vec::new(),
+            max_age_secs: None,
+            grpc_web: true,
+        }
+    }
 }
 
 /// Logging configuration.

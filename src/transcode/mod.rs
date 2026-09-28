@@ -25,6 +25,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodFilter, MethodRouter};
+use axum::Extension;
 use axum::Router;
 use futures::{StreamExt, TryStreamExt};
 use prost_reflect::{
@@ -33,30 +34,41 @@ use prost_reflect::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tonic::client::Grpc;
 use tonic::metadata::MetadataMap;
 
 use crate::config::AliasConfig;
+use crate::service::ConnectionInfo;
+use crate::upstream::Upstream;
 use error::{ErrorDetailsPolicy, StatusDetails};
 use response::UpstreamHeaders;
 use rule::RouteMethod;
 
+/// How long the upstream may take to answer a call with its response headers
+/// when the client's `grpc-timeout` asks for no shorter deadline.
+pub const UPSTREAM_DEADLINE: Duration = Duration::from_secs(5);
+
 /// Trait for state types that support REST→gRPC transcoding.
 ///
 /// Implement this for your application's state type to use `transcode::routes()`.
-/// Provides the minimal interface needed by transcode handlers.
+/// Provides the minimal interface needed by transcode handlers. Each request
+/// works on its own clone of the state, so a clone should be cheap.
 pub trait TranscodeState: Clone + Send + Sync + 'static {
-    /// Lazy gRPC channel to upstream service.
-    fn grpc_channel(&self) -> tonic::transport::Channel;
+    /// The gRPC service transcoded calls go to.
+    type Upstream: Upstream;
+    /// The upstream, taken out of this request's clone of the state.
+    fn into_upstream(self) -> Self::Upstream;
     /// Headers to forward from HTTP to gRPC metadata.
     fn forwarded_headers(&self) -> &[String];
     /// SSE keep-alive interval (seconds) for server-streaming responses.
     fn sse_keep_alive_secs(&self) -> u64;
 }
 
-impl TranscodeState for crate::ProxyState {
-    fn grpc_channel(&self) -> tonic::transport::Channel {
-        self.grpc_channel.clone()
+impl<U: Upstream> TranscodeState for crate::ProxyState<U> {
+    type Upstream = U;
+    fn into_upstream(self) -> U {
+        self.upstream
     }
     fn forwarded_headers(&self) -> &[String] {
         &self.forwarded_headers
@@ -282,7 +294,14 @@ macro_rules! endpoint {
               headers: HeaderMap,
               path_params: Path<PathParams>,
               raw_query: RawQuery,
-              body: Bytes| handle(state, headers, path_params, raw_query, body, entry)
+              connection: Option<Extension<ConnectionInfo>>,
+              body: Bytes| {
+            let client = Client {
+                headers,
+                connection: connection.map(|Extension(connection)| connection),
+            };
+            handle(state, client, path_params, raw_query, body, entry)
+        }
     }};
 }
 
@@ -512,85 +531,137 @@ fn accept_range_selects_sse(range: &str) -> bool {
     true
 }
 
+/// Who sent a transcoded request: its headers, and the connection it came
+/// on when the server recorded one.
+struct Client {
+    headers: HeaderMap,
+    connection: Option<ConnectionInfo>,
+}
+
 /// Serve one request on a transcoded route.
 async fn handle<S: TranscodeState>(
     State(proxy_state): State<S>,
-    headers: HeaderMap,
+    client: Client,
     Path(path_params): Path<PathParams>,
     RawQuery(raw_query): RawQuery,
     body: Bytes,
     entry: Arc<RouteEntry>,
 ) -> Response {
+    let keep_alive_secs = proxy_state.sse_keep_alive_secs();
+    let Client {
+        headers,
+        connection,
+    } = client;
     let prepared = prepare(
-        &proxy_state,
+        proxy_state,
         &headers,
+        connection,
         &path_params,
         raw_query.as_deref(),
         body,
         &entry,
-    )
-    .await;
-    let (client, request) = match prepared {
-        Ok(prepared) => prepared,
+    );
+    let call = match prepared {
+        Ok(call) => call,
         Err(rejection) => return rejection.into_response(&entry),
     };
     if entry.streaming {
-        let keep_alive_secs = proxy_state.sse_keep_alive_secs();
-        streaming_call(client, request, entry, wants_sse(&headers), keep_alive_secs).await
+        streaming_call(call, entry, wants_sse(&headers), keep_alive_secs).await
     } else {
-        unary_call(client, request, &entry).await
+        unary_call(call, &entry).await
     }
 }
 
-/// Why a request ends before the upstream is called.
-enum Rejection {
-    /// It cannot be mapped onto the RPC (`INVALID_ARGUMENT`, 400).
-    Unmappable(String),
-    /// The upstream channel is not ready (`UNAVAILABLE`, 503).
-    NotReady(String),
-}
+/// Why a request ends before the upstream is called: it cannot be mapped onto
+/// the RPC (`INVALID_ARGUMENT`, 400).
+struct Unmappable(String);
 
-impl Rejection {
+impl Unmappable {
     /// The answer, in the error body the upstream's own errors get on the route.
     fn into_response(self, entry: &RouteEntry) -> Response {
-        let status = match self {
-            Self::Unmappable(message) => tonic::Status::invalid_argument(message),
-            Self::NotReady(message) => tonic::Status::unavailable(message),
-        };
+        let status = tonic::Status::invalid_argument(self.0);
         error::status_to_response_with_details(&status, entry.error_details.as_deref())
     }
 }
 
-/// Map the request onto the RPC's input message and get a client whose
-/// channel is ready.
-async fn prepare<S: TranscodeState>(
-    proxy_state: &S,
+/// A call ready to be made: the upstream, the request, and how long the
+/// upstream may take to answer it.
+struct Call<U> {
+    upstream: U,
+    request: tonic::Request<DynamicMessage>,
+    deadline: Duration,
+}
+
+impl<U: Upstream> Call<U> {
+    /// Wait for the upstream to take the call, start it, and wait for its
+    /// response headers, all within the one deadline: an upstream under
+    /// backpressure that never frees a slot answers `DEADLINE_EXCEEDED` like
+    /// one that never answers. Every upstream gets the same deadline here, in
+    /// process or remote, rather than whatever its transport enforces.
+    async fn open(
+        self,
+        entry: &RouteEntry,
+    ) -> Result<tonic::Response<tonic::Streaming<DynamicMessage>>, tonic::Status> {
+        let Self {
+            upstream,
+            request,
+            deadline,
+        } = self;
+        let call = async move {
+            let mut client = Grpc::new(upstream);
+            if let Err(e) = client.ready().await {
+                let e: crate::upstream::BoxError = e.into();
+                return Err(tonic::Status::unavailable(format!(
+                    "gRPC upstream not ready: {e}"
+                )));
+            }
+            client
+                .server_streaming(request, entry.grpc_path.clone(), entry.codec())
+                .await
+        };
+        match tokio::time::timeout(deadline, call).await {
+            Ok(result) => result,
+            Err(_) => Err(tonic::Status::deadline_exceeded(
+                "upstream did not answer within the deadline",
+            )),
+        }
+    }
+}
+
+/// Map the request onto the RPC's input message.
+fn prepare<S: TranscodeState>(
+    proxy_state: S,
     headers: &HeaderMap,
+    connection: Option<ConnectionInfo>,
     path_params: &PathParams,
     raw_query: Option<&str>,
     body: Bytes,
     entry: &RouteEntry,
-) -> Result<
-    (
-        Grpc<tonic::transport::Channel>,
-        tonic::Request<DynamicMessage>,
-    ),
-    Rejection,
-> {
+) -> Result<Call<S::Upstream>, Unmappable> {
     let request_metadata =
         metadata::try_http_headers_to_grpc_metadata(headers, proxy_state.forwarded_headers())
-            .map_err(|e| Rejection::Unmappable(e.to_string()))?;
-    let message = decode_request(entry, headers, path_params, raw_query, body)
-        .map_err(Rejection::Unmappable)?;
+            .map_err(|e| Unmappable(e.to_string()))?;
+    let message =
+        decode_request(entry, headers, path_params, raw_query, body).map_err(Unmappable)?;
     let mut request = tonic::Request::new(message);
     *request.metadata_mut() = request_metadata;
-    metadata::apply_request_deadline(&mut request, headers);
-
-    let mut client = Grpc::new(proxy_state.grpc_channel());
-    if let Err(e) = client.ready().await {
-        return Err(Rejection::NotReady(format!("gRPC upstream not ready: {e}")));
+    // An upstream in process reads the HTTP client's address and TLS
+    // certificates with `Request::remote_addr` / `peer_certs`; a remote one
+    // never sees request extensions.
+    if let Some(connection) = connection {
+        connection.into_tonic_extensions(request.extensions_mut());
     }
-    Ok((client, request))
+    // Only the client's own deadline travels upstream: a default one would
+    // cut a long server stream short on an upstream that applies
+    // `grpc-timeout` to the whole call.
+    let deadline = metadata::apply_request_deadline(&mut request, headers)
+        .map_or(UPSTREAM_DEADLINE, |client| client.min(UPSTREAM_DEADLINE));
+
+    Ok(Call {
+        upstream: proxy_state.into_upstream(),
+        request,
+        deadline,
+    })
 }
 
 /// A successful unary answer with its initial metadata and trailers kept
@@ -605,15 +676,11 @@ struct UnaryAnswer {
 /// initial metadata, so a key sent in both keeps only its trailer value; the
 /// HTTP response carries both, so the call is made as a one-message stream
 /// instead, reading exactly what `Grpc::unary` reads.
-async fn call_unary(
-    client: &mut Grpc<tonic::transport::Channel>,
-    request: tonic::Request<DynamicMessage>,
+async fn call_unary<U: Upstream>(
+    call: Call<U>,
     entry: &RouteEntry,
 ) -> Result<UnaryAnswer, tonic::Status> {
-    let response = client
-        .server_streaming(request, entry.grpc_path.clone(), entry.codec())
-        .await?;
-    let (initial, mut stream, _) = response.into_parts();
+    let (initial, mut stream, _) = call.open(entry).await?.into_parts();
     let message = match stream.message().await {
         Ok(Some(message)) => message,
         Ok(None) => {
@@ -654,12 +721,8 @@ fn with_initial(mut status: tonic::Status, initial: MetadataMap) -> tonic::Statu
 }
 
 /// Serve a unary RPC.
-async fn unary_call(
-    mut client: Grpc<tonic::transport::Channel>,
-    request: tonic::Request<DynamicMessage>,
-    entry: &RouteEntry,
-) -> Response {
-    match call_unary(&mut client, request, entry).await {
+async fn unary_call<U: Upstream>(call: Call<U>, entry: &RouteEntry) -> Response {
+    match call_unary(call, entry).await {
         Ok(answer) => unary_success(entry, answer),
         Err(status) => upstream_error(status, entry),
     }
@@ -754,19 +817,15 @@ fn upstream_error(mut status: tonic::Status, entry: &RouteEntry) -> Response {
 /// stream is the concatenated `data` of its messages. The upstream's initial
 /// metadata becomes response headers; trailers arrive after the headers are
 /// sent and are not forwarded.
-async fn streaming_call(
-    mut client: Grpc<tonic::transport::Channel>,
-    request: tonic::Request<DynamicMessage>,
+async fn streaming_call<U: Upstream>(
+    call: Call<U>,
     entry: Arc<RouteEntry>,
     use_sse: bool,
     keep_alive_secs: u64,
 ) -> Response {
-    let response = match client
-        .server_streaming(request, entry.grpc_path.clone(), entry.codec())
-        .await
-    {
+    let response = match call.open(&entry).await {
         Ok(response) => response,
-        // Only a trailers-only rejection lands here.
+        // A trailers-only rejection, or no answer within the deadline.
         Err(status) => return upstream_error(status, &entry),
     };
     let (initial, stream, _) = response.into_parts();

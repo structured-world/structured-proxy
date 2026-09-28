@@ -16,9 +16,9 @@ use structured_proxy::ProxyServer;
 fn embedded_config_is_constructible() {
     static DESCRIPTOR_BYTES: &[u8] = &[];
     let config = ProxyConfig {
-        upstream: UpstreamConfig {
+        upstream: Some(UpstreamConfig {
             default: "http://127.0.0.1:50051".into(),
-        },
+        }),
         descriptors: vec![DescriptorSource::Embedded {
             bytes: DESCRIPTOR_BYTES,
         }],
