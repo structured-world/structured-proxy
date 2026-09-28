@@ -1,6 +1,8 @@
 //! Running a [`ProxyService`] on a TCP listener: HTTP/1.1 and HTTP/2 on one
-//! port, optionally behind TLS, with an optional cap on open connections.
+//! port, optionally behind TLS, with an optional cap on open connections and
+//! a graceful shutdown.
 
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -8,11 +10,13 @@ use std::time::Duration;
 
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder;
+use hyper_util::server::graceful::GracefulConnection;
 use hyper_util::service::TowerToHyperService;
 use pin_project_lite::pin_project;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinSet;
 use tonic::transport::server::Connected;
 
 use crate::service::{ConnectionInfo, ProxyService};
@@ -40,6 +44,7 @@ pub struct ServeOptions {
     idle_timeout: Option<Duration>,
     header_read_timeout: Duration,
     tls_handshake_timeout: Duration,
+    drain_timeout: Option<Duration>,
 }
 
 impl Default for ServeOptions {
@@ -50,6 +55,7 @@ impl Default for ServeOptions {
             idle_timeout: Some(Duration::from_secs(60)),
             header_read_timeout: Duration::from_secs(30),
             tls_handshake_timeout: Duration::from_secs(10),
+            drain_timeout: Some(Duration::from_secs(30)),
         }
     }
 }
@@ -57,9 +63,19 @@ impl Default for ServeOptions {
 impl ServeOptions {
     /// Cleartext, with no limit on connections; a connection idle for 60 s is
     /// closed, a client gets 30 s to send the headers of an HTTP/1.1 request
-    /// and 10 s to finish a TLS handshake.
+    /// and 10 s to finish a TLS handshake, and a shutdown waits at most 30 s
+    /// for open connections.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// How long a shutdown ([`serve_with_shutdown`]) waits for the
+    /// connections still open to finish what they serve; the ones open after
+    /// it are closed. `None` waits for all of them.
+    #[must_use]
+    pub fn drain_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.drain_timeout = timeout;
+        self
     }
 
     /// Close a connection that has had no request in flight for `timeout`
@@ -120,9 +136,10 @@ impl ServeOptions {
     }
 }
 
-/// Serve `service` on `listener` until the listener fails: cleartext HTTP/1.1
-/// and HTTP/2 on the same port, so REST clients and native gRPC clients share
-/// it. [`serve_with`] adds TLS and a connection limit.
+/// Serve `service` on `listener`: cleartext HTTP/1.1 and HTTP/2 on the same
+/// port, so REST clients and native gRPC clients share it. It runs until the
+/// future is dropped, which closes every connection; [`serve_with_shutdown`]
+/// stops gracefully, and [`serve_with`] adds TLS and a connection limit.
 ///
 /// # Errors
 ///
@@ -178,6 +195,52 @@ pub async fn serve_with<U: Upstream>(
     service: ProxyService<U>,
     options: ServeOptions,
 ) -> std::io::Result<()> {
+    serve_with_shutdown(listener, service, options, std::future::pending()).await
+}
+
+/// [`serve_with`], until `signal` resolves; then a graceful shutdown. The
+/// listening socket closes, so new connections are refused; a connection
+/// still in its TLS handshake or waiting for its `max_connections` slot is
+/// dropped; every open connection is asked to wind down (HTTP/2 gets a GOAWAY,
+/// so its client opens no new streams; HTTP/1.1 closes after the response in
+/// progress), and requests and streams in flight finish. The future resolves
+/// once every connection has closed, or after
+/// [`drain_timeout`](ServeOptions::drain_timeout), closing the ones still
+/// open. Dropping it closes every connection at once.
+///
+/// A connection a fallback upgraded (a WebSocket) belongs to the fallback's
+/// own task once upgraded, and closes when that task lets it go.
+///
+/// # Errors
+///
+/// See [`serve`].
+///
+/// # Examples
+///
+/// ```no_run
+/// use structured_proxy::{ProxyServer, ServeOptions};
+///
+/// # async fn run() -> anyhow::Result<()> {
+/// let service = ProxyServer::from_yaml_str("service:\n  name: demo\n")?
+///     .service(tonic::service::Routes::default())?;
+/// let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
+/// let shutdown = async {
+///     tokio::signal::ctrl_c().await.expect("the signal handler installs");
+/// };
+/// structured_proxy::serve_with_shutdown(listener, service, ServeOptions::new(), shutdown).await?;
+/// # Ok(())
+/// # }
+/// ```
+pub async fn serve_with_shutdown<U, F>(
+    listener: TcpListener,
+    service: ProxyService<U>,
+    options: ServeOptions,
+    signal: F,
+) -> std::io::Result<()>
+where
+    U: Upstream,
+    F: Future<Output = ()>,
+{
     let slots = options
         .max_connections
         .map(|max| Arc::new(Semaphore::new(max)));
@@ -187,30 +250,40 @@ pub async fn serve_with<U: Upstream>(
         idle_timeout: options.idle_timeout,
         header_read_timeout: options.header_read_timeout,
     };
+    // Tells every connection to wind down. The connections are this future's
+    // own tasks, so dropping it ends them too.
+    let (stop, stopping) = watch::channel(false);
+    let mut connections = JoinSet::new();
+    tokio::pin!(signal);
     loop {
+        // Finished connections leave the set, which holds only open ones.
+        while connections.try_join_next().is_some() {}
         // The slot is taken before the accept, so a full server leaves new
         // connections in the kernel's backlog instead of accepting and
         // dropping them.
-        let slot = match &slots {
-            Some(slots) => Some(
-                slots
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .expect("the connection semaphore is never closed"),
-            ),
-            None => None,
+        let slot = tokio::select! {
+            biased;
+            () = &mut signal => break,
+            slot = take_slot(slots.as_ref()) => slot,
         };
-        let tcp = match listener.accept().await {
-            Ok((tcp, _)) => tcp,
-            Err(error) => {
-                accept_failed(error).await;
-                continue;
-            }
+        let tcp = tokio::select! {
+            biased;
+            () = &mut signal => break,
+            accepted = listener.accept() => match accepted {
+                Ok((tcp, _)) => tcp,
+                Err(error) => {
+                    tokio::select! {
+                        biased;
+                        () = &mut signal => break,
+                        () = accept_failed(error) => continue,
+                    }
+                }
+            },
         };
         let service = service.clone();
         let acceptor = acceptor.clone();
-        tokio::spawn(async move {
+        let stopping = stopping.clone();
+        connections.spawn(async move {
             // Small gRPC frames and REST answers are latency-bound.
             if let Err(error) = tcp.set_nodelay(true) {
                 tracing::debug!(%error, "cannot set TCP_NODELAY");
@@ -218,13 +291,15 @@ pub async fn serve_with<U: Upstream>(
             match acceptor {
                 None => {
                     let service = service.for_connection(tcp.connect_info());
-                    serve_connection(SlotIo { io: tcp, slot }, service, limits).await;
+                    serve_connection(SlotIo { io: tcp, slot }, service, limits, stopping).await;
                 }
                 Some(acceptor) => {
                     // The slot is held through the handshake, then by the
-                    // stream.
-                    let stream =
-                        match tokio::time::timeout(handshake_timeout, acceptor.accept(tcp)).await {
+                    // stream. A handshake still running at shutdown is not
+                    // finished: the connection would only be closed again.
+                    let handshake = tokio::time::timeout(handshake_timeout, acceptor.accept(tcp));
+                    let stream = tokio::select! {
+                        handshake = handshake => match handshake {
                             Ok(Ok(stream)) => stream,
                             Ok(Err(error)) => {
                                 tracing::debug!(%error, "TLS handshake failed");
@@ -234,14 +309,53 @@ pub async fn serve_with<U: Upstream>(
                                 tracing::debug!("TLS handshake timed out");
                                 return;
                             }
-                        };
+                        },
+                        () = stopped(stopping.clone()) => return,
+                    };
                     let service =
                         service.for_connection(ConnectionInfo::tls(stream.connect_info()));
-                    serve_connection(SlotIo { io: stream, slot }, service, limits).await;
+                    serve_connection(SlotIo { io: stream, slot }, service, limits, stopping).await;
                 }
             }
         });
     }
+    // No new connections from here: the listening socket closes, then the
+    // open connections wind down.
+    drop(listener);
+    stop.send_replace(true);
+    let drained = async { while connections.join_next().await.is_some() {} };
+    match options.drain_timeout {
+        None => drained.await,
+        Some(timeout) => {
+            if tokio::time::timeout(timeout, drained).await.is_err() {
+                tracing::warn!(
+                    open = connections.len(),
+                    "shutdown drain timed out; closing the connections still open"
+                );
+                connections.shutdown().await;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A `max_connections` slot, or none without a limit.
+async fn take_slot(slots: Option<&Arc<Semaphore>>) -> Option<OwnedSemaphorePermit> {
+    match slots {
+        Some(slots) => Some(
+            Arc::clone(slots)
+                .acquire_owned()
+                .await
+                .expect("the connection semaphore is never closed"),
+        ),
+        None => None,
+    }
+}
+
+/// Resolves once the server shuts down.
+async fn stopped(mut stopping: watch::Receiver<bool>) {
+    // A closed channel means the serve future is gone: stop as well.
+    stopping.wait_for(|stop| *stop).await.ok();
 }
 
 pin_project! {
@@ -309,9 +423,14 @@ struct ConnectionLimits {
     header_read_timeout: Duration,
 }
 
-/// HTTP/1.1 or HTTP/2, whichever the client speaks, on one connection.
-async fn serve_connection<U, I>(io: I, service: ProxyService<U>, limits: ConnectionLimits)
-where
+/// HTTP/1.1 or HTTP/2, whichever the client speaks, on one connection, until
+/// it closes, idles out or the server shuts down.
+async fn serve_connection<U, I>(
+    io: I,
+    service: ProxyService<U>,
+    limits: ConnectionLimits,
+    stopping: watch::Receiver<bool>,
+) where
     U: Upstream,
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -325,9 +444,11 @@ where
     builder.http2().timer(TokioTimer::new());
     let served = match limits.idle_timeout {
         None => {
-            builder
-                .serve_connection_with_upgrades(TokioIo::new(io), TowerToHyperService::new(service))
-                .await
+            let connection = builder.serve_connection_with_upgrades(
+                TokioIo::new(io),
+                TowerToHyperService::new(service),
+            );
+            drive(connection, std::future::pending(), stopping).await
         }
         Some(timeout) => {
             let activity = Arc::new(idle::Activity::default());
@@ -339,20 +460,33 @@ where
                 TokioIo::new(io),
                 TowerToHyperService::new(service),
             );
-            tokio::pin!(connection);
-            tokio::select! {
-                served = connection.as_mut() => served,
-                () = activity.idle_for(timeout) => {
-                    // HTTP/2 gets a GOAWAY, HTTP/1.1 closes after the request
-                    // it is reading, if any.
-                    connection.as_mut().graceful_shutdown();
-                    connection.await
-                }
-            }
+            drive(connection, activity.idle_for(timeout), stopping).await
         }
     };
     if let Err(error) = served {
         tracing::debug!(%error, "connection ended");
+    }
+}
+
+/// Serve `connection` until it ends; when `idle` resolves or the server
+/// shuts down first, it is asked to wind down (HTTP/2 gets a GOAWAY, HTTP/1.1
+/// closes after the request in progress) and served until it has.
+async fn drive<C: GracefulConnection>(
+    connection: C,
+    idle: impl Future<Output = ()>,
+    stopping: watch::Receiver<bool>,
+) -> Result<(), C::Error> {
+    tokio::pin!(connection);
+    tokio::select! {
+        served = connection.as_mut() => served,
+        () = idle => {
+            connection.as_mut().graceful_shutdown();
+            connection.await
+        }
+        () = stopped(stopping) => {
+            connection.as_mut().graceful_shutdown();
+            connection.await
+        }
     }
 }
 

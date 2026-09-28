@@ -73,7 +73,7 @@ pub mod upstream;
 /// [`install_default_crypto_provider`] for when a call is needed.
 #[cfg(feature = "builtin_jwt")]
 pub use auth::crypto::install_default_crypto_provider;
-pub use serve::{serve, serve_with, ServeOptions};
+pub use serve::{serve, serve_with, serve_with_shutdown, ServeOptions};
 pub use service::{ConnectionInfo, ProxyService};
 
 use axum::extract::State;
@@ -1152,7 +1152,11 @@ impl ProxyServer {
                 (listen.idle_timeout_secs > 0)
                     .then(|| Duration::from_secs(listen.idle_timeout_secs)),
             )
-            .header_read_timeout(Duration::from_secs(listen.header_read_timeout_secs));
+            .header_read_timeout(Duration::from_secs(listen.header_read_timeout_secs))
+            .drain_timeout(
+                (listen.drain_timeout_secs > 0)
+                    .then(|| Duration::from_secs(listen.drain_timeout_secs)),
+            );
         if let Some(max) = listen.max_connections {
             anyhow::ensure!(max > 0, "listen.max_connections must be at least 1");
             options = options.max_connections(max);
@@ -1183,6 +1187,31 @@ impl ProxyServer {
     /// [`serve_options`](Self::serve_options) reject, an invalid listen
     /// address, or a listener that fails.
     pub async fn serve(&self) -> anyhow::Result<()> {
+        self.serve_with_shutdown(std::future::pending()).await
+    }
+
+    /// [`serve`](Self::serve) until `signal` completes, then shut down with
+    /// the drain of `listen.drain_timeout_secs` (see [`serve_with_shutdown`]).
+    ///
+    /// # Errors
+    ///
+    /// What [`serve`](Self::serve) returns.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn run(server: structured_proxy::ProxyServer) -> anyhow::Result<()> {
+    /// server
+    ///     .serve_with_shutdown(async {
+    ///         tokio::signal::ctrl_c().await.ok();
+    ///     })
+    ///     .await
+    /// # }
+    /// ```
+    pub async fn serve_with_shutdown(
+        &self,
+        signal: impl std::future::Future<Output = ()>,
+    ) -> anyhow::Result<()> {
         let service = self.service(self.upstream()?)?;
         let options = self.serve_options()?;
         let addr: SocketAddr = self.config.listen.http.parse()?;
@@ -1194,7 +1223,8 @@ impl ProxyServer {
             self.config.service.name,
             addr
         );
-        serve_with(listener, service, options).await?;
+        serve_with_shutdown(listener, service, options, signal).await?;
+        tracing::info!("{} stopped", self.config.service.name);
         Ok(())
     }
 }

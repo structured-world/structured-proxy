@@ -194,16 +194,23 @@ fn a_limit_of_zero_is_refused() {
 #[test]
 fn connection_timeouts_come_from_the_config() {
     let server = crate::ProxyServer::from_yaml_str(
-        "listen:\n  idle_timeout_secs: 0\n  header_read_timeout_secs: 5\n",
+        "listen:\n  idle_timeout_secs: 0\n  header_read_timeout_secs: 5\n  drain_timeout_secs: 0\n",
     )
     .unwrap();
     let options = server.serve_options().unwrap();
-    // 0 keeps idle connections open.
+    // 0 keeps idle connections open, and a shutdown waits for every one.
     assert_eq!(options.idle_timeout, None);
     assert_eq!(options.header_read_timeout, Duration::from_secs(5));
+    assert_eq!(options.drain_timeout, None);
     let defaults = crate::ProxyServer::new().serve_options().unwrap();
     assert_eq!(defaults.idle_timeout, Some(Duration::from_secs(60)));
     assert_eq!(defaults.header_read_timeout, Duration::from_secs(30));
+    assert_eq!(defaults.drain_timeout, Some(Duration::from_secs(30)));
+    let set = crate::ProxyServer::from_yaml_str("listen:\n  drain_timeout_secs: 7\n")
+        .unwrap()
+        .serve_options()
+        .unwrap();
+    assert_eq!(set.drain_timeout, Some(Duration::from_secs(7)));
 }
 
 #[test]

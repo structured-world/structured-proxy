@@ -180,6 +180,48 @@ fn the_binary_keeps_the_shared_rate_limit_store() {
     assert!(!output.contains("not compiled in"), "{output}");
 }
 
+#[cfg(unix)]
+#[test]
+fn sigterm_stops_the_proxy_cleanly() {
+    // What a container runtime or service manager sends to stop it.
+    let port = free_port();
+    let config = ConfigFile::new(
+        "sigterm",
+        &format!(
+            "listen:\n  http: \"127.0.0.1:{port}\"\n\
+             upstream:\n  default: \"http://127.0.0.1:9\"\n\
+             descriptors: []\n"
+        ),
+    );
+    let mut proxy = Running(
+        Command::new(BIN)
+            .arg("--config")
+            .arg(&config.0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    assert!(live(port).starts_with("HTTP/1.1 200"));
+
+    let sent = Command::new("kill")
+        .arg("-TERM")
+        .arg(proxy.0.id().to_string())
+        .status()
+        .unwrap();
+    assert!(sent.success());
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = proxy.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "the proxy kept running");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(status.success(), "{status}");
+    assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
+}
+
 /// A config file for this test process holding `yaml`, removed on drop.
 struct ConfigFile(std::path::PathBuf);
 

@@ -37,6 +37,8 @@ tonic services.
   through, or translated to gRPC for an upstream that speaks only gRPC
 - Built-in TLS and mTLS, and a cap on open connections; or your own TLS, with
   the client's address and certificate reaching the upstream
+- Graceful shutdown: calls and streams in flight finish within a bounded
+  drain, HTTP/2 clients get a GOAWAY ([Shutting down](#shutting-down))
 - Guards you scope to the traffic they cover (transcoded calls, the proxy's
   own endpoints, native gRPC, the fallback), rejecting in the protocol of the
   request ([Guards and scopes](#guards-and-scopes)):
@@ -90,6 +92,9 @@ binary uses. Unset, `TOKIO_WORKER_THREADS` decides, else the number of CPUs
 available to the process. The startup log (`RUST_LOG=info`) shows the count
 and where it came from.
 
+SIGTERM or Ctrl-C stops the binary gracefully: it stops accepting, lets the
+calls in flight finish for up to `listen.drain_timeout_secs`, and exits 0.
+
 ## Configuration
 
 ```yaml
@@ -105,6 +110,10 @@ listen:
   idle_timeout_secs: 60
   # Seconds an HTTP/1.1 client has to send a request's headers.
   header_read_timeout_secs: 30
+  # Seconds a shutdown (SIGTERM, Ctrl-C) waits for requests and streams in
+  # flight to finish; the connections still open after it are closed.
+  # 0 waits for all of them.
+  drain_timeout_secs: 30
   # Optional: TLS on the listener (REST and gRPC share the port; ALPN offers
   # h2 and http/1.1). With client_ca_file, client certificates are verified
   # (mTLS) and reach an in-process tonic upstream as Request::peer_certs.
@@ -738,8 +747,13 @@ async fn main() -> anyhow::Result<()> {
     // `ProxyConfig`.
     let server = ProxyServer::from_file(Path::new("my-service.yaml"))?;
 
-    // Run the proxy on the configured listen address.
-    server.serve().await?;
+    // Run the proxy on the configured listen address until Ctrl-C, then
+    // drain (see "Shutting down").
+    server
+        .serve_with_shutdown(async {
+            tokio::signal::ctrl_c().await.ok();
+        })
+        .await?;
     Ok(())
 }
 ```
@@ -857,6 +871,47 @@ timeouts, and keeps its slot until it closes. In code the same settings are
 listener verified reaches a tonic handler in process as `Request::peer_certs`.
 TLS needs a rustls crypto provider: the one a crypto backend feature brings,
 or the one your process installed (see [TLS crypto](#tls-crypto)).
+
+### Shutting down
+
+`serve` and `serve_with` run until their future is dropped, which closes every
+connection at once. For a graceful stop, hand `serve_with_shutdown` (or
+`ProxyServer::serve_with_shutdown`) a future that completes when the process
+should stop:
+
+```rust
+use std::time::Duration;
+use structured_proxy::{ProxyServer, ServeOptions};
+
+# async fn run(grpc: tonic::service::Routes) -> anyhow::Result<()> {
+let proxy = ProxyServer::from_file(std::path::Path::new("my-service.yaml"))?.service(grpc)?;
+let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
+let options = ServeOptions::new().drain_timeout(Some(Duration::from_secs(20)));
+let stop = async {
+    tokio::signal::ctrl_c().await.ok();
+};
+structured_proxy::serve_with_shutdown(listener, proxy, options, stop).await?;
+# Ok(())
+# }
+```
+
+Once the future completes:
+
+- the listening socket closes, so new connections are refused, and a
+  connection still in its TLS handshake or waiting for a `max_connections`
+  slot is dropped;
+- HTTP/2 connections get a GOAWAY, so their clients open no new calls, and
+  HTTP/1.1 connections close after the response in progress;
+- calls and streams in flight run to their end, and `serve_with_shutdown`
+  returns once every connection has closed;
+- after `drain_timeout` (`listen.drain_timeout_secs`, 30 s by default; `None`
+  or 0 waits without a bound) the connections still open are closed, so the
+  shutdown fits the grace period of your orchestrator.
+
+Past that grace period (30 s from SIGTERM in Kubernetes by default) the
+process is killed along with its calls. A connection a fallback upgraded (a
+WebSocket) belongs to the fallback's task and closes when that task lets it
+go.
 
 ### Behind your own TLS
 
