@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.0.0](https://github.com/structured-world/structured-proxy/compare/v5.0.0...v6.0.0) - 2026-09-28
+
+### Added
+
+- *(embed)* [**breaking**] scoped guards, TLS listener, gRPC-Web translation and capability builder ([#122](https://github.com/structured-world/structured-proxy/pull/122))
+- *(embed)* [**breaking**] in-process upstream, pass-through and your own TLS on one listener ([#119](https://github.com/structured-world/structured-proxy/pull/119))
+
 ## [5.0.0](https://github.com/structured-world/structured-proxy/compare/v4.3.0...v5.0.0) - 2026-09-27
 
 ### Added
