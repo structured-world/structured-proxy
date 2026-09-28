@@ -6,42 +6,66 @@
 [![downloads](https://img.shields.io/crates/d/structured-proxy.svg)](https://crates.io/crates/structured-proxy)
 [![license](https://img.shields.io/crates/l/structured-proxy.svg)](https://github.com/structured-world/structured-proxy/blob/main/LICENSE)
 
-Universal, config-driven gRPC→REST transcoding proxy. One binary, different YAML configs, different products.
-
-Works with **any** gRPC service via proto descriptor files. No code generation, no custom handlers, just configuration.
+A gRPC→REST transcoding proxy and edge for any gRPC service. Point it at your
+proto descriptors and it serves REST/JSON next to native gRPC on one port,
+with auth, rate limits and the rest of an edge configured in YAML. Run it as a
+standalone binary, or embed it in your own Rust service in front of your own
+tonic services.
 
 ## Features
 
-- **Dynamic REST routes** from proto descriptors using `google.api.http` annotations
-- **Full request mapping**: path params, query parameters (typed + repeated + nested), and a JSON or form `body` (`*` / named field / none), decoded straight into the request message (see [Request mapping](#request-mapping))
-- **`response_body`** to return a single response subfield, and **`additional_bindings`** for multiple routes per RPC
-- **`custom` rules**: any HTTP method (`HEAD`, `OPTIONS`, extension methods), or `kind: "*"` for every method
-- **Upstream-controlled HTTP answers**: response metadata becomes response headers, `x-http-code` sets the status, and `google.api.HttpBody` carries a raw body and content type in either direction, so OAuth 2.0 / OIDC endpoints, redirects and file downloads work as gRPC (see [Upstream controls](#upstream-controls))
-- **Auto-generated OpenAPI** documentation from proto messages, served at `/openapi.json`
-- **Server-streaming** RPC → NDJSON by default, or Server-Sent Events via `Accept: text/event-stream` negotiation
-- **gRPC → HTTP status mapping** following the standard `google.rpc.Code` table
-- **Typed error details**: the upstream's `google.rpc.Status` details (`ErrorInfo`, `BadRequest`, `RetryInfo`, ...) reach the HTTP client as ProtoJSON, switchable globally and per route (see [Error responses](#error-responses))
-- **One port for REST and native gRPC**: HTTP/1.1 and HTTP/2 on the same listener, gRPC and gRPC-Web requests pass through to the upstream unchanged (an upstream that speaks gRPC-Web, e.g. behind tonic-web, answers it); behind the built-in TLS listener (mTLS with a client CA, a cap on open connections) or your own TLS, with the client's address and certificate reaching the upstream
-- **In-process upstream** for embedders: transcoded calls reach your own tonic services with no socket or loopback hop (see [Library Usage](#library-usage))
-- **Header forwarding** from HTTP requests to gRPC metadata (configurable allow-list)
-- **Context propagation**: W3C trace-context (`traceparent` forwarded or synthesized) and client deadlines (`grpc-timeout`) carried across the REST↔gRPC boundary
-- **Path aliasing** for route remapping (e.g. `/oauth2/*` → `/v1/oauth2/*`)
-- **Scoped guards**: maintenance, rate limits, a concurrency limit, JWT, ext_authz and the auth decider each cover the traffic you name (transcoded, the proxy's own endpoints, native gRPC, the fallback), narrowed by path and method; a rejection answers in the request's protocol, a `google.rpc.Status` JSON body for REST and a gRPC status for gRPC (see [Guards and scopes](#guards-and-scopes))
-- **Maintenance mode** returning 503 with a configurable exempt-path list
-- **Concurrency limit**: requests past `max_in_flight` are shed at once with 503 instead of queueing; a stream holds its slot until its body ends
-- **Health endpoints** `/health/live`, `/health/ready` (upstream gRPC health probe), `/health/startup`
-- **Prometheus metrics** at `/metrics`
-- **CORS** with a configurable origin allow-list, exposed headers and preflight cache, applied to gRPC-Web pass-through too
-- **Rate limiting (Shield)**: local GCRA shaper (no blocking latency) keyed by client IP, header, or validated JWT claim; named limit tiers as config data; optional async cross-instance reconciliation for an approximate fleet-wide limit (requires both the `redis` feature and a configured `sync` block)
-- **JWT auth**: validate `Bearer` tokens via an Ed25519 PEM key or JWKS auto-discovery, enforce per-route `require_auth` / `required_roles`, and forward claims as headers — or hand the signature check to your own verifier (a validated / FIPS module, an HSM) without changing anything else
-- **OIDC discovery**: serve `/.well-known/openid-configuration` and a JWKS endpoint (Ed25519) built from config, to front an identity provider
-- **Forward-auth**: a verification endpoint (`/auth/verify`) for a fronting proxy (nginx `auth_request`, Traefik `forwardAuth`) to delegate auth, returning the verified identity as headers
-- **External AuthZ**: gate proxied requests through an Envoy ext_authz gRPC server (`envoy.service.auth.v3.Authorization/Check`), interoperating with OPA and any ext_authz server, with fail-open/closed control
-- **Zero code changes** between services: same binary, different config
+**Transcoding**
+
+- REST routes from the `google.api.http` annotations in your protos: path,
+  query and JSON or form body mapped onto the request message
+  ([Request mapping](#request-mapping)), `response_body`,
+  `additional_bindings`, and `custom` rules for any HTTP method
+- Server streaming as NDJSON, or Server-Sent Events when the client asks for
+  `text/event-stream`
+- Errors as `google.rpc.Status` JSON with the standard HTTP status mapping and
+  typed error details ([Error responses](#error-responses))
+- The upstream decides status, headers and raw bodies, so OAuth 2.0 / OIDC
+  endpoints, redirects and file downloads can be written as gRPC
+  ([Upstream controls](#upstream-controls))
+- OpenAPI generated from the protos, served at `/openapi.json`
+- Header forwarding, W3C trace context and client deadlines carried across
+  REST↔gRPC; path aliases
+
+**Edge**
+
+- REST and native gRPC (and gRPC-Web) on one port, HTTP/1.1 and HTTP/2
+- Built-in TLS and mTLS, and a cap on open connections; or your own TLS, with
+  the client's address and certificate reaching the upstream
+- Guards you scope to the traffic they cover (transcoded calls, the proxy's
+  own endpoints, native gRPC, the fallback), rejecting in the protocol of the
+  request ([Guards and scopes](#guards-and-scopes)):
+  - rate limits keyed by IP, header or JWT claim, optionally shared across
+    instances through Redis ([Rate limiting](#rate-limiting))
+  - a limit on requests in flight
+  - JWT auth with per-route policies, or your own token verifier
+  - Envoy ext_authz (OPA and any other ext_authz server) and an in-process
+    auth decider
+  - maintenance mode
+- CORS, applied to gRPC-Web calls too
+- Health probes (`/health/live`, `/health/ready` against the upstream's gRPC
+  health, `/health/startup`) and Prometheus metrics at `/metrics`
+- Forward-auth endpoint for nginx `auth_request` / Traefik `forwardAuth`, and
+  OIDC discovery with a JWKS endpoint
+
+**Embedding**
+
+- Your own tonic services as the upstream, called in process
+  ([Library Usage](#library-usage))
+- Requests the proxy does not serve go to your own fallback service
+- Hooks for auth decisions, token verification, OIDC and extra routes, with no
+  HTTP framework in your code
 
 ## Non-goals
 
-- **Session / BFF management** (cookie-based login, server-side token storage, refresh flows) and **stateful OIDC** (`authorize` / `token` with auth codes / PKCE state). The **default build** is a stateless transcoding data plane with stateless auth primitives; session lifecycle is a separate, stateful concern. Put a dedicated BFF (e.g. `oauth2-proxy`, Pomerium) in front, or drive auth through the stateless forward-auth / external-authz hooks below. (A stateful surface behind an opt-in, default-off `bff` Cargo feature is planned; it does not affect the default data-plane build.)
+- **Sessions and stateful OIDC** (cookie login, server-side tokens, refresh,
+  `authorize` / `token` with PKCE state). The proxy is a stateless data plane:
+  put a BFF such as `oauth2-proxy` or Pomerium in front, or decide auth
+  through the forward-auth and ext_authz hooks.
 
 ## Quick Start
 
@@ -58,10 +82,10 @@ Prebuilt static Linux binaries and deb/rpm packages are attached to each GitHub
 release. To embed the proxy in your own service instead, add the library with
 `cargo add structured-proxy` (see [Library Usage](#library-usage)).
 
-The binary runs the proxy on a multi-thread async runtime. `runtime.worker_threads`
-in the config file sets how many worker threads, and so CPU cores, it keeps busy;
-unset, `TOKIO_WORKER_THREADS` or the available parallelism decides. The startup
-log line (`RUST_LOG=info`) states the count and where it came from.
+`runtime.worker_threads` sets how many worker threads, and so CPU cores, the
+binary uses. Unset, `TOKIO_WORKER_THREADS` decides, else the number of CPUs
+available to the process. The startup log (`RUST_LOG=info`) shows the count
+and where it came from.
 
 ## Configuration
 
@@ -279,8 +303,8 @@ protoc --descriptor_set_out=my-service.descriptor.bin --include_imports *.proto
 
 ## Request mapping
 
-The gRPC request message is built from the three sources `google.api.http`
-names, in one pass and without an intermediate JSON tree:
+The gRPC request message is built from the path, the query string and the
+body, as the route's `google.api.http` rule says:
 
 - **Precedence:** a path parameter wins over the body, and the body over the
   query string. A query parameter only fills a field the body did not send;
@@ -304,67 +328,57 @@ answered with `INVALID_ARGUMENT` (400) before the upstream is called.
 
 ## Rate limiting
 
-Shield is an embedded, config-driven limiter designed for a data plane: every
-decision is made in-process by a GCRA shaper, so it adds no blocking latency to
-the request path. GCRA (a token-bucket equivalent storing one timestamp per key)
-lets legitimate bursts through up to a configured `burst` while throttling
-sustained abuse to the `rate`, with no fixed-window boundary burst.
+Shield decides every request in the proxy's own process with GCRA, so a limit
+never waits on the network. GCRA lets a client burst up to `burst` requests
+and then holds it to `rate`, without the spikes a fixed window allows at its
+edges.
 
-**Keying and phases.** A rule keys on the client IP, a header value (API key),
-or a validated JWT claim. The phase is derived from the key, not configured: an
-IP/header rule needs no verified identity so it runs *before* auth (a fast,
-purely local check that sheds anonymous floods before any signature verification,
-and short-circuits so blocked clients never reach the auth layer); a `jwt_claim`
-rule needs the verified principal so it runs *after* auth. A key falls back to
-the client IP when its value is absent within its own phase, so a limit can't be
-dodged by omitting a header. Note the fallback is phase-local: an anonymous
-request under a `jwt_claim` rule keys by IP in the post-auth phase, but is *not*
-shed pre-auth. For anonymous flood protection, add a separate pre-auth IP (or
-header) rule covering the same paths; a path may match one rule per phase and
-each is enforced independently (defense in depth).
+**Keys and when they run.** A rule keys on the client IP, a header (an API
+key) or a verified JWT claim, and the key decides when the rule runs:
 
-**Limit sources.** A key's `{rate, burst}` resolves in order: the JWT itself
-(a `ratelimit_tier` claim naming a profile, or explicit `ratelimit_rpm` /
-`ratelimit_burst`), then an external service (cached and refreshed in the
-background, never blocking), then the rule's pinned profile, then the default.
-JWT-based resolution only applies to `jwt_claim` rules, since only they run with
-verified claims available; setting `jwt_limits` has no effect on an IP/header
-rule, which runs pre-auth (use a `jwt_claim` key if you want the token's tier to
-drive the limit). Tier-name indirection lets you retune the numbers in config
-without re-issuing tokens or changing the service.
+- IP and header rules run before auth, so a flood is shed before any token
+  signature is checked.
+- `jwt_claim` rules run after auth, on the verified claim.
 
-**Response headers.** Every metered response carries the
+A request that lacks the key's value (no header, no token) is keyed by its IP,
+so leaving the header out does not escape the limit. That fallback happens in
+the rule's own phase: an anonymous request under a `jwt_claim` rule is limited
+by IP only after auth. To shed anonymous floods early, add an IP rule for the
+same paths; a path matches at most one rule in each phase, and both apply.
+
+**Which limit applies.** A key's rate and burst come from, in order: the token
+(a `ratelimit_tier` claim naming a profile, or `ratelimit_rpm` /
+`ratelimit_burst` claims), the external limit service (cached and refreshed in
+the background), the rule's profile, the default profile. Limits from the
+token apply to `jwt_claim` rules only, the only ones that see verified claims.
+A tier name in the token lets you retune the numbers in config without
+reissuing tokens.
+
+**Response headers.** Every limited response carries the
 [draft-ietf-httpapi-ratelimit-headers](https://datatracker.ietf.org/doc/draft-ietf-httpapi-ratelimit-headers/)
-fields: `RateLimit-Limit` (the tier's per-window quota), `RateLimit-Remaining`
-(requests still admissible now), and `RateLimit-Reset` (whole seconds until the
-limiter drains toward full). A rejected request returns `429` with `Retry-After`
-(whole seconds until a retry would conform). Clients should back off for
-`Retry-After` seconds on a `429`, and may pace themselves using `RateLimit-*` on
-allowed responses. Behind a browser, these are exposed via CORS.
+fields: `RateLimit-Limit` (the quota per window), `RateLimit-Remaining`
+(requests allowed right now) and `RateLimit-Reset` (seconds until the budget
+refills). A rejected request gets `429` with `Retry-After`, the seconds to wait
+before retrying. CORS exposes all of them to browser scripts.
 
 **Deployment modes.**
 
-- **Local (default).** No shared store. Each instance enforces the limit
-  independently, so the fleet-wide effect is roughly `N × rate` for `N`
-  instances. Zero dependencies, lowest latency. Set per-instance limits with
-  that multiplier in mind.
-- **Reconciled (`sync` + `redis` feature).** Instances asynchronously push their
-  deltas to a shared store and pull the aggregate on an interval, converging on
-  an approximate fleet-wide limit. The configured `rate` is then the *fleet*
-  budget. The request path still never blocks on the store; if the store is
-  unreachable, instances degrade to local limiting rather than failing requests.
+- **Local (default).** Each instance enforces the limit on its own, so `N`
+  instances admit roughly `N × rate` together. Set per-instance limits with
+  that in mind.
+- **Shared (`sync`, with the `redis` feature).** Instances push their counts
+  to Redis in the background and read the fleet's total on an interval, so
+  `rate` becomes the budget of the whole fleet, approximately. A request never
+  waits on Redis; while Redis is down, each instance limits locally.
 
-**Sizing the overshoot.** In reconciled mode the aggregate lags by up to one
-`sync.interval_ms`. Within that lag each of the other instances can admit its
-local `burst` plus a `rate` fraction of the window before the estimate catches
-up (the fleet gate caps sustained fleet volume at `rate`, but `burst` is a
-per-instance allowance the gate does not pre-reserve). With the interval in the
-same time unit as the window, the worst-case fleet overshoot is about
-`(N - 1) × (burst + rate × (interval / window))` requests. For example,
-`burst = 100`, `rate = 1000/min`, `interval = 500 ms`, `N = 4` gives
-`3 × (100 + 1000 × (0.5 / 60)) ≈ 325` extra requests. Smaller `burst` and shorter
-intervals tighten the bound. The global view uses a sliding-window counter, so
-there is no boundary burst on top of this lag.
+**How far the fleet can overshoot.** The shared total is up to one
+`sync.interval_ms` old. Within that time every other instance can still admit
+its own `burst` plus the share of `rate` that falls in the interval, so the
+fleet can exceed its budget by about
+`(N - 1) × (burst + rate × interval / window)` requests. With `burst = 100`,
+`rate = 1000/min`, a 500 ms interval and 4 instances that is
+`3 × (100 + 1000 × 0.5 / 60) ≈ 325` requests. A smaller `burst` and a shorter
+interval shrink it.
 
 See the `shield:` block under [Configuration](#configuration) for the full
 schema.
@@ -474,16 +488,15 @@ mapping (`INVALID_ARGUMENT` → 400, `NOT_FOUND` → 404, ...):
   request that cannot be mapped onto the RPC (`INVALID_ARGUMENT`, 400), an
   upstream that is not reachable (`UNAVAILABLE`, 503), a response that cannot
   be serialized (`INTERNAL`, 500). Their `details` is empty.
-- A broken upstream error status is never passed on in part or reinterpreted:
-  a trailer that is not a `google.rpc.Status` or disagrees with `grpc-status` /
-  `grpc-message`, a type URL without a `/` or whose last segment is not a
-  protobuf full name, or a detail of a known type whose bytes do not decode or
-  whose value has no valid JSON form (a `Duration` beyond its range), turns the
-  whole error into
+- A malformed upstream error is replaced as a whole, never passed on in part
+  or guessed at. The client gets
   `{"error": "INTERNAL", "code": 13, "message": "upstream returned a malformed error status", "details": []}`
-  (500, or the terminal frame of a started stream). The cause is logged by the
-  proxy and not sent to the client. With details switched off for a route the
-  trailer is not read, so this does not apply there.
+  (500, or the terminal frame of a started stream), and the proxy logs the
+  cause. Malformed means: a details trailer that is not a `google.rpc.Status`
+  or contradicts `grpc-status` / `grpc-message`, a type URL that is not
+  `…/<protobuf full name>`, or a detail of a known type that does not decode
+  or has no JSON form (a `Duration` out of range). Routes with details
+  switched off never read the trailer.
 
 **Opaque-detail extension.** ProtoJSON cannot represent an `Any` whose type is
 unknown to the writer, so a detail whose type is in neither descriptor set has
@@ -522,51 +535,43 @@ of ProtoJSON or `google.rpc.Status`:
 - Only an unknown type goes there. A detail of a known type that fails to
   decode is a broken upstream status (see above), never an opaque entry.
 
-**Errors in server-streaming responses.** An upstream that rejects the call
-outright (a gRPC trailers-only response, with no response headers or messages)
-gets the mapped HTTP status and the body above. Once the upstream has accepted
-the call, the proxy answers `200` and starts the stream right away, so that
-headers and SSE keep-alives are not held back waiting for the first message.
-Any later failure, including one that arrives before the first message, is then
-delivered as a terminal frame whose payload is exactly that body, after which
-the stream ends and no further data follows:
+**Errors in server-streaming responses.** If the upstream rejects the call
+outright, the client gets the mapped HTTP status and the body above. Once the
+upstream accepts the call, the proxy answers `200` and starts the stream at
+once, without waiting for the first message. A failure after that, or a
+message the proxy cannot serialize, ends the stream with one terminal frame
+carrying that body:
 
-- **NDJSON**: the last line, framed by an extra
-  `"@type": "type.googleapis.com/google.rpc.Status"` next to the error body. A
-  data line is the ProtoJSON of a response message, which has a top-level
-  `@type` only when the RPC streams `google.protobuf.Any`, while `Struct`,
-  `Value` and `ListValue` messages can carry any key at all. For those RPCs no
-  in-band marker is collision-free: set `streaming.ndjson_envelope: true` (or
-  `ProxyServer::with_ndjson_envelope(true)`) and every line is wrapped instead,
-  `{"result": <message>}` for data and `{"error": <error body>}` for the
-  terminal error, the grpc-gateway stream shape. The envelope changes data
-  lines too, so it is off by default.
-- **SSE**: one event with type `stream-error` (listen with
-  `addEventListener("stream-error", ...)`), distinct from the `EventSource`
-  `onerror` that fires on transport failures. The event type is the framing,
-  so the event data is exactly the error body, without the NDJSON marker.
-
-The same applies to a message the proxy cannot serialize mid-stream: the
-stream ends with an `INTERNAL` terminal frame.
+- **NDJSON**: the last line, the error body with
+  `"@type": "type.googleapis.com/google.rpc.Status"` added. An RPC that streams
+  `google.protobuf.Any`, `Struct`, `Value` or `ListValue` can send data lines
+  that look the same; for those set `streaming.ndjson_envelope: true` (or
+  `ProxyServer::with_ndjson_envelope(true)`), and every data line becomes
+  `{"result": <message>}` and the error `{"error": <error body>}`, the
+  grpc-gateway shape. It is off by default because it changes the data lines
+  too.
+- **SSE**: an event of type `stream-error` (listen with
+  `addEventListener("stream-error", ...)`) whose data is the error body. It is
+  not `EventSource.onerror`, which fires on transport failures.
 
 This is the HTTP/JSON transcoding format. It is not the Connect protocol's error
 format, and it is not an OAuth 2.0 token endpoint error body (RFC 6749 §5.2):
 an upstream that needs one answers successfully with that body instead (see
 [Upstream controls](#upstream-controls)).
 
-**Switching details off.** In the config file, `error_details:` (see
-[Configuration](#configuration)) is read by the standalone binary and by
-`ProxyServer::from_yaml_str` / `ProxyServer::from_file`; it is not part of
-`ProxyConfig`, so `ProxyConfig::from_yaml_str` alone ignores it. Both log a
-warning for a top-level or `streaming:` key no setting reads, so a misspelled
-`error_detail:` or `ndjson_envelop:` shows up at startup instead of silently
-leaving the default in force. An embedding
-service can choose in code with `ProxyServer::with_error_details`. Overrides are
-checked in the order they are added; for each switch (`enabled`, `opaque`) the
-first rule whose pattern matches the mounted route and that sets the switch
-decides, otherwise the global value; `*` stays within one path segment (a path
-parameter counts as one) and `**` spans segments. A config rule that sets
-neither switch is rejected:
+**Switching details off.** `error_details:` in the config file (see
+[Configuration](#configuration)) is read by the binary and by
+`ProxyServer::from_yaml_str` / `ProxyServer::from_file`. It is not part of
+`ProxyConfig`, so `ProxyConfig::from_yaml_str` alone ignores it. Both warn at
+startup about a top-level or `streaming:` key they do not know, so a typo such
+as `error_detail:` does not silently keep the default. In code, use
+`ProxyServer::with_error_details`.
+
+Route rules are checked in order: for each switch (`enabled`, `opaque`), the
+first rule that matches the route and sets that switch decides; with none, the
+global value holds. `*` matches within one path segment (a path parameter
+counts as one), `**` across segments. A config rule that sets neither switch
+is an error:
 
 ```rust
 use structured_proxy::transcode::error::ErrorDetailsPolicy;
@@ -592,31 +597,30 @@ methods other than the five standard ones. The upstream RPC decides all of
 these; the proxy only carries them, as Envoy's `grpc_json_transcoder` and
 grpc-gateway do, so the same service works behind any of them.
 
-**Request headers → request metadata.** Each header named in
-`forwarded_headers` reaches the upstream as request metadata byte for byte,
-every value in the order the client sent it, so a check that depends on how
-often a header was sent (RFC 9449 §4.3 rejects a request with two `DPoP`
-headers) sees the same request behind the proxy. A `-bin` header keeps the
-base64 it arrived with, one metadata value per comma-separated part. A value
-gRPC metadata cannot carry (empty, or outside visible ASCII and space, such as
-a tab or obs-text, or not canonical base64 under a `-bin` key) is refused with
-`INVALID_ARGUMENT` (400) naming the header: gRPC lets a receiver drop such a
-value, which would change what the upstream counts. A `forwarded_headers` name
-must be a gRPC metadata key (letters, digits, `_`, `-`, `.`), or the proxy
-does not start. W3C trace-context is the exception, listed or
-not: the upstream always gets exactly one valid `traceparent` (the client's
-first, or a fresh one when it is missing or malformed), and every `tracestate`
-line only with the client's own trace.
+**Request headers → request metadata.** Each header listed in
+`forwarded_headers` reaches the upstream as metadata:
 
-**Response metadata → response headers.** The upstream's response metadata is
-its HTTP response headers. Every ASCII entry becomes a header, in order, with
-repeated values as repeated fields; a key sent in both the initial metadata and
-the trailers keeps both values. This covers a successful unary call (initial
-metadata and trailers), a failed call (its trailers-only metadata, or the
-response headers and trailers of a call that failed after sending headers, so a
-`401` carries its `WWW-Authenticate`), and the initial metadata of a server-streaming
-call (its trailers arrive after the headers are sent and are not forwarded).
-Never forwarded:
+- byte for byte, every value, in the client's order, so a check that counts
+  headers (RFC 9449 §4.3 rejects two `DPoP` headers) sees the request as sent;
+- a `-bin` header keeps its base64, one metadata value per comma-separated
+  part;
+- a value gRPC metadata cannot carry (empty, a character outside visible ASCII
+  and space, or bad base64 under a `-bin` key) is refused with
+  `INVALID_ARGUMENT` (400) naming the header, since gRPC lets a receiver
+  silently drop such a value;
+- a listed name that is not a gRPC metadata key (letters, digits, `_`, `-`,
+  `.`) stops the proxy at startup.
+
+Trace context goes through whether listed or not: the upstream gets exactly
+one valid `traceparent` (the client's first, or a new one when it is missing
+or malformed), and `tracestate` only together with the client's own trace.
+
+**Response metadata → response headers.** The upstream's response metadata
+becomes HTTP response headers: every ASCII entry, in order, repeated values as
+repeated headers, a key in both initial metadata and trailers with both
+values. That covers a unary call, succeeded or failed (so a `401` carries its
+`WWW-Authenticate`), and the initial metadata of a server stream; a stream's
+trailers arrive after its headers are sent. Not forwarded:
 
 - gRPC's own keys: `grpc-*`, binary `-bin` keys and `content-type` (the proxy
   sets it for the body it writes);
@@ -638,31 +642,30 @@ response headers plus the exposed ones, so a browser client that must read a
 forwarded header needs it listed in `cors.expose_headers`.
 
 **Status from `x-http-code`.** On a successful unary call, the response
-metadata `x-http-code` (grpc-gateway's convention) sets the HTTP status: one
-integer from 200 to 599. Anything else (a value that is not three digits, out
-of range, or given twice) turns the answer into
+metadata `x-http-code` (grpc-gateway's convention) sets the HTTP status, one
+integer from 200 to 599. A value that is not three digits, is out of range or
+comes twice turns the whole answer into
 `{"error": "INTERNAL", "code": 13, "message": "upstream returned a malformed response", "details": []}`
-(500), with nothing else of the upstream's answer. `204`, `205` and `304` are
-sent without a body or `Content-Type` (RFC 9110 §15.3.5, §15.3.6, §15.4.5).
-Errors keep the
-`google.rpc.Code` mapping: a protocol-specific error body is a successful
-answer with `x-http-code` and that body. Server-streaming calls ignore the key.
+(500). `204`, `205` and `304` go out without a body or `Content-Type`
+(RFC 9110 §15.3.5, §15.3.6, §15.4.5). Failed calls keep the `google.rpc.Code`
+mapping, so a protocol's own error body is sent as a successful call with
+`x-http-code` and that body. Server-streaming calls ignore the key.
 
-**Raw bodies with `google.api.HttpBody`.** An RPC whose response type is
-`google.api.HttpBody`, or whose `response_body` names a field of that type,
-answers with `content_type` as `Content-Type` (none when empty) and `data` as
-the raw body. An RPC whose request type is `HttpBody` with `body: "*"`, or
-whose `body` names a field of that type, receives the raw request body and its
-full `Content-Type` value there. With a named field, the other fields still
-come from the path and query (a query key naming the body field is ignored);
-with `body: "*"`, the query binds nothing, since every field comes from the
-body. A server-streaming `HttpBody` writes each message's `data` as it
-arrives, with `Content-Type` from the first message; as a raw body has no
-in-band error frame, a failure after the first message aborts the transfer so
-the client does not take a partial body for a complete one. An `HttpBody`
-content type that is not a valid header value is a malformed response (500).
-`google/api/httpbody.proto` is always resolvable for error details, like the
-`google/rpc` types.
+**Raw bodies with `google.api.HttpBody`.**
+
+- An RPC that returns `google.api.HttpBody` (or whose `response_body` names a
+  field of that type) answers with `data` as the body and `content_type` as
+  `Content-Type` (none when empty; a value that is not a valid header is a
+  malformed response, 500).
+- An RPC that takes `HttpBody` with `body: "*"` (or whose `body` names a field
+  of that type) receives the raw request body and its full `Content-Type`.
+  With a named field, the other fields still come from the path and query; a
+  query key naming the body field is ignored. With `body: "*"` every field
+  comes from the body, so the query binds nothing.
+- A server-streaming `HttpBody` writes each message's `data` as it arrives,
+  with `Content-Type` from the first message. A raw body has no way to carry
+  an error, so a failure after the first message aborts the transfer, and the
+  client does not take a partial body for a complete one.
 
 An RFC 6749 token endpoint, for example:
 
@@ -678,28 +681,26 @@ client gets exactly that `400`. An authorization endpoint answers
 `x-http-code: 302` with `location` and an empty `HttpBody`; a JWKS endpoint
 returns `application/jwk-set+json` (RFC 7517 §8.5).
 
-**`custom` rules.** `HttpRule.custom` (`{kind, path}`) binds any method token:
+**`custom` rules.** `HttpRule.custom` (`{kind, path}`) binds any method:
 `kind: "HEAD"`, `kind: "OPTIONS"`, an extension method such as `PROPFIND`
 (case-sensitive, RFC 9110 §9.1), or `kind: "*"` for every method, as
-`google/api/http.proto` defines. A forward-auth sub-request (nginx
-`auth_request`, Traefik `forwardAuth`) arrives with the original request's
-method, so a `*` rule answers it whatever that method is. `custom` works in
-`additional_bindings` too. A `*` rule takes its path for every method, so
-another binding on that path is rejected at startup. OpenAPI lists a `*` rule
-under every operation, and cannot describe an extension method. Only a real
-CORS preflight (an `OPTIONS` request with both `Origin` and
-`Access-Control-Request-Method`) is
-answered by the CORS layer; any other `OPTIONS` request reaches its route.
+`google/api/http.proto` defines; in `additional_bindings` too.
+
+- A `*` rule suits a forward-auth sub-request (nginx `auth_request`, Traefik
+  `forwardAuth`), which arrives with the original request's method.
+- A `*` rule owns its path for every method, so another binding on the same
+  path is an error at startup.
+- OpenAPI lists a `*` rule under every operation and leaves extension methods
+  out.
+- Only a real CORS preflight (`OPTIONS` with both `Origin` and
+  `Access-Control-Request-Method`) is answered by CORS; any other `OPTIONS`
+  request reaches its route.
 
 ## Library Usage
 
-`cargo add structured-proxy` adds the library alone: the binary and its
-command-line dependencies (`clap`, `tracing-subscriber`) sit behind the `cli`
-feature, which is off by default, so a service that embeds the proxy compiles
-none of them. The library starts no runtime and installs no logger of its own;
-it runs on the
-embedder's tokio runtime and logs through `tracing` to whatever subscriber the
-embedder sets up.
+`cargo add structured-proxy` adds the library; the binary and its
+command-line dependencies come with the `cli` feature. The library runs on
+your tokio runtime and logs through `tracing` to the subscriber you set up.
 
 ```rust
 use std::path::Path;
@@ -724,12 +725,11 @@ upstream as they arrived, so native gRPC clients can use the same address.
 
 ### Your own gRPC services as the upstream
 
-A gRPC service that embeds the proxy to add REST (a forward-auth decision
-service, an API that also speaks gRPC) hands its own services to the proxy
-instead of an address. Transcoded calls then reach them in process: no
-socket, no loopback connection, no second HTTP/2 round, and they pass through
-the service's whole tonic stack (interceptors, layers) like a native gRPC
-call. `Request::remote_addr` in a handler gives the HTTP client's address.
+A gRPC service that embeds the proxy to add REST hands the proxy its own
+services instead of an address. Transcoded calls then reach them in process,
+through the service's whole tonic stack (interceptors, layers), like a native
+gRPC call. `Request::remote_addr` in a handler gives the HTTP client's
+address.
 
 ```rust
 use structured_proxy::ProxyServer;
@@ -826,33 +826,35 @@ loop {
 A plain TCP connection passes `stream.connect_info()` directly
 (`ConnectionInfo` converts from tonic's `TcpConnectInfo`).
 
-What the proxy does not serve is not its business: a request no route matches
-gets `404`, or goes to a service of yours with
-`ProxyService::with_fallback(my_axum_app)`. By default no guard covers those
-requests or native gRPC ones, and they reach your service untouched; name
-`grpc` or `fallback` in a guard's scope to put them behind it (see
-[Guards and scopes](#guards-and-scopes)). CORS and tracing stay the fallback's
-own.
+### What passes through
 
-gRPC-Web requests pass through unchanged as well, so the upstream answers
-them in that protocol: wrap your services in tonic-web's layer
-(`tower::ServiceBuilder::new().layer(tonic_web::GrpcWebLayer::new()).service(grpc)`),
-binary and text gRPC-Web alike. When the upstream cannot take a call at all,
-the proxy's own error answer keeps the request's protocol. Browsers get the
-proxy's CORS policy on these calls, the same one their preflight got
-(`cors.grpc_web`, on by default); a gRPC-Web client reads `grpc-status`,
-`grpc-message` and `grpc-status-details-bin`, which are always exposed. A
-browser's preflight for a gRPC-Web call (one announcing `x-grpc-web`) goes
-where the call goes: the proxy answers it under that policy, a fallback never
-sees it, and with `cors.grpc_web: false` it reaches the upstream, whose own
-CORS policy then covers preflight and call alike.
+A request no route matches gets `404`, or goes to your own service with
+`ProxyService::with_fallback(my_axum_app)`. Native gRPC calls and the fallback
+pass only the guards whose scope names `grpc` or `fallback` (see
+[Guards and scopes](#guards-and-scopes)); by default none does. The fallback
+keeps its own CORS and tracing.
 
-**Deadlines.** Every call waits at most five seconds for the upstream's
-response headers, or less when the client's `grpc-timeout` says so; after that
-the client gets `504` `DEADLINE_EXCEEDED`. The proxy enforces this itself, in
-process and remote alike. The client's `grpc-timeout` travels to the upstream;
-the five-second default does not, so an upstream that applies `grpc-timeout`
-to a whole call does not cut a long server stream short.
+gRPC-Web calls pass through as they are, so the upstream answers them: wrap
+your services in tonic-web's layer
+(`tower::ServiceBuilder::new().layer(tonic_web::GrpcWebLayer::new()).service(grpc)`)
+for binary and text gRPC-Web alike.
+
+- Browsers get the proxy's CORS policy on these calls, the same one their
+  preflight got (`cors.grpc_web`, on by default). `grpc-status`,
+  `grpc-message` and `grpc-status-details-bin` are always exposed to them.
+- A preflight for a gRPC-Web call (one announcing `x-grpc-web`) goes where
+  the call goes: the proxy answers it, the fallback never sees it. With
+  `cors.grpc_web: false` it reaches the upstream, whose own CORS policy then
+  covers the preflight and the call.
+- When the upstream cannot take a call at all, the proxy answers in the
+  request's own protocol.
+
+**Deadlines.** A call waits at most five seconds for the upstream's response
+headers, or less when the client's `grpc-timeout` says so; then the client
+gets `504` `DEADLINE_EXCEEDED`, with an upstream in process or remote. The
+client's `grpc-timeout` travels to the upstream; the five-second default does
+not, so an upstream that applies `grpc-timeout` to the whole call does not cut
+a long server stream short.
 
 ### Merging into an axum application
 
@@ -876,11 +878,9 @@ async fn main() -> anyhow::Result<()> {
 
 ### Embedding hooks (axum-free)
 
-Inject *stateless* service-specific logic without naming an HTTP framework in
-your own crate: implement the hook traits with foundational types (`http`,
-`bytes`, `serde_json`) plus `async-trait` (the traits are `#[async_trait]`),
-none of which is an HTTP framework. `cargo tree -i axum` in your crate then
-shows `axum` solely under `structured-proxy`.
+Hooks plug your own stateless logic into the proxy. Their traits use `http`,
+`bytes` and `serde_json` types and `#[async_trait]`, so your crate implements
+them without depending on axum itself.
 
 ```rust
 use std::sync::Arc;
@@ -1020,27 +1020,23 @@ ProxyServer::from_config(config)
 # }
 ```
 
-Injection also resolves a problem the features cannot: Cargo unifies features
-across the whole dependency graph, so `rust_crypto` / `aws_lc_rs` is a property
-of the *resolution*, not of a binary. Two crates in one workspace that link this
-one and want different backends cannot both get their way: the resolution enables
-both features, and the tie-break above picks `aws_lc_rs` for everyone. A consumer
-that injects its own verifier is not in that argument at all: it takes
+Injection also gets around Cargo feature unification. Features apply to the
+whole dependency graph, so when two crates in one workspace ask for different
+backends, both are enabled and the tie-break above picks `aws_lc_rs` for
+everyone. A crate that injects its own verifier takes no backend at all:
 
 ```toml
 [dependencies]
-structured-proxy = { version = "4", default-features = false }
+structured-proxy = { version = "6", default-features = false }
 # What the verifier above is written with: the trait is `#[async_trait]`, and
 # claims cross it as `serde_json::Value`. Neither is re-exported.
 async-trait = "0.1"
 serde_json = "1"
 ```
 
-which links no JWT or TLS crypto (see [TLS crypto](#tls-crypto)), and
-supplies the backend from its own binary. With no
-verifier injected and no backend feature, an `auth.mode: "jwt"` config is
-rejected at startup with that instruction, rather than silently accepting
-tokens.
+and brings its own crypto (see [TLS crypto](#tls-crypto)). With neither an
+injected verifier nor a backend feature, an `auth.mode: "jwt"` config fails at
+startup with a message saying so.
 
 ## TLS crypto
 
@@ -1070,45 +1066,35 @@ CRL and name-constraint advisories are listed in `deny.toml` with why they do no
 apply: the provider reads only algorithm identifiers from it, and rustls
 verifies certificates with its own patched `rustls-webpki`.
 
-## How It Works
+## How it works
 
-1. Load the proto descriptor from a pre-compiled descriptor file
-2. Parse `google.api.http` annotations → generate REST routes
-3. Incoming HTTP request → transcode to gRPC (path params + query params + JSON body → protobuf)
-4. Forward to the upstream gRPC service
-5. Response protobuf → transcode to JSON
-6. Serve the OpenAPI spec at `/openapi.json`
-
-## Architecture
+At startup the proxy reads your proto descriptors and turns every
+`google.api.http` rule into a REST route. Each request is then sorted once:
 
 ```
-Client (HTTP/JSON)
-    │
-    ▼
-┌──────────────────────┐
-│  structured-proxy     │
-│                       │
-│  ┌─────────────────┐  │
-│  │ CORS            │  │
-│  ├─────────────────┤  │
-│  │ Maintenance     │  │  503 gate (exempt paths)
-│  ├─────────────────┤  │
-│  │ Concurrency     │  │  in-flight limit (503)
-│  ├─────────────────┤  │
-│  │ Shield          │  │  rate limiting (429)
-│  ├─────────────────┤  │
-│  │ Auth (JWT)      │  │  validate + policies (401/403)
-│  ├─────────────────┤  │
-│  │ Transcoder      │  │  REST → gRPC
-│  │ (prost-reflect) │  │  JSON → Protobuf
-│  ├─────────────────┤  │
-│  │ OpenAPI gen     │  │  /openapi.json
-│  └─────────────────┘  │
-└─────────┬─────────────┘
-          │ gRPC
-          ▼
-   Upstream Service
+     REST, gRPC and gRPC-Web clients (HTTP/1.1, HTTP/2, optional TLS)
+                                  │
+                   ┌──────────────▼──────────────┐
+                   │ listener                    │  TLS / mTLS, connection limit
+                   └──────────────┬──────────────┘
+         ┌────────────────────────┼────────────────────────┐
+         ▼                        ▼                        ▼
+   a REST route             gRPC / gRPC-Web          no route matches
+   (transcoded call or      content type
+    own endpoint)
+         │                        │                        │
+   CORS, guards             guards in scope          guards in scope
+         │                        │                        │
+   transcoder               passed through           your fallback
+   JSON ↔ protobuf          unchanged                (or 404)
+         │                        │
+         └───────────┬────────────┘
+                     ▼
+   upstream: a remote gRPC server, or your tonic services in process
 ```
+
+Guards run in this order: maintenance, concurrency limit, rate limits keyed
+before auth, JWT, rate limits keyed by claims, ext_authz, the auth decider.
 
 <div align="center">
 
