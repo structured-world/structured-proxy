@@ -838,13 +838,22 @@ structured_proxy::serve_with(listener, proxy, options).await?;
 # }
 ```
 
-The TLS handshake runs in each connection's task under
-`listen.tls.handshake_timeout_secs`, so a slow or stalled client holds up no
-one else. A connection with no request in flight for `listen.idle_timeout_secs`
-is closed (HTTP/2 gets a GOAWAY, and a gRPC client reconnects when it next
-calls), so idle clients cannot keep `max_connections` slots. The same settings
-are `ServeOptions::idle_timeout`, `header_read_timeout` and
-`tls_handshake_timeout` in code. A client certificate the
+Every connection takes a `max_connections` slot from the moment it is
+accepted until its socket closes; past the limit, new connections wait in the
+listen backlog. Three timeouts keep slots from being held for nothing:
+
+- the TLS handshake runs in the connection's own task, so it never stalls the
+  accept loop, and must finish within `listen.tls.handshake_timeout_secs`;
+- an HTTP/1.1 request's headers must arrive within
+  `listen.header_read_timeout_secs`;
+- a connection with no request in flight for `listen.idle_timeout_secs` is
+  closed (HTTP/2 gets a GOAWAY, and a gRPC client reconnects when it next
+  calls).
+
+A connection a fallback upgrades (a WebSocket) leaves HTTP and these
+timeouts, and keeps its slot until it closes. In code the same settings are
+`ServeOptions::idle_timeout`, `header_read_timeout` and
+`tls_handshake_timeout`. A client certificate the
 listener verified reaches a tonic handler in process as `Request::peer_certs`.
 TLS needs a rustls crypto provider: the one a crypto backend feature brings,
 or the one your process installed (see [TLS crypto](#tls-crypto)).

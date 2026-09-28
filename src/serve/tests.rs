@@ -40,6 +40,61 @@ async fn status_line(stream: &mut TcpStream) -> String {
 }
 
 #[tokio::test]
+async fn an_upgraded_connection_keeps_its_slot_until_it_closes() {
+    // A fallback that upgrades (a WebSocket) takes the socket out of hyper;
+    // the connection still counts against the limit while it is open.
+    let fallback = axum::Router::new().route(
+        "/upgrade",
+        axum::routing::get(|request: axum::extract::Request| async move {
+            let upgrade = hyper::upgrade::on(request);
+            tokio::spawn(async move {
+                let mut upgraded = hyper_util::rt::TokioIo::new(upgrade.await.unwrap());
+                // Hold the socket until the client closes it; a reset ends it
+                // as well as an end of stream.
+                let mut rest = Vec::new();
+                upgraded.read_to_end(&mut rest).await.unwrap_or_default();
+            });
+            http::Response::builder()
+                .status(http::StatusCode::SWITCHING_PROTOCOLS)
+                .header("connection", "upgrade")
+                .header("upgrade", "test")
+                .body(axum::body::Body::empty())
+                .unwrap()
+        }),
+    );
+    let service = crate::ProxyServer::from_yaml_str("service:\n  name: demo\n")
+        .unwrap()
+        .service(tonic::service::Routes::default())
+        .unwrap()
+        .with_fallback(fallback);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let options = ServeOptions::new().max_connections(1).idle_timeout(None);
+    tokio::spawn(serve_with(listener, service, options));
+
+    let mut upgraded = TcpStream::connect(addr).await.unwrap();
+    upgraded
+        .write_all(b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: upgrade\r\nUpgrade: test\r\n\r\n")
+        .await
+        .unwrap();
+    assert_eq!(
+        status_line(&mut upgraded).await,
+        "HTTP/1.1 101 Switching Protocols"
+    );
+
+    let mut other = TcpStream::connect(addr).await.unwrap();
+    request(&mut other).await;
+    let waiting = tokio::time::timeout(Duration::from_millis(300), status_line(&mut other)).await;
+    assert!(waiting.is_err(), "served past the connection limit");
+
+    drop(upgraded);
+    let served = tokio::time::timeout(Duration::from_secs(5), status_line(&mut other))
+        .await
+        .expect("closing the upgraded connection frees its slot");
+    assert_eq!(served, "HTTP/1.1 200 OK");
+}
+
+#[tokio::test]
 async fn a_connection_past_the_limit_is_served_once_another_closes() {
     let addr = listen(ServeOptions::new().max_connections(1)).await;
 

@@ -161,6 +161,36 @@ fn paths_and_methods_narrow_the_requests_a_scope_matches() {
     assert!(!scope.matches(&request("POST", "/v1/users/1")));
 }
 
+#[tokio::test]
+async fn a_narrowed_guard_readies_the_branch_it_calls() {
+    // An embedder's fallback may need `poll_ready` before `call` (a
+    // concurrency limit panics without it); a request outside the scope's
+    // paths reaches it through the plain branch.
+    use tower::ServiceExt;
+    let fallback = tower::limit::ConcurrencyLimit::new(
+        tower::service_fn(|_: Request| async {
+            Ok::<_, Infallible>(Response::new(axum::body::Body::empty()))
+        }),
+        1,
+    );
+    let config = ScopeConfig {
+        paths: vec!["/guarded".into()],
+        ..ScopeConfig::traffic([Traffic::Fallback])
+    };
+    let scoped = Scoped {
+        layer: tower::layer::layer_fn(|inner| inner),
+        scope: Scope::compile(Some(&config), &[], "maintenance", &[]).unwrap(),
+    }
+    .layer(fallback);
+    for path in ["/other", "/guarded", "/other"] {
+        let request = http::Request::get(path)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = scoped.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+    }
+}
+
 #[test]
 fn http_statuses_map_back_to_their_grpc_codes() {
     // The inverse of google/rpc/code.proto's HTTP mapping, so a code a guard

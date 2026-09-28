@@ -20,8 +20,8 @@ use axum::{Json, Router};
 use futures::future::Either;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use http::{Method, StatusCode};
-use tower::util::BoxCloneSyncService;
-use tower::{Layer, Service};
+use tower::util::{BoxCloneSyncService, Oneshot};
+use tower::{Layer, Service, ServiceExt};
 
 use crate::config::{ScopeConfig, Traffic};
 use crate::hooks::AuthDecider;
@@ -288,24 +288,26 @@ struct ScopedService<G, S> {
 
 impl<G, S> Service<Request> for ScopedService<G, S>
 where
-    G: Service<Request, Response = Response, Error = Infallible>,
-    S: Service<Request, Response = Response, Error = Infallible>,
+    G: Service<Request, Response = Response, Error = Infallible> + Clone,
+    S: Service<Request, Response = Response, Error = Infallible> + Clone,
 {
     type Response = Response;
     type Error = Infallible;
-    type Future = Either<G::Future, S::Future>;
+    type Future = Either<Oneshot<G, Request>, Oneshot<S, Request>>;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
-        // Guard middleware and routes are always ready; readiness further in
-        // is waited for per request.
+        // Which branch serves a request is known only from the request, so
+        // readiness is waited for per request, on the chosen branch's clone
+        // (as axum's `Route` does): polling both here would hold a
+        // reservation of the other one, such as a concurrency permit.
         Poll::Ready(Ok(()))
     }
 
     fn call(&mut self, request: Request) -> Self::Future {
         if self.scope.matches(&request) {
-            Either::Left(self.guarded.call(request))
+            Either::Left(self.guarded.clone().oneshot(request))
         } else {
-            Either::Right(self.plain.call(request))
+            Either::Right(self.plain.clone().oneshot(request))
         }
     }
 }

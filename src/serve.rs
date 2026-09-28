@@ -1,15 +1,18 @@
 //! Running a [`ProxyService`] on a TCP listener: HTTP/1.1 and HTTP/2 on one
 //! port, optionally behind TLS, with an optional cap on open connections.
 
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder;
 use hyper_util::service::TowerToHyperService;
-use tokio::io::{AsyncRead, AsyncWrite};
+use pin_project_lite::pin_project;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::transport::server::Connected;
 
 use crate::service::{ConnectionInfo, ProxyService};
@@ -64,6 +67,9 @@ impl ServeOptions {
     /// open. A request counts until its response body ends, so a stream keeps
     /// its connection. Without it an idle client holds a
     /// [`max_connections`](Self::max_connections) slot for as long as it likes.
+    /// A connection upgraded to another protocol (a WebSocket in a fallback)
+    /// leaves HTTP and this timeout with it; it keeps its slot until it
+    /// closes.
     #[must_use]
     pub fn idle_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.idle_timeout = timeout;
@@ -205,8 +211,6 @@ pub async fn serve_with<U: Upstream>(
         let service = service.clone();
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
-            // Held for the connection's life.
-            let _slot = slot;
             // Small gRPC frames and REST answers are latency-bound.
             if let Err(error) = tcp.set_nodelay(true) {
                 tracing::debug!(%error, "cannot set TCP_NODELAY");
@@ -214,9 +218,11 @@ pub async fn serve_with<U: Upstream>(
             match acceptor {
                 None => {
                     let service = service.for_connection(tcp.connect_info());
-                    serve_connection(tcp, service, limits).await;
+                    serve_connection(SlotIo { io: tcp, slot }, service, limits).await;
                 }
                 Some(acceptor) => {
+                    // The slot is held through the handshake, then by the
+                    // stream.
                     let stream =
                         match tokio::time::timeout(handshake_timeout, acceptor.accept(tcp)).await {
                             Ok(Ok(stream)) => stream,
@@ -231,10 +237,68 @@ pub async fn serve_with<U: Upstream>(
                         };
                     let service =
                         service.for_connection(ConnectionInfo::tls(stream.connect_info()));
-                    serve_connection(stream, service, limits).await;
+                    serve_connection(SlotIo { io: stream, slot }, service, limits).await;
                 }
             }
         });
+    }
+}
+
+pin_project! {
+    /// A connection's IO holding its `max_connections` slot for as long as
+    /// the socket is open. hyper hands the IO of an upgraded connection (a
+    /// WebSocket in a fallback) to the upgrading service and finishes the
+    /// connection future, so the slot has to live with the IO, not the task.
+    struct SlotIo<I> {
+        #[pin]
+        io: I,
+        slot: Option<OwnedSemaphorePermit>,
+    }
+}
+
+impl<I: AsyncRead> AsyncRead for SlotIo<I> {
+    #[inline]
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        self.project().io.poll_read(cx, buf)
+    }
+}
+
+impl<I: AsyncWrite> AsyncWrite for SlotIo<I> {
+    #[inline]
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        self.project().io.poll_write(cx, buf)
+    }
+
+    #[inline]
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.project().io.poll_flush(cx)
+    }
+
+    #[inline]
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.project().io.poll_shutdown(cx)
+    }
+
+    #[inline]
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        self.project().io.poll_write_vectored(cx, bufs)
+    }
+
+    #[inline]
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
     }
 }
 

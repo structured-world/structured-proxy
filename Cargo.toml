@@ -176,8 +176,10 @@ cli = ["dep:clap", "dep:tracing-subscriber", "redis"]
 [dev-dependencies]
 # `test-util`: deadline tests run on a paused clock instead of waiting.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
-tower = { version = "0.5", features = ["util"] }
+tower = { version = "0.5", features = ["util", "limit"] }
 http-body-util = "0.1"
+# `hyper::upgrade::on`: a fallback that upgrades its connection (src/serve/tests.rs).
+hyper = "1"
 # Trailer frames for the hand-written upstream response in
 # tests/upstream_controls.rs (tonic's server API cannot set success trailers).
 http-body = "1"
