@@ -134,6 +134,46 @@ jobs:
         if: matrix.backend.name == 'rust_crypto'
         run: cargo publish --dry-run --features cli
 
+  # The release packages ship static musl binaries; build and test that target
+  # on every change, so a dependency that breaks it fails here, not at release.
+  musl:
+    name: musl (${{ matrix.target }})
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runs-on: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install musl tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      # Third-party action: pinned to a commit SHA (dependabot keeps it fresh).
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: ${{ matrix.target }}
+      # Third-party action: pinned to a commit SHA (dependabot keeps it fresh).
+      - uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
+        with:
+          tool: cargo-nextest
+
+      # The build the release workflow packages.
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} --features cli --bin structured-proxy
+
+      - name: Test
+        run: cargo nextest run --target ${{ matrix.target }} --features cli
+
   security-audit:
     name: Security Audit
     runs-on: ubuntu-latest
