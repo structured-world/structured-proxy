@@ -58,6 +58,7 @@ pub mod config;
 mod cors;
 mod embed;
 mod guard;
+mod held;
 pub mod hooks;
 pub mod oidc;
 pub mod openapi;
@@ -788,7 +789,7 @@ impl ProxyServer {
         let forward_auth = auth.as_ref().and_then(|built| {
             auth::forward::ForwardAuth::build(self.config.auth.as_ref()?, built.clone())
         });
-        let guards = self.guards(auth, maintenance_exempt)?;
+        let guards = self.guards(auth, maintenance_exempt, &mounted)?;
 
         // Health routes. Paths are configurable; the whole group is skippable.
         let health_routes = if self.config.health.enabled {
@@ -926,7 +927,7 @@ impl ProxyServer {
 
     /// The guards the configuration and the hooks turn on, each with its
     /// scope; `maintenance_exempt` lists the paths maintenance mode leaves
-    /// reachable.
+    /// reachable, `mounted` the `(method, path)` of every route.
     ///
     /// # Errors
     ///
@@ -936,10 +937,17 @@ impl ProxyServer {
         &self,
         auth: Option<Arc<auth::Auth>>,
         maintenance_exempt: Vec<String>,
+        mounted: &[(String, String)],
     ) -> anyhow::Result<guard::Guards> {
         use config::Traffic::{Endpoints, Grpc, Transcoded};
+        // `*` marks a route that answers every method, not a method.
+        let routed: Vec<http::Method> = mounted
+            .iter()
+            .filter(|(method, _)| method != "*")
+            .filter_map(|(method, _)| http::Method::from_bytes(method.as_bytes()).ok())
+            .collect();
         let scope = |config: Option<&ScopeConfig>, default: &[config::Traffic], what: &str| {
-            guard::Scope::compile(config, default, what).map_err(anyhow::Error::msg)
+            guard::Scope::compile(config, default, what, &routed).map_err(anyhow::Error::msg)
         };
         let mut guards = guard::Guards::default();
         // Mounted only while maintenance is on, so normal traffic pays nothing
@@ -961,11 +969,9 @@ impl ProxyServer {
         if let Some(cfg) = &self.config.concurrency {
             guards.concurrency = Some((
                 guard::Concurrency::build(cfg).map_err(anyhow::Error::msg)?,
-                scope(
-                    cfg.scope.as_ref(),
-                    &[Transcoded, Endpoints, Grpc],
-                    "concurrency",
-                )?,
+                // The proxy's own endpoints stay out by default: a health
+                // probe refused under load gets a busy instance restarted.
+                scope(cfg.scope.as_ref(), &[Transcoded, Grpc], "concurrency")?,
             ));
         }
         if let Some(cfg) = &self.config.shield {
@@ -1126,24 +1132,42 @@ impl ProxyServer {
     }
 
     /// The [`ServeOptions`] of `listen:`: TLS from `listen.tls` (mTLS with its
-    /// `client_ca_file`) and the `listen.max_connections` cap, for
-    /// [`serve_with`] on a listener of your own.
+    /// `client_ca_file`), the `listen.max_connections` cap and the connection
+    /// timeouts, for [`serve_with`] on a listener of your own.
     ///
     /// # Errors
     ///
-    /// A `max_connections` of zero, or TLS files that cannot be loaded, or no
-    /// rustls crypto provider for TLS.
+    /// A `max_connections`, `header_read_timeout_secs` or
+    /// `tls.handshake_timeout_secs` of zero, TLS files that cannot be loaded,
+    /// or no rustls crypto provider for TLS.
     pub fn serve_options(&self) -> anyhow::Result<ServeOptions> {
+        use std::time::Duration;
         let listen = &self.config.listen;
-        let mut options = ServeOptions::new();
+        anyhow::ensure!(
+            listen.header_read_timeout_secs > 0,
+            "listen.header_read_timeout_secs must be at least 1"
+        );
+        let mut options = ServeOptions::new()
+            .idle_timeout(
+                (listen.idle_timeout_secs > 0)
+                    .then(|| Duration::from_secs(listen.idle_timeout_secs)),
+            )
+            .header_read_timeout(Duration::from_secs(listen.header_read_timeout_secs));
         if let Some(max) = listen.max_connections {
             anyhow::ensure!(max > 0, "listen.max_connections must be at least 1");
             options = options.max_connections(max);
         }
         if let Some(tls) = &listen.tls {
-            options = options.tls(
-                tls::server_config(tls).map_err(|e| anyhow::anyhow!("invalid listen.tls: {e}"))?,
+            anyhow::ensure!(
+                tls.handshake_timeout_secs > 0,
+                "listen.tls.handshake_timeout_secs must be at least 1"
             );
+            options = options
+                .tls(
+                    tls::server_config(tls)
+                        .map_err(|e| anyhow::anyhow!("invalid listen.tls: {e}"))?,
+                )
+                .tls_handshake_timeout(Duration::from_secs(tls.handshake_timeout_secs));
         }
         Ok(options)
     }

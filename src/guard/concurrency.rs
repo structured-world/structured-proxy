@@ -2,18 +2,12 @@
 //! turned away at once rather than queued, since a queue behind a saturated
 //! upstream only adds latency to what will time out anyway.
 
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
-use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::middleware::Next;
 use axum::response::Response;
-use bytes::Bytes;
-use http_body::{Frame, SizeHint};
-use pin_project_lite::pin_project;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::Semaphore;
 
 use super::reject;
 use crate::config::ConcurrencyConfig;
@@ -59,46 +53,7 @@ pub(super) async fn middleware(
         );
         return response;
     };
-    next.run(request).await.map(|body| {
-        Body::new(Holding {
-            body,
-            slot: Some(slot),
-        })
-    })
-}
-
-pin_project! {
-    /// A response body that frees its request's slot when it ends or is
-    /// dropped.
-    struct Holding {
-        #[pin]
-        body: Body,
-        slot: Option<OwnedSemaphorePermit>,
-    }
-}
-
-impl http_body::Body for Holding {
-    type Data = Bytes;
-    type Error = axum::Error;
-
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
-        let this = self.project();
-        let frame = this.body.poll_frame(cx);
-        if let Poll::Ready(None | Some(Err(_))) = frame {
-            // Ended: the slot is free before the connection moves on.
-            this.slot.take();
-        }
-        frame
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.body.is_end_stream()
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        self.body.size_hint()
-    }
+    next.run(request)
+        .await
+        .map(|body| crate::held::until_end(body, slot))
 }

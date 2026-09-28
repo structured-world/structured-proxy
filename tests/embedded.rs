@@ -26,6 +26,8 @@ fn embedded_config_is_constructible() {
             http: "0.0.0.0:8080".into(),
             max_connections: None,
             tls: None,
+            idle_timeout_secs: 60,
+            header_read_timeout_secs: 30,
         },
         service: ServiceConfig {
             name: "embedded-test".into(),

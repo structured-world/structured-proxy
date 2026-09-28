@@ -567,6 +567,27 @@ fn translation_needs_the_proxys_grpc_web_cors() {
     assert!(err.to_string().contains("grpc_web.translate"), "{err}");
 }
 
+#[tokio::test]
+async fn a_saturated_proxy_still_answers_its_health_probes() {
+    // A liveness probe that fails under load gets a busy pod restarted,
+    // which moves its load onto the others; the limit covers the traffic
+    // that loads the upstream, not the probes.
+    let addr = listen(
+        common::Upstream::InProcess,
+        "concurrency:\n  max_in_flight: 1\n",
+        None,
+    )
+    .await;
+    // `Hang` holds the only slot until its deadline.
+    let hang = tokio::spawn(http1_get(addr, "/v1/hang"));
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let (status, body, _) = http1_get(addr, "/health/live").await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body, _) = http1_get(addr, "/v1/echo/a").await;
+    assert_eq!(status, 503, "{body}");
+    hang.abort();
+}
+
 /// Denies every request with `403`, recording the peer it saw.
 #[derive(Default)]
 struct PeerDecider {

@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder;
 use hyper_util::service::TowerToHyperService;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -15,30 +15,76 @@ use tonic::transport::server::Connected;
 use crate::service::{ConnectionInfo, ProxyService};
 use crate::upstream::Upstream;
 
-/// How long a client has to finish its TLS handshake before the connection is
-/// dropped, so a stalled client holds neither a task nor a connection slot.
-const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+mod idle;
 
 /// How [`serve_with`] runs its listener.
 ///
 /// # Examples
 ///
 /// ```
+/// use std::time::Duration;
 /// use structured_proxy::ServeOptions;
 ///
-/// let options = ServeOptions::new().max_connections(10_000);
+/// let options = ServeOptions::new()
+///     .max_connections(10_000)
+///     .idle_timeout(Some(Duration::from_secs(120)));
 /// # let _ = options;
 /// ```
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct ServeOptions {
     max_connections: Option<usize>,
     tls: Option<Arc<rustls::ServerConfig>>,
+    idle_timeout: Option<Duration>,
+    header_read_timeout: Duration,
+    tls_handshake_timeout: Duration,
+}
+
+impl Default for ServeOptions {
+    fn default() -> Self {
+        Self {
+            max_connections: None,
+            tls: None,
+            idle_timeout: Some(Duration::from_secs(60)),
+            header_read_timeout: Duration::from_secs(30),
+            tls_handshake_timeout: Duration::from_secs(10),
+        }
+    }
 }
 
 impl ServeOptions {
-    /// Cleartext, with no limit on connections.
+    /// Cleartext, with no limit on connections; a connection idle for 60 s is
+    /// closed, a client gets 30 s to send the headers of an HTTP/1.1 request
+    /// and 10 s to finish a TLS handshake.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Close a connection that has had no request in flight for `timeout`
+    /// (gracefully: HTTP/2 gets a GOAWAY); `None` keeps idle connections
+    /// open. A request counts until its response body ends, so a stream keeps
+    /// its connection. Without it an idle client holds a
+    /// [`max_connections`](Self::max_connections) slot for as long as it likes.
+    #[must_use]
+    pub fn idle_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.idle_timeout = timeout;
+        self
+    }
+
+    /// How long an HTTP/1.1 client has to send a request's headers, so a
+    /// client that trickles them in holds no connection for long.
+    #[must_use]
+    pub fn header_read_timeout(mut self, timeout: Duration) -> Self {
+        self.header_read_timeout = timeout;
+        self
+    }
+
+    /// How long a client has to finish its TLS handshake before the
+    /// connection is dropped, so a stalled client holds neither a task nor a
+    /// connection slot.
+    #[must_use]
+    pub fn tls_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.tls_handshake_timeout = timeout;
+        self
     }
 
     /// Serve at most `max` connections at once: past it, the next connection
@@ -130,6 +176,11 @@ pub async fn serve_with<U: Upstream>(
         .max_connections
         .map(|max| Arc::new(Semaphore::new(max)));
     let acceptor = options.tls.map(tokio_rustls::TlsAcceptor::from);
+    let handshake_timeout = options.tls_handshake_timeout;
+    let limits = ConnectionLimits {
+        idle_timeout: options.idle_timeout,
+        header_read_timeout: options.header_read_timeout,
+    };
     loop {
         // The slot is taken before the accept, so a full server leaves new
         // connections in the kernel's backlog instead of accepting and
@@ -163,13 +214,11 @@ pub async fn serve_with<U: Upstream>(
             match acceptor {
                 None => {
                     let service = service.for_connection(tcp.connect_info());
-                    serve_connection(tcp, service).await;
+                    serve_connection(tcp, service, limits).await;
                 }
                 Some(acceptor) => {
                     let stream =
-                        match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(tcp))
-                            .await
-                        {
+                        match tokio::time::timeout(handshake_timeout, acceptor.accept(tcp)).await {
                             Ok(Ok(stream)) => stream,
                             Ok(Err(error)) => {
                                 tracing::debug!(%error, "TLS handshake failed");
@@ -182,22 +231,62 @@ pub async fn serve_with<U: Upstream>(
                         };
                     let service =
                         service.for_connection(ConnectionInfo::tls(stream.connect_info()));
-                    serve_connection(stream, service).await;
+                    serve_connection(stream, service, limits).await;
                 }
             }
         });
     }
 }
 
+/// The timeouts every connection is served under.
+#[derive(Clone, Copy, Debug)]
+struct ConnectionLimits {
+    idle_timeout: Option<Duration>,
+    header_read_timeout: Duration,
+}
+
 /// HTTP/1.1 or HTTP/2, whichever the client speaks, on one connection.
-async fn serve_connection<U, I>(io: I, service: ProxyService<U>)
+async fn serve_connection<U, I>(io: I, service: ProxyService<U>, limits: ConnectionLimits)
 where
     U: Upstream,
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let served = Builder::new(TokioExecutor::new())
-        .serve_connection_with_upgrades(TokioIo::new(io), TowerToHyperService::new(service))
-        .await;
+    let mut builder = Builder::new(TokioExecutor::new());
+    // hyper times nothing without a timer: its own default header read
+    // timeout is dropped with a warning.
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(limits.header_read_timeout);
+    builder.http2().timer(TokioTimer::new());
+    let served = match limits.idle_timeout {
+        None => {
+            builder
+                .serve_connection_with_upgrades(TokioIo::new(io), TowerToHyperService::new(service))
+                .await
+        }
+        Some(timeout) => {
+            let activity = Arc::new(idle::Activity::default());
+            let service = idle::Tracked {
+                inner: service,
+                activity: Arc::clone(&activity),
+            };
+            let connection = builder.serve_connection_with_upgrades(
+                TokioIo::new(io),
+                TowerToHyperService::new(service),
+            );
+            tokio::pin!(connection);
+            tokio::select! {
+                served = connection.as_mut() => served,
+                () = activity.idle_for(timeout) => {
+                    // HTTP/2 gets a GOAWAY, HTTP/1.1 closes after the request
+                    // it is reading, if any.
+                    connection.as_mut().graceful_shutdown();
+                    connection.await
+                }
+            }
+        }
+    };
     if let Err(error) = served {
         tracing::debug!(%error, "connection ended");
     }

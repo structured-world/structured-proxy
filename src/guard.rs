@@ -140,15 +140,18 @@ pub(crate) struct Scope {
 
 impl Scope {
     /// Compile `config` for the guard named `what`, with `default` traffic
-    /// when the config names none.
+    /// when the config names none; `routed` are the methods the proxy's
+    /// routes answer beyond the standard ones (`custom` rules, extra routes).
     ///
     /// # Errors
     /// A scope that covers no traffic, a path glob that is relative or does
-    /// not compile, or a method that is not an HTTP method token.
+    /// not compile, `*` or a method no request can carry (see
+    /// [`scope_method`]).
     pub(crate) fn compile(
         config: Option<&ScopeConfig>,
         default: &[Traffic],
         what: &str,
+        routed: &[Method],
     ) -> Result<Arc<Self>, String> {
         let traffic = config.and_then(|c| c.traffic.as_deref()).unwrap_or(default);
         let classes = traffic.iter().fold(0, |acc, t| acc | traffic_bits(*t));
@@ -186,11 +189,7 @@ impl Scope {
             Some(
                 names
                     .iter()
-                    .map(|name| {
-                        Method::from_bytes(name.to_ascii_uppercase().as_bytes()).map_err(|_| {
-                            format!("{what}.scope.methods entry {name:?} is not a method")
-                        })
-                    })
+                    .map(|name| scope_method(name, what, classes & FALLBACK != 0, routed))
                     .collect::<Result<Vec<_>, _>>()?,
             )
         };
@@ -218,6 +217,45 @@ impl Scope {
                 .paths
                 .as_ref()
                 .is_none_or(|paths| paths.is_match(request.uri().path()))
+    }
+}
+
+/// The methods of RFC 9110 §9.3 and PATCH (RFC 5789).
+const STANDARD_METHODS: [Method; 9] = [
+    Method::GET,
+    Method::HEAD,
+    Method::POST,
+    Method::PUT,
+    Method::DELETE,
+    Method::CONNECT,
+    Method::OPTIONS,
+    Method::TRACE,
+    Method::PATCH,
+];
+
+/// One `scope.methods` entry of the guard `what`: a method some request can
+/// carry, or an error. A method no route answers would match no request and
+/// leave the guard covering nothing, unless the scope covers the fallback,
+/// whose methods are the embedder's.
+fn scope_method(
+    name: &str,
+    what: &str,
+    covers_fallback: bool,
+    routed: &[Method],
+) -> Result<Method, String> {
+    if name == "*" {
+        return Err(format!(
+            "{what}.scope.methods entry \"*\" is not a method: leave methods out to cover every one"
+        ));
+    }
+    let method = Method::from_bytes(name.to_ascii_uppercase().as_bytes())
+        .map_err(|_| format!("{what}.scope.methods entry {name:?} is not a method"))?;
+    if covers_fallback || STANDARD_METHODS.contains(&method) || routed.contains(&method) {
+        Ok(method)
+    } else {
+        Err(format!(
+            "{what}.scope.methods entry {name:?} is neither a standard method nor one a route answers"
+        ))
     }
 }
 

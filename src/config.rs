@@ -470,6 +470,27 @@ pub struct ListenConfig {
     /// TLS on the listener, mTLS with `client_ca_file`. Unset: cleartext.
     #[serde(default)]
     pub tls: Option<ListenTlsConfig>,
+    /// Seconds a connection may go without a request in flight before it is
+    /// closed (HTTP/2 gets a GOAWAY), so idle clients do not hold
+    /// `max_connections` slots. 0 keeps idle connections open. Default: 60.
+    #[serde(default = "default_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+    /// Seconds an HTTP/1.1 client has to send a request's headers. At least
+    /// 1. Default: 30.
+    #[serde(default = "default_header_read_timeout_secs")]
+    pub header_read_timeout_secs: u64,
+}
+
+fn default_idle_timeout_secs() -> u64 {
+    60
+}
+
+fn default_header_read_timeout_secs() -> u64 {
+    30
+}
+
+fn default_tls_handshake_timeout_secs() -> u64 {
+    10
 }
 
 /// TLS for the listener.
@@ -492,10 +513,15 @@ pub struct ListenTlsConfig {
     /// Unset: clients present none.
     #[serde(default)]
     pub client_ca_file: Option<PathBuf>,
-    /// Whether a client must present a certificate once `client_ca_file`
-    /// is set.
+    /// Whether a client must present a certificate; `required` when
+    /// `client_ca_file` is set and this is not. Setting it without
+    /// `client_ca_file` is an error: nothing could verify the certificate.
     #[serde(default)]
-    pub client_auth: ClientAuth,
+    pub client_auth: Option<ClientAuth>,
+    /// Seconds a client has to finish the TLS handshake. At least 1.
+    /// Default: 10.
+    #[serde(default = "default_tls_handshake_timeout_secs")]
+    pub handshake_timeout_secs: u64,
 }
 
 /// Whether a TLS client must present a certificate.
@@ -519,6 +545,8 @@ impl Default for ListenConfig {
             http: default_http_listen(),
             max_connections: None,
             tls: None,
+            idle_timeout_secs: default_idle_timeout_secs(),
+            header_read_timeout_secs: default_header_read_timeout_secs(),
         }
     }
 }
@@ -629,7 +657,9 @@ pub struct ScopeConfig {
     /// `/<package>.<Service>/<Method>`.
     #[serde(default)]
     pub paths: Vec<String>,
-    /// Methods the guard is narrowed to; empty covers every method.
+    /// Methods the guard is narrowed to; empty covers every method. Each is a
+    /// standard method or one a route answers (a `custom` rule, an extra
+    /// route); a scope covering the fallback takes any method token.
     #[serde(default)]
     pub methods: Vec<String>,
 }
@@ -680,7 +710,8 @@ pub struct ConcurrencyConfig {
     /// ends, so a stream holds its slot for its whole life. At least 1.
     pub max_in_flight: usize,
     /// The traffic the limit covers, one budget shared by all of it.
-    /// Default: `transcoded`, `endpoints` and `grpc`.
+    /// Default: `transcoded` and `grpc`; the proxy's own endpoints stay out,
+    /// so health probes answer while the proxy is saturated.
     #[serde(default)]
     pub scope: Option<ScopeConfig>,
 }

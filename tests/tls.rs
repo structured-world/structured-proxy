@@ -506,6 +506,17 @@ async fn builtin_mtls_required_refuses_a_client_without_a_valid_certificate() {
 }
 
 #[tokio::test]
+async fn a_client_ca_alone_requires_a_client_certificate() {
+    let yaml = format!(
+        "{}    client_ca_file: {TESTDATA}/client-ca.pem\n",
+        tls_yaml(None)
+    );
+    let addr = listen_builtin(&yaml).await;
+    assert!(!answered(addr, Identity::Anonymous).await);
+    assert!(answered(addr, Identity::Client).await);
+}
+
+#[tokio::test]
 async fn builtin_mtls_optional_serves_a_client_without_a_certificate() {
     let addr = listen_builtin(&tls_yaml(Some("optional"))).await;
     let (status, seen, _) = rest_me(addr, Identity::Anonymous).await;

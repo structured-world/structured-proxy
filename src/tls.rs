@@ -42,14 +42,20 @@ pub(crate) fn client_config_with(
 ///
 /// # Errors
 ///
-/// No crypto provider (see [`select_provider`]), a file that cannot be read or
-/// holds no certificate / key, or a certificate rustls refuses.
+/// `client_auth` without `client_ca_file`, no crypto provider (see
+/// [`select_provider`]), a file that cannot be read or holds no certificate /
+/// key, or a certificate rustls refuses.
 pub(crate) fn server_config(
     config: &crate::config::ListenTlsConfig,
 ) -> Result<rustls::ServerConfig, String> {
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
+    // A client policy with nothing to verify against would leave the listener
+    // accepting every client while the config reads as mTLS.
+    if config.client_auth.is_some() && config.client_ca_file.is_none() {
+        return Err("client_auth needs client_ca_file to verify the certificates against".into());
+    }
     let provider = select_provider(CryptoProvider::get_default(), builtin_provider)?;
     let certs = |path: &std::path::Path| {
         let certs = CertificateDer::pem_file_iter(path)
@@ -77,7 +83,7 @@ pub(crate) fn server_config(
             }
             let verifier =
                 rustls::server::WebPkiClientVerifier::builder_with_provider(roots.into(), provider);
-            let verifier = match config.client_auth {
+            let verifier = match config.client_auth.unwrap_or_default() {
                 crate::config::ClientAuth::Required => verifier,
                 crate::config::ClientAuth::Optional => verifier.allow_unauthenticated(),
             }

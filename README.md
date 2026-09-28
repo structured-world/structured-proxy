@@ -99,6 +99,12 @@ listen:
   # Optional: most connections served at once; past it the next one waits in
   # the listen backlog until a connection closes. Unset: no limit.
   # max_connections: 10000
+  # Seconds a connection may go without a request in flight before it is
+  # closed (HTTP/2 gets a GOAWAY), so idle clients do not hold connection
+  # slots; 0 keeps idle connections open. A stream keeps its connection.
+  idle_timeout_secs: 60
+  # Seconds an HTTP/1.1 client has to send a request's headers.
+  header_read_timeout_secs: 30
   # Optional: TLS on the listener (REST and gRPC share the port; ALPN offers
   # h2 and http/1.1). With client_ca_file, client certificates are verified
   # (mTLS) and reach an in-process tonic upstream as Request::peer_certs.
@@ -106,7 +112,8 @@ listen:
   #   cert_file: "/etc/proxy/tls.crt"      # PEM chain, leaf first
   #   key_file: "/etc/proxy/tls.key"       # PEM private key
   #   client_ca_file: "/etc/proxy/ca.crt"
-  #   client_auth: required                # or `optional`
+  #   client_auth: required                # or `optional`; needs client_ca_file
+  #   handshake_timeout_secs: 10
 
 # The gRPC service behind the proxy. Required by the standalone binary; an
 # embedder with an in-process upstream leaves it out.
@@ -190,7 +197,8 @@ maintenance:
 
 # Optional: request concurrency limit. Requests past max_in_flight get 503
 # UNAVAILABLE with `Retry-After: 1` at once; a request holds its slot until its
-# response body ends. Default scope: [transcoded, endpoints, grpc].
+# response body ends. Default scope: [transcoded, grpc], so health probes and
+# metrics still answer while the proxy is saturated.
 concurrency:
   max_in_flight: 512
   # scope: { traffic: [grpc], paths: ["/acme.v1.Orders/*"] }
@@ -420,13 +428,16 @@ scope:
 
 `paths` and `methods` narrow the guard within its traffic; `*` stays within a
 path segment and `**` spans segments. A native gRPC call's path is
-`/<package>.<Service>/<Method>`. A scope whose `traffic` is empty, a relative
-or invalid glob, or an invalid method stops the proxy at startup.
+`/<package>.<Service>/<Method>`. A method is a standard one or one a route
+answers (a `custom` rule, an extra route); a scope covering `fallback` takes
+any method. A scope whose `traffic` is empty, a relative or invalid glob, `*`
+as a method (leave `methods` out to cover every method) or a method no route
+answers stops the proxy at startup.
 
 | Guard | Configured by | Default traffic |
 |-------|---------------|-----------------|
 | maintenance | `maintenance.scope` | `transcoded`, `endpoints` |
-| concurrency limit | `concurrency.scope` | `transcoded`, `endpoints`, `grpc` |
+| concurrency limit | `concurrency.scope` | `transcoded`, `grpc` |
 | rate limits | `shield.scope` | `transcoded`, `endpoints` |
 | JWT | `auth.scope` | `transcoded`, `endpoints` |
 | ext_authz | `auth.authz.scope` | `transcoded` |
@@ -827,8 +838,13 @@ structured_proxy::serve_with(listener, proxy, options).await?;
 # }
 ```
 
-The TLS handshake runs in each connection's task with a ten-second limit, so
-a slow or stalled client holds up no one else. A client certificate the
+The TLS handshake runs in each connection's task under
+`listen.tls.handshake_timeout_secs`, so a slow or stalled client holds up no
+one else. A connection with no request in flight for `listen.idle_timeout_secs`
+is closed (HTTP/2 gets a GOAWAY, and a gRPC client reconnects when it next
+calls), so idle clients cannot keep `max_connections` slots. The same settings
+are `ServeOptions::idle_timeout`, `header_read_timeout` and
+`tls_handshake_timeout` in code. A client certificate the
 listener verified reaches a tonic handler in process as `Request::peer_certs`.
 TLS needs a rustls crypto provider: the one a crypto backend feature brings,
 or the one your process installed (see [TLS crypto](#tls-crypto)).
