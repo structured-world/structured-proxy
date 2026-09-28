@@ -2,11 +2,9 @@
 //! turned away at once rather than queued, since a queue behind a saturated
 //! upstream only adds latency to what will time out anyway.
 
-use alloc::format;
-use alloc::string::String;
-use alloc::sync::Arc;
-use core::pin::Pin;
-use core::task::{Context, Poll};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -15,7 +13,6 @@ use axum::response::Response;
 use bytes::Bytes;
 use http_body::{Frame, SizeHint};
 use pin_project_lite::pin_project;
-// no-std: an `AtomicUsize` slot counter with a drop guard (only try-acquire is used).
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::reject;

@@ -53,8 +53,6 @@ compile_error!(
      (or neither, and inject a verifier with `ProxyServer::with_token_verifier`)"
 );
 
-extern crate alloc;
-
 pub mod auth;
 pub mod config;
 mod cors;

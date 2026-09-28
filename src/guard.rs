@@ -8,19 +8,16 @@
 mod concurrency;
 mod grpc;
 
-use alloc::borrow::Cow;
-use alloc::string::String;
-use alloc::sync::Arc;
-use alloc::vec::Vec;
-use core::convert::Infallible;
-use core::task::{Context, Poll};
+use std::borrow::Cow;
+use std::convert::Infallible;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use axum::extract::{Request, State};
 use axum::middleware::{from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 use futures::future::Either;
-// no-std: a segment-wise glob matcher over `&str` (globset needs std).
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use http::{Method, StatusCode};
 use tower::util::BoxCloneSyncService;
