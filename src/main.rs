@@ -52,5 +52,38 @@ fn main() -> anyhow::Result<()> {
         "Starting structured-proxy"
     );
 
-    rt.block_on(server.serve())
+    rt.block_on(server.serve_with_shutdown(stop_requested()))
+}
+
+/// Completes on Ctrl-C, and on SIGTERM on Unix (what container runtimes and
+/// service managers send to stop a process).
+async fn stop_requested() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    () = ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot listen for SIGTERM; stopping on Ctrl-C only");
+                ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    ctrl_c().await;
+    tracing::info!("stop requested; draining connections");
+}
+
+/// Completes on Ctrl-C. A handler that cannot be installed never completes:
+/// failing to listen for the signal is no reason to stop serving.
+async fn ctrl_c() {
+    if let Err(e) = tokio::signal::ctrl_c().await {
+        tracing::warn!(error = %e, "cannot listen for Ctrl-C");
+        std::future::pending::<()>().await;
+    }
 }

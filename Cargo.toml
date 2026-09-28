@@ -50,7 +50,13 @@ http-body = "1"
 pin-project-lite = "0.2"
 # `serve_with`'s connections: HTTP/1.1 and HTTP/2 on one port, over TCP or
 # TLS. Already in the tree through axum and tonic.
-hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
+hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "service", "tokio"] }
+# The executor HTTP/2 connections spawn their stream tasks on: a
+# `TaskTracker` a shutdown waits on, and a `CancellationToken` that ends
+# them (0.7.16: `run_until_cancelled` checks the token first). Both already
+# in the tree through hyper-util and tonic.
+hyper = "1"
+tokio-util = { version = "0.7.16", features = ["rt"] }
 
 # gRPC client (to upstream service). `tls-connect-info` gives a rustls server
 # stream the connection record (client certificates) a tonic handler reads, so
@@ -180,6 +186,9 @@ tower = { version = "0.5", features = ["util", "limit"] }
 http-body-util = "0.1"
 # `hyper::upgrade::on`: a fallback that upgrades its connection (src/serve/tests.rs).
 hyper = "1"
+# A raw HTTP/2 client that sees the GOAWAY of a graceful shutdown
+# (tests/shutdown.rs); already in the tree through hyper.
+h2 = "0.4"
 # Trailer frames for the hand-written upstream response in
 # tests/upstream_controls.rs (tonic's server API cannot set success trailers).
 http-body = "1"

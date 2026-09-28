@@ -28,6 +28,7 @@ fn embedded_config_is_constructible() {
             tls: None,
             idle_timeout_secs: 60,
             header_read_timeout_secs: 30,
+            drain_timeout_secs: 25,
         },
         service: ServiceConfig {
             name: "embedded-test".into(),

@@ -207,7 +207,10 @@ async fn a_lookup_during_a_refresh_waits_for_its_keys() {
     // refresh is in flight when a second lookup arrives: the second must not
     // answer from the aged set in the meantime.
     let (endpoint, uri) = endpoint().await;
-    let interval = Duration::from_millis(50);
+    // The second lookup checks the throttle only once the held refresh ends,
+    // against when that refresh started. The interval must outlast that on a
+    // loaded machine, or the second lookup may rightly refresh a third time.
+    let interval = Duration::from_millis(500);
     let cache = Arc::new(
         JwksCache::new(uri)
             .unwrap()
