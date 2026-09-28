@@ -399,6 +399,75 @@ async fn the_auth_decider_scoped_to_grpc_gates_native_calls_by_the_client_addres
     let (status, body, _) = http1_get(addr, "/v1/echo/rest").await;
     assert_eq!(status, 200, "{body}");
 }
+
+// --- gRPC-Web translation ------------------------------------------------------------
+
+async fn binary_grpc_web_is_translated_for_an_upstream_that_speaks_only_grpc() {
+    // The upstream has no gRPC-Web layer; the proxy converts the call, over
+    // HTTP/1.1 here, to gRPC and the answer back.
+    let app = translating_proxy(UPSTREAM, "").await;
+    let (content_type, body) =
+        grpc_web_echo_via(app, "application/grpc-web+proto", request_frame("web")).await;
+    assert_eq!(content_type, "application/grpc-web+proto");
+    assert_eq!(seen_name(&body), "web");
+}
+
+async fn text_grpc_web_is_translated_for_an_upstream_that_speaks_only_grpc() {
+    use base64::Engine as _;
+    let engine = base64::engine::general_purpose::STANDARD;
+    let app = translating_proxy(UPSTREAM, "").await;
+    let (content_type, body) = grpc_web_echo_via(
+        app,
+        "application/grpc-web-text+proto",
+        engine.encode(request_frame("text")).into_bytes(),
+    )
+    .await;
+    assert_eq!(content_type, "application/grpc-web-text+proto");
+    let decoded: Vec<u8> = body
+        .chunks(4)
+        .flat_map(|group| engine.decode(group).unwrap())
+        .collect();
+    assert_eq!(seen_name(&decoded), "text");
+}
+
+async fn a_guard_rejects_a_translated_call_in_grpc_web() {
+    let yaml = "maintenance:\n  enabled: true\n  scope:\n    traffic: [grpc]\n";
+    let request = http::Request::post("/test.v1.Edge/Echo")
+        .header("content-type", "application/grpc-web+proto")
+        .header("x-grpc-web", "1")
+        .body(Body::from(request_frame("web")))
+        .unwrap();
+    let app = translating_proxy(UPSTREAM, yaml).await;
+    let response = tower::ServiceExt::oneshot(app, request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["content-type"],
+        "application/grpc-web+proto"
+    );
+    assert_eq!(response.headers()["grpc-status"], "14");
+}
+}
+
+/// The proxy in front of the `Edge` service with no gRPC-Web layer of its
+/// own, translating gRPC-Web, with `extra_yaml`.
+async fn translating_proxy(upstream: common::Upstream, extra_yaml: &str) -> common::App {
+    let pool = pool();
+    common::app(upstream, Edge { pool: pool.clone() }, |yaml| {
+        ProxyServer::from_yaml_str(&format!("{yaml}grpc_web:\n  translate: true\n{extra_yaml}"))
+            .unwrap()
+            .with_descriptors(pool)
+    })
+    .await
+}
+
+#[test]
+fn translation_needs_the_proxys_grpc_web_cors() {
+    // The upstream cannot answer the preflight of a call it cannot read.
+    let err =
+        ProxyServer::from_yaml_str("grpc_web:\n  translate: true\ncors:\n  grpc_web: false\n")
+            .err()
+            .expect("translation without the proxy's gRPC-Web CORS is refused");
+    assert!(err.to_string().contains("grpc_web.translate"), "{err}");
 }
 
 /// Denies every request with `403`, recording the peer it saw.
@@ -804,6 +873,15 @@ fn seen_name(body: &[u8]) -> String {
 /// Send a gRPC-Web `Echo` with `body` as `content_type`; returns the response
 /// content type and body.
 async fn grpc_web_echo(content_type: &str, body: Vec<u8>) -> (String, bytes::Bytes) {
+    grpc_web_echo_via(grpc_web_proxy(), content_type, body).await
+}
+
+/// [`grpc_web_echo`] through `app`.
+async fn grpc_web_echo_via(
+    app: common::App,
+    content_type: &str,
+    body: Vec<u8>,
+) -> (String, bytes::Bytes) {
     // A gRPC-Web client names the encoding it reads back in `Accept`.
     let request = http::Request::post("/test.v1.Edge/Echo")
         .header("content-type", content_type)
@@ -811,10 +889,17 @@ async fn grpc_web_echo(content_type: &str, body: Vec<u8>) -> (String, bytes::Byt
         .header("x-grpc-web", "1")
         .body(Body::from(body))
         .unwrap();
-    let response = tower::ServiceExt::oneshot(grpc_web_proxy(), request)
-        .await
-        .unwrap();
+    let response = tower::ServiceExt::oneshot(app, request).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    // A trailers-only answer is a failed call, whatever its HTTP status.
+    assert!(
+        response
+            .headers()
+            .get("grpc-status")
+            .is_none_or(|status| status == "0"),
+        "{:?}",
+        response.headers()
+    );
     let content_type = response.headers()["content-type"]
         .to_str()
         .unwrap()

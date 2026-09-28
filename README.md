@@ -33,7 +33,8 @@ tonic services.
 
 **Edge**
 
-- REST and native gRPC (and gRPC-Web) on one port, HTTP/1.1 and HTTP/2
+- REST and native gRPC on one port, HTTP/1.1 and HTTP/2; gRPC-Web passed
+  through, or translated to gRPC for an upstream that speaks only gRPC
 - Built-in TLS and mTLS, and a cap on open connections; or your own TLS, with
   the client's address and certificate reaching the upstream
 - Guards you scope to the traffic they cover (transcoded calls, the proxy's
@@ -138,6 +139,12 @@ cors:
   # their preflights. Turn off only when the upstream sets CORS on gRPC-Web
   # itself: its preflights then reach the upstream too.
   grpc_web: true
+
+# Optional: convert gRPC-Web calls to gRPC for an upstream that speaks only
+# gRPC (binary and text gRPC-Web, over HTTP/1.1 too). Off: gRPC-Web passes
+# through for the upstream to answer. Needs cors.grpc_web.
+grpc_web:
+  translate: false
 
 # Optional: path aliases (rewrite before routing)
 aliases:
@@ -837,7 +844,10 @@ keeps its own CORS and tracing.
 gRPC-Web calls pass through as they are, so the upstream answers them: wrap
 your services in tonic-web's layer
 (`tower::ServiceBuilder::new().layer(tonic_web::GrpcWebLayer::new()).service(grpc)`)
-for binary and text gRPC-Web alike.
+for binary and text gRPC-Web alike. For an upstream that speaks only gRPC,
+set `grpc_web.translate: true` and the proxy converts gRPC-Web calls to gRPC
+and the answers back; that needs `cors.grpc_web`, since such an upstream
+cannot answer a browser's preflight.
 
 - Browsers get the proxy's CORS policy on these calls, the same one their
   preflight got (`cors.grpc_web`, on by default). `grpc-status`,

@@ -89,6 +89,23 @@ pub struct ProxyConfig {
     /// Request concurrency limit.
     #[serde(default)]
     pub concurrency: Option<ConcurrencyConfig>,
+
+    /// How gRPC-Web calls reach the upstream.
+    #[serde(default)]
+    pub grpc_web: GrpcWebConfig,
+}
+
+/// How gRPC-Web calls reach the upstream.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrpcWebConfig {
+    /// Translate gRPC-Web (binary and text, over HTTP/1.1 too) to gRPC for an
+    /// upstream that speaks only gRPC. Off: gRPC-Web passes through, for an
+    /// upstream that translates it itself. Needs the proxy's CORS policy on
+    /// gRPC-Web (`cors.grpc_web`), since the upstream then cannot answer a
+    /// browser's preflight.
+    #[serde(default)]
+    pub translate: bool,
 }
 
 fn default_forwarded_headers() -> Vec<String> {
@@ -235,6 +252,7 @@ pub(crate) const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "response_headers",
     "runtime",
     "concurrency",
+    "grpc_web",
 ];
 
 /// Every `streaming:` key: the [`StreamingConfig`] fields plus the ones
@@ -1243,6 +1261,12 @@ impl ProxyConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.streaming.sse_keep_alive_secs == 0 {
             anyhow::bail!("streaming.sse_keep_alive_secs must be greater than 0");
+        }
+        if self.grpc_web.translate && !self.cors.grpc_web {
+            anyhow::bail!(
+                "grpc_web.translate needs cors.grpc_web: an upstream that speaks only \
+                 gRPC cannot answer a browser's preflight for a gRPC-Web call"
+            );
         }
         self.validate_edge_paths()?;
         Ok(())

@@ -499,6 +499,7 @@ fn known_top_level_keys_cover_every_proxy_config_field() {
         forwarded_headers: _,
         streaming: _,
         concurrency: _,
+        grpc_web: _,
     } = config;
     for key in [
         "upstream",
@@ -522,10 +523,11 @@ fn known_top_level_keys_cover_every_proxy_config_field() {
         "response_headers",
         "runtime",
         "concurrency",
+        "grpc_web",
     ] {
         assert!(KNOWN_TOP_LEVEL_KEYS.contains(&key), "{key}");
     }
-    assert_eq!(KNOWN_TOP_LEVEL_KEYS.len(), 21);
+    assert_eq!(KNOWN_TOP_LEVEL_KEYS.len(), 22);
 }
 
 #[test]

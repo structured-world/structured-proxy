@@ -60,6 +60,8 @@ hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
 tonic = { version = "0.14", features = ["tls-connect-info"] }
 tokio-rustls = { version = "0.26", default-features = false }
 tonic-health = "0.14"
+# `grpc_web.translate`: gRPC-Web to gRPC for an upstream that speaks only gRPC.
+tonic-web = "0.14"
 # Canonical google.rpc.Status / error_details descriptors (FILE_DESCRIPTOR_SET)
 # and the Status message used to decode `grpc-status-details-bin`, so REST error
 # bodies can render typed details even when the product descriptors do not
@@ -184,12 +186,6 @@ http-body = "1"
 # features would pull in aws-lc.
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
 rustls-rustcrypto = "0.0.2-alpha"
-# The embedder-owned TLS server of tests/tls.rs (HTTP/1.1 and HTTP/2 on one
-# connection type), and the TLS stream a tonic client dials through.
-hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
-# An upstream that speaks gRPC-Web, the way an embedder gives it that
-# protocol (tests/edge.rs).
-tonic-web = "0.14"
 # benches/jwt_verify.rs. Plots and rayon are left out: numbers are enough.
 criterion = { version = "0.8", default-features = false, features = ["async_tokio", "cargo_bench_support"] }
 # The embedding-hooks integration test (tests/hooks.rs) writes hook impls using

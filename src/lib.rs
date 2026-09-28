@@ -505,7 +505,13 @@ impl ProxyServer {
         // The routes answer a browser's preflight for gRPC-Web too, so its
         // call carries the same policy unless the upstream sets its own.
         let grpc_web_cors = self.config.cors.grpc_web.then_some(cors);
-        Ok(ProxyService::new(upstream, routes, grpc_web_cors, guards))
+        Ok(ProxyService::new(
+            upstream,
+            routes,
+            grpc_web_cors,
+            guards,
+            self.config.grpc_web.translate,
+        ))
     }
 
     /// Build the axum router with all endpoints, calling `upstream`, the CORS

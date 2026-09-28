@@ -48,6 +48,7 @@ fn embedded_config_is_constructible() {
         forwarded_headers: vec!["authorization".into()],
         streaming: Default::default(),
         concurrency: None,
+        grpc_web: Default::default(),
     };
     // The server accepts a programmatically-built config (the embedded path).
     let _server = ProxyServer::from_config(config);
