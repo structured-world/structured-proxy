@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.0.0](https://github.com/structured-world/structured-proxy/compare/v6.0.0...v7.0.0) - 2026-09-28
+
+### Added
+
+- *(serve)* [**breaking**] graceful shutdown with a bounded drain ([#124](https://github.com/structured-world/structured-proxy/pull/124))
+
 ## [6.0.0](https://github.com/structured-world/structured-proxy/compare/v5.0.0...v6.0.0) - 2026-09-28
 
 ### Added
