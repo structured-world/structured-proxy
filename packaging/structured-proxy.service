@@ -19,10 +19,10 @@ Environment=RUST_LOG=info
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
-# On SIGTERM the proxy drains for up to listen.drain_timeout_secs (30 by
-# default), then exits; keep this a few seconds above it, so systemd does not
-# kill calls the drain would still finish.
-TimeoutStopSec=35
+# On SIGTERM the proxy drains for up to listen.drain_timeout_secs (25 by
+# default), then exits; keep this above it, so systemd does not kill calls the
+# drain would still finish.
+TimeoutStopSec=30
 StandardOutput=journal
 StandardError=journal
 

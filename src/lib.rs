@@ -53,6 +53,11 @@ compile_error!(
      (or neither, and inject a verifier with `ProxyServer::with_token_verifier`)"
 );
 
+/// The README's Rust examples, compiled as doc tests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+
 pub mod auth;
 pub mod config;
 mod cors;

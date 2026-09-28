@@ -55,7 +55,9 @@ impl Default for ServeOptions {
             idle_timeout: Some(Duration::from_secs(60)),
             header_read_timeout: Duration::from_secs(30),
             tls_handshake_timeout: Duration::from_secs(10),
-            drain_timeout: Some(Duration::from_secs(30)),
+            // Below the 30 s a Kubernetes pod gets after SIGTERM by default,
+            // so the drain ends before the kill.
+            drain_timeout: Some(Duration::from_secs(25)),
         }
     }
 }
@@ -63,7 +65,7 @@ impl Default for ServeOptions {
 impl ServeOptions {
     /// Cleartext, with no limit on connections; a connection idle for 60 s is
     /// closed, a client gets 30 s to send the headers of an HTTP/1.1 request
-    /// and 10 s to finish a TLS handshake, and a shutdown waits at most 30 s
+    /// and 10 s to finish a TLS handshake, and a shutdown waits at most 25 s
     /// for open connections.
     pub fn new() -> Self {
         Self::default()

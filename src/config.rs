@@ -481,13 +481,13 @@ pub struct ListenConfig {
     pub header_read_timeout_secs: u64,
     /// Seconds a graceful shutdown waits for open connections to finish what
     /// they serve; the ones still open after it are closed. 0 waits for all.
-    /// Default: 30.
+    /// Default: 25, below the 30 s grace period Kubernetes gives by default.
     #[serde(default = "default_drain_timeout_secs")]
     pub drain_timeout_secs: u64,
 }
 
 fn default_drain_timeout_secs() -> u64 {
-    30
+    25
 }
 
 fn default_idle_timeout_secs() -> u64 {

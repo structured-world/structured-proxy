@@ -113,7 +113,7 @@ listen:
   # Seconds a shutdown (SIGTERM, Ctrl-C) waits for requests and streams in
   # flight to finish; the connections still open after it are closed.
   # 0 waits for all of them.
-  drain_timeout_secs: 30
+  drain_timeout_secs: 25
   # Optional: TLS on the listener (REST and gRPC share the port; ALPN offers
   # h2 and http/1.1). With client_ca_file, client certificates are verified
   # (mTLS) and reach an in-process tonic upstream as Request::peer_certs.
@@ -736,7 +736,7 @@ returns `application/jwk-set+json` (RFC 7517 §8.5).
 command-line dependencies come with the `cli` feature. The library runs on
 your tokio runtime and logs through `tracing` to the subscriber you set up.
 
-```rust
+```rust,no_run
 use std::path::Path;
 use structured_proxy::ProxyServer;
 
@@ -904,12 +904,13 @@ Once the future completes:
   HTTP/1.1 connections close after the response in progress;
 - calls and streams in flight run to their end, and `serve_with_shutdown`
   returns once every connection has closed;
-- after `drain_timeout` (`listen.drain_timeout_secs`, 30 s by default; `None`
-  or 0 waits without a bound) the connections still open are closed, so the
-  shutdown fits the grace period of your orchestrator.
+- after `drain_timeout` (`listen.drain_timeout_secs`; `None` or 0 waits
+  without a bound) the connections still open are closed.
 
-Past that grace period (30 s from SIGTERM in Kubernetes by default) the
-process is killed along with its calls. A connection a fallback upgraded (a
+Past its grace period an orchestrator kills the process along with its calls,
+so keep the drain below it. The default of 25 s fits the 30 s Kubernetes gives
+a pod after SIGTERM; with a longer `terminationGracePeriodSeconds` the drain
+can grow with it. A connection a fallback upgraded (a
 WebSocket) belongs to the fallback's task and closes when that task lets it
 go.
 
@@ -996,7 +997,7 @@ a long server stream short.
 `ProxyServer::router` returns the proxy's HTTP routes in front of the
 configured upstream address, to serve or to merge into your own axum `Router`:
 
-```rust
+```rust,no_run
 use std::path::Path;
 use structured_proxy::{config::ProxyConfig, ProxyServer};
 
@@ -1088,6 +1089,7 @@ single-backend while `jsonwebtoken` sees two. Settle it once at the top of
 
 ```rust
 # fn main() {
+# #[cfg(feature = "builtin_jwt")]
 structured_proxy::install_default_crypto_provider();
 # }
 ```
@@ -1206,7 +1208,7 @@ verifies certificates with its own patched `rustls-webpki`.
 At startup the proxy reads your proto descriptors and turns every
 `google.api.http` rule into a REST route. Each request is then sorted once:
 
-```
+```text
      REST, gRPC and gRPC-Web clients (HTTP/1.1, HTTP/2, optional TLS)
                                   │
                    ┌──────────────▼──────────────┐

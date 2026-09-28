@@ -205,7 +205,7 @@ fn connection_timeouts_come_from_the_config() {
     let defaults = crate::ProxyServer::new().serve_options().unwrap();
     assert_eq!(defaults.idle_timeout, Some(Duration::from_secs(60)));
     assert_eq!(defaults.header_read_timeout, Duration::from_secs(30));
-    assert_eq!(defaults.drain_timeout, Some(Duration::from_secs(30)));
+    assert_eq!(defaults.drain_timeout, Some(Duration::from_secs(25)));
     let set = crate::ProxyServer::from_yaml_str("listen:\n  drain_timeout_secs: 7\n")
         .unwrap()
         .serve_options()

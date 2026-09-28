@@ -23,8 +23,8 @@ listen:
   http: "0.0.0.0:8080"
   # Seconds a stop (systemctl stop, SIGTERM) waits for calls in flight to
   # finish before closing their connections. Keep it below TimeoutStopSec of
-  # the unit (35).
-  # drain_timeout_secs: 30
+  # the unit (30).
+  # drain_timeout_secs: 25
 
 # Upstream gRPC service this proxy transcodes to. REQUIRED — replace with your
 # service address.
