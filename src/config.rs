@@ -219,15 +219,15 @@ pub struct ForwardConfig {
     pub x_forwarded_for: XForwardedFor,
     /// The header the resolved address is written to, replacing any value
     /// the request carried; absent when no address resolved. `None` (`null`
-    /// in YAML) writes none. A gRPC metadata key other than
-    /// `x-forwarded-for` and `forwarded`. Default: `x-real-ip`.
+    /// in YAML) writes none. A text gRPC metadata key (not ending in `-bin`)
+    /// other than `x-forwarded-for` and `forwarded`. Default: `x-real-ip`.
     #[serde(default = "default_client_header")]
     pub client_header: Option<String>,
     /// A header receiving the `X-Forwarded-For` field lines exactly as the
     /// request carried them, before any change: for logs and audits only,
-    /// since nothing in it is verified. Off by default. A gRPC metadata key
-    /// other than `x-forwarded-for`, `x-real-ip`, `forwarded` and
-    /// `client_header`, e.g. `x-original-forwarded-for`.
+    /// since nothing in it is verified. Off by default. A text gRPC metadata
+    /// key (not ending in `-bin`) other than `x-forwarded-for`, `x-real-ip`,
+    /// `forwarded` and `client_header`, e.g. `x-original-forwarded-for`.
     #[serde(default)]
     pub audit_header: Option<String>,
 }

@@ -540,8 +540,10 @@ fn appended_chain(headers: &HeaderMap, peer: Option<SocketAddr>) -> Option<Heade
     )
 }
 
-/// A `forward` header name: a gRPC metadata key, so a transcoded call can
-/// carry it, other than the headers in `taken`.
+/// A `forward` header name: a text gRPC metadata key, so a transcoded call can
+/// carry it, other than the headers in `taken`. A `-bin` key would need base64
+/// values (gRPC PROTOCOL-HTTP2, "Custom-Metadata"), and an address or an
+/// address list is text.
 fn forward_header(setting: &str, name: &str, taken: &[&str]) -> Result<HeaderName, String> {
     let header = HeaderName::from_bytes(name.as_bytes())
         .ok()
@@ -549,6 +551,12 @@ fn forward_header(setting: &str, name: &str, taken: &[&str]) -> Result<HeaderNam
         .ok_or_else(|| {
             format!("forward.{setting} {name:?} is not a gRPC metadata key (letters, digits, '_', '-' and '.')")
         })?;
+    if header.as_str().ends_with("-bin") {
+        return Err(format!(
+            "forward.{setting} {name:?} is a binary metadata key, whose values must be base64; \
+             the address is text"
+        ));
+    }
     if taken.contains(&header.as_str()) {
         return Err(format!(
             "forward.{setting} {name:?} names a header the forwarding already writes"

@@ -654,11 +654,15 @@ fn the_audit_header_holds_what_arrived_and_nothing_the_client_named_it() {
 
 #[test]
 fn a_forward_header_must_be_a_new_grpc_key() {
-    let cases: [(Option<&str>, Option<&str>, &str); 6] = [
+    let cases: [(Option<&str>, Option<&str>, &str); 8] = [
         (Some("x-forwarded-for"), None, "client_header"),
         (Some("Forwarded"), None, "client_header"),
         (Some("not a header"), None, "client_header"),
         (Some("x+ip"), None, "client_header"),
+        // A binary metadata key: the values are text, not base64, so every
+        // transcoded call would be refused.
+        (Some("client-ip-bin"), None, "client_header"),
+        (None, Some("x-original-forwarded-for-bin"), "audit_header"),
         (Some("x-real-ip"), Some("X-Real-IP"), "audit_header"),
         (
             Some("cf-connecting-ip"),

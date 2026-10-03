@@ -48,11 +48,16 @@ pub struct RequestParts<'a> {
     pub path: &'a str,
     /// Raw query string, if any (without the leading `?`).
     pub query: Option<&'a str>,
-    /// Request headers. Their `X-Forwarded-For` and `X-Real-IP` hold the
-    /// resolved client address and nothing the client sent.
+    /// Request headers, with the forwarding headers as the
+    /// `client_address.forward` policy wrote them for the upstream. With the
+    /// default policy they hold only verified data; with `append` or
+    /// `preserve`, `X-Forwarded-For` (and with `preserve`, `X-Real-IP`) still
+    /// carries what the client sent. Decide on [`client`](Self::client), never
+    /// on these headers.
     pub headers: &'a HeaderMap,
     /// The client address the proxy resolved, with the connection's peer
-    /// (the client, or the fronting proxy).
+    /// (the client, or the fronting proxy): the one to authorize on, whatever
+    /// the forwarding policy.
     pub client: &'a ClientAddress,
 }
 
@@ -205,7 +210,9 @@ pub struct RouteRequest {
     pub method: Method,
     /// Full request URI (path + query).
     pub uri: http::Uri,
-    /// Request headers.
+    /// Request headers, with the forwarding headers as the
+    /// `client_address.forward` policy wrote them (see
+    /// [`RequestParts::headers`]). Decide on [`client`](Self::client).
     pub headers: HeaderMap,
     /// Request body bytes.
     pub body: Bytes,
