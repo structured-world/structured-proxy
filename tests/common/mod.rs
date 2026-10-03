@@ -63,7 +63,7 @@ pub async fn serve<S: TestService>(service: S) -> String {
 }
 
 /// Where the upstream of a proxy under test runs.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Upstream {
     /// A tonic server on a local port, reached over HTTP/2.
     Remote,

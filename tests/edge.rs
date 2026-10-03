@@ -600,7 +600,7 @@ impl structured_proxy::hooks::AuthDecider for PeerDecider {
         &self,
         req: &structured_proxy::hooks::RequestParts<'_>,
     ) -> structured_proxy::hooks::Decision {
-        *self.peer.lock().unwrap() = Some(req.peer);
+        *self.peer.lock().unwrap() = req.client.peer();
         structured_proxy::hooks::Decision::Deny {
             status: StatusCode::FORBIDDEN,
             body: bytes::Bytes::from_static(br#"{"error":"denied"}"#),

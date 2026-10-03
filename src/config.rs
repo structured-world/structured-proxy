@@ -8,12 +8,25 @@ use std::path::PathBuf;
 
 /// Top-level proxy configuration (loaded from YAML).
 ///
-/// This and the wiring structs below (`UpstreamConfig`, `ListenConfig`,
-/// `ServiceConfig`, `DescriptorSource`) are intentionally NOT
-/// `#[non_exhaustive]`: embedding consumers build them programmatically with
-/// runtime values. The leaf auth/shield/oidc config structs are
-/// `#[non_exhaustive]` instead, since those are deserialized, not hand-built.
+/// Every config type is `#[non_exhaustive]`, so a new setting is not a
+/// breaking change. Build one in code from its `Default` (or its constructor
+/// when a field has no default) and set the fields you need, or use the
+/// `ProxyServer::with_*` builder methods.
+///
+/// # Examples
+///
+/// ```
+/// use structured_proxy::config::{DescriptorSource, ProxyConfig, UpstreamConfig};
+///
+/// static DESCRIPTORS: &[u8] = &[];
+/// let mut config = ProxyConfig::default();
+/// config.upstream = Some(UpstreamConfig::new("http://127.0.0.1:50051"));
+/// config.descriptors = vec![DescriptorSource::Embedded { bytes: DESCRIPTORS }];
+/// config.service.name = "embedded".into();
+/// config.validate().unwrap();
+/// ```
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct ProxyConfig {
     /// The remote gRPC upstream. Required by the standalone proxy and by
     /// [`ProxyServer::upstream`](crate::ProxyServer::upstream); an embedder
@@ -78,7 +91,10 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub metrics_classes: Vec<MetricsClassConfig>,
 
-    /// Headers to forward from HTTP to gRPC metadata.
+    /// Headers to forward from HTTP to gRPC metadata. `x-forwarded-for`,
+    /// `x-real-ip`, `forwarded` and the headers named in
+    /// `client_address.forward` carry what that forwarding policy wrote,
+    /// listed or not.
     #[serde(default = "default_forwarded_headers")]
     pub forwarded_headers: Vec<String>,
 
@@ -97,6 +113,11 @@ pub struct ProxyConfig {
     /// Which annotated RPCs are transcoded.
     #[serde(default)]
     pub transcode: TranscodeConfig,
+
+    /// How the client's address is resolved: the proxies trusted to report
+    /// it, and the header they report it in.
+    #[serde(default)]
+    pub client_address: ClientAddressConfig,
 }
 
 impl Default for ProxyConfig {
@@ -124,8 +145,147 @@ impl Default for ProxyConfig {
             concurrency: None,
             grpc_web: GrpcWebConfig::default(),
             transcode: TranscodeConfig::default(),
+            client_address: ClientAddressConfig::default(),
         }
     }
+}
+
+/// How the client's address is resolved, for every consumer of it at once
+/// (the rate limits, the hooks, the fallback, the upstream), and what the
+/// upstream receives of it.
+///
+/// ```yaml
+/// client_address:
+///   trusted_proxies: ["10.0.0.0/8", "192.0.2.10"]
+///   header: x_forwarded_for
+///   required: false
+///   forward:
+///     x_forwarded_for: verified
+///     client_header: x-real-ip
+///     audit_header: null
+/// ```
+///
+/// The connection's peer is the client unless it is a trusted proxy; only
+/// then is `header` read, so an address a client asserts itself never
+/// counts. The defaults trust no proxy: the right setting for a proxy that
+/// faces its clients directly. Resolution and [`forward`](Self::forward) are
+/// independent: the rate limits and the hooks always use the resolved
+/// address, whatever is forwarded.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct ClientAddressConfig {
+    /// Proxies trusted to report the client's address: CIDR ranges, or bare
+    /// addresses for one host. An IPv4-mapped IPv6 peer (`::ffff:10.0.0.1`)
+    /// matches its IPv4 range. An entry that is neither stops the proxy at
+    /// startup.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
+    /// The header trusted proxies report the client's address in.
+    #[serde(default)]
+    pub header: ForwardingHeader,
+    /// Refuse a request whose client address cannot be resolved: no
+    /// connection information (`INTERNAL`, 500), or a trusted proxy's report
+    /// that cannot be read (`INVALID_ARGUMENT`, 400). Off: such a request
+    /// goes on with no address.
+    #[serde(default)]
+    pub required: bool,
+    /// What the upstream receives of the client's address.
+    #[serde(default)]
+    pub forward: ForwardConfig,
+}
+
+/// What the upstream (and the fallback) receives of the client's address.
+///
+/// The defaults give an upstream nothing a client can forge: a verified
+/// `X-Forwarded-For` whose first element is the client, and the address in
+/// `X-Real-IP`. Every header named here is written by the proxy alone; a
+/// guard (JWT claim headers, ext_authz, the auth decider) cannot set it.
+///
+/// | Behind | Setting |
+/// |---|---|
+/// | nginx, `$proxy_add_x_forwarded_for` and `X-Real-IP` | `x_forwarded_for: append`, `client_header: x-real-ip` |
+/// | Envoy, `use_remote_address` | `append`, `client_header: x-envoy-external-address` |
+/// | HAProxy, `option forwardfor` | `append` |
+/// | AWS ALB `append` / `preserve` / `remove` | the mode of the same name |
+/// | Cloudflare | `append`, `client_header: cf-connecting-ip` |
+/// | Traefik, Caddy | `verified` (stricter), or `append` |
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct ForwardConfig {
+    /// What `X-Forwarded-For` carries upstream.
+    #[serde(default)]
+    pub x_forwarded_for: XForwardedFor,
+    /// The header the resolved address is written to, replacing any value
+    /// the request carried; absent when no address resolved. `None` (`null`
+    /// in YAML) writes none. A text gRPC metadata key (not ending in `-bin`)
+    /// other than `x-forwarded-for` and `forwarded`. Default: `x-real-ip`.
+    #[serde(default = "default_client_header")]
+    pub client_header: Option<String>,
+    /// A header receiving the `X-Forwarded-For` field lines exactly as the
+    /// request carried them, before any change: for logs and audits only,
+    /// since nothing in it is verified. Off by default. A text gRPC metadata
+    /// key (not ending in `-bin`) other than `x-forwarded-for`, `x-real-ip`,
+    /// `forwarded` and `client_header`, e.g. `x-original-forwarded-for`.
+    #[serde(default)]
+    pub audit_header: Option<String>,
+}
+
+fn default_client_header() -> Option<String> {
+    Some("x-real-ip".into())
+}
+
+impl Default for ForwardConfig {
+    fn default() -> Self {
+        Self {
+            x_forwarded_for: XForwardedFor::default(),
+            client_header: default_client_header(),
+            audit_header: None,
+        }
+    }
+}
+
+/// What `X-Forwarded-For` carries upstream. `X-Real-IP` and `Forwarded`
+/// (RFC 7239) from the request reach the upstream only with `preserve`; in
+/// every other mode they are removed, since they would contradict it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum XForwardedFor {
+    /// The verified part of the chain: the resolved client, the trusted
+    /// proxies between it and this proxy, then this proxy's peer
+    /// (`203.0.113.7, 10.0.0.2, 10.0.0.1`). Whatever the client wrote left of
+    /// its own address is dropped, so the first element is always the
+    /// client, and an upstream walking the list from the right reaches the
+    /// same client. Absent when no address resolved.
+    #[default]
+    Verified,
+    /// The resolved address alone; absent when none resolved.
+    Resolved,
+    /// The request's list as it arrived, then this proxy's peer, as nginx,
+    /// Envoy, HAProxy and most load balancers append. Its first element is
+    /// whatever the client wrote.
+    Append,
+    /// The request's `X-Forwarded-For`, `X-Real-IP` and `Forwarded` as they
+    /// arrived, nothing added. Its first element is whatever the client
+    /// wrote.
+    Preserve,
+    /// No `X-Forwarded-For`.
+    Remove,
+}
+
+/// The header trusted proxies report the client's address in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ForwardingHeader {
+    /// `X-Forwarded-For`, every field line in order, read right to left
+    /// through the trusted proxies to the first address outside them.
+    #[default]
+    XForwardedFor,
+    /// `X-Real-IP`: one address, the trusted proxy's own peer.
+    XRealIp,
 }
 
 /// Which annotated RPCs are transcoded.
@@ -136,6 +296,7 @@ impl Default for ProxyConfig {
 /// ```
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct TranscodeConfig {
     /// Services (`package.Service`) and single methods
     /// (`package.Service/Method`) whose `google.api.http` rules become REST
@@ -171,6 +332,7 @@ pub fn from_yaml<T: serde::de::DeserializeOwned>(yaml: &str) -> anyhow::Result<T
 /// How gRPC-Web calls reach the upstream.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct GrpcWebConfig {
     /// Translate gRPC-Web (binary and text, over HTTP/1.1 too) to gRPC for an
     /// upstream that speaks only gRPC. Off: gRPC-Web passes through, for an
@@ -186,9 +348,7 @@ fn default_forwarded_headers() -> Vec<String> {
         "authorization".into(),
         "dpop".into(),
         "x-request-id".into(),
-        "x-forwarded-for".into(),
         "x-forwarded-proto".into(),
-        "x-real-ip".into(),
         "accept-language".into(),
         "user-agent".into(),
         "idempotency-key".into(),
@@ -201,6 +361,7 @@ fn default_forwarded_headers() -> Vec<String> {
 /// Events when the client sends `Accept: text/event-stream`. The keep-alive
 /// interval applies only to the SSE path.
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct StreamingConfig {
     /// SSE keep-alive interval in seconds. Comment frames are emitted on idle
     /// streams to keep intermediaries (load balancers, nginx) from closing the
@@ -327,6 +488,7 @@ pub(crate) const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "concurrency",
     "grpc_web",
     "transcode",
+    "client_address",
 ];
 
 /// Every `streaming:` key: the [`StreamingConfig`] fields plus the ones
@@ -359,6 +521,24 @@ pub(crate) fn unknown_config_keys(yaml: &str) -> Vec<String> {
         );
     }
     unknown
+}
+
+/// The error for a config that sets `shield.trusted_proxies`, which became
+/// `client_address.trusted_proxies`: the parse error alone would name an
+/// unknown field, not where its value belongs now.
+fn moved_setting(yaml: &str) -> Option<anyhow::Error> {
+    let serde_yaml::Value::Mapping(map) = serde_yaml::from_str(yaml).ok()? else {
+        return None;
+    };
+    let serde_yaml::Value::Mapping(shield) = map.get("shield")? else {
+        return None;
+    };
+    shield.contains_key("trusted_proxies").then(|| {
+        anyhow::anyhow!(
+            "shield.trusted_proxies is now client_address.trusted_proxies: the client \
+             address is resolved once for the rate limits, the hooks and the upstream"
+        )
+    })
 }
 
 impl TranscodeFileConfig {
@@ -411,13 +591,24 @@ impl TranscodeFileConfig {
 
 /// Upstream gRPC service configuration.
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct UpstreamConfig {
     /// gRPC upstream address (e.g., "http://localhost:4180").
     pub default: String,
 }
 
+impl UpstreamConfig {
+    /// The upstream at `address` (e.g. `http://localhost:4180`).
+    pub fn new(address: impl Into<String>) -> Self {
+        Self {
+            default: address.into(),
+        }
+    }
+}
+
 /// Descriptor loading source.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum DescriptorSource {
     /// Pre-compiled descriptor file.
     File { file: PathBuf },
@@ -459,6 +650,7 @@ where
 /// The listener [`ProxyServer::serve`](crate::ProxyServer::serve) runs.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ListenConfig {
     /// Listen address (default: "0.0.0.0:8080").
     #[serde(default = "default_http_listen")]
@@ -513,6 +705,7 @@ fn default_tls_handshake_timeout_secs() -> u64 {
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ListenTlsConfig {
     /// The server certificate chain, PEM, leaf first.
     pub cert_file: PathBuf,
@@ -533,9 +726,24 @@ pub struct ListenTlsConfig {
     pub handshake_timeout_secs: u64,
 }
 
+impl ListenTlsConfig {
+    /// TLS with the certificate chain and private key in these PEM files, no
+    /// client certificates, and the default handshake timeout.
+    pub fn new(cert_file: impl Into<PathBuf>, key_file: impl Into<PathBuf>) -> Self {
+        Self {
+            cert_file: cert_file.into(),
+            key_file: key_file.into(),
+            client_ca_file: None,
+            client_auth: None,
+            handshake_timeout_secs: default_tls_handshake_timeout_secs(),
+        }
+    }
+}
+
 /// Whether a TLS client must present a certificate.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ClientAuth {
     /// A client without a valid certificate is refused in the handshake.
     #[default]
@@ -563,6 +771,7 @@ impl Default for ListenConfig {
 
 /// Service identity.
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct ServiceConfig {
     /// Service name (appears in /health response and metrics namespace).
     #[serde(default = "default_service_name")]
@@ -587,6 +796,17 @@ impl Default for ServiceConfig {
 pub struct AliasConfig {
     pub from: String,
     pub to: String,
+}
+
+impl AliasConfig {
+    /// Serve the routes under `to` at `from` as well, e.g. `/oauth2/{path}`
+    /// for `/v1/oauth2/{path}`.
+    pub fn new(from: impl Into<String>, to: impl Into<String>) -> Self {
+        Self {
+            from: from.into(),
+            to: to.into(),
+        }
+    }
 }
 
 /// OpenAPI generation config.
@@ -658,6 +878,7 @@ pub struct AuthConfig {
 /// method of it.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ScopeConfig {
     /// The classes of traffic covered; `all` names every class.
     #[serde(default)]
@@ -697,6 +918,7 @@ impl ScopeConfig {
 /// A class of traffic the proxy tells apart before any guard runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Traffic {
     /// REST calls the proxy transcodes to gRPC.
     Transcoded,
@@ -715,6 +937,7 @@ pub enum Traffic {
 /// `UNAVAILABLE` (503) at once instead of queueing.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ConcurrencyConfig {
     /// Most requests in flight at once, counted until each response body
     /// ends, so a stream holds its slot for its whole life. At least 1.
@@ -724,6 +947,23 @@ pub struct ConcurrencyConfig {
     /// so health probes answer while the proxy is saturated.
     #[serde(default)]
     pub scope: Option<ScopeConfig>,
+}
+
+impl ConcurrencyConfig {
+    /// At most `max_in_flight` requests at once, over the default traffic.
+    pub fn new(max_in_flight: usize) -> Self {
+        Self {
+            max_in_flight,
+            scope: None,
+        }
+    }
+
+    /// The same limit over the traffic `scope` names.
+    #[must_use]
+    pub fn with_scope(mut self, scope: ScopeConfig) -> Self {
+        self.scope = Some(scope);
+        self
+    }
 }
 
 fn default_auth_mode() -> String {
@@ -931,13 +1171,6 @@ pub struct ShieldConfig {
     /// each instance limits locally (fleet limit ≈ N × per-instance).
     #[serde(default)]
     pub sync: Option<SyncConfig>,
-    /// CIDR ranges of trusted reverse proxies / load balancers (e.g.
-    /// "10.0.0.0/8"). `X-Forwarded-For` / `X-Real-IP` are honored only when the
-    /// direct peer falls in one of these ranges; otherwise the peer socket
-    /// address is used as the client identity. Empty (the default) means do not
-    /// trust forwarding headers; set this behind a load balancer.
-    #[serde(default)]
-    pub trusted_proxies: Vec<String>,
     /// The traffic the rules apply to. Default: `transcoded` and `endpoints`.
     #[serde(default)]
     pub scope: Option<ScopeConfig>,
@@ -985,7 +1218,8 @@ pub struct RateRuleConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum KeySourceConfig {
-    /// Client IP (trusted-proxy `X-Forwarded-For` aware). `{ type: ip }`.
+    /// The client address the proxy resolved (see
+    /// [`ClientAddressConfig`]). `{ type: ip }`.
     #[default]
     Ip,
     /// Value of a named request header (e.g. an API key).
@@ -1363,7 +1597,10 @@ impl ProxyConfig {
     /// Useful for embedding the proxy: load a baked-in config (e.g. via
     /// `include_str!`) without touching the filesystem.
     pub fn from_yaml_str(yaml: &str) -> anyhow::Result<Self> {
-        let config: Self = serde_yaml::from_str(yaml)?;
+        let config: Self = match serde_yaml::from_str(yaml) {
+            Ok(config) => config,
+            Err(error) => return Err(moved_setting(yaml).map_or_else(|| error.into(), Into::into)),
+        };
         config.validate()?;
         Ok(config)
     }
@@ -1383,6 +1620,8 @@ impl ProxyConfig {
                  gRPC cannot answer a browser's preflight for a gRPC-Web call"
             );
         }
+        crate::client_address::Resolver::build(&self.client_address)
+            .map_err(|e| anyhow::anyhow!("invalid client_address config: {e}"))?;
         self.validate_edge_paths()?;
         Ok(())
     }

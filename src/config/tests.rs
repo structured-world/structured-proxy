@@ -241,6 +241,8 @@ shield:
       profile: "auth"
     - pattern: "/v1/**"
       key: { type: jwt_claim, claim: "sub" }
+
+client_address:
   trusted_proxies: ["10.0.0.0/8"]
 
 oidc_discovery:
@@ -283,6 +285,7 @@ forwarded_headers:
     assert_eq!(authz.timeout_ms, 200);
     assert!(!authz.failure_mode_allow);
     assert!(config.shield.is_some());
+    assert_eq!(config.client_address.trusted_proxies, ["10.0.0.0/8"]);
     assert!(config.oidc_discovery.is_some());
     assert_eq!(config.cors.origins.len(), 1);
     assert_eq!(config.metrics_classes.len(), 2);
@@ -501,6 +504,7 @@ fn known_top_level_keys_cover_every_proxy_config_field() {
         concurrency: _,
         grpc_web: _,
         transcode: _,
+        client_address: _,
     } = config;
     for key in [
         "upstream",
@@ -526,10 +530,116 @@ fn known_top_level_keys_cover_every_proxy_config_field() {
         "concurrency",
         "grpc_web",
         "transcode",
+        "client_address",
     ] {
         assert!(KNOWN_TOP_LEVEL_KEYS.contains(&key), "{key}");
     }
-    assert_eq!(KNOWN_TOP_LEVEL_KEYS.len(), 23);
+    assert_eq!(KNOWN_TOP_LEVEL_KEYS.len(), 24);
+}
+
+#[test]
+fn client_address_reads_its_section() {
+    let config = ProxyConfig::from_yaml_str(
+        "client_address:\n  trusted_proxies: [\"10.0.0.0/8\", \"192.0.2.10\"]\n  header: x_real_ip\n  required: true\n",
+    )
+    .unwrap();
+    assert_eq!(
+        config.client_address.trusted_proxies,
+        ["10.0.0.0/8", "192.0.2.10"]
+    );
+    assert_eq!(config.client_address.header, ForwardingHeader::XRealIp);
+    assert!(config.client_address.required);
+    // The defaults trust no proxy: a proxy facing its clients directly.
+    let config = ProxyConfig::from_yaml_str("").unwrap();
+    assert!(config.client_address.trusted_proxies.is_empty());
+    assert_eq!(
+        config.client_address.header,
+        ForwardingHeader::XForwardedFor
+    );
+    assert!(!config.client_address.required);
+}
+
+#[test]
+fn client_address_forward_reads_its_section() {
+    let config = ProxyConfig::from_yaml_str(
+        "client_address:\n  forward:\n    x_forwarded_for: append\n    client_header: cf-connecting-ip\n    audit_header: x-original-forwarded-for\n",
+    )
+    .unwrap();
+    let forward = &config.client_address.forward;
+    assert_eq!(forward.x_forwarded_for, XForwardedFor::Append);
+    assert_eq!(forward.client_header.as_deref(), Some("cf-connecting-ip"));
+    assert_eq!(
+        forward.audit_header.as_deref(),
+        Some("x-original-forwarded-for")
+    );
+    // `null` turns the client header off.
+    let config =
+        ProxyConfig::from_yaml_str("client_address:\n  forward:\n    client_header: null\n")
+            .unwrap();
+    assert_eq!(config.client_address.forward.client_header, None);
+    // The defaults forward nothing a client can forge, and audit nothing.
+    let forward = ProxyConfig::from_yaml_str("")
+        .unwrap()
+        .client_address
+        .forward;
+    assert_eq!(forward.x_forwarded_for, XForwardedFor::Verified);
+    assert_eq!(forward.client_header.as_deref(), Some("x-real-ip"));
+    assert_eq!(forward.audit_header, None);
+    for mode in ["verified", "resolved", "append", "preserve", "remove"] {
+        let yaml = format!("client_address:\n  forward:\n    x_forwarded_for: {mode}\n");
+        assert!(ProxyConfig::from_yaml_str(&yaml).is_ok(), "{mode}");
+    }
+}
+
+#[test]
+fn an_invalid_client_address_section_fails_to_load() {
+    for yaml in [
+        // Not a range or an address.
+        "client_address:\n  trusted_proxies: [\"10.0.0.0/33\"]\n",
+        // A header the resolution does not read.
+        "client_address:\n  header: forwarded\n",
+        // A typo would leave the default in force.
+        "client_address:\n  trusted_proxy: [\"10.0.0.0/8\"]\n",
+        // A mode that does not exist, a typo inside `forward`.
+        "client_address:\n  forward:\n    x_forwarded_for: rewrite\n",
+        "client_address:\n  forward:\n    client_headers: x-real-ip\n",
+        // A client header the forwarding writes already, or no header at all.
+        "client_address:\n  forward:\n    client_header: x-forwarded-for\n",
+        "client_address:\n  forward:\n    client_header: \"not a header\"\n",
+        // An audit header that would overwrite the client header.
+        "client_address:\n  forward:\n    audit_header: x-real-ip\n",
+    ] {
+        assert!(ProxyConfig::from_yaml_str(yaml).is_err(), "{yaml}");
+    }
+}
+
+#[test]
+fn shield_trusted_proxies_names_its_new_place() {
+    // The list moved to `client_address`; the error says where, rather than
+    // only that the field is unknown.
+    let err = ProxyConfig::from_yaml_str(
+        "shield:\n  enabled: true\n  trusted_proxies: [\"10.0.0.0/8\"]\n",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("client_address.trusted_proxies"),
+        "{err}"
+    );
+    // Any other mistake keeps its own message.
+    let err = ProxyConfig::from_yaml_str("shield:\n  enabld: true\n").unwrap_err();
+    assert!(err.to_string().contains("enabld"), "{err}");
+}
+
+#[test]
+fn the_default_forwarded_headers_carry_no_client_address() {
+    // The upstream gets the resolved address in their place.
+    let config = ProxyConfig::default();
+    for owned in ["x-forwarded-for", "x-real-ip", "forwarded"] {
+        assert!(
+            !config.forwarded_headers.iter().any(|h| h == owned),
+            "{owned}"
+        );
+    }
 }
 
 #[test]

@@ -112,7 +112,7 @@ fn strip_then_insert_overrides_client_supplied_values() {
     let mut inject = HeaderMap::new();
     inject.insert("x-user", "verified".parse().unwrap());
 
-    strip_then_insert(&mut dst, &inject);
+    strip_then_insert(&mut dst, &inject, &[]);
 
     // The forged value is gone, only the verified one remains.
     let users: Vec<_> = dst.get_all("x-user").iter().collect();
@@ -120,6 +120,27 @@ fn strip_then_insert_overrides_client_supplied_values() {
     assert_eq!(dst["x-user"], "verified");
     // Unrelated client headers are untouched.
     assert_eq!(dst["x-other"], "keep");
+}
+
+#[test]
+fn strip_then_insert_leaves_the_forwarding_headers_alone() {
+    // The client-address headers and the ones the forwarding policy writes
+    // (here a custom client header) keep the proxy's values.
+    let mut dst = HeaderMap::new();
+    dst.insert("x-forwarded-for", "203.0.113.7".parse().unwrap());
+    dst.insert("cf-connecting-ip", "203.0.113.7".parse().unwrap());
+    let mut inject = HeaderMap::new();
+    inject.insert("x-forwarded-for", "198.51.100.1".parse().unwrap());
+    inject.insert("cf-connecting-ip", "198.51.100.2".parse().unwrap());
+    inject.insert("x-user", "alice".parse().unwrap());
+    strip_then_insert(
+        &mut dst,
+        &inject,
+        &[http::HeaderName::from_static("cf-connecting-ip")],
+    );
+    assert_eq!(dst["x-forwarded-for"], "203.0.113.7");
+    assert_eq!(dst["cf-connecting-ip"], "203.0.113.7");
+    assert_eq!(dst["x-user"], "alice");
 }
 
 // --- auth_decider_gate (inline gate) ------------------------------------
@@ -137,7 +158,10 @@ fn gated_app(decider: Arc<dyn AuthDecider>) -> Router {
     Router::new()
         .route("/x", get(echo))
         .layer(axum::middleware::from_fn_with_state(
-            decider,
+            Arc::new(DeciderGate {
+                decider,
+                reserved: Arc::from([]),
+            }),
             auth_decider_gate,
         ))
 }

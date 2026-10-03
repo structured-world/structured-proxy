@@ -32,9 +32,13 @@ fn config(profiles: Vec<(&str, &str, Option<u64>)>, rules: Vec<RateRuleConfig>) 
         jwt_limits: None,
         limit_service: None,
         sync: None,
-        trusted_proxies: Vec::new(),
         scope: None,
     }
+}
+
+/// A request from `ip` through no proxy.
+fn client(ip: &str) -> ClientAddress {
+    ClientAddress::from_peer(Some(std::net::SocketAddr::new(ip.parse().unwrap(), 4000)))
 }
 
 fn rule(pattern: &str, key: KeySourceConfig, profile: Option<&str>) -> RateRuleConfig {
@@ -182,7 +186,8 @@ fn jwt_claim_key_uses_claim_then_falls_back_to_ip() {
     let key = KeySource::JwtClaim("sub".to_string());
     // Present claim: identity is the raw claim value (for service resolution);
     // the store key is de-identified (no raw value) and tagged `jwt`.
-    let k = rule_key("fp", &key, "1.1.1.1", &HeaderMap::new(), Some(&claims));
+    let ip = client("1.1.1.1");
+    let k = rule_key("fp", &key, &ip, &HeaderMap::new(), Some(&claims));
     assert_eq!(k.identity, "alice");
     assert!(k.store.starts_with("fp:jwt:"));
     assert!(
@@ -192,18 +197,18 @@ fn jwt_claim_key_uses_claim_then_falls_back_to_ip() {
     // Dotted path into a nested claim.
     let nested = KeySource::JwtClaim("org.id".to_string());
     assert_eq!(
-        rule_key("fp", &nested, "1.1.1.1", &HeaderMap::new(), Some(&claims)).identity,
+        rule_key("fp", &nested, &ip, &HeaderMap::new(), Some(&claims)).identity,
         "acme"
     );
     // No claims (anonymous) → IP fallback, so the limit can't be dodged.
-    let anon = rule_key("fp", &key, "1.1.1.1", &HeaderMap::new(), None);
+    let anon = rule_key("fp", &key, &ip, &HeaderMap::new(), None);
     assert_eq!(anon.identity, "1.1.1.1");
     assert!(anon.store.starts_with("fp:ip:"));
     // Claim present but missing the requested field → IP fallback.
     let missing = rule_key(
         "fp",
         &KeySource::JwtClaim("missing".to_string()),
-        "1.1.1.1",
+        &ip,
         &HeaderMap::new(),
         Some(&claims),
     );
@@ -214,16 +219,67 @@ fn jwt_claim_key_uses_claim_then_falls_back_to_ip() {
 #[test]
 fn store_key_namespaced_by_fingerprint_and_value() {
     let key = KeySource::Ip;
+    let one = client("1.1.1.1");
     // Same client under two different rules (fingerprints) → independent budgets.
-    let a = rule_key("fpA", &key, "1.1.1.1", &HeaderMap::new(), None);
-    let b = rule_key("fpB", &key, "1.1.1.1", &HeaderMap::new(), None);
+    let a = rule_key("fpA", &key, &one, &HeaderMap::new(), None);
+    let b = rule_key("fpB", &key, &one, &HeaderMap::new(), None);
     assert_ne!(a.store, b.store);
     // Same rule + same value → identical store key (stable across instances).
-    let a2 = rule_key("fpA", &key, "1.1.1.1", &HeaderMap::new(), None);
+    let a2 = rule_key("fpA", &key, &one, &HeaderMap::new(), None);
     assert_eq!(a.store, a2.store);
     // Different value → different store key.
-    let c = rule_key("fpA", &key, "2.2.2.2", &HeaderMap::new(), None);
+    let c = rule_key("fpA", &key, &client("2.2.2.2"), &HeaderMap::new(), None);
     assert_ne!(a.store, c.store);
+}
+
+#[test]
+fn an_unresolved_address_never_keys_by_the_proxys_own_address() {
+    // A trusted proxy's broken report leaves no client address: the request
+    // is keyed into the shared `invalid` bucket, not by the proxy's address,
+    // which would hand every client behind it one budget per proxy.
+    let resolver = crate::client_address::Resolver::build(&crate::config::ClientAddressConfig {
+        trusted_proxies: vec!["10.0.0.0/8".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert("x-forwarded-for", "garbage".parse().unwrap());
+    let invalid = resolver.resolve(Some("10.0.0.1:4000".parse().unwrap()), &headers);
+    let key = rule_key("fp", &KeySource::Ip, &invalid, &HeaderMap::new(), None);
+    assert_eq!(key.identity, "invalid");
+    let unavailable = ClientAddress::from_peer(None);
+    let key = rule_key("fp", &KeySource::Ip, &unavailable, &HeaderMap::new(), None);
+    assert_eq!(key.identity, "unknown");
+}
+
+#[tokio::test]
+async fn the_rules_key_by_the_resolved_address() {
+    // The address the proxy resolved before any guard is the one the rule
+    // keys by, whatever the request's own forwarding headers say.
+    let app = app(config(
+        vec![("t", "60/min", Some(1))],
+        vec![rule("/api/**", KeySourceConfig::Ip, Some("t"))],
+    ));
+    let send = |ip: &'static str, xff: &'static str| {
+        let app = app.clone();
+        async move {
+            let mut request = Request::builder()
+                .uri("/api/x")
+                .header("x-forwarded-for", xff)
+                .body(Body::empty())
+                .unwrap();
+            request.extensions_mut().insert(client(ip));
+            app.oneshot(request).await.unwrap().status()
+        }
+    };
+    assert_eq!(send("203.0.113.7", "1.1.1.1").await, StatusCode::OK);
+    // Same resolved client, another forged header: the same budget.
+    assert_eq!(
+        send("203.0.113.7", "2.2.2.2").await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    // Another resolved client: its own budget.
+    assert_eq!(send("203.0.113.8", "1.1.1.1").await, StatusCode::OK);
 }
 
 #[test]

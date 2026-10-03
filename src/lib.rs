@@ -59,6 +59,7 @@ compile_error!(
 struct ReadmeDoctests;
 
 pub mod auth;
+pub mod client_address;
 pub mod config;
 mod cors;
 mod embed;
@@ -78,6 +79,7 @@ pub mod upstream;
 /// [`install_default_crypto_provider`] for when a call is needed.
 #[cfg(feature = "builtin_jwt")]
 pub use auth::crypto::install_default_crypto_provider;
+pub use client_address::ClientAddress;
 pub use serve::{serve, serve_with, serve_with_shutdown, ServeOptions};
 pub use service::{ConnectionInfo, ProxyService};
 
@@ -221,10 +223,9 @@ impl ProxyServer {
     /// // Your gRPC API, with at most 1000 calls in flight and nothing else.
     /// let grpc = tonic::service::Routes::default();
     /// let service = ProxyServer::new()
-    ///     .with_concurrency_limit(ConcurrencyConfig {
-    ///         max_in_flight: 1000,
-    ///         scope: Some(ScopeConfig::traffic([Traffic::Grpc])),
-    ///     })
+    ///     .with_concurrency_limit(
+    ///         ConcurrencyConfig::new(1000).with_scope(ScopeConfig::traffic([Traffic::Grpc])),
+    ///     )
     ///     .service(grpc)?;
     /// # let _ = service;
     /// # Ok(())
@@ -334,6 +335,35 @@ impl ProxyServer {
     /// The limit on requests in flight (`concurrency:`).
     pub fn with_concurrency_limit(mut self, concurrency: config::ConcurrencyConfig) -> Self {
         self.config.concurrency = Some(concurrency);
+        self
+    }
+
+    /// How the client's address is resolved (`client_address:`): the proxies
+    /// trusted to report it and the header they use. Every consumer reads the
+    /// result, the rate limits as much as the upstream.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use structured_proxy::config::{ClientAddressConfig, ForwardingHeader};
+    /// use structured_proxy::ProxyServer;
+    ///
+    /// # fn build() -> anyhow::Result<()> {
+    /// // Behind a load balancer in 10.0.0.0/8 that appends to X-Forwarded-For.
+    /// let mut client_address = ClientAddressConfig::default();
+    /// client_address.trusted_proxies = vec!["10.0.0.0/8".into()];
+    /// client_address.header = ForwardingHeader::XForwardedFor;
+    /// client_address.required = true;
+    /// let service = ProxyServer::new()
+    ///     .with_client_address(client_address)
+    ///     .service(tonic::service::Routes::default())?;
+    /// # let _ = service;
+    /// # Ok(())
+    /// # }
+    /// # build().unwrap();
+    /// ```
+    pub fn with_client_address(mut self, client_address: config::ClientAddressConfig) -> Self {
+        self.config.client_address = client_address;
         self
     }
 
@@ -769,9 +799,24 @@ impl ProxyServer {
             );
         }
 
+        let resolver = Arc::new(
+            client_address::Resolver::build(&self.config.client_address)
+                .map_err(|e| anyhow::anyhow!("invalid client_address config: {e}"))?,
+        );
+        // The client-address headers reach a transcoded call as the
+        // forwarding policy wrote them on the request, whatever the list
+        // says; the rest of the list is forwarded as configured.
+        let forwarded_headers: Arc<[String]> = self
+            .config
+            .forwarded_headers
+            .iter()
+            .filter(|name| !resolver.reserves(name))
+            .cloned()
+            .chain(resolver.forwarded_headers().map(str::to_owned))
+            .collect();
         let state = ProxyState {
             upstream,
-            forwarded_headers: self.config.forwarded_headers.as_slice().into(),
+            forwarded_headers,
             sse_keep_alive_secs: self.config.streaming.sse_keep_alive_secs,
         };
 
@@ -794,7 +839,7 @@ impl ProxyServer {
         let forward_auth = auth.as_ref().and_then(|built| {
             auth::forward::ForwardAuth::build(self.config.auth.as_ref()?, built.clone())
         });
-        let guards = self.guards(auth, maintenance_exempt, &mounted)?;
+        let guards = Arc::new(self.guards(resolver, auth, maintenance_exempt, &mounted)?);
 
         // Health routes. Paths are configurable; the whole group is skippable.
         let health_routes = if self.config.health.enabled {
@@ -922,24 +967,31 @@ impl ProxyServer {
             .merge(guards.router(transcode_routes, guard::Class::Transcoded))
             .merge(guards.router(endpoints, guard::Class::Endpoints))
             .merge(guards.router(verify, guard::Class::Verify))
+            // Before every guard: they and the handlers read its result.
+            .layer(client_address::ClientAddressLayer::with(
+                guards.client_address.clone(),
+            ))
             .layer(TraceLayer::new_for_http());
         // Outermost: wraps every enforcement layer so short-circuited
         // responses keep CORS headers, and answers preflight before auth.
         let router = cors::layer(router, cors.clone()).with_state(state);
 
-        Ok((router, cors, Arc::new(guards)))
+        Ok((router, cors, guards))
     }
 
     /// The guards the configuration and the hooks turn on, each with its
-    /// scope; `maintenance_exempt` lists the paths maintenance mode leaves
+    /// scope, after the client-address resolution `resolver`;
+    /// `maintenance_exempt` lists the paths maintenance mode leaves
     /// reachable, `mounted` the `(method, path)` of every route.
     ///
     /// # Errors
     ///
-    /// A malformed shield, authz or concurrency section, or a scope that
+    /// A malformed shield, authz or concurrency section, a JWT claim mapped
+    /// onto a header the client-address forwarding writes, or a scope that
     /// covers no traffic, names an invalid path glob or an invalid method.
     fn guards(
         &self,
+        resolver: Arc<client_address::Resolver>,
         auth: Option<Arc<auth::Auth>>,
         maintenance_exempt: Vec<String>,
         mounted: &[(String, String)],
@@ -954,7 +1006,27 @@ impl ProxyServer {
         let scope = |config: Option<&ScopeConfig>, default: &[config::Traffic], what: &str| {
             guard::Scope::compile(config, default, what, &routed).map_err(anyhow::Error::msg)
         };
-        let mut guards = guard::Guards::default();
+        // A guard never sets what the client-address forwarding writes.
+        let reserved: Arc<[http::HeaderName]> = resolver.configured_headers().cloned().collect();
+        if let Some(header) = self
+            .config
+            .auth
+            .as_ref()
+            .and_then(|auth| auth.jwt.as_ref())
+            .and_then(|jwt| jwt.claims_headers.values().find(|h| resolver.reserves(h)))
+        {
+            anyhow::bail!(
+                "auth.jwt.claims_headers maps a claim onto {header:?}, which the \
+                 client_address forwarding writes"
+            );
+        }
+        let mut guards = guard::Guards {
+            client_address: resolver,
+            ..Default::default()
+        };
+        if guards.client_address.required() {
+            guards.require_client = Some(scope(None, &[config::Traffic::All], "client_address")?);
+        }
         // Mounted only while maintenance is on, so normal traffic pays nothing
         // for it.
         let maintenance = &self.config.maintenance;
@@ -1001,7 +1073,7 @@ impl ProxyServer {
             ));
         }
         if let Some(cfg) = auth_config.and_then(|a| a.authz.as_ref()) {
-            if let Some(authz) = auth::authz::Authz::build(cfg)
+            if let Some(authz) = auth::authz::Authz::build_reserving(cfg, reserved.clone())
                 .map_err(|e| anyhow::anyhow!("invalid authz config: {e}"))?
             {
                 guards.authz = Some((
@@ -1012,7 +1084,10 @@ impl ProxyServer {
         }
         if let Some(decider) = &self.auth_decider {
             guards.decider = Some((
-                decider.clone(),
+                Arc::new(embed::DeciderGate {
+                    decider: decider.clone(),
+                    reserved,
+                }),
                 scope(
                     self.auth_decider_scope.as_ref(),
                     &[Transcoded],

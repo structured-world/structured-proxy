@@ -37,6 +37,10 @@ tonic services.
   through, or translated to gRPC for an upstream that speaks only gRPC
 - Built-in TLS and mTLS, and a cap on open connections; or your own TLS, with
   the client's address and certificate reaching the upstream
+- The client's address resolved once from the connection and the proxies you
+  trust, then shared by the rate limits, the hooks and the upstream, which
+  gets a verified `X-Forwarded-For` by default, or the forwarding of nginx,
+  Envoy or your load balancer ([Client address](#client-address))
 - Graceful shutdown: calls and streams in flight finish within a bounded
   drain, HTTP/2 clients get a GOAWAY ([Shutting down](#shutting-down))
 - Guards you scope to the traffic they cover (transcoded calls, the proxy's
@@ -247,6 +251,26 @@ error_details:
 response_headers:
   deny: ["x-debug-trace"]
 
+# Optional: how the client's address is resolved and what the upstream
+# receives of it (see "Client address"). Defaults: no trusted proxy, the right
+# setting for a proxy facing clients; a verified X-Forwarded-For.
+client_address:
+  # Proxies trusted to report the client's address: CIDR ranges or addresses.
+  trusted_proxies: ["10.0.0.0/8"]
+  # The header they report it in: x_forwarded_for (default) or x_real_ip.
+  header: x_forwarded_for
+  # Refuse a request whose address does not resolve. Default: false.
+  required: false
+  forward:
+    # X-Forwarded-For upstream: verified (default), resolved, append,
+    # preserve or remove.
+    x_forwarded_for: verified
+    # Header carrying the resolved address; null for none.
+    client_header: x-real-ip
+    # Header carrying X-Forwarded-For exactly as it arrived, for logs.
+    # Default: off.
+    audit_header: null
+
 # Rate limiting (Shield)
 #
 # Every decision is made locally with a GCRA shaper (no blocking latency).
@@ -257,9 +281,7 @@ shield:
   enabled: true
   # Which traffic the rules apply to. Default: [transcoded, endpoints].
   # scope: { traffic: [transcoded, endpoints, grpc] }
-  # CIDR ranges of trusted proxies/LBs. X-Forwarded-For is honored only from
-  # these peers; set this behind a load balancer for correct per-client limits.
-  trusted_proxies: ["10.0.0.0/8"]
+  # IP rules key by the client address of `client_address:` below.
   # Limit tiers: sustained rate ("N/unit" or a bare count = per minute) + burst
   # (max back-to-back requests; defaults to one window of the rate).
   profiles:
@@ -356,6 +378,170 @@ body, as the route's `google.api.http` rule says:
 
 A value that is not valid for its field, or two members of one `oneof`, is
 answered with `INVALID_ARGUMENT` (400) before the upstream is called.
+
+## Client address
+
+The proxy works out who the client is once per request, before any guard
+runs, and every consumer reads that one answer: the rate limits, the auth
+decider and extra routes, your fallback and an upstream in process (as the
+`ClientAddress` request extension), and a remote upstream (as headers).
+
+**Resolution.** The connection's peer is the client, unless it is listed in
+`client_address.trusted_proxies`. Only then does the proxy read the header the
+trusted proxy reports the address in, because forwarding information is not
+trustworthy by itself (RFC 7239 §8.1):
+
+- `x_forwarded_for` (default): every `X-Forwarded-For` field line, in order, as
+  one list (RFC 9110 §5.3). The proxy walks it from the right through the
+  trusted proxies and stops at the first address outside them; what lies left
+  of that address is the client's own claim and is never read. When every hop
+  is trusted, the leftmost is the client. Empty elements are skipped
+  (RFC 9110 §5.6.1). An element may be an IPv4 or IPv6 address, bracketed
+  IPv6, either with a port; an IPv4-mapped IPv6 address counts as IPv4, for
+  the peer too.
+- `x_real_ip`: one `X-Real-IP` value, the trusted proxy's own peer.
+
+The proxy does not fall back from one header to the other. A trusted peer that
+sends neither is the client itself (an internal service calling directly).
+The walk reads at most 32 elements of at most 128 bytes each before the
+client, so a long header costs nothing past that, and no lookup leaves the
+process.
+
+**When nothing resolves.** The proxy never makes an address up:
+
+| Case | `Resolution` | The request |
+|------|--------------|-------------|
+| The server recorded no connection (a Unix socket, a server of your own without `for_connection`) | `Unavailable` | goes on without an address, or with `required: true` is refused with `INTERNAL` (500) |
+| A trusted proxy reported something unreadable where the client should be (not an address, a repeated `X-Real-IP`, more than 32 hops) | `Invalid` | goes on without an address, or with `required: true` is refused with `INVALID_ARGUMENT` (400) |
+
+Such a request is never credited to the trusted proxy's own address. Its rate
+limits key into one shared bucket per case, so it cannot escape a limit. A
+refusal reaches a gRPC or gRPC-Web client as a status in its own protocol, like
+any guard's (see [Guards and scopes](#guards-and-scopes)). Malformed data left
+of an address already resolved cannot cause either case.
+
+**What the upstream receives.** Resolution decides who the client is; the
+`forward` policy decides what the upstream is told, independently. The rate
+limits and the hooks always use the resolved address, whatever is forwarded.
+
+| `forward.x_forwarded_for` | `X-Forwarded-For` upstream | Its first element |
+|---|---|---|
+| `verified` (default) | the client, the trusted proxies after it, this proxy's peer: `203.0.113.7, 10.0.0.2, 10.0.0.1` | the client |
+| `resolved` | the client alone | the client |
+| `append` | the list as it arrived, then this proxy's peer | whatever the client wrote |
+| `preserve` | the list as it arrived; `X-Real-IP` and `Forwarded` too | whatever the client wrote |
+| `remove` | nothing | none |
+
+With `verified`, whatever the client wrote left of its own address is dropped,
+so an upstream reading the first element and one walking the list from the
+right reach the same client. In every mode but `preserve`, `X-Real-IP` and
+`Forwarded` (RFC 7239) from the request are removed, since they would
+contradict the list. On top of the list:
+
+- `forward.client_header` (`x-real-ip` by default, `null` for none) carries
+  the resolved address alone, whatever the request sent under that name, and
+  is absent when nothing resolved.
+- `forward.audit_header` (off by default) carries the request's
+  `X-Forwarded-For` field lines exactly as they arrived, before any change.
+  Nothing in it is verified: it is for logs and audits, never for decisions.
+
+The same headers reach native gRPC, gRPC-Web passed through or translated,
+transcoded unary and streaming calls, and the fallback; remote and in process
+alike. Listing them in `forwarded_headers` changes nothing. They are the
+proxy's own: a JWT `claims_headers` entry naming one stops the proxy at
+startup, and an ext_authz server's or the auth decider's copies are ignored
+with a warning in the log. An upstream in process also gets the
+`ClientAddress` extension, while `Request::remote_addr` and
+`Request::peer_certs` keep describing the real connection.
+
+**Coming from another proxy.** Each one's habit is one setting away:
+
+| Behind | `forward` |
+|---|---|
+| nginx with `$proxy_add_x_forwarded_for` and `X-Real-IP $remote_addr` | `x_forwarded_for: append`, `client_header: x-real-ip` |
+| nginx without `proxy_set_header` | `x_forwarded_for: preserve`, `client_header: null` |
+| Envoy with `use_remote_address` | `append`, `client_header: x-envoy-external-address` |
+| HAProxy with `option forwardfor` | `append` |
+| AWS ALB `append` / `preserve` / `remove` | the mode of the same name |
+| Cloudflare | `append`, `client_header: cf-connecting-ip` |
+| Akamai | `client_header: true-client-ip` |
+| Traefik, Caddy | `verified` (stricter: a prefix forged before a trusted balancer does not get through), or `append` |
+
+With `append` and `preserve`, the first element of `X-Forwarded-For` is
+whatever the client chose to write. An upstream behind them should read the
+client header, or walk the list from the right with this proxy as its only
+trusted hop.
+
+**At the edge**, facing clients directly, leave `trusted_proxies` empty: the
+peer is the client, and what it sends in forwarding headers never counts.
+
+**Behind a load balancer**, trust exactly the addresses it connects from, and
+have it append the peer it sees to `X-Forwarded-For` (nginx
+`proxy_add_x_forwarded_for`, most cloud load balancers), or set `X-Real-IP` and
+choose `header: x_real_ip`:
+
+```yaml
+client_address:
+  trusted_proxies: ["10.0.0.0/8"]   # the load balancer's subnet
+  header: x_forwarded_for
+  required: true                    # every request must name its client
+  forward:
+    audit_header: x-original-forwarded-for   # what arrived, for the access log
+```
+
+**The upstream's side.** The proxy is the upstream's only reporter: the
+upstream should trust forwarding headers from the proxy's address alone and
+read the client header, or the first element of a `verified` list, rather than
+judge the chain on its own (Keycloak, for instance: `proxy-headers=xforwarded`
+with `proxy-trusted-addresses` set to the proxy). This holds only while
+nothing else can reach the upstream: keep it off any network the clients
+reach, by network policy or by running it in process, or a client could talk
+to it directly and send its own `X-Forwarded-For`.
+
+**In code**, `ProxyServer::with_client_address` takes the same section, and a
+tonic handler behind the proxy reads the result:
+
+```rust
+use structured_proxy::client_address::Resolution;
+use structured_proxy::config::{ClientAddressConfig, ForwardingHeader, XForwardedFor};
+use structured_proxy::{ClientAddress, ProxyServer};
+
+# fn build(grpc: tonic::service::Routes) -> anyhow::Result<()> {
+let mut client_address = ClientAddressConfig::default();
+client_address.trusted_proxies = vec!["10.0.0.0/8".into()];
+client_address.header = ForwardingHeader::XForwardedFor;
+// As nginx forwards with `$proxy_add_x_forwarded_for`, plus the audit copy.
+client_address.forward.x_forwarded_for = XForwardedFor::Append;
+client_address.forward.audit_header = Some("x-original-forwarded-for".into());
+let service = ProxyServer::new()
+    .with_client_address(client_address)
+    .service(grpc)?;
+# let _ = service;
+# Ok(())
+# }
+
+// In a tonic handler, transcoded call or native gRPC alike.
+fn caller(request: &tonic::Request<()>) -> String {
+    match request.extensions().get::<ClientAddress>().map(ClientAddress::resolution) {
+        Some(Resolution::Peer(ip) | Resolution::Forwarded(ip)) => ip.to_string(),
+        _ => "unknown".to_string(),
+    }
+}
+# let _ = caller;
+```
+
+**Moving from `shield.trusted_proxies`.** The list moved to
+`client_address.trusted_proxies` and now applies to every consumer, with or
+without rate limits; a config that still sets the old key fails to load with a
+message saying so. Shield used to fall back to `X-Real-IP` when
+`X-Forwarded-For` was missing or broken: a load balancer that sends only
+`X-Real-IP` now needs `header: x_real_ip`. Code that mounts the Shield
+middleware in a router of its own puts
+`client_address::ClientAddressLayer::new(&config)` in front of it, which
+resolves the address the same way the proxy does. The hooks' `RequestParts::peer` and
+`RouteRequest::peer` became `client`, a `ClientAddress` whose `peer()` is the
+connection's peer, absent when the server recorded none instead of
+`0.0.0.0:0`.
 
 ## Rate limiting
 
@@ -454,9 +640,11 @@ answers stops the proxy at startup.
 
 The forward-auth endpoint answers for JWT, ext_authz and the decider, so it is
 never behind them, whatever their scope. A request runs the guards of its own
-class only, in this order: maintenance, concurrency, rate limits keyed before
-auth, JWT, rate limits keyed by verified claims, ext_authz, the decider. A
-guard outside the request's class costs it nothing.
+class only, in this order: a required client address
+(`client_address.required`, every class, see [Client address](#client-address)),
+maintenance, concurrency, rate limits keyed before auth, JWT, rate limits keyed
+by verified claims, ext_authz, the decider. A guard outside the request's class
+costs it nothing.
 
 **Rejections in the request's protocol.** A REST client gets the
 `google.rpc.Status` JSON body of [Error responses](#error-responses) with the
@@ -648,6 +836,9 @@ grpc-gateway do, so the same service works behind any of them.
 Trace context goes through whether listed or not: the upstream gets exactly
 one valid `traceparent` (the client's first, or a new one when it is missing
 or malformed), and `tracestate` only together with the client's own trace.
+`X-Forwarded-For`, `X-Real-IP`, `Forwarded` and the headers named in
+`client_address.forward` carry what that forwarding policy wrote, listed or
+not (see [Client address](#client-address)).
 
 **Response metadata → response headers.** The upstream's response metadata
 becomes HTTP response headers: every ASCII entry, in order, repeated values as
@@ -767,8 +958,9 @@ upstream as they arrived, so native gRPC clients can use the same address.
 A gRPC service that embeds the proxy to add REST hands the proxy its own
 services instead of an address. Transcoded calls then reach them in process,
 through the service's whole tonic stack (interceptors, layers), like a native
-gRPC call. `Request::remote_addr` in a handler gives the HTTP client's
-address.
+gRPC call. `Request::remote_addr` in a handler gives the address of the
+connection, and the `ClientAddress` extension the client's address as the
+proxy resolved it (see [Client address](#client-address)).
 
 ```rust
 use structured_proxy::ProxyServer;
@@ -811,10 +1003,9 @@ let service = ProxyServer::new()
     .with_descriptors(pool)
     .with_transcoded_rpcs(["acme.v1.Orders/GetOrder", "acme.v1.Orders/ListOrders"])
     // At most 1000 native gRPC calls in flight.
-    .with_concurrency_limit(ConcurrencyConfig {
-        max_in_flight: 1000,
-        scope: Some(ScopeConfig::traffic([Traffic::Grpc])),
-    })
+    .with_concurrency_limit(
+        ConcurrencyConfig::new(1000).with_scope(ScopeConfig::traffic([Traffic::Grpc])),
+    )
     // Sections with many options come from YAML, the file's own syntax.
     .with_rate_limits(config::from_yaml(
         "enabled: true\nprofiles:\n  anon: { rate: \"600/min\" }\nrules:\n  - pattern: \"/**\"\n    key: { type: ip }\n    profile: anon\n",
@@ -829,8 +1020,15 @@ The methods are `with_upstream_address`, `with_listen`, `with_descriptors`,
 `with_transcoded_rpcs`, `with_aliases`, `with_forwarded_headers`,
 `with_health`, `with_metrics`, `with_openapi`, `with_oidc_discovery`,
 `with_cors`, `with_grpc_web_translation`, `with_streaming`,
-`with_maintenance`, `with_concurrency_limit`, `with_rate_limits` and
-`with_auth`, next to the hooks below.
+`with_maintenance`, `with_concurrency_limit`, `with_client_address`,
+`with_rate_limits` and `with_auth`, next to the hooks below.
+
+The config types, and the request views the hooks receive, are
+`#[non_exhaustive]`, so a new setting or field is not a breaking change. Build
+one from its `Default` and set the fields you need, or with its constructor
+when a field has no default (`UpstreamConfig::new`, `ConcurrencyConfig::new`,
+`ListenTlsConfig::new`, `AliasConfig::new`, `RequestParts::new`,
+`RouteRequest::new`).
 
 ### TLS and connection limits
 
@@ -967,7 +1165,8 @@ pass only the guards whose scope names `grpc` or `fallback` (see
 [Guards and scopes](#guards-and-scopes)); by default none does. The fallback
 keeps its own CORS and tracing.
 
-gRPC-Web calls pass through as they are, so the upstream answers them: wrap
+gRPC-Web calls pass through as they are (but for the forwarding headers, see
+[Client address](#client-address)), so the upstream answers them: wrap
 your services in tonic-web's layer
 (`tower::ServiceBuilder::new().layer(tonic_web::GrpcWebLayer::new()).service(grpc)`)
 for binary and text gRPC-Web alike. For an upstream that speaks only gRPC,
@@ -1028,7 +1227,7 @@ struct MyPdp; // your forward-auth / policy decision
 #[async_trait::async_trait]
 impl AuthDecider for MyPdp {
     async fn decide(&self, req: &RequestParts<'_>) -> Decision {
-        // method / path / headers / peer in, a decision out (no axum types)
+        // method / path / headers / client address in, a decision out (no axum types)
         Decision::Allow { inject_headers: http::HeaderMap::new() }
     }
 }
@@ -1230,7 +1429,8 @@ At startup the proxy reads your proto descriptors and turns every
    upstream: a remote gRPC server, or your tonic services in process
 ```
 
-Guards run in this order: maintenance, concurrency limit, rate limits keyed
+The client address is resolved before every guard. Guards run in this order:
+a required client address, maintenance, concurrency limit, rate limits keyed
 before auth, JWT, rate limits keyed by claims, ext_authz, the auth decider.
 
 <div align="center">

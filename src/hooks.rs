@@ -12,19 +12,34 @@
 //! absent: the default build is a stateless data plane (see the crate README
 //! Non-goals). They are planned behind an opt-in `bff` feature.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::{HeaderMap, Method, StatusCode};
 
+use crate::client_address::ClientAddress;
+
 /// Borrowed view of an incoming request, passed to an [`AuthDecider`].
 ///
 /// All fields borrow from the live request: building this is allocation-free, so
 /// the per-request gate stays cheap. The body is intentionally absent: an auth
-/// decision is taken from method, path, query, headers, and peer alone.
+/// decision is taken from method, path, query, headers, and client alone.
+///
+/// # Examples
+///
+/// ```
+/// use structured_proxy::hooks::RequestParts;
+/// use structured_proxy::ClientAddress;
+///
+/// // The view a decider's own tests build.
+/// let client = ClientAddress::from_peer(Some("203.0.113.7:51234".parse().unwrap()));
+/// let headers = http::HeaderMap::new();
+/// let parts = RequestParts::new(&http::Method::GET, "/v1/things", None, &headers, &client);
+/// assert_eq!(parts.client.ip(), Some("203.0.113.7".parse().unwrap()));
+/// ```
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct RequestParts<'a> {
     /// Request method (the *original* method on the `/verify` path, recovered
     /// from the fronting proxy's forwarding headers).
@@ -33,13 +48,41 @@ pub struct RequestParts<'a> {
     pub path: &'a str,
     /// Raw query string, if any (without the leading `?`).
     pub query: Option<&'a str>,
-    /// Request headers.
+    /// Request headers, with the forwarding headers as the
+    /// `client_address.forward` policy wrote them for the upstream. With the
+    /// default policy they hold only verified data; with `append` or
+    /// `preserve`, `X-Forwarded-For` (and with `preserve`, `X-Real-IP`) still
+    /// carries what the client sent. Decide on [`client`](Self::client), never
+    /// on these headers.
     pub headers: &'a HeaderMap,
-    /// Direct peer socket address (the connecting client, or the fronting proxy).
-    pub peer: SocketAddr,
+    /// The client address the proxy resolved, with the connection's peer
+    /// (the client, or the fronting proxy): the one to authorize on, whatever
+    /// the forwarding policy.
+    pub client: &'a ClientAddress,
+}
+
+impl<'a> RequestParts<'a> {
+    /// The view of a request: what the proxy hands a decider, and what a
+    /// decider's own tests build.
+    pub fn new(
+        method: &'a Method,
+        path: &'a str,
+        query: Option<&'a str>,
+        headers: &'a HeaderMap,
+        client: &'a ClientAddress,
+    ) -> Self {
+        Self {
+            method,
+            path,
+            query,
+            headers,
+            client,
+        }
+    }
 }
 
 /// The outcome of an [`AuthDecider`] evaluation.
+#[non_exhaustive]
 pub enum Decision {
     /// Allow the request; merge these (decider-controlled) headers onto it before
     /// it continues upstream. The proxy strips any client-supplied copies of
@@ -110,6 +153,7 @@ pub trait TokenVerifier: Send + Sync {
 /// A static JSON document served at a fixed path (an OIDC metadata document or a
 /// JWKS document).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct MetadataDocument {
     /// Path to serve at (e.g. `/.well-known/openid-configuration`).
     pub path: String,
@@ -160,20 +204,44 @@ pub trait OidcBackend: Send + Sync {
 /// Unlike [`RequestParts`], this owns its data (including the full body), since
 /// an extra route may consume the body to produce a response.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct RouteRequest {
     /// Request method.
     pub method: Method,
     /// Full request URI (path + query).
     pub uri: http::Uri,
-    /// Request headers.
+    /// Request headers, with the forwarding headers as the
+    /// `client_address.forward` policy wrote them (see
+    /// [`RequestParts::headers`]). Decide on [`client`](Self::client).
     pub headers: HeaderMap,
     /// Request body bytes.
     pub body: Bytes,
-    /// Direct peer socket address.
-    pub peer: SocketAddr,
+    /// The client address the proxy resolved, with the connection's peer.
+    pub client: ClientAddress,
+}
+
+impl RouteRequest {
+    /// The request a handler gets: what the proxy builds, and what a
+    /// handler's own tests build.
+    pub fn new(
+        method: Method,
+        uri: http::Uri,
+        headers: HeaderMap,
+        body: Bytes,
+        client: ClientAddress,
+    ) -> Self {
+        Self {
+            method,
+            uri,
+            headers,
+            body,
+            client,
+        }
+    }
 }
 
 /// Response produced by an [`ExtraRouteHandler`].
+#[non_exhaustive]
 pub struct RouteResponse {
     /// HTTP status.
     pub status: StatusCode,
