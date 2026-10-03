@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [8.0.0](https://github.com/structured-world/structured-proxy/compare/v7.0.0...v8.0.0) - 2026-10-03
+
+### Added
+
+- [**breaking**] resolve the client address once and make public types non_exhaustive ([#128](https://github.com/structured-world/structured-proxy/pull/128))
+
+### Other
+
+- *(deps)* bump taiki-e/install-action from 2.87.17 to 2.87.21 ([#126](https://github.com/structured-world/structured-proxy/pull/126))
+
 ## [7.0.0](https://github.com/structured-world/structured-proxy/compare/v6.0.0...v7.0.0) - 2026-09-28
 
 ### Added
