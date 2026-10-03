@@ -168,7 +168,7 @@ impl ClaimsCache {
     /// Take one slot, unless all `max_entries` are taken.
     fn reserve(&self) -> bool {
         self.taken
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |taken| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |taken| {
                 (taken < self.max_entries).then_some(taken + 1)
             })
             .is_ok()
@@ -179,7 +179,7 @@ impl ClaimsCache {
     /// before that sweep never sweeps, so late callers cannot repeat it.
     fn claim_sweep(&self, mono: u64) -> bool {
         self.next_sweep
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 // `mono` counts seconds since start-up: `+ 1` cannot overflow.
                 (mono >= next).then_some(mono + 1)
             })
