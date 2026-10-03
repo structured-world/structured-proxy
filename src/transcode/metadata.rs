@@ -17,6 +17,7 @@ use crate::client_address::{X_FORWARDED_FOR, X_REAL_IP};
 /// A forwarded request header whose value gRPC metadata cannot carry.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("header `{header}` has a value gRPC metadata cannot carry")]
+#[non_exhaustive]
 pub struct InvalidForwardedHeader {
     /// The header, as the request named it.
     pub header: HeaderName,

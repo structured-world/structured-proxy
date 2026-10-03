@@ -452,12 +452,11 @@ use structured_proxy::config::{ClientAddressConfig, ForwardingHeader};
 use structured_proxy::{ClientAddress, ProxyServer};
 
 # fn build(grpc: tonic::service::Routes) -> anyhow::Result<()> {
+let mut client_address = ClientAddressConfig::default();
+client_address.trusted_proxies = vec!["10.0.0.0/8".into()];
+client_address.header = ForwardingHeader::XForwardedFor;
 let service = ProxyServer::new()
-    .with_client_address(ClientAddressConfig {
-        trusted_proxies: vec!["10.0.0.0/8".into()],
-        header: ForwardingHeader::XForwardedFor,
-        required: false,
-    })
+    .with_client_address(client_address)
     .service(grpc)?;
 # let _ = service;
 # Ok(())
@@ -943,10 +942,9 @@ let service = ProxyServer::new()
     .with_descriptors(pool)
     .with_transcoded_rpcs(["acme.v1.Orders/GetOrder", "acme.v1.Orders/ListOrders"])
     // At most 1000 native gRPC calls in flight.
-    .with_concurrency_limit(ConcurrencyConfig {
-        max_in_flight: 1000,
-        scope: Some(ScopeConfig::traffic([Traffic::Grpc])),
-    })
+    .with_concurrency_limit(
+        ConcurrencyConfig::new(1000).with_scope(ScopeConfig::traffic([Traffic::Grpc])),
+    )
     // Sections with many options come from YAML, the file's own syntax.
     .with_rate_limits(config::from_yaml(
         "enabled: true\nprofiles:\n  anon: { rate: \"600/min\" }\nrules:\n  - pattern: \"/**\"\n    key: { type: ip }\n    profile: anon\n",
@@ -963,6 +961,13 @@ The methods are `with_upstream_address`, `with_listen`, `with_descriptors`,
 `with_cors`, `with_grpc_web_translation`, `with_streaming`,
 `with_maintenance`, `with_concurrency_limit`, `with_client_address`,
 `with_rate_limits` and `with_auth`, next to the hooks below.
+
+The config types, and the request views the hooks receive, are
+`#[non_exhaustive]`, so a new setting or field is not a breaking change. Build
+one from its `Default` and set the fields you need, or with its constructor
+when a field has no default (`UpstreamConfig::new`, `ConcurrencyConfig::new`,
+`ListenTlsConfig::new`, `AliasConfig::new`, `RequestParts::new`,
+`RouteRequest::new`).
 
 ### TLS and connection limits
 

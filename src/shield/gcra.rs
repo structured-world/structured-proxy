@@ -30,6 +30,7 @@ pub struct Gcra {
 /// A named limit tier: a sustained rate over a window plus an instantaneous
 /// burst capacity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Profile {
     /// Sustained requests permitted per `window`.
     pub rate: u64,
@@ -40,8 +41,20 @@ pub struct Profile {
     pub burst: u64,
 }
 
+impl Profile {
+    /// `rate` requests per `window`, `burst` of them back to back.
+    pub fn new(rate: u64, window: Duration, burst: u64) -> Self {
+        Self {
+            rate,
+            window,
+            burst,
+        }
+    }
+}
+
 /// The outcome of a single GCRA check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Verdict {
     /// Whether the request is conforming (allowed).
     pub allowed: bool,

@@ -2,59 +2,41 @@
 //!
 //! Downstream products embed the proxy by building a [`ProxyConfig`]
 //! programmatically (runtime upstream port, listen address, baked-in
-//! descriptors) rather than loading a YAML file. This test lives in a separate
-//! crate, so it sees the config types exactly as an external consumer does: if
-//! any wiring struct gains `#[non_exhaustive]`, this stops compiling and the
-//! embedded API regression is caught here.
+//! descriptors) rather than loading a YAML file. The config types are
+//! `#[non_exhaustive]`, so a new setting is not a breaking change; this test
+//! lives in a separate crate and sees them as an external consumer does, so
+//! it fails if any of them can no longer be built from its default or its
+//! constructor.
 
 use structured_proxy::config::{
-    DescriptorSource, ListenConfig, ProxyConfig, ServiceConfig, UpstreamConfig,
+    AliasConfig, ClientAddressConfig, ConcurrencyConfig, DescriptorSource, ListenTlsConfig,
+    ProxyConfig, ScopeConfig, Traffic, UpstreamConfig,
 };
 use structured_proxy::ProxyServer;
 
 #[test]
 fn embedded_config_is_constructible() {
     static DESCRIPTOR_BYTES: &[u8] = &[];
-    let config = ProxyConfig {
-        upstream: Some(UpstreamConfig {
-            default: "http://127.0.0.1:50051".into(),
-        }),
-        descriptors: vec![DescriptorSource::Embedded {
-            bytes: DESCRIPTOR_BYTES,
-        }],
-        listen: ListenConfig {
-            http: "0.0.0.0:8080".into(),
-            max_connections: None,
-            tls: None,
-            idle_timeout_secs: 60,
-            header_read_timeout_secs: 30,
-            drain_timeout_secs: 25,
-        },
-        service: ServiceConfig {
-            name: "embedded-test".into(),
-        },
-        aliases: vec![],
-        openapi: None,
-        auth: None,
-        shield: None,
-        oidc_discovery: None,
-        health: Default::default(),
-        metrics: Default::default(),
-        maintenance: Default::default(),
-        cors: Default::default(),
-        logging: Default::default(),
-        metrics_classes: vec![],
-        // Arbitrary: this test only exercises that the config is constructible,
-        // not header forwarding. NOTE for real embeddings: a programmatic literal
-        // bypasses the serde defaults, so set every header you need here (or load
-        // the config via from_file / from_yaml_str, where the default list applies).
-        forwarded_headers: vec!["authorization".into()],
-        streaming: Default::default(),
-        concurrency: None,
-        grpc_web: Default::default(),
-        transcode: Default::default(),
-        client_address: Default::default(),
-    };
+    let mut config = ProxyConfig::default();
+    config.upstream = Some(UpstreamConfig::new("http://127.0.0.1:50051"));
+    config.descriptors = vec![DescriptorSource::Embedded {
+        bytes: DESCRIPTOR_BYTES,
+    }];
+    config.listen.http = "0.0.0.0:8080".into();
+    config.listen.max_connections = Some(1000);
+    config.listen.tls = Some(ListenTlsConfig::new("/etc/tls.crt", "/etc/tls.key"));
+    config.service.name = "embedded-test".into();
+    config.aliases = vec![AliasConfig::new("/oauth2/{path}", "/v1/oauth2/{path}")];
+    config.concurrency =
+        Some(ConcurrencyConfig::new(512).with_scope(ScopeConfig::traffic([Traffic::Grpc])));
+    let mut client_address = ClientAddressConfig::default();
+    client_address.trusted_proxies = vec!["10.0.0.0/8".into()];
+    config.client_address = client_address;
+    // The default list, unlike a literal, keeps the serde defaults.
+    assert!(config
+        .forwarded_headers
+        .iter()
+        .any(|h| h == "authorization"));
     // The server accepts a programmatically-built config (the embedded path).
     let _server = ProxyServer::from_config(config);
 }

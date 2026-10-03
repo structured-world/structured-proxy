@@ -14,6 +14,7 @@ const BARE_COUNT_WINDOW: Duration = Duration::from_secs(60);
 /// A compiled limit tier: the GCRA shaper, the per-window count reported in the
 /// `RateLimit-Limit` header, and the window itself (the fleet-gate epoch length).
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct CompiledProfile {
     pub gcra: Gcra,
     /// Sustained request count per window (for `RateLimit-Limit`).
@@ -24,8 +25,9 @@ pub struct CompiledProfile {
 
 /// How a rule derives its limit key.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum KeySource {
-    /// Client IP (trusted-proxy aware).
+    /// The client address the proxy resolved.
     Ip,
     /// A named request-header value (API-key style); IP fallback when absent.
     Header(String),
@@ -35,6 +37,7 @@ pub enum KeySource {
 
 /// Whether a rule can be decided before auth runs, or needs validated claims.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Phase {
     /// No validated claims needed: run before auth so floods are shed cheaply.
     PreAuth,
@@ -44,6 +47,7 @@ pub enum Phase {
 
 /// A compiled rate-limit rule.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CompiledRule {
     pub matcher: GlobMatcher,
     pub key: KeySource,

@@ -223,10 +223,9 @@ impl ProxyServer {
     /// // Your gRPC API, with at most 1000 calls in flight and nothing else.
     /// let grpc = tonic::service::Routes::default();
     /// let service = ProxyServer::new()
-    ///     .with_concurrency_limit(ConcurrencyConfig {
-    ///         max_in_flight: 1000,
-    ///         scope: Some(ScopeConfig::traffic([Traffic::Grpc])),
-    ///     })
+    ///     .with_concurrency_limit(
+    ///         ConcurrencyConfig::new(1000).with_scope(ScopeConfig::traffic([Traffic::Grpc])),
+    ///     )
     ///     .service(grpc)?;
     /// # let _ = service;
     /// # Ok(())
@@ -351,12 +350,12 @@ impl ProxyServer {
     ///
     /// # fn build() -> anyhow::Result<()> {
     /// // Behind a load balancer in 10.0.0.0/8 that appends to X-Forwarded-For.
+    /// let mut client_address = ClientAddressConfig::default();
+    /// client_address.trusted_proxies = vec!["10.0.0.0/8".into()];
+    /// client_address.header = ForwardingHeader::XForwardedFor;
+    /// client_address.required = true;
     /// let service = ProxyServer::new()
-    ///     .with_client_address(ClientAddressConfig {
-    ///         trusted_proxies: vec!["10.0.0.0/8".into()],
-    ///         header: ForwardingHeader::XForwardedFor,
-    ///         required: true,
-    ///     })
+    ///     .with_client_address(client_address)
     ///     .service(tonic::service::Routes::default())?;
     /// # let _ = service;
     /// # Ok(())
