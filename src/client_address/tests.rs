@@ -371,6 +371,39 @@ fn x_real_ip_is_read_when_selected() {
 }
 
 #[test]
+fn an_overlong_x_real_ip_is_malformed_without_being_read() {
+    // The bound covers the spaces around the address, as for an
+    // X-Forwarded-For element: padding cannot make the proxy scan an
+    // arbitrarily long value, nor get a short address accepted inside it.
+    let lb = resolver(&["10.0.0.0/8"], ForwardingHeader::XRealIp);
+    let padded = format!("{}203.0.113.7", " ".repeat(MAX_ELEMENT));
+    assert_eq!(
+        lb.resolve(peer("10.0.0.1:4000"), &headers("x-real-ip", &[&padded]))
+            .resolution(),
+        Resolution::Invalid(InvalidForwarding::Malformed)
+    );
+    // Spaces within the bound still trim away.
+    assert_eq!(
+        lb.resolve(
+            peer("10.0.0.1:4000"),
+            &headers("x-real-ip", &["  203.0.113.7  "])
+        )
+        .resolution(),
+        Resolution::Forwarded(ip("203.0.113.7"))
+    );
+}
+
+#[test]
+fn the_proxy_owns_the_client_address_headers() {
+    for name in ["x-forwarded-for", "X-Real-IP", "Forwarded"] {
+        assert!(owns(name), "{name}");
+    }
+    for name in ["x-forwarded-proto", "x-forwarded-host", "x-user-id"] {
+        assert!(!owns(name), "{name}");
+    }
+}
+
+#[test]
 fn without_a_peer_nothing_resolves() {
     // No connection information: the forwarding headers cannot be trusted,
     // since nobody is known to have sent them.

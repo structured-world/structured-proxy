@@ -29,6 +29,16 @@ pub(crate) const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwar
 /// `X-Real-IP`.
 pub(crate) const X_REAL_IP: HeaderName = HeaderName::from_static("x-real-ip");
 
+/// Whether `name` is a header carrying a client's address: `X-Forwarded-For`,
+/// `X-Real-IP` or `Forwarded`. The proxy writes these from the resolved
+/// address alone, so neither the request nor a guard (claim headers,
+/// ext_authz, the auth decider) may set them.
+pub(crate) fn owns(name: &str) -> bool {
+    name.eq_ignore_ascii_case("x-forwarded-for")
+        || name.eq_ignore_ascii_case("x-real-ip")
+        || name.eq_ignore_ascii_case("forwarded")
+}
+
 /// Most list elements of `X-Forwarded-For` read before an address outside the
 /// trusted proxies turns up. Only trusted hops and empty elements count
 /// towards it, and no real chain of proxies comes near it.
@@ -327,11 +337,13 @@ fn real_ip<'a>(
     if lines.next().is_some() {
         return Err(InvalidForwarding::Repeated);
     }
-    let value = trim_whitespace(line.as_bytes());
-    if value.len() > MAX_ELEMENT {
+    // Bounded before trimming, so the spaces around the address count too and
+    // no value is read past `MAX_ELEMENT`, as for an `X-Forwarded-For` element.
+    let raw = line.as_bytes();
+    if raw.len() > MAX_ELEMENT {
         return Err(InvalidForwarding::Malformed);
     }
-    parse_address(value)
+    parse_address(trim_whitespace(raw))
         .map(|ip| Some(ip.to_canonical()))
         .ok_or(InvalidForwarding::Malformed)
 }

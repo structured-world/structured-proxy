@@ -432,8 +432,12 @@ async fn http1(
         request.push_str(&format!("{name}: {value}\r\n"));
     }
     request.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
-    stream.write_all(request.as_bytes()).await.unwrap();
-    stream.write_all(body).await.unwrap();
+    // Head and body in one write: a guard that refuses before reading the
+    // body closes the connection, and a body still unread in the socket then
+    // turns the close into a reset that loses the refusal.
+    let mut bytes = request.into_bytes();
+    bytes.extend_from_slice(body);
+    stream.write_all(&bytes).await.unwrap();
     let mut response = Vec::new();
     stream.read_to_end(&mut response).await.unwrap();
     let split = response
@@ -836,4 +840,70 @@ async fn the_fallback_and_the_decider_read_the_same_address() {
     let seen = decider.0.lock().unwrap().clone();
     assert_eq!(seen.len(), 1 + TRANSPORTS.len());
     assert!(seen.iter().all(|ip| ip == "203.0.113.7"), "{seen:?}");
+}
+
+#[tokio::test]
+async fn a_guard_cannot_set_the_client_address_headers() {
+    // The proxy writes these from the resolved address alone: a decider that
+    // injects them changes nothing the upstream or the fallback sees, so they
+    // never disagree with the address the rate limits keyed by.
+    struct Forging;
+
+    #[async_trait::async_trait]
+    impl structured_proxy::hooks::AuthDecider for Forging {
+        async fn decide(
+            &self,
+            _req: &structured_proxy::hooks::RequestParts<'_>,
+        ) -> structured_proxy::hooks::Decision {
+            let mut inject_headers = http::HeaderMap::new();
+            inject_headers.insert("x-forwarded-for", "198.51.100.66".parse().unwrap());
+            inject_headers.insert("x-real-ip", "198.51.100.67".parse().unwrap());
+            inject_headers.insert("forwarded", "for=198.51.100.68".parse().unwrap());
+            inject_headers.insert("x-user-id", "alice".parse().unwrap());
+            structured_proxy::hooks::Decision::Allow { inject_headers }
+        }
+    }
+
+    let service = in_process_proxy(TRUST_LOOPBACK, |server| {
+        server
+            .with_auth_decider(std::sync::Arc::new(Forging))
+            .with_auth_decider_scope(structured_proxy::config::ScopeConfig::traffic([
+                structured_proxy::config::Traffic::All,
+            ]))
+    });
+    let fallback = axum::Router::new().fallback(|headers: http::HeaderMap| async move {
+        let all = |name: &str| {
+            headers
+                .get_all(name)
+                .iter()
+                .map(|v| v.to_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        format!(
+            "{}|{}|{}|{}",
+            all("x-forwarded-for"),
+            all("x-real-ip"),
+            all("forwarded"),
+            all("x-user-id")
+        )
+    });
+    let addr = spawn_serve(service.with_fallback(fallback)).await;
+
+    let forwarded = [("x-forwarded-for", "203.0.113.7")];
+    let (status, _, body) = http1(addr, "GET", "/static/page", &forwarded, &[]).await;
+    assert_eq!(status, 200);
+    // The decider's other headers still go through.
+    assert_eq!(
+        String::from_utf8(body).unwrap(),
+        "203.0.113.7|203.0.113.7||alice"
+    );
+    for transport in TRANSPORTS {
+        let outcome = call(addr, transport, &forwarded).await;
+        assert_eq!(
+            outcome.address(common::Upstream::InProcess),
+            "203.0.113.7",
+            "{transport:?}"
+        );
+    }
 }

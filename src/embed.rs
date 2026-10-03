@@ -279,12 +279,18 @@ where
 
 /// Remove any incoming copies of the soon-to-be-injected header names, then
 /// insert the decider's values, so a client cannot forge them onto the upstream.
+/// A client-address header is left alone: the proxy sets those from the
+/// resolved address, and the decider's copy would contradict it.
 fn strip_then_insert(dst: &mut HeaderMap, inject: &HeaderMap) {
     for name in inject.keys() {
+        if crate::client_address::owns(name.as_str()) {
+            tracing::warn!(header = %name, "auth decider header ignored: the proxy sets it from the client address");
+            continue;
+        }
         while dst.remove(name).is_some() {}
-    }
-    for (name, value) in inject {
-        dst.append(name.clone(), value.clone());
+        for value in inject.get_all(name) {
+            dst.append(name.clone(), value.clone());
+        }
     }
 }
 

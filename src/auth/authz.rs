@@ -174,10 +174,16 @@ fn evaluate(resp: CheckResponse) -> Decision {
 /// The message of a denial that carries none of its own.
 const DENIED: &str = "forbidden by authorization policy";
 
-/// Append authz-supplied headers, preserving multiple values for the same name
-/// (e.g. several `Set-Cookie`) instead of overwriting all but the last.
+/// Append the headers an allowed check adds to the upstream request,
+/// preserving multiple values for the same name (e.g. several `Set-Cookie`)
+/// instead of overwriting all but the last. A client-address header is not
+/// applied: the proxy sets those from the resolved address alone.
 fn apply_headers(dst: &mut HeaderMap, headers: Vec<(HeaderName, HeaderValue)>) {
     for (name, value) in headers {
+        if crate::client_address::owns(name.as_str()) {
+            tracing::warn!(header = %name, "ext_authz header ignored: the proxy sets it from the client address");
+            continue;
+        }
         dst.append(name, value);
     }
 }
@@ -198,11 +204,11 @@ fn denied_to_response(denied: DeniedHttpResponse) -> Response {
         .and_then(|s| u16::try_from(s.code).ok())
         .and_then(|c| StatusCode::from_u16(c).ok())
         .unwrap_or(StatusCode::FORBIDDEN);
+    // The denial's own headers go to the client as they are.
     let mut headers = HeaderMap::new();
-    apply_headers(
-        &mut headers,
-        denied.headers.into_iter().filter_map(header_kv).collect(),
-    );
+    for (name, value) in denied.headers.into_iter().filter_map(header_kv) {
+        headers.append(name, value);
+    }
     (status, headers, denied.body).into_response()
 }
 
@@ -300,6 +306,38 @@ mod tests {
             .map(|v| v.to_str().unwrap())
             .collect();
         assert_eq!(values, vec!["a=1", "b=2"]);
+    }
+
+    #[test]
+    fn an_allowed_check_cannot_set_the_client_address_headers() {
+        // The proxy writes these from the resolved client address: an
+        // ext_authz server's OK headers must not replace it upstream.
+        let mut dst = HeaderMap::new();
+        dst.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.7"));
+        apply_headers(
+            &mut dst,
+            [
+                ("x-forwarded-for", "198.51.100.1"),
+                ("X-Real-IP", "198.51.100.2"),
+                ("forwarded", "for=198.51.100.3"),
+                ("x-authz-decision", "allow"),
+            ]
+            .into_iter()
+            .map(|(n, v)| {
+                (
+                    HeaderName::from_bytes(n.as_bytes()).unwrap(),
+                    HeaderValue::from_static(v),
+                )
+            })
+            .collect(),
+        );
+        assert_eq!(
+            dst.get_all("x-forwarded-for").iter().collect::<Vec<_>>(),
+            ["203.0.113.7"]
+        );
+        assert!(dst.get("x-real-ip").is_none());
+        assert!(dst.get("forwarded").is_none());
+        assert_eq!(dst["x-authz-decision"], "allow");
     }
 
     #[test]

@@ -132,6 +132,31 @@ fn auth_with_stub(roles: &[&str], jwt: Option<JwtConfig>) -> Arc<Auth> {
     Auth::build(&cfg, Some(Arc::new(stub))).unwrap().unwrap()
 }
 
+#[test]
+fn a_claim_cannot_be_forwarded_as_a_client_address_header() {
+    // The proxy writes these from the resolved client address; a claim mapped
+    // onto one would replace that address on the way upstream.
+    for header in ["x-forwarded-for", "X-Real-IP", "forwarded"] {
+        let mut jwt = jwt_claims_only();
+        jwt.claims_headers = HashMap::from([("sub".to_string(), header.to_string())]);
+        let cfg = AuthConfig {
+            mode: "jwt".into(),
+            jwt: Some(jwt),
+            forward_auth: None,
+            authz: None,
+            scope: None,
+        };
+        let stub = StubVerifier {
+            accepts: "good-token",
+            claims: serde_json::json!({ "sub": "stub-user" }),
+        };
+        let Err(err) = Auth::build(&cfg, Some(Arc::new(stub))) else {
+            panic!("{header}: a claim mapped onto a client-address header must be refused");
+        };
+        assert!(err.contains(header), "{header}: {err}");
+    }
+}
+
 #[tokio::test]
 async fn injected_verifier_decides_authentication() {
     let auth = auth_with_stub(&[], Some(jwt_claims_only()));

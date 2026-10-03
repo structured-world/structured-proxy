@@ -415,7 +415,9 @@ calls) carries exactly one `X-Forwarded-For` and one `X-Real-IP`, both the
 resolved address, or neither when none resolved. `Forwarded` (RFC 7239) is
 removed, since its `for=` would contradict them. Listing these headers in
 `forwarded_headers` changes nothing: the client's own values never reach the
-upstream. An upstream in process also gets the `ClientAddress` extension,
+upstream. Nor can a guard set them: a JWT `claims_headers` entry naming one
+stops the proxy at startup, and the ext_authz server's and the auth decider's
+copies are ignored with a warning in the log. An upstream in process also gets the `ClientAddress` extension,
 while `Request::remote_addr` and `Request::peer_certs` keep describing the
 real connection. Remote and in process, the address is the same.
 

@@ -101,7 +101,7 @@ fn forward<E>(
     for name in forwarded_headers {
         // Trace-context propagation and client-address resolution own these,
         // listed or not.
-        if is_trace_context(name) || is_client_address(name) {
+        if is_trace_context(name) || crate::client_address::owns(name) {
             continue;
         }
         let values = headers.get_all(name.as_str());
@@ -187,14 +187,6 @@ pub(crate) fn is_grpc_key(name: &str) -> bool {
 /// Whether `name` is a W3C trace-context header, which propagation owns.
 fn is_trace_context(name: &str) -> bool {
     name.eq_ignore_ascii_case("traceparent") || name.eq_ignore_ascii_case("tracestate")
-}
-
-/// Whether `name` carries a client's address, which client-address
-/// resolution owns.
-fn is_client_address(name: &str) -> bool {
-    name.eq_ignore_ascii_case("x-forwarded-for")
-        || name.eq_ignore_ascii_case("x-real-ip")
-        || name.eq_ignore_ascii_case("forwarded")
 }
 
 /// `ASCII-Value → 1*( %x20-%x7E )`. An empty value is valid HTTP but not a
