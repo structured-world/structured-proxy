@@ -39,7 +39,8 @@ tonic services.
   the client's address and certificate reaching the upstream
 - The client's address resolved once from the connection and the proxies you
   trust, then shared by the rate limits, the hooks and the upstream, which
-  gets one sanitized `X-Forwarded-For` ([Client address](#client-address))
+  gets a verified `X-Forwarded-For` by default, or the forwarding of nginx,
+  Envoy or your load balancer ([Client address](#client-address))
 - Graceful shutdown: calls and streams in flight finish within a bounded
   drain, HTTP/2 clients get a GOAWAY ([Shutting down](#shutting-down))
 - Guards you scope to the traffic they cover (transcoded calls, the proxy's
@@ -250,8 +251,9 @@ error_details:
 response_headers:
   deny: ["x-debug-trace"]
 
-# Optional: how the client's address is resolved (see "Client address").
-# Defaults: no trusted proxy, the right setting for a proxy facing clients.
+# Optional: how the client's address is resolved and what the upstream
+# receives of it (see "Client address"). Defaults: no trusted proxy, the right
+# setting for a proxy facing clients; a verified X-Forwarded-For.
 client_address:
   # Proxies trusted to report the client's address: CIDR ranges or addresses.
   trusted_proxies: ["10.0.0.0/8"]
@@ -259,6 +261,15 @@ client_address:
   header: x_forwarded_for
   # Refuse a request whose address does not resolve. Default: false.
   required: false
+  forward:
+    # X-Forwarded-For upstream: verified (default), resolved, append,
+    # preserve or remove.
+    x_forwarded_for: verified
+    # Header carrying the resolved address; null for none.
+    client_header: x-real-ip
+    # Header carrying X-Forwarded-For exactly as it arrived, for logs.
+    # Default: off.
+    audit_header: null
 
 # Rate limiting (Shield)
 #
@@ -409,20 +420,60 @@ refusal reaches a gRPC or gRPC-Web client as a status in its own protocol, like
 any guard's (see [Guards and scopes](#guards-and-scopes)). Malformed data left
 of an address already resolved cannot cause either case.
 
-**What the upstream receives.** Every request bound for the upstream (native
-gRPC, gRPC-Web passed through or translated, transcoded unary and streaming
-calls) carries exactly one `X-Forwarded-For` and one `X-Real-IP`, both the
-resolved address, or neither when none resolved. `Forwarded` (RFC 7239) is
-removed, since its `for=` would contradict them. Listing these headers in
-`forwarded_headers` changes nothing: the client's own values never reach the
-upstream. Nor can a guard set them: a JWT `claims_headers` entry naming one
-stops the proxy at startup, and the ext_authz server's and the auth decider's
-copies are ignored with a warning in the log. An upstream in process also gets the `ClientAddress` extension,
-while `Request::remote_addr` and `Request::peer_certs` keep describing the
-real connection. Remote and in process, the address is the same.
+**What the upstream receives.** Resolution decides who the client is; the
+`forward` policy decides what the upstream is told, independently. The rate
+limits and the hooks always use the resolved address, whatever is forwarded.
+
+| `forward.x_forwarded_for` | `X-Forwarded-For` upstream | Its first element |
+|---|---|---|
+| `verified` (default) | the client, the trusted proxies after it, this proxy's peer: `203.0.113.7, 10.0.0.2, 10.0.0.1` | the client |
+| `resolved` | the client alone | the client |
+| `append` | the list as it arrived, then this proxy's peer | whatever the client wrote |
+| `preserve` | the list as it arrived; `X-Real-IP` and `Forwarded` too | whatever the client wrote |
+| `remove` | nothing | none |
+
+With `verified`, whatever the client wrote left of its own address is dropped,
+so an upstream reading the first element and one walking the list from the
+right reach the same client. In every mode but `preserve`, `X-Real-IP` and
+`Forwarded` (RFC 7239) from the request are removed, since they would
+contradict the list. On top of the list:
+
+- `forward.client_header` (`x-real-ip` by default, `null` for none) carries
+  the resolved address alone, whatever the request sent under that name, and
+  is absent when nothing resolved.
+- `forward.audit_header` (off by default) carries the request's
+  `X-Forwarded-For` field lines exactly as they arrived, before any change.
+  Nothing in it is verified: it is for logs and audits, never for decisions.
+
+The same headers reach native gRPC, gRPC-Web passed through or translated,
+transcoded unary and streaming calls, and the fallback; remote and in process
+alike. Listing them in `forwarded_headers` changes nothing. They are the
+proxy's own: a JWT `claims_headers` entry naming one stops the proxy at
+startup, and an ext_authz server's or the auth decider's copies are ignored
+with a warning in the log. An upstream in process also gets the
+`ClientAddress` extension, while `Request::remote_addr` and
+`Request::peer_certs` keep describing the real connection.
+
+**Coming from another proxy.** Each one's habit is one setting away:
+
+| Behind | `forward` |
+|---|---|
+| nginx with `$proxy_add_x_forwarded_for` and `X-Real-IP $remote_addr` | `x_forwarded_for: append`, `client_header: x-real-ip` |
+| nginx without `proxy_set_header` | `x_forwarded_for: preserve`, `client_header: null` |
+| Envoy with `use_remote_address` | `append`, `client_header: x-envoy-external-address` |
+| HAProxy with `option forwardfor` | `append` |
+| AWS ALB `append` / `preserve` / `remove` | the mode of the same name |
+| Cloudflare | `append`, `client_header: cf-connecting-ip` |
+| Akamai | `client_header: true-client-ip` |
+| Traefik, Caddy | `verified` (stricter: a prefix forged before a trusted balancer does not get through), or `append` |
+
+With `append` and `preserve`, the first element of `X-Forwarded-For` is
+whatever the client chose to write. An upstream behind them should read the
+client header, or walk the list from the right with this proxy as its only
+trusted hop.
 
 **At the edge**, facing clients directly, leave `trusted_proxies` empty: the
-peer is the client, and whatever it sends in forwarding headers is replaced.
+peer is the client, and what it sends in forwarding headers never counts.
 
 **Behind a load balancer**, trust exactly the addresses it connects from, and
 have it append the peer it sees to `X-Forwarded-For` (nginx
@@ -434,29 +485,34 @@ client_address:
   trusted_proxies: ["10.0.0.0/8"]   # the load balancer's subnet
   header: x_forwarded_for
   required: true                    # every request must name its client
+  forward:
+    audit_header: x-original-forwarded-for   # what arrived, for the access log
 ```
 
-**The upstream's side.** The proxy is now the upstream's only reporter: the
-upstream should trust forwarding headers from the proxy's address alone, and
-take the single `X-Forwarded-For` value as the client rather than walk a chain
-of its own (Keycloak, for instance: `proxy-headers=xforwarded` with
-`proxy-trusted-addresses` set to the proxy). This holds only while nothing
-else can reach the upstream: keep it off any network the clients reach, by
-network policy or by running it in process, or a client could talk to it
-directly and send its own `X-Forwarded-For`.
+**The upstream's side.** The proxy is the upstream's only reporter: the
+upstream should trust forwarding headers from the proxy's address alone and
+read the client header, or the first element of a `verified` list, rather than
+judge the chain on its own (Keycloak, for instance: `proxy-headers=xforwarded`
+with `proxy-trusted-addresses` set to the proxy). This holds only while
+nothing else can reach the upstream: keep it off any network the clients
+reach, by network policy or by running it in process, or a client could talk
+to it directly and send its own `X-Forwarded-For`.
 
 **In code**, `ProxyServer::with_client_address` takes the same section, and a
 tonic handler behind the proxy reads the result:
 
 ```rust
 use structured_proxy::client_address::Resolution;
-use structured_proxy::config::{ClientAddressConfig, ForwardingHeader};
+use structured_proxy::config::{ClientAddressConfig, ForwardingHeader, XForwardedFor};
 use structured_proxy::{ClientAddress, ProxyServer};
 
 # fn build(grpc: tonic::service::Routes) -> anyhow::Result<()> {
 let mut client_address = ClientAddressConfig::default();
 client_address.trusted_proxies = vec!["10.0.0.0/8".into()];
 client_address.header = ForwardingHeader::XForwardedFor;
+// As nginx forwards with `$proxy_add_x_forwarded_for`, plus the audit copy.
+client_address.forward.x_forwarded_for = XForwardedFor::Append;
+client_address.forward.audit_header = Some("x-original-forwarded-for".into());
 let service = ProxyServer::new()
     .with_client_address(client_address)
     .service(grpc)?;
@@ -780,9 +836,9 @@ grpc-gateway do, so the same service works behind any of them.
 Trace context goes through whether listed or not: the upstream gets exactly
 one valid `traceparent` (the client's first, or a new one when it is missing
 or malformed), and `tracestate` only together with the client's own trace.
-`X-Forwarded-For`, `X-Real-IP` and `Forwarded` are never taken from the
-request, listed or not: the upstream gets the resolved client address instead
-(see [Client address](#client-address)).
+`X-Forwarded-For`, `X-Real-IP`, `Forwarded` and the headers named in
+`client_address.forward` carry what that forwarding policy wrote, listed or
+not (see [Client address](#client-address)).
 
 **Response metadata → response headers.** The upstream's response metadata
 becomes HTTP response headers: every ASCII entry, in order, repeated values as

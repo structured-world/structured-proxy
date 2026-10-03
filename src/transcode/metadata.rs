@@ -12,8 +12,6 @@ use axum::http::header::{Entry, OccupiedEntry};
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use tonic::metadata::MetadataMap;
 
-use crate::client_address::{X_FORWARDED_FOR, X_REAL_IP};
-
 /// A forwarded request header whose value gRPC metadata cannot carry.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("header `{header}` has a value gRPC metadata cannot carry")]
@@ -51,18 +49,34 @@ pub fn try_http_headers_to_grpc_metadata(
     headers: &HeaderMap,
     forwarded_headers: &[String],
 ) -> Result<MetadataMap, InvalidForwardedHeader> {
-    client_metadata(headers, forwarded_headers, None)
+    checked(headers, forwarded_headers, Source::Client)
 }
 
-/// [`try_http_headers_to_grpc_metadata`], with `client` as the one
-/// `x-forwarded-for` and `x-real-ip` value of the metadata: the address the
-/// proxy resolved, or nothing when none did.
-pub(crate) fn client_metadata(
+/// [`try_http_headers_to_grpc_metadata`] for a request whose client-address
+/// headers the proxy already rewrote: `forwarded_headers` names them too, and
+/// they are forwarded as the rewrite left them.
+pub(crate) fn rewritten_headers_to_grpc_metadata(
     headers: &HeaderMap,
     forwarded_headers: &[String],
-    client: Option<&HeaderValue>,
 ) -> Result<MetadataMap, InvalidForwardedHeader> {
-    forward(headers, forwarded_headers, client, |name, value| {
+    checked(headers, forwarded_headers, Source::Rewritten)
+}
+
+/// Who last wrote a request's client-address headers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Source {
+    /// The client: they carry its own assertions and are not forwarded.
+    Client,
+    /// The proxy's client-address resolution.
+    Rewritten,
+}
+
+fn checked(
+    headers: &HeaderMap,
+    forwarded_headers: &[String],
+    source: Source,
+) -> Result<MetadataMap, InvalidForwardedHeader> {
+    forward(headers, forwarded_headers, source, |name, value| {
         if carries(name, value.as_bytes()) {
             Ok(())
         } else {
@@ -83,25 +97,25 @@ pub fn http_headers_to_grpc_metadata(
     headers: &HeaderMap,
     forwarded_headers: &[String],
 ) -> MetadataMap {
-    match forward::<Infallible>(headers, forwarded_headers, None, |_, _| Ok(())) {
+    match forward::<Infallible>(headers, forwarded_headers, Source::Client, |_, _| Ok(())) {
         Ok(metadata) => metadata,
         Err(never) => match never {},
     }
 }
 
-/// The metadata for `headers` and the resolved `client` address, with `check`
-/// deciding on each forwarded value.
+/// The metadata for `headers`, with `check` deciding on each forwarded value.
 fn forward<E>(
     headers: &HeaderMap,
     forwarded_headers: &[String],
-    client: Option<&HeaderValue>,
+    source: Source,
     mut check: impl FnMut(&HeaderName, &HeaderValue) -> Result<(), E>,
 ) -> Result<MetadataMap, E> {
     let mut forwarded = HeaderMap::new();
     for name in forwarded_headers {
-        // Trace-context propagation and client-address resolution own these,
-        // listed or not.
-        if is_trace_context(name) || crate::client_address::owns(name) {
+        // Trace-context propagation owns these, listed or not, and
+        // client-address resolution owns the address headers a client sent.
+        if is_trace_context(name) || (source == Source::Client && crate::client_address::owns(name))
+        {
             continue;
         }
         let values = headers.get_all(name.as_str());
@@ -150,10 +164,6 @@ fn forward<E>(
                 push(value.clone());
             }
         }
-    }
-    if let Some(client) = client {
-        forwarded.insert(X_FORWARDED_FOR, client.clone());
-        forwarded.insert(X_REAL_IP, client.clone());
     }
     let mut metadata = MetadataMap::from_headers(forwarded);
 

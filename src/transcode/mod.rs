@@ -670,11 +670,17 @@ fn prepare<S: TranscodeState>(
         connection,
         address,
     } = origin;
-    let request_metadata = metadata::client_metadata(
-        headers,
-        proxy_state.forwarded_headers(),
-        address.as_ref().and_then(ClientAddress::header_value),
-    )
+    // A request the proxy resolved carries the client-address headers its
+    // forwarding policy wrote; one routed here without that resolution
+    // carries only what its client asserted, which is never forwarded.
+    let request_metadata = match address {
+        Some(_) => {
+            metadata::rewritten_headers_to_grpc_metadata(headers, proxy_state.forwarded_headers())
+        }
+        None => {
+            metadata::try_http_headers_to_grpc_metadata(headers, proxy_state.forwarded_headers())
+        }
+    }
     .map_err(|e| Unmappable(e.to_string()))?;
     let message =
         decode_request(entry, headers, path_params, raw_query, body).map_err(Unmappable)?;

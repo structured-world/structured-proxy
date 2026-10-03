@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::XForwardedFor;
 
 /// A resolver trusting `trusted`, reading `header`.
 fn resolver(trusted: &[&str], header: ForwardingHeader) -> Resolver {
@@ -6,6 +7,7 @@ fn resolver(trusted: &[&str], header: ForwardingHeader) -> Resolver {
         trusted_proxies: trusted.iter().map(|t| (*t).to_string()).collect(),
         header,
         required: false,
+        forward: Default::default(),
     })
     .unwrap()
 }
@@ -417,37 +419,293 @@ fn without_a_peer_nothing_resolves() {
     );
 }
 
-#[test]
-fn applying_rewrites_the_forwarding_headers_to_the_resolved_address() {
+/// A resolver trusting 10.0.0.0/8 that forwards as `forward` says.
+fn forwarding(forward: crate::config::ForwardConfig) -> Resolver {
+    Resolver::build(&ClientAddressConfig {
+        trusted_proxies: vec!["10.0.0.0/8".into()],
+        header: ForwardingHeader::XForwardedFor,
+        required: false,
+        forward,
+    })
+    .unwrap()
+}
+
+/// `forward` with `mode`, the default client header and no audit header.
+fn mode(mode: XForwardedFor) -> crate::config::ForwardConfig {
+    crate::config::ForwardConfig {
+        x_forwarded_for: mode,
+        ..Default::default()
+    }
+}
+
+/// A request through the load balancer at 10.0.0.1, whose client wrote a
+/// forged prefix and every other forwarding header, plus two DPoP proofs.
+fn forged_request() -> http::Request<()> {
     let mut request = http::Request::new(());
     let headers = request.headers_mut();
     headers.append("x-forwarded-for", HeaderValue::from_static("198.51.100.1"));
     headers.append(
         "x-forwarded-for",
-        HeaderValue::from_static("203.0.113.7, 10.0.0.2"),
+        HeaderValue::from_static("203.0.113.7:51234, 10.0.0.2"),
     );
     headers.append("x-real-ip", HeaderValue::from_static("198.51.100.2"));
     headers.append("forwarded", HeaderValue::from_static("for=198.51.100.3"));
     headers.append("dpop", HeaderValue::from_static("proof-a"));
     headers.append("dpop", HeaderValue::from_static("proof-b"));
-    behind_lb().apply(&mut request, peer("10.0.0.1:4000"));
-    let headers = request.headers();
-    let all = |name: &str| -> Vec<&str> {
-        headers
-            .get_all(name)
-            .iter()
-            .map(|v| v.to_str().unwrap())
-            .collect()
-    };
-    assert_eq!(all("x-forwarded-for"), ["203.0.113.7"]);
-    assert_eq!(all("x-real-ip"), ["203.0.113.7"]);
-    assert!(all("forwarded").is_empty());
+    request
+}
+
+/// Every value of `name` on `request`, in order.
+fn all<'a>(request: &'a http::Request<()>, name: &str) -> Vec<&'a str> {
+    request
+        .headers()
+        .get_all(name)
+        .iter()
+        .map(|v| v.to_str().unwrap())
+        .collect()
+}
+
+#[test]
+fn verified_forwards_the_checked_chain_from_the_client() {
+    // The client's forged prefix is gone; what remains is what the trusted
+    // proxies vouched for, in canonical form, then this proxy's peer.
+    let mut request = forged_request();
+    forwarding(Default::default()).apply(&mut request, peer("10.0.0.1:4000"));
+    assert_eq!(
+        all(&request, "x-forwarded-for"),
+        ["203.0.113.7, 10.0.0.2, 10.0.0.1"]
+    );
+    assert_eq!(all(&request, "x-real-ip"), ["203.0.113.7"]);
+    assert!(all(&request, "forwarded").is_empty());
     // Unrelated headers keep every value (RFC 9449 §4.3 counts DPoP).
-    assert_eq!(all("dpop"), ["proof-a", "proof-b"]);
+    assert_eq!(all(&request, "dpop"), ["proof-a", "proof-b"]);
     let client = request.extensions().get::<ClientAddress>().unwrap();
     assert_eq!(
         client.resolution(),
         Resolution::Forwarded(ip("203.0.113.7"))
+    );
+}
+
+#[test]
+fn verified_lists_a_client_that_is_the_peer_once() {
+    // An untrusted peer, and a trusted one that forwarded nothing, are the
+    // client and the whole verified chain.
+    for (from, client) in [
+        ("203.0.113.9:4000", "203.0.113.9"),
+        ("10.0.0.1:4000", "10.0.0.1"),
+    ] {
+        let mut request = http::Request::new(());
+        if from.starts_with("203") {
+            request
+                .headers_mut()
+                .insert("x-forwarded-for", HeaderValue::from_static("198.51.100.1"));
+        }
+        forwarding(Default::default()).apply(&mut request, peer(from));
+        assert_eq!(all(&request, "x-forwarded-for"), [client], "{from}");
+    }
+    // Every hop trusted: the leftmost is the client, listed once.
+    let mut request = http::Request::new(());
+    request.headers_mut().insert(
+        "x-forwarded-for",
+        HeaderValue::from_static("10.0.0.5, 10.0.0.2"),
+    );
+    forwarding(Default::default()).apply(&mut request, peer("10.0.0.1:4000"));
+    assert_eq!(
+        all(&request, "x-forwarded-for"),
+        ["10.0.0.5, 10.0.0.2, 10.0.0.1"]
+    );
+}
+
+#[test]
+fn verified_from_x_real_ip_is_the_client_and_the_peer() {
+    let resolver = Resolver::build(&ClientAddressConfig {
+        trusted_proxies: vec!["10.0.0.0/8".into()],
+        header: ForwardingHeader::XRealIp,
+        required: false,
+        forward: Default::default(),
+    })
+    .unwrap();
+    let mut request = forged_request();
+    request
+        .headers_mut()
+        .insert("x-real-ip", HeaderValue::from_static("203.0.113.7"));
+    resolver.apply(&mut request, peer("10.0.0.1:4000"));
+    assert_eq!(all(&request, "x-forwarded-for"), ["203.0.113.7, 10.0.0.1"]);
+}
+
+#[test]
+fn resolved_forwards_the_address_alone() {
+    let mut request = forged_request();
+    forwarding(mode(XForwardedFor::Resolved)).apply(&mut request, peer("10.0.0.1:4000"));
+    assert_eq!(all(&request, "x-forwarded-for"), ["203.0.113.7"]);
+    assert_eq!(all(&request, "x-real-ip"), ["203.0.113.7"]);
+    assert!(all(&request, "forwarded").is_empty());
+}
+
+#[test]
+fn append_keeps_the_arrived_list_and_adds_the_peer() {
+    // As nginx's `$proxy_add_x_forwarded_for`, Envoy and HAProxy do: the
+    // field lines joined in order, then the peer.
+    let mut request = forged_request();
+    forwarding(mode(XForwardedFor::Append)).apply(&mut request, peer("10.0.0.1:4000"));
+    assert_eq!(
+        all(&request, "x-forwarded-for"),
+        ["198.51.100.1, 203.0.113.7:51234, 10.0.0.2, 10.0.0.1"]
+    );
+    // The resolved address still has its own header, and the rest is gone.
+    assert_eq!(all(&request, "x-real-ip"), ["203.0.113.7"]);
+    assert!(all(&request, "forwarded").is_empty());
+    // Nothing arrived: the peer alone. No peer: the lines alone.
+    let mut request = http::Request::new(());
+    forwarding(mode(XForwardedFor::Append)).apply(&mut request, peer("203.0.113.9:4000"));
+    assert_eq!(all(&request, "x-forwarded-for"), ["203.0.113.9"]);
+    let mut request = forged_request();
+    forwarding(mode(XForwardedFor::Append)).apply(&mut request, None);
+    assert_eq!(
+        all(&request, "x-forwarded-for"),
+        ["198.51.100.1, 203.0.113.7:51234, 10.0.0.2"]
+    );
+    assert!(all(&request, "x-real-ip").is_empty());
+}
+
+#[test]
+fn preserve_leaves_what_arrived() {
+    let mut request = forged_request();
+    let mut forward = mode(XForwardedFor::Preserve);
+    forward.client_header = Some("cf-connecting-ip".into());
+    forwarding(forward).apply(&mut request, peer("10.0.0.1:4000"));
+    assert_eq!(
+        all(&request, "x-forwarded-for"),
+        ["198.51.100.1", "203.0.113.7:51234, 10.0.0.2"]
+    );
+    assert_eq!(all(&request, "x-real-ip"), ["198.51.100.2"]);
+    assert_eq!(all(&request, "forwarded"), ["for=198.51.100.3"]);
+    assert_eq!(all(&request, "cf-connecting-ip"), ["203.0.113.7"]);
+    // The client header still wins over a preserved X-Real-IP.
+    let mut request = forged_request();
+    forwarding(mode(XForwardedFor::Preserve)).apply(&mut request, peer("10.0.0.1:4000"));
+    assert_eq!(all(&request, "x-real-ip"), ["203.0.113.7"]);
+}
+
+#[test]
+fn remove_forwards_no_list() {
+    let mut request = forged_request();
+    forwarding(mode(XForwardedFor::Remove)).apply(&mut request, peer("10.0.0.1:4000"));
+    assert!(all(&request, "x-forwarded-for").is_empty());
+    assert!(all(&request, "forwarded").is_empty());
+    assert_eq!(all(&request, "x-real-ip"), ["203.0.113.7"]);
+}
+
+#[test]
+fn the_client_header_is_named_by_the_config_and_never_by_the_client() {
+    let forward = crate::config::ForwardConfig {
+        client_header: Some("CF-Connecting-IP".into()),
+        ..Default::default()
+    };
+    let mut request = forged_request();
+    request
+        .headers_mut()
+        .insert("cf-connecting-ip", HeaderValue::from_static("198.51.100.9"));
+    forwarding(forward.clone()).apply(&mut request, peer("10.0.0.1:4000"));
+    assert_eq!(all(&request, "cf-connecting-ip"), ["203.0.113.7"]);
+    assert!(all(&request, "x-real-ip").is_empty());
+    // Nothing resolved: the client's copy is gone, and none is written.
+    let mut request = forged_request();
+    request
+        .headers_mut()
+        .insert("cf-connecting-ip", HeaderValue::from_static("198.51.100.9"));
+    forwarding(forward).apply(&mut request, None);
+    assert!(all(&request, "cf-connecting-ip").is_empty());
+    // No client header at all.
+    let forward = crate::config::ForwardConfig {
+        client_header: None,
+        ..Default::default()
+    };
+    let mut request = forged_request();
+    forwarding(forward).apply(&mut request, peer("10.0.0.1:4000"));
+    assert!(all(&request, "x-real-ip").is_empty());
+}
+
+#[test]
+fn the_audit_header_holds_what_arrived_and_nothing_the_client_named_it() {
+    let forward = crate::config::ForwardConfig {
+        audit_header: Some("x-original-forwarded-for".into()),
+        ..Default::default()
+    };
+    let mut request = forged_request();
+    request.headers_mut().insert(
+        "x-original-forwarded-for",
+        HeaderValue::from_static("198.51.100.66"),
+    );
+    forwarding(forward.clone()).apply(&mut request, peer("10.0.0.1:4000"));
+    assert_eq!(
+        all(&request, "x-original-forwarded-for"),
+        ["198.51.100.1", "203.0.113.7:51234, 10.0.0.2"]
+    );
+    // Nothing arrived: nothing is recorded, and the client's copy is gone.
+    let mut request = http::Request::new(());
+    request.headers_mut().insert(
+        "x-original-forwarded-for",
+        HeaderValue::from_static("198.51.100.66"),
+    );
+    forwarding(forward).apply(&mut request, peer("203.0.113.9:4000"));
+    assert!(all(&request, "x-original-forwarded-for").is_empty());
+}
+
+#[test]
+fn a_forward_header_must_be_a_new_grpc_key() {
+    let cases: [(Option<&str>, Option<&str>, &str); 6] = [
+        (Some("x-forwarded-for"), None, "client_header"),
+        (Some("Forwarded"), None, "client_header"),
+        (Some("not a header"), None, "client_header"),
+        (Some("x+ip"), None, "client_header"),
+        (Some("x-real-ip"), Some("X-Real-IP"), "audit_header"),
+        (
+            Some("cf-connecting-ip"),
+            Some("cf-connecting-ip"),
+            "audit_header",
+        ),
+    ];
+    for (client, audit, setting) in cases {
+        let err = Resolver::build(&ClientAddressConfig {
+            forward: crate::config::ForwardConfig {
+                client_header: client.map(str::to_owned),
+                audit_header: audit.map(str::to_owned),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(err.contains(setting), "{client:?} {audit:?}: {err}");
+    }
+}
+
+#[test]
+fn the_forwarding_headers_are_reserved() {
+    let resolver = forwarding(crate::config::ForwardConfig {
+        client_header: Some("cf-connecting-ip".into()),
+        audit_header: Some("x-original-forwarded-for".into()),
+        ..Default::default()
+    });
+    for name in [
+        "x-forwarded-for",
+        "X-Real-IP",
+        "forwarded",
+        "CF-Connecting-IP",
+        "x-original-forwarded-for",
+    ] {
+        assert!(resolver.reserves(name), "{name}");
+    }
+    assert!(!resolver.reserves("x-user-id"));
+    assert_eq!(
+        resolver.forwarded_headers().collect::<Vec<_>>(),
+        [
+            "x-forwarded-for",
+            "x-real-ip",
+            "forwarded",
+            "cf-connecting-ip",
+            "x-original-forwarded-for"
+        ]
     );
 }
 

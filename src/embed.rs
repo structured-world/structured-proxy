@@ -47,16 +47,24 @@ fn unresolved(req: &Request) -> ClientAddress {
     )
 }
 
+/// The embedder's [`AuthDecider`] as an inline gate, with the headers it may
+/// not set: those the client-address forwarding writes beyond the fixed ones.
+pub(crate) struct DeciderGate {
+    pub(crate) decider: Arc<dyn AuthDecider>,
+    pub(crate) reserved: Arc<[http::HeaderName]>,
+}
+
 /// Inline gate: run the embedder's [`AuthDecider`] on every proxied request.
 ///
 /// On `Allow`, the decider-controlled headers are injected onto the request
 /// after stripping any client-supplied copies (so a client cannot forge them),
 /// then the request proceeds upstream.
 pub(crate) async fn auth_decider_gate(
-    State(decider): State<Arc<dyn AuthDecider>>,
+    State(gate): State<Arc<DeciderGate>>,
     mut request: Request,
     next: Next,
 ) -> Response {
+    let DeciderGate { decider, reserved } = &*gate;
     // Borrowed when the proxy resolved it, as on every request it serves.
     let fallback;
     let client = match request.extensions().get::<ClientAddress>() {
@@ -81,7 +89,7 @@ pub(crate) async fn auth_decider_gate(
     match decision {
         Decision::Allow { inject_headers } => {
             let dst = request.headers_mut();
-            strip_then_insert(dst, &inject_headers);
+            strip_then_insert(dst, &inject_headers, reserved);
             next.run(request).await
         }
         // The decider owns the HTTP answer; a gRPC caller gets the code its
@@ -279,11 +287,12 @@ where
 
 /// Remove any incoming copies of the soon-to-be-injected header names, then
 /// insert the decider's values, so a client cannot forge them onto the upstream.
-/// A client-address header is left alone: the proxy sets those from the
-/// resolved address, and the decider's copy would contradict it.
-fn strip_then_insert(dst: &mut HeaderMap, inject: &HeaderMap) {
+/// A client-address header, or one in `reserved` the client-address
+/// forwarding writes, is left alone: the decider's copy would contradict the
+/// resolved address.
+fn strip_then_insert(dst: &mut HeaderMap, inject: &HeaderMap, reserved: &[http::HeaderName]) {
     for name in inject.keys() {
-        if crate::client_address::owns(name.as_str()) {
+        if crate::client_address::owns(name.as_str()) || reserved.contains(name) {
             tracing::warn!(header = %name, "auth decider header ignored: the proxy sets it from the client address");
             continue;
         }

@@ -24,7 +24,6 @@ use tower::util::{BoxCloneSyncService, Oneshot};
 use tower::{Layer, Service, ServiceExt};
 
 use crate::config::{ScopeConfig, Traffic};
-use crate::hooks::AuthDecider;
 use crate::transcode::error::{grpc_to_http_status, guard_error_body};
 
 pub(crate) use concurrency::Concurrency;
@@ -329,7 +328,7 @@ pub(crate) struct Guards {
     pub(crate) shield: Option<(Arc<crate::shield::Shield>, Arc<Scope>)>,
     pub(crate) auth: Option<(Arc<crate::auth::Auth>, Arc<Scope>)>,
     pub(crate) authz: Option<(Arc<crate::auth::authz::Authz>, Arc<Scope>)>,
-    pub(crate) decider: Option<(Arc<dyn AuthDecider>, Arc<Scope>)>,
+    pub(crate) decider: Option<(Arc<crate::embed::DeciderGate>, Arc<Scope>)>,
 }
 
 /// Put the guards that cover `$class` around `$target`, in pipeline order

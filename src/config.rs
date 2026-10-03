@@ -92,8 +92,8 @@ pub struct ProxyConfig {
     pub metrics_classes: Vec<MetricsClassConfig>,
 
     /// Headers to forward from HTTP to gRPC metadata. `x-forwarded-for`,
-    /// `x-real-ip` and `forwarded` are never taken from the request: the
-    /// upstream gets the resolved client address instead (`client_address`),
+    /// `x-real-ip`, `forwarded` and the headers named in
+    /// `client_address.forward` carry what that forwarding policy wrote,
     /// listed or not.
     #[serde(default = "default_forwarded_headers")]
     pub forwarded_headers: Vec<String>,
@@ -150,20 +150,27 @@ impl Default for ProxyConfig {
     }
 }
 
-/// How the client's address is resolved, for every consumer of it at once:
-/// the rate limits, the hooks, the fallback and the upstream.
+/// How the client's address is resolved, for every consumer of it at once
+/// (the rate limits, the hooks, the fallback, the upstream), and what the
+/// upstream receives of it.
 ///
 /// ```yaml
 /// client_address:
 ///   trusted_proxies: ["10.0.0.0/8", "192.0.2.10"]
 ///   header: x_forwarded_for
 ///   required: false
+///   forward:
+///     x_forwarded_for: verified
+///     client_header: x-real-ip
+///     audit_header: null
 /// ```
 ///
 /// The connection's peer is the client unless it is a trusted proxy; only
 /// then is `header` read, so an address a client asserts itself never
 /// counts. The defaults trust no proxy: the right setting for a proxy that
-/// faces its clients directly.
+/// faces its clients directly. Resolution and [`forward`](Self::forward) are
+/// independent: the rate limits and the hooks always use the resolved
+/// address, whatever is forwarded.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
@@ -180,9 +187,92 @@ pub struct ClientAddressConfig {
     /// Refuse a request whose client address cannot be resolved: no
     /// connection information (`INTERNAL`, 500), or a trusted proxy's report
     /// that cannot be read (`INVALID_ARGUMENT`, 400). Off: such a request
-    /// goes on with no address and no forwarding headers.
+    /// goes on with no address.
     #[serde(default)]
     pub required: bool,
+    /// What the upstream receives of the client's address.
+    #[serde(default)]
+    pub forward: ForwardConfig,
+}
+
+/// What the upstream (and the fallback) receives of the client's address.
+///
+/// The defaults give an upstream nothing a client can forge: a verified
+/// `X-Forwarded-For` whose first element is the client, and the address in
+/// `X-Real-IP`. Every header named here is written by the proxy alone; a
+/// guard (JWT claim headers, ext_authz, the auth decider) cannot set it.
+///
+/// | Behind | Setting |
+/// |---|---|
+/// | nginx, `$proxy_add_x_forwarded_for` and `X-Real-IP` | `x_forwarded_for: append`, `client_header: x-real-ip` |
+/// | Envoy, `use_remote_address` | `append`, `client_header: x-envoy-external-address` |
+/// | HAProxy, `option forwardfor` | `append` |
+/// | AWS ALB `append` / `preserve` / `remove` | the mode of the same name |
+/// | Cloudflare | `append`, `client_header: cf-connecting-ip` |
+/// | Traefik, Caddy | `verified` (stricter), or `append` |
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct ForwardConfig {
+    /// What `X-Forwarded-For` carries upstream.
+    #[serde(default)]
+    pub x_forwarded_for: XForwardedFor,
+    /// The header the resolved address is written to, replacing any value
+    /// the request carried; absent when no address resolved. `None` (`null`
+    /// in YAML) writes none. A gRPC metadata key other than
+    /// `x-forwarded-for` and `forwarded`. Default: `x-real-ip`.
+    #[serde(default = "default_client_header")]
+    pub client_header: Option<String>,
+    /// A header receiving the `X-Forwarded-For` field lines exactly as the
+    /// request carried them, before any change: for logs and audits only,
+    /// since nothing in it is verified. Off by default. A gRPC metadata key
+    /// other than `x-forwarded-for`, `x-real-ip`, `forwarded` and
+    /// `client_header`, e.g. `x-original-forwarded-for`.
+    #[serde(default)]
+    pub audit_header: Option<String>,
+}
+
+fn default_client_header() -> Option<String> {
+    Some("x-real-ip".into())
+}
+
+impl Default for ForwardConfig {
+    fn default() -> Self {
+        Self {
+            x_forwarded_for: XForwardedFor::default(),
+            client_header: default_client_header(),
+            audit_header: None,
+        }
+    }
+}
+
+/// What `X-Forwarded-For` carries upstream. `X-Real-IP` and `Forwarded`
+/// (RFC 7239) from the request reach the upstream only with `preserve`; in
+/// every other mode they are removed, since they would contradict it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum XForwardedFor {
+    /// The verified part of the chain: the resolved client, the trusted
+    /// proxies between it and this proxy, then this proxy's peer
+    /// (`203.0.113.7, 10.0.0.2, 10.0.0.1`). Whatever the client wrote left of
+    /// its own address is dropped, so the first element is always the
+    /// client, and an upstream walking the list from the right reaches the
+    /// same client. Absent when no address resolved.
+    #[default]
+    Verified,
+    /// The resolved address alone; absent when none resolved.
+    Resolved,
+    /// The request's list as it arrived, then this proxy's peer, as nginx,
+    /// Envoy, HAProxy and most load balancers append. Its first element is
+    /// whatever the client wrote.
+    Append,
+    /// The request's `X-Forwarded-For`, `X-Real-IP` and `Forwarded` as they
+    /// arrived, nothing added. Its first element is whatever the client
+    /// wrote.
+    Preserve,
+    /// No `X-Forwarded-For`.
+    Remove,
 }
 
 /// The header trusted proxies report the client's address in.

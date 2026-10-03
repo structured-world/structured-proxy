@@ -560,6 +560,38 @@ fn client_address_reads_its_section() {
 }
 
 #[test]
+fn client_address_forward_reads_its_section() {
+    let config = ProxyConfig::from_yaml_str(
+        "client_address:\n  forward:\n    x_forwarded_for: append\n    client_header: cf-connecting-ip\n    audit_header: x-original-forwarded-for\n",
+    )
+    .unwrap();
+    let forward = &config.client_address.forward;
+    assert_eq!(forward.x_forwarded_for, XForwardedFor::Append);
+    assert_eq!(forward.client_header.as_deref(), Some("cf-connecting-ip"));
+    assert_eq!(
+        forward.audit_header.as_deref(),
+        Some("x-original-forwarded-for")
+    );
+    // `null` turns the client header off.
+    let config =
+        ProxyConfig::from_yaml_str("client_address:\n  forward:\n    client_header: null\n")
+            .unwrap();
+    assert_eq!(config.client_address.forward.client_header, None);
+    // The defaults forward nothing a client can forge, and audit nothing.
+    let forward = ProxyConfig::from_yaml_str("")
+        .unwrap()
+        .client_address
+        .forward;
+    assert_eq!(forward.x_forwarded_for, XForwardedFor::Verified);
+    assert_eq!(forward.client_header.as_deref(), Some("x-real-ip"));
+    assert_eq!(forward.audit_header, None);
+    for mode in ["verified", "resolved", "append", "preserve", "remove"] {
+        let yaml = format!("client_address:\n  forward:\n    x_forwarded_for: {mode}\n");
+        assert!(ProxyConfig::from_yaml_str(&yaml).is_ok(), "{mode}");
+    }
+}
+
+#[test]
 fn an_invalid_client_address_section_fails_to_load() {
     for yaml in [
         // Not a range or an address.
@@ -568,6 +600,14 @@ fn an_invalid_client_address_section_fails_to_load() {
         "client_address:\n  header: forwarded\n",
         // A typo would leave the default in force.
         "client_address:\n  trusted_proxy: [\"10.0.0.0/8\"]\n",
+        // A mode that does not exist, a typo inside `forward`.
+        "client_address:\n  forward:\n    x_forwarded_for: rewrite\n",
+        "client_address:\n  forward:\n    client_headers: x-real-ip\n",
+        // A client header the forwarding writes already, or no header at all.
+        "client_address:\n  forward:\n    client_header: x-forwarded-for\n",
+        "client_address:\n  forward:\n    client_header: \"not a header\"\n",
+        // An audit header that would overwrite the client header.
+        "client_address:\n  forward:\n    audit_header: x-real-ip\n",
     ] {
         assert!(ProxyConfig::from_yaml_str(yaml).is_err(), "{yaml}");
     }

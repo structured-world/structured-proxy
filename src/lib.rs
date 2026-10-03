@@ -799,9 +799,24 @@ impl ProxyServer {
             );
         }
 
+        let resolver = Arc::new(
+            client_address::Resolver::build(&self.config.client_address)
+                .map_err(|e| anyhow::anyhow!("invalid client_address config: {e}"))?,
+        );
+        // The client-address headers reach a transcoded call as the
+        // forwarding policy wrote them on the request, whatever the list
+        // says; the rest of the list is forwarded as configured.
+        let forwarded_headers: Arc<[String]> = self
+            .config
+            .forwarded_headers
+            .iter()
+            .filter(|name| !resolver.reserves(name))
+            .cloned()
+            .chain(resolver.forwarded_headers().map(str::to_owned))
+            .collect();
         let state = ProxyState {
             upstream,
-            forwarded_headers: self.config.forwarded_headers.as_slice().into(),
+            forwarded_headers,
             sse_keep_alive_secs: self.config.streaming.sse_keep_alive_secs,
         };
 
@@ -824,7 +839,7 @@ impl ProxyServer {
         let forward_auth = auth.as_ref().and_then(|built| {
             auth::forward::ForwardAuth::build(self.config.auth.as_ref()?, built.clone())
         });
-        let guards = Arc::new(self.guards(auth, maintenance_exempt, &mounted)?);
+        let guards = Arc::new(self.guards(resolver, auth, maintenance_exempt, &mounted)?);
 
         // Health routes. Paths are configurable; the whole group is skippable.
         let health_routes = if self.config.health.enabled {
@@ -965,15 +980,18 @@ impl ProxyServer {
     }
 
     /// The guards the configuration and the hooks turn on, each with its
-    /// scope; `maintenance_exempt` lists the paths maintenance mode leaves
+    /// scope, after the client-address resolution `resolver`;
+    /// `maintenance_exempt` lists the paths maintenance mode leaves
     /// reachable, `mounted` the `(method, path)` of every route.
     ///
     /// # Errors
     ///
-    /// A malformed shield, authz or concurrency section, or a scope that
+    /// A malformed shield, authz or concurrency section, a JWT claim mapped
+    /// onto a header the client-address forwarding writes, or a scope that
     /// covers no traffic, names an invalid path glob or an invalid method.
     fn guards(
         &self,
+        resolver: Arc<client_address::Resolver>,
         auth: Option<Arc<auth::Auth>>,
         maintenance_exempt: Vec<String>,
         mounted: &[(String, String)],
@@ -988,11 +1006,22 @@ impl ProxyServer {
         let scope = |config: Option<&ScopeConfig>, default: &[config::Traffic], what: &str| {
             guard::Scope::compile(config, default, what, &routed).map_err(anyhow::Error::msg)
         };
+        // A guard never sets what the client-address forwarding writes.
+        let reserved: Arc<[http::HeaderName]> = resolver.configured_headers().cloned().collect();
+        if let Some(header) = self
+            .config
+            .auth
+            .as_ref()
+            .and_then(|auth| auth.jwt.as_ref())
+            .and_then(|jwt| jwt.claims_headers.values().find(|h| resolver.reserves(h)))
+        {
+            anyhow::bail!(
+                "auth.jwt.claims_headers maps a claim onto {header:?}, which the \
+                 client_address forwarding writes"
+            );
+        }
         let mut guards = guard::Guards {
-            client_address: Arc::new(
-                client_address::Resolver::build(&self.config.client_address)
-                    .map_err(|e| anyhow::anyhow!("invalid client_address config: {e}"))?,
-            ),
+            client_address: resolver,
             ..Default::default()
         };
         if guards.client_address.required() {
@@ -1044,7 +1073,7 @@ impl ProxyServer {
             ));
         }
         if let Some(cfg) = auth_config.and_then(|a| a.authz.as_ref()) {
-            if let Some(authz) = auth::authz::Authz::build(cfg)
+            if let Some(authz) = auth::authz::Authz::build_reserving(cfg, reserved.clone())
                 .map_err(|e| anyhow::anyhow!("invalid authz config: {e}"))?
             {
                 guards.authz = Some((
@@ -1055,7 +1084,10 @@ impl ProxyServer {
         }
         if let Some(decider) = &self.auth_decider {
             guards.decider = Some((
-                decider.clone(),
+                Arc::new(embed::DeciderGate {
+                    decider: decider.clone(),
+                    reserved,
+                }),
                 scope(
                     self.auth_decider_scope.as_ref(),
                     &[Transcoded],

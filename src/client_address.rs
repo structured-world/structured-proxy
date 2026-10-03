@@ -1,13 +1,97 @@
-//! The client's address, resolved once per request from the connection's peer
-//! and, when that peer is a trusted proxy, the address it forwarded.
+//! The client's address: resolved once per request, before any guard, and
+//! forwarded to the upstream by an explicit policy.
 //!
-//! Every consumer reads the one result: the rate limits, the auth decider,
-//! extra routes, the fallback and an upstream in process as the
-//! [`ClientAddress`] request extension; a remote upstream as the single
-//! `X-Forwarded-For` and `X-Real-IP` address the proxy writes in place of
-//! whatever the request carried. Forwarding information is not trustworthy by
-//! itself (RFC 7239 §8.1), so it counts only from a peer listed in
-//! [`ClientAddressConfig::trusted_proxies`].
+//! # Resolution
+//!
+//! The connection's peer is the client, unless it is listed in
+//! [`trusted_proxies`](ClientAddressConfig::trusted_proxies). Forwarding
+//! information is not trustworthy by itself (RFC 7239 §8.1), so only then is
+//! the header the trusted proxy reports in read:
+//!
+//! - `X-Forwarded-For` (the default): every field line, in order, as one list
+//!   (RFC 9110 §5.3), walked from the right through the trusted proxies to the
+//!   first address outside them. What lies left of that address is the
+//!   client's own claim and is never read. When every hop is trusted, the
+//!   leftmost is the client.
+//! - `X-Real-IP`, when chosen: one address, the trusted proxy's own peer.
+//!
+//! The result is a [`ClientAddress`] on the request, and every consumer reads
+//! that one value: the rate limits, the auth decider, extra routes, the
+//! fallback and an upstream in process. When nothing can be resolved (no
+//! connection information, or a trusted proxy's report that cannot be read)
+//! the [`Resolution`] says why, and no address is ever made up: a trusted
+//! proxy's own address never stands in for its client's.
+//!
+//! # What the upstream receives
+//!
+//! [`ForwardConfig`](crate::config::ForwardConfig) decides, independently of
+//! the resolution:
+//!
+//! | `x_forwarded_for` | `X-Forwarded-For` upstream | Its first element |
+//! |---|---|---|
+//! | `verified` (default) | the client, the trusted proxies after it, this proxy's peer | the client |
+//! | `resolved` | the client alone | the client |
+//! | `append` | the list as it arrived, then this proxy's peer | whatever the client wrote |
+//! | `preserve` | the list as it arrived (`X-Real-IP` and `Forwarded` too) | whatever the client wrote |
+//! | `remove` | nothing | none |
+//!
+//! Next to it, `client_header` (`X-Real-IP` by default) carries the resolved
+//! address alone, and `audit_header` (off by default) the list exactly as it
+//! arrived, for logs. These headers are the proxy's: the request cannot set
+//! them, and neither can a guard (JWT claim headers, ext_authz, the auth
+//! decider). Native gRPC, gRPC-Web and transcoded calls receive the same
+//! values, remote or in process, and so does the fallback.
+//!
+//! With `append` and `preserve` the first element of `X-Forwarded-For` is
+//! whatever the client chose to write: an upstream should then read the
+//! client header, or walk the list from the right trusting this proxy.
+//!
+//! # Examples
+//!
+//! Behind a load balancer in `10.0.0.0/8`, forwarding as nginx does with
+//! `$proxy_add_x_forwarded_for`, and keeping what arrived for the access log:
+//!
+//! ```yaml
+//! client_address:
+//!   trusted_proxies: ["10.0.0.0/8"]
+//!   forward:
+//!     x_forwarded_for: append
+//!     client_header: x-real-ip
+//!     audit_header: x-original-forwarded-for
+//! ```
+//!
+//! The same in code, with the address read back in a tonic handler:
+//!
+//! ```
+//! use structured_proxy::client_address::Resolution;
+//! use structured_proxy::config::{ClientAddressConfig, XForwardedFor};
+//! use structured_proxy::{ClientAddress, ProxyServer};
+//!
+//! # fn build() -> anyhow::Result<()> {
+//! let mut client_address = ClientAddressConfig::default();
+//! client_address.trusted_proxies = vec!["10.0.0.0/8".into()];
+//! client_address.forward.x_forwarded_for = XForwardedFor::Append;
+//! client_address.forward.audit_header = Some("x-original-forwarded-for".into());
+//! let service = ProxyServer::new()
+//!     .with_client_address(client_address)
+//!     .service(tonic::service::Routes::default())?;
+//! # let _ = service;
+//! # Ok(())
+//! # }
+//! # build().unwrap();
+//!
+//! fn caller(request: &tonic::Request<()>) -> String {
+//!     match request.extensions().get::<ClientAddress>().map(ClientAddress::resolution) {
+//!         Some(Resolution::Peer(ip) | Resolution::Forwarded(ip)) => ip.to_string(),
+//!         _ => "unknown".into(),
+//!     }
+//! }
+//! # let _ = caller;
+//! ```
+//!
+//! Routers of your own that mount proxy parts such as the
+//! [`shield`](crate::shield) middleware get the same resolution from
+//! [`ClientAddressLayer`].
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -21,7 +105,7 @@ use http::{HeaderMap, HeaderValue};
 use ipnet::IpNet;
 use tower::{Layer, Service};
 
-use crate::config::{ClientAddressConfig, ForwardingHeader};
+use crate::config::{ClientAddressConfig, ForwardingHeader, XForwardedFor};
 
 /// `X-Forwarded-For`.
 pub(crate) const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
@@ -29,9 +113,9 @@ pub(crate) const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwar
 pub(crate) const X_REAL_IP: HeaderName = HeaderName::from_static("x-real-ip");
 
 /// Whether `name` is a header carrying a client's address: `X-Forwarded-For`,
-/// `X-Real-IP` or `Forwarded`. The proxy writes these from the resolved
-/// address alone, so neither the request nor a guard (claim headers,
-/// ext_authz, the auth decider) may set them.
+/// `X-Real-IP` or `Forwarded`. The forwarding policy decides what they hold
+/// upstream, so no guard (claim headers, ext_authz, the auth decider) may set
+/// them.
 pub(crate) fn owns(name: &str) -> bool {
     name.eq_ignore_ascii_case("x-forwarded-for")
         || name.eq_ignore_ascii_case("x-real-ip")
@@ -167,8 +251,8 @@ impl ClientAddress {
         self.resolution
     }
 
-    /// The resolved address as the value of `X-Forwarded-For` and
-    /// `X-Real-IP`.
+    /// The resolved address as a header value: the client header's, and
+    /// `X-Forwarded-For`'s in the `resolved` mode.
     pub(crate) fn header_value(&self) -> Option<&HeaderValue> {
         self.value.as_ref()
     }
@@ -192,22 +276,47 @@ pub(crate) struct Resolver {
     trusted: Box<[IpNet]>,
     header: ForwardingHeader,
     required: bool,
+    forward: XForwardedFor,
+    /// Receives the resolved address.
+    client_header: Option<HeaderName>,
+    /// Receives the request's `X-Forwarded-For` as it arrived.
+    audit_header: Option<HeaderName>,
 }
 
 impl Resolver {
     /// # Errors
     ///
-    /// A `trusted_proxies` entry that is neither a CIDR range nor an address.
+    /// A `trusted_proxies` entry that is neither a CIDR range nor an address,
+    /// or a `forward` header name that is not a gRPC metadata key or names a
+    /// header the forwarding already writes.
     pub(crate) fn build(config: &ClientAddressConfig) -> Result<Self, String> {
         let trusted = config
             .trusted_proxies
             .iter()
             .map(|entry| parse_trusted(entry))
             .collect::<Result<_, _>>()?;
+        let forward = &config.forward;
+        let client_header = forward
+            .client_header
+            .as_deref()
+            .map(|name| forward_header("client_header", name, &["x-forwarded-for", "forwarded"]))
+            .transpose()?;
+        let audit_header = forward
+            .audit_header
+            .as_deref()
+            .map(|name| {
+                let mut taken = vec!["x-forwarded-for", "x-real-ip", "forwarded"];
+                taken.extend(client_header.as_ref().map(HeaderName::as_str));
+                forward_header("audit_header", name, &taken)
+            })
+            .transpose()?;
         Ok(Self {
             trusted,
             header: config.header,
             required: config.required,
+            forward: forward.x_forwarded_for,
+            client_header,
+            audit_header,
         })
     }
 
@@ -216,12 +325,47 @@ impl Resolver {
         self.required
     }
 
+    /// Whether the proxy alone writes `name`: a client-address header, or a
+    /// header the forwarding policy writes. A guard may not set it.
+    pub(crate) fn reserves(&self, name: &str) -> bool {
+        owns(name)
+            || self
+                .configured_headers()
+                .any(|own| name.eq_ignore_ascii_case(own.as_str()))
+    }
+
+    /// The headers named in `forward`, the ones [`owns`] does not cover.
+    pub(crate) fn configured_headers(&self) -> impl Iterator<Item = &HeaderName> {
+        self.client_header.iter().chain(&self.audit_header)
+    }
+
+    /// Every header the forwarding policy may leave on a request: what a
+    /// transcoded call forwards as metadata in their place.
+    pub(crate) fn forwarded_headers(&self) -> impl Iterator<Item = &str> {
+        ["x-forwarded-for", "x-real-ip", "forwarded"]
+            .into_iter()
+            .chain(self.configured_headers().map(HeaderName::as_str))
+    }
+
     fn trusts(&self, ip: IpAddr) -> bool {
         self.trusted.iter().any(|net| net.contains(&ip))
     }
 
-    /// The client address of a request from `peer` carrying `headers`.
+    /// The client address of a request from `peer` carrying `headers`, without
+    /// touching the request: what [`apply`](Self::apply) puts on it.
+    #[cfg(test)]
     pub(crate) fn resolve(&self, peer: Option<SocketAddr>, headers: &HeaderMap) -> ClientAddress {
+        self.resolve_noting(peer, headers, None)
+    }
+
+    /// [`resolve`](Self::resolve), noting in `hops` the trusted proxies
+    /// between the client and this proxy, nearest first.
+    fn resolve_noting(
+        &self,
+        peer: Option<SocketAddr>,
+        headers: &HeaderMap,
+        hops: Option<&mut Vec<IpAddr>>,
+    ) -> ClientAddress {
         let Some(peer) = peer else {
             return ClientAddress::new(None, Resolution::Unavailable);
         };
@@ -231,7 +375,9 @@ impl Resolver {
             return ClientAddress::new(Some(peer), Resolution::Peer(peer_ip));
         }
         let forwarded = match self.header {
-            ForwardingHeader::XForwardedFor => self.walk(headers.get_all(X_FORWARDED_FOR).iter()),
+            ForwardingHeader::XForwardedFor => {
+                self.walk(headers.get_all(X_FORWARDED_FOR).iter(), hops)
+            }
             ForwardingHeader::XRealIp => real_ip(headers.get_all(X_REAL_IP).iter()),
         };
         let resolution = match forwarded {
@@ -243,20 +389,50 @@ impl Resolver {
     }
 
     /// Resolve the address of `request` from `peer`, put it on the request as
-    /// a [`ClientAddress`], and replace the request's forwarding headers with
-    /// it, so no consumer past this point reads an address the client
-    /// asserted: one `X-Forwarded-For` and one `X-Real-IP` carrying the
-    /// address, none when it did not resolve, and no `Forwarded` (RFC 7239),
-    /// whose `for=` would contradict them.
+    /// a [`ClientAddress`], and rewrite its forwarding headers by the
+    /// `forward` policy, so every consumer past this point (the guards, the
+    /// fallback, the upstream) sees exactly what the upstream will:
+    ///
+    /// - the audit header, when set, gets the request's `X-Forwarded-For`
+    ///   lines as they arrived, and nothing the client sent under its name;
+    /// - `X-Forwarded-For` as the mode says (see [`XForwardedFor`]);
+    /// - `X-Real-IP` and `Forwarded` as they arrived with `preserve`, removed
+    ///   otherwise, since they would contradict it;
+    /// - the client header, last, the resolved address, so it overrides even
+    ///   a preserved `X-Real-IP`; absent when nothing resolved.
     pub(crate) fn apply<B>(&self, request: &mut http::Request<B>, peer: Option<SocketAddr>) {
-        let client = self.resolve(peer, request.headers());
+        let mut hops = Vec::new();
+        let noting = (self.forward == XForwardedFor::Verified).then_some(&mut hops);
+        let client = self.resolve_noting(peer, request.headers(), noting);
         let headers = request.headers_mut();
-        headers.remove(X_FORWARDED_FOR);
-        headers.remove(X_REAL_IP);
-        headers.remove(FORWARDED);
-        if let Some(value) = client.header_value() {
-            headers.insert(X_FORWARDED_FOR, value.clone());
-            headers.insert(X_REAL_IP, value.clone());
+        if let Some(audit) = &self.audit_header {
+            let arrived: Vec<HeaderValue> =
+                headers.get_all(X_FORWARDED_FOR).iter().cloned().collect();
+            headers.remove(audit);
+            for line in arrived {
+                headers.append(audit.clone(), line);
+            }
+        }
+        let xff = match self.forward {
+            XForwardedFor::Verified => verified_chain(&client, &hops),
+            XForwardedFor::Resolved => client.header_value().cloned(),
+            XForwardedFor::Append => appended_chain(headers, client.peer),
+            XForwardedFor::Preserve => None,
+            XForwardedFor::Remove => None,
+        };
+        if self.forward != XForwardedFor::Preserve {
+            headers.remove(X_FORWARDED_FOR);
+            headers.remove(X_REAL_IP);
+            headers.remove(FORWARDED);
+            if let Some(xff) = xff {
+                headers.insert(X_FORWARDED_FOR, xff);
+            }
+        }
+        if let Some(name) = &self.client_header {
+            headers.remove(name);
+            if let Some(value) = client.header_value() {
+                headers.insert(name.clone(), value.clone());
+            }
         }
         request.extensions_mut().insert(client);
     }
@@ -268,9 +444,12 @@ impl Resolver {
     /// are the client's own assertions and are never read. An element that
     /// is not an address where the walk needs one makes the whole result
     /// invalid: skipping it would credit a hop the chain never vouched for.
+    /// `hops`, when given, receives the trusted proxies right of the client,
+    /// nearest first.
     fn walk<'a>(
         &self,
         lines: impl DoubleEndedIterator<Item = &'a HeaderValue>,
+        mut hops: Option<&mut Vec<IpAddr>>,
     ) -> Result<Option<IpAddr>, InvalidForwarding> {
         let mut read = 0;
         let mut leftmost = None;
@@ -290,6 +469,9 @@ impl Resolver {
                     if !self.trusts(ip) {
                         return Ok(Some(ip));
                     }
+                    if let Some(hops) = hops.as_deref_mut() {
+                        hops.push(ip);
+                    }
                     leftmost = Some(ip);
                 }
                 match before {
@@ -298,8 +480,81 @@ impl Resolver {
                 }
             }
         }
+        // Every hop trusted: the leftmost is the client, not a hop.
+        if leftmost.is_some() {
+            if let Some(hops) = hops {
+                hops.pop();
+            }
+        }
         Ok(leftmost)
     }
+}
+
+/// The verified `X-Forwarded-For`: the resolved client, the trusted proxies
+/// `hops` (nearest first) in the order they forwarded, then this proxy's peer,
+/// each in canonical form; `None` when nothing resolved. A client that is the
+/// peer itself is listed once.
+fn verified_chain(client: &ClientAddress, hops: &[IpAddr]) -> Option<HeaderValue> {
+    use std::fmt::Write;
+    let value = client.header_value()?;
+    let Resolution::Forwarded(ip) = client.resolution else {
+        // The peer is the client: nothing else is verified.
+        return Some(value.clone());
+    };
+    let peer = client.peer?.ip().to_canonical();
+    let mut chain = ip.to_string();
+    for hop in hops.iter().rev().chain([&peer]) {
+        write!(chain, ", {hop}").expect("writing to a String cannot fail");
+    }
+    Some(HeaderValue::try_from(chain).expect("addresses and commas are a header value"))
+}
+
+/// The request's `X-Forwarded-For` as it arrived, its field lines joined in
+/// order, with `peer` appended; the lines alone without a peer, and `None`
+/// with neither.
+fn appended_chain(headers: &HeaderMap, peer: Option<SocketAddr>) -> Option<HeaderValue> {
+    use std::io::Write;
+    let mut lines = headers.get_all(X_FORWARDED_FOR).iter();
+    let Some(peer) = peer else {
+        // Nothing to append: one line stays as it is, several are joined.
+        let first = lines.next()?;
+        let mut joined = first.as_bytes().to_vec();
+        for line in lines {
+            joined.extend_from_slice(b", ");
+            joined.extend_from_slice(line.as_bytes());
+        }
+        return Some(
+            HeaderValue::from_maybe_shared(bytes::Bytes::from(joined))
+                .expect("joined header values are a header value"),
+        );
+    };
+    let mut chain = Vec::new();
+    for line in lines {
+        chain.extend_from_slice(line.as_bytes());
+        chain.extend_from_slice(b", ");
+    }
+    write!(chain, "{}", peer.ip().to_canonical()).expect("writing to a Vec cannot fail");
+    Some(
+        HeaderValue::from_maybe_shared(bytes::Bytes::from(chain))
+            .expect("header values, commas and an address are a header value"),
+    )
+}
+
+/// A `forward` header name: a gRPC metadata key, so a transcoded call can
+/// carry it, other than the headers in `taken`.
+fn forward_header(setting: &str, name: &str, taken: &[&str]) -> Result<HeaderName, String> {
+    let header = HeaderName::from_bytes(name.as_bytes())
+        .ok()
+        .filter(|header| crate::transcode::metadata::is_grpc_key(header.as_str()))
+        .ok_or_else(|| {
+            format!("forward.{setting} {name:?} is not a gRPC metadata key (letters, digits, '_', '-' and '.')")
+        })?;
+    if taken.contains(&header.as_str()) {
+        return Err(format!(
+            "forward.{setting} {name:?} names a header the forwarding already writes"
+        ));
+    }
+    Ok(header)
 }
 
 /// The last element of the list `bytes`, trimmed of the spaces and tabs

@@ -33,6 +33,8 @@ message Seen {
   string forwarded = 3;
   string client = 4;
   string dpop = 5;
+  string cf_ip = 6;
+  string audit = 7;
 }
 
 service Addr {
@@ -77,6 +79,8 @@ fn seen<T>(pool: &DescriptorPool, request: &tonic::Request<T>) -> DynamicMessage
     seen.set_field_by_name("real_ip", PbValue::String(joined("x-real-ip")));
     seen.set_field_by_name("forwarded", PbValue::String(joined("forwarded")));
     seen.set_field_by_name("client", PbValue::String(client));
+    seen.set_field_by_name("cf_ip", PbValue::String(joined("cf-connecting-ip")));
+    seen.set_field_by_name("audit", PbValue::String(joined("x-original-forwarded-for")));
     seen.set_field_by_name("dpop", PbValue::String(joined("dpop")));
     seen
 }
@@ -241,6 +245,8 @@ enum Outcome {
         forwarded: String,
         client: String,
         dpop: String,
+        cf_ip: String,
+        audit: String,
     },
     /// The HTTP status of a REST call, or the gRPC code of a gRPC one.
     Refused(String),
@@ -258,6 +264,8 @@ impl Outcome {
             forwarded: field("forwarded"),
             client: field("client"),
             dpop: field("dpop"),
+            cf_ip: field("cf_ip"),
+            audit: field("audit"),
         }
     }
 
@@ -269,11 +277,14 @@ impl Outcome {
             forwarded: field("forwarded"),
             client: field("client"),
             dpop: field("dpop"),
+            cf_ip: field("cfIp"),
+            audit: field("audit"),
         }
     }
 
-    /// The forwarded address, as the upstream saw it: `X-Forwarded-For` and
-    /// `X-Real-IP` must agree, and in process so must the `ClientAddress`.
+    /// The resolved address, as the upstream saw it under the default
+    /// forwarding: `X-Real-IP` carries it, it is the first element of the
+    /// verified `X-Forwarded-For`, and in process the `ClientAddress` agrees.
     fn address(&self, upstream: common::Upstream) -> &str {
         let Self::Seen {
             xff,
@@ -285,22 +296,34 @@ impl Outcome {
         else {
             panic!("the call was refused: {self:?}");
         };
-        assert_eq!(xff, real_ip, "{self:?}");
+        assert_eq!(
+            xff.split(", ").next().unwrap_or_default(),
+            real_ip,
+            "{self:?}"
+        );
         assert_eq!(forwarded, "", "{self:?}");
         match upstream {
             common::Upstream::Remote => assert_eq!(client, "", "{self:?}"),
             common::Upstream::InProcess => {
-                let expected = if xff.is_empty() {
+                let expected = if real_ip.is_empty() {
                     "invalid"
                 } else {
-                    xff.as_str()
+                    real_ip.as_str()
                 };
                 if client != "unavailable" {
                     assert_eq!(client, expected, "{self:?}");
                 }
             }
         }
-        xff
+        real_ip
+    }
+
+    /// `X-Forwarded-For` as the upstream saw it.
+    fn xff(&self) -> &str {
+        match self {
+            Self::Seen { xff, .. } => xff,
+            Self::Refused(_) => panic!("the call was refused: {self:?}"),
+        }
     }
 
     fn client(&self) -> &str {
@@ -656,6 +679,105 @@ async fn the_rate_limits_key_by_the_address_the_upstream_receives() {
 }
 }
 
+/// The forwarding policy, over every transport and both kinds of upstream.
+mod forwarding {
+    use super::*;
+
+    upstream_tests! {
+    async fn each_forwarding_mode_reaches_the_upstream_through_every_transport() {
+        // The client wrote a forged first element; the balancer at 10.0.0.2
+        // appended the client, and this proxy's peer is the loopback client of
+        // the test, trusted as the last balancer.
+        let sent = [
+            ("x-forwarded-for", "198.51.100.1, 203.0.113.7"),
+            ("x-forwarded-for", "10.0.0.2"),
+            ("x-real-ip", "198.51.100.2"),
+            ("forwarded", "for=198.51.100.3"),
+            ("cf-connecting-ip", "198.51.100.4"),
+            ("x-original-forwarded-for", "198.51.100.5"),
+        ];
+        let arrived = "198.51.100.1, 203.0.113.7|10.0.0.2";
+        for (mode, xff, real_ip, forwarded) in [
+            ("verified", "203.0.113.7, 10.0.0.2, 127.0.0.1", "", ""),
+            ("resolved", "203.0.113.7", "", ""),
+            ("append", "198.51.100.1, 203.0.113.7, 10.0.0.2, 127.0.0.1", "", ""),
+            ("preserve", arrived, "198.51.100.2", "for=198.51.100.3"),
+            ("remove", "", "", ""),
+        ] {
+            let yaml = format!(
+                "{TRUST_LOOPBACK_AND_LB}  forward:\n    x_forwarded_for: {mode}\n    client_header: cf-connecting-ip\n    audit_header: x-original-forwarded-for\n"
+            );
+            let addr = listen(UPSTREAM, &yaml).await;
+            for transport in TRANSPORTS {
+                let outcome = call(addr, transport, &sent).await;
+                let Outcome::Seen { xff: seen_xff, real_ip: seen_real_ip, forwarded: seen_forwarded, cf_ip, audit, .. } = &outcome else {
+                    panic!("{mode} {transport:?}: {outcome:?}");
+                };
+                assert_eq!(seen_xff, xff, "{mode} {transport:?}");
+                assert_eq!(seen_real_ip, real_ip, "{mode} {transport:?}");
+                assert_eq!(seen_forwarded, forwarded, "{mode} {transport:?}");
+                // Whatever the mode: the resolved address under the configured
+                // name, and the list as it arrived under the audit name.
+                assert_eq!(cf_ip, "203.0.113.7", "{mode} {transport:?}");
+                assert_eq!(audit, arrived, "{mode} {transport:?}");
+            }
+        }
+    }
+
+    async fn the_audit_header_is_off_by_default() {
+        let addr = listen(UPSTREAM, TRUST_LOOPBACK).await;
+        for transport in TRANSPORTS {
+            let outcome = call(
+                addr,
+                transport,
+                &[
+                    ("x-forwarded-for", "203.0.113.7"),
+                    ("x-original-forwarded-for", "198.51.100.5"),
+                ],
+            )
+            .await;
+            let Outcome::Seen { audit, .. } = &outcome else {
+                panic!("{transport:?}: {outcome:?}");
+            };
+            // Off, the proxy writes nothing under the name: it is the
+            // client's own header, which native gRPC and gRPC-Web pass on as
+            // they pass any other, and a transcoded call forwards only when
+            // `forwarded_headers` lists it.
+            let expected = match transport {
+                Transport::Grpc | Transport::GrpcWeb => "198.51.100.5",
+                Transport::Unary | Transport::Stream => "",
+            };
+            assert_eq!(audit, expected, "{transport:?}");
+            assert_eq!(outcome.xff(), "203.0.113.7, 127.0.0.1");
+        }
+    }
+    }
+}
+
+#[tokio::test]
+async fn a_claim_mapped_onto_a_forwarding_header_fails_the_build() {
+    // The configured client header is the proxy's alone, as the fixed
+    // client-address headers are.
+    struct Accepting;
+
+    #[async_trait::async_trait]
+    impl structured_proxy::hooks::TokenVerifier for Accepting {
+        async fn verify(&self, _token: &str) -> Option<serde_json::Value> {
+            Some(serde_json::json!({ "sub": "alice" }))
+        }
+    }
+
+    let yaml = "client_address:\n  forward:\n    client_header: cf-connecting-ip\nauth:\n  mode: jwt\n  jwt:\n    claims_headers:\n      sub: cf-connecting-ip\n";
+    let server = ProxyServer::from_yaml_str(yaml)
+        .unwrap()
+        .with_descriptors(pool())
+        .with_token_verifier(std::sync::Arc::new(Accepting));
+    let Err(err) = server.service(in_process_upstream()) else {
+        panic!("a claim mapped onto the client header must be refused");
+    };
+    assert!(err.to_string().contains("cf-connecting-ip"), "{err}");
+}
+
 #[tokio::test]
 async fn translated_grpc_web_carries_the_resolved_address() {
     for upstream in [common::Upstream::Remote, common::Upstream::InProcess] {
@@ -723,6 +845,8 @@ async fn without_connection_information_no_address_resolves() {
             forwarded: String::new(),
             client: "unavailable".into(),
             dpop: String::new(),
+            cf_ip: String::new(),
+            audit: String::new(),
         }
     );
 
@@ -832,7 +956,11 @@ async fn the_fallback_and_the_decider_read_the_same_address() {
     let forwarded = [("x-forwarded-for", "198.51.100.1, 203.0.113.7")];
     let (status, _, body) = http1(addr, "GET", "/static/page", &forwarded, &[]).await;
     assert_eq!(status, 200);
-    assert_eq!(String::from_utf8(body).unwrap(), "203.0.113.7|203.0.113.7");
+    // The verified chain: the client, then the trusted peer it came through.
+    assert_eq!(
+        String::from_utf8(body).unwrap(),
+        "203.0.113.7|203.0.113.7, 127.0.0.1"
+    );
     for transport in TRANSPORTS {
         let outcome = call(addr, transport, &forwarded).await;
         assert_eq!(outcome.address(common::Upstream::InProcess), "203.0.113.7");
@@ -958,7 +1086,7 @@ async fn a_guard_cannot_set_the_client_address_headers() {
     // The decider's other headers still go through.
     assert_eq!(
         String::from_utf8(body).unwrap(),
-        "203.0.113.7|203.0.113.7||alice"
+        "203.0.113.7, 127.0.0.1|203.0.113.7||alice"
     );
     for transport in TRANSPORTS {
         let outcome = call(addr, transport, &forwarded).await;
