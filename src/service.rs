@@ -18,7 +18,7 @@ use tonic::transport::server::{Connected, TcpConnectInfo};
 use tower::{Layer, Service, ServiceExt};
 use tower_http::cors::{Cors, CorsLayer};
 
-use crate::client_address::ResolveLayer;
+use crate::client_address::ClientAddressLayer;
 use crate::guard::{BoxedService, Class, GrpcRejections, Guards};
 
 /// tonic's `TlsConnectInfo<TcpConnectInfo>`, the record its TLS server puts on
@@ -350,9 +350,7 @@ impl<U: Upstream> ProxyService<U> {
     {
         // The routes' own layers do not reach a fallback set after them, so
         // it gets the client-address resolution of its own, around its guards.
-        let resolve = ResolveLayer {
-            guards: self.guards.clone(),
-        };
+        let resolve = ClientAddressLayer::with(self.guards.client_address.clone());
         self.routes = if self.guards.cover(Class::Fallback) {
             let fallback = BoxedService::new(fallback.map_response(IntoResponse::into_response));
             self.routes

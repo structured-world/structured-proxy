@@ -479,7 +479,10 @@ fn caller(request: &tonic::Request<()>) -> String {
 without rate limits; a config that still sets the old key fails to load with a
 message saying so. Shield used to fall back to `X-Real-IP` when
 `X-Forwarded-For` was missing or broken: a load balancer that sends only
-`X-Real-IP` now needs `header: x_real_ip`. The hooks' `RequestParts::peer` and
+`X-Real-IP` now needs `header: x_real_ip`. Code that mounts the Shield
+middleware in a router of its own puts
+`client_address::ClientAddressLayer::new(&config)` in front of it, which
+resolves the address the same way the proxy does. The hooks' `RequestParts::peer` and
 `RouteRequest::peer` became `client`, a `ClientAddress` whose `peer()` is the
 connection's peer, absent when the server recorded none instead of
 `0.0.0.0:0`.

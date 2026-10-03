@@ -198,7 +198,8 @@ async fn enforce(shield: &Shield, phase: Phase, request: Request, next: Next) ->
     };
 
     // The proxy resolved the client address before any guard. Shield used on
-    // its own, in a router of the embedder's, falls back to what that
+    // its own, in a router of the embedder's, gets it from a
+    // `ClientAddressLayer` in front of it; without one it falls back to what
     // resolution gives with no trusted proxy: the peer an axum server records.
     let unresolved;
     let client = match request.extensions().get::<ClientAddress>() {

@@ -319,7 +319,8 @@ pub(crate) type BoxedService = BoxCloneSyncService<Request, Response, Infallible
 /// resolution that runs before all of them.
 #[derive(Default)]
 pub(crate) struct Guards {
-    pub(crate) client_address: crate::client_address::Resolver,
+    /// Shared with the resolution layers of the routes and the fallback.
+    pub(crate) client_address: Arc<crate::client_address::Resolver>,
     /// `client_address.required`: the guard refusing a request whose address
     /// did not resolve, over every class.
     pub(crate) require_client: Option<Arc<Scope>>,

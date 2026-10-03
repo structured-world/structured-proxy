@@ -22,7 +22,6 @@ use ipnet::IpNet;
 use tower::{Layer, Service};
 
 use crate::config::{ClientAddressConfig, ForwardingHeader};
-use crate::guard::Guards;
 
 /// `X-Forwarded-For`.
 pub(crate) const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
@@ -365,44 +364,105 @@ fn parse_address(bytes: &[u8]) -> Option<IpAddr> {
 
 /// A `trusted_proxies` entry: a CIDR range, or an address for one host.
 fn parse_trusted(entry: &str) -> Result<IpNet, String> {
-    if let Ok(net) = entry.parse::<IpNet>() {
-        return Ok(net);
+    let net = match entry.parse::<IpNet>() {
+        Ok(net) => net,
+        Err(_) => match entry.parse::<IpAddr>() {
+            Ok(ip) => IpNet::from(ip),
+            Err(_) => {
+                return Err(format!(
+                    "trusted_proxies entry {entry:?} is neither a CIDR range nor an IP address"
+                ))
+            }
+        },
+    };
+    Ok(canonical_net(net))
+}
+
+/// `net` in the form peers are compared in: a range inside the IPv4-mapped
+/// block `::ffff:0:0/96` (RFC 4291 §2.5.5.2) becomes the IPv4 range it maps,
+/// since peers are canonicalized to IPv4 before matching. A wider IPv6 range
+/// stays IPv6, so trusting `::/0` does not trust every IPv4 peer.
+fn canonical_net(net: IpNet) -> IpNet {
+    if let IpNet::V6(v6) = net {
+        if let (Some(v4), Some(prefix)) = (
+            v6.network().to_ipv4_mapped(),
+            v6.prefix_len().checked_sub(96),
+        ) {
+            return ipnet::Ipv4Net::new(v4, prefix)
+                .expect("a prefix of at most 128 - 96 fits IPv4")
+                .into();
+        }
     }
-    match entry.parse::<IpAddr>() {
-        Ok(ip) => Ok(IpNet::from(ip)),
-        Err(_) => Err(format!(
-            "trusted_proxies entry {entry:?} is neither a CIDR range nor an IP address"
-        )),
+    net
+}
+
+/// Resolves the client address of every request before the service it wraps
+/// sees it: puts the [`ClientAddress`] on the request and rewrites its
+/// forwarding headers, as the proxy does before its own guards.
+///
+/// The proxy applies it itself. Use it in a router of your own that mounts
+/// proxy parts such as the [`shield`](crate::shield) middleware directly, so
+/// they key by the client behind your trusted proxies rather than by the
+/// proxies' own address. The peer comes from the `ConnectInfo<SocketAddr>` an
+/// axum server records (`into_make_service_with_connect_info`); without one
+/// the address is [`Resolution::Unavailable`]. `required` is not enforced
+/// here: read [`ClientAddress::resolution`] where it matters.
+///
+/// # Examples
+///
+/// ```
+/// use structured_proxy::client_address::ClientAddressLayer;
+/// use structured_proxy::config::ClientAddressConfig;
+///
+/// let mut trust = ClientAddressConfig::default();
+/// trust.trusted_proxies = vec!["10.0.0.0/8".into()];
+/// let app: axum::Router = axum::Router::new()
+///     .route("/", axum::routing::get(|| async { "ok" }))
+///     .layer(ClientAddressLayer::new(&trust).unwrap());
+/// # let _ = app;
+/// ```
+#[derive(Clone, Debug)]
+pub struct ClientAddressLayer {
+    resolver: Arc<Resolver>,
+}
+
+impl ClientAddressLayer {
+    /// The resolution `config` describes.
+    ///
+    /// # Errors
+    ///
+    /// A `trusted_proxies` entry that is neither a CIDR range nor an address.
+    pub fn new(config: &ClientAddressConfig) -> anyhow::Result<Self> {
+        let resolver = Resolver::build(config)
+            .map_err(|e| anyhow::anyhow!("invalid client_address config: {e}"))?;
+        Ok(Self::with(Arc::new(resolver)))
+    }
+
+    /// The layer over a resolver the proxy already compiled.
+    pub(crate) fn with(resolver: Arc<Resolver>) -> Self {
+        Self { resolver }
     }
 }
 
-/// Resolves the client address of every request before `S` sees it, from the
-/// peer an axum server recorded as `ConnectInfo`.
-#[derive(Clone)]
-pub(crate) struct ResolveLayer {
-    pub(crate) guards: Arc<Guards>,
-}
+impl<S> Layer<S> for ClientAddressLayer {
+    type Service = ClientAddressService<S>;
 
-impl<S> Layer<S> for ResolveLayer {
-    type Service = Resolve<S>;
-
-    fn layer(&self, inner: S) -> Resolve<S> {
-        Resolve {
+    fn layer(&self, inner: S) -> ClientAddressService<S> {
+        ClientAddressService {
             inner,
-            guards: self.guards.clone(),
+            resolver: self.resolver.clone(),
         }
     }
 }
 
-/// The service of [`ResolveLayer`].
-#[derive(Clone)]
-pub(crate) struct Resolve<S> {
+/// The service of [`ClientAddressLayer`].
+#[derive(Clone, Debug)]
+pub struct ClientAddressService<S> {
     inner: S,
-    /// The resolver lives with the guards, which key on its result.
-    guards: Arc<Guards>,
+    resolver: Arc<Resolver>,
 }
 
-impl<S, B> Service<http::Request<B>> for Resolve<S>
+impl<S, B> Service<http::Request<B>> for ClientAddressService<S>
 where
     S: Service<http::Request<B>>,
 {
@@ -420,7 +480,7 @@ where
             .extensions()
             .get::<ConnectInfo<SocketAddr>>()
             .map(|ConnectInfo(peer)| *peer);
-        self.guards.client_address.apply(&mut request, peer);
+        self.resolver.apply(&mut request, peer);
         self.inner.call(request)
     }
 }

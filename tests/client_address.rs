@@ -843,6 +843,68 @@ async fn the_fallback_and_the_decider_read_the_same_address() {
 }
 
 #[tokio::test]
+async fn shield_in_an_embedders_router_keys_by_the_forwarded_client() {
+    // Shield mounted on its own, behind a trusted load balancer: the public
+    // resolution layer in front of it names the client, so one client cannot
+    // spend the budget of every other client behind the same balancer.
+    use structured_proxy::client_address::ClientAddressLayer;
+    use structured_proxy::config::{self, ClientAddressConfig, ShieldConfig};
+
+    let shield: ShieldConfig = config::from_yaml(
+        "enabled: true\nprofiles:\n  one: { rate: \"1/min\", burst: 1 }\nrules:\n  - pattern: \"/**\"\n    key: { type: ip }\n    profile: one\n",
+    )
+    .unwrap();
+    let shield = structured_proxy::shield::Shield::build(&shield)
+        .unwrap()
+        .unwrap();
+    let mut trust = ClientAddressConfig::default();
+    trust.trusted_proxies = vec!["127.0.0.1".into()];
+    let app = axum::Router::new()
+        .route(
+            "/",
+            axum::routing::get(
+                |axum::Extension(client): axum::Extension<ClientAddress>| async move {
+                    client.ip().unwrap().to_string()
+                },
+            ),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            shield,
+            structured_proxy::shield::pre_auth_middleware,
+        ))
+        .layer(ClientAddressLayer::new(&trust).unwrap());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+    });
+
+    let get = |xff: &'static str| async move {
+        let (status, _, body) = http1(addr, "GET", "/", &[("x-forwarded-for", xff)], &[]).await;
+        (status, String::from_utf8(body).unwrap())
+    };
+    assert_eq!(get("203.0.113.7").await, (200, "203.0.113.7".to_owned()));
+    // The same client is out of budget...
+    assert_eq!(get("198.51.100.1, 203.0.113.7").await.0, 429);
+    // ...another client behind the same balancer is not.
+    assert_eq!(get("203.0.113.8").await, (200, "203.0.113.8".to_owned()));
+}
+
+#[test]
+fn an_invalid_trust_list_fails_the_layer() {
+    let mut trust = structured_proxy::config::ClientAddressConfig::default();
+    trust.trusted_proxies = vec!["10.0.0.0/33".into()];
+    let Err(err) = structured_proxy::client_address::ClientAddressLayer::new(&trust) else {
+        panic!("an invalid trusted_proxies entry must be refused");
+    };
+    assert!(err.to_string().contains("10.0.0.0/33"), "{err}");
+}
+
+#[tokio::test]
 async fn a_guard_cannot_set_the_client_address_headers() {
     // The proxy writes these from the resolved address alone: a decider that
     // injects them changes nothing the upstream or the fallback sees, so they

@@ -953,9 +953,9 @@ impl ProxyServer {
             .merge(guards.router(endpoints, guard::Class::Endpoints))
             .merge(guards.router(verify, guard::Class::Verify))
             // Before every guard: they and the handlers read its result.
-            .layer(client_address::ResolveLayer {
-                guards: guards.clone(),
-            })
+            .layer(client_address::ClientAddressLayer::with(
+                guards.client_address.clone(),
+            ))
             .layer(TraceLayer::new_for_http());
         // Outermost: wraps every enforcement layer so short-circuited
         // responses keep CORS headers, and answers preflight before auth.
@@ -989,8 +989,10 @@ impl ProxyServer {
             guard::Scope::compile(config, default, what, &routed).map_err(anyhow::Error::msg)
         };
         let mut guards = guard::Guards {
-            client_address: client_address::Resolver::build(&self.config.client_address)
-                .map_err(|e| anyhow::anyhow!("invalid client_address config: {e}"))?,
+            client_address: Arc::new(
+                client_address::Resolver::build(&self.config.client_address)
+                    .map_err(|e| anyhow::anyhow!("invalid client_address config: {e}"))?,
+            ),
             ..Default::default()
         };
         if guards.client_address.required() {

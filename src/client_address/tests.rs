@@ -488,6 +488,34 @@ fn the_header_value_is_the_canonical_text_form() {
 }
 
 #[test]
+fn a_trusted_proxy_written_as_ipv4_mapped_matches_its_ipv4_peer() {
+    // Peers are compared in canonical form, so a range written in the
+    // mapped form a dual-stack socket reports must match the same peers.
+    let lb = resolver(
+        &["::ffff:10.0.0.0/104", "::ffff:192.0.2.10"],
+        ForwardingHeader::XForwardedFor,
+    );
+    for from in ["10.1.2.3:4000", "[::ffff:10.1.2.3]:4000", "192.0.2.10:4000"] {
+        assert_eq!(
+            resolve_xff(&lb, from, &["203.0.113.7"]),
+            Resolution::Forwarded(ip("203.0.113.7")),
+            "{from}"
+        );
+    }
+    assert_eq!(
+        resolve_xff(&lb, "192.0.2.11:4000", &["203.0.113.7"]),
+        Resolution::Peer(ip("192.0.2.11"))
+    );
+    // A range wider than the mapped block stays IPv6: trusting `::/0` does
+    // not trust every IPv4 peer.
+    let v6 = resolver(&["::/0"], ForwardingHeader::XForwardedFor);
+    assert_eq!(
+        resolve_xff(&v6, "10.0.0.1:4000", &["203.0.113.7"]),
+        Resolution::Peer(ip("10.0.0.1"))
+    );
+}
+
+#[test]
 fn a_trusted_proxy_is_a_range_or_one_address() {
     let lb = resolver(
         &["10.0.0.0/8", "192.0.2.10", "2001:db8::/32"],
