@@ -12,18 +12,38 @@
 //! absent: the default build is a stateless data plane (see the crate README
 //! Non-goals). They are planned behind an opt-in `bff` feature.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::{HeaderMap, Method, StatusCode};
 
+use crate::client_address::ClientAddress;
+
 /// Borrowed view of an incoming request, passed to an [`AuthDecider`].
 ///
 /// All fields borrow from the live request: building this is allocation-free, so
 /// the per-request gate stays cheap. The body is intentionally absent: an auth
-/// decision is taken from method, path, query, headers, and peer alone.
+/// decision is taken from method, path, query, headers, and client alone.
+///
+/// # Examples
+///
+/// ```
+/// use structured_proxy::hooks::RequestParts;
+/// use structured_proxy::ClientAddress;
+///
+/// // The view a decider's own tests build.
+/// let client = ClientAddress::from_peer(Some("203.0.113.7:51234".parse().unwrap()));
+/// let headers = http::HeaderMap::new();
+/// let parts = RequestParts {
+///     method: &http::Method::GET,
+///     path: "/v1/things",
+///     query: None,
+///     headers: &headers,
+///     client: &client,
+/// };
+/// assert_eq!(parts.client.ip(), Some("203.0.113.7".parse().unwrap()));
+/// ```
 #[derive(Debug)]
 pub struct RequestParts<'a> {
     /// Request method (the *original* method on the `/verify` path, recovered
@@ -33,10 +53,12 @@ pub struct RequestParts<'a> {
     pub path: &'a str,
     /// Raw query string, if any (without the leading `?`).
     pub query: Option<&'a str>,
-    /// Request headers.
+    /// Request headers. Their `X-Forwarded-For` and `X-Real-IP` hold the
+    /// resolved client address and nothing the client sent.
     pub headers: &'a HeaderMap,
-    /// Direct peer socket address (the connecting client, or the fronting proxy).
-    pub peer: SocketAddr,
+    /// The client address the proxy resolved, with the connection's peer
+    /// (the client, or the fronting proxy).
+    pub client: &'a ClientAddress,
 }
 
 /// The outcome of an [`AuthDecider`] evaluation.
@@ -169,8 +191,8 @@ pub struct RouteRequest {
     pub headers: HeaderMap,
     /// Request body bytes.
     pub body: Bytes,
-    /// Direct peer socket address.
-    pub peer: SocketAddr,
+    /// The client address the proxy resolved, with the connection's peer.
+    pub client: ClientAddress,
 }
 
 /// Response produced by an [`ExtraRouteHandler`].

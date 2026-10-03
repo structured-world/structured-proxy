@@ -53,6 +53,7 @@ fn embedded_config_is_constructible() {
         concurrency: None,
         grpc_web: Default::default(),
         transcode: Default::default(),
+        client_address: Default::default(),
     };
     // The server accepts a programmatically-built config (the embedded path).
     let _server = ProxyServer::from_config(config);

@@ -315,9 +315,14 @@ where
 /// A gRPC-path or fallback service with its guards around it.
 pub(crate) type BoxedService = BoxCloneSyncService<Request, Response, Infallible>;
 
-/// The guards the proxy runs, each with its scope.
+/// The guards the proxy runs, each with its scope, and the client-address
+/// resolution that runs before all of them.
 #[derive(Default)]
 pub(crate) struct Guards {
+    pub(crate) client_address: crate::client_address::Resolver,
+    /// `client_address.required`: the guard refusing a request whose address
+    /// did not resolve, over every class.
+    pub(crate) require_client: Option<Arc<Scope>>,
     pub(crate) maintenance: Option<(Arc<Maintenance>, Arc<Scope>)>,
     pub(crate) concurrency: Option<(Arc<Concurrency>, Arc<Scope>)>,
     pub(crate) shield: Option<(Arc<crate::shield::Shield>, Arc<Scope>)>,
@@ -327,8 +332,9 @@ pub(crate) struct Guards {
 }
 
 /// Put the guards that cover `$class` around `$target`, in pipeline order
-/// (outermost first): maintenance, concurrency, rate limits before auth, JWT,
-/// rate limits after auth (keyed by verified claims), ext_authz, the decider.
+/// (outermost first): a required client address, maintenance, concurrency,
+/// rate limits before auth, JWT, rate limits after auth (keyed by verified
+/// claims), ext_authz, the decider.
 /// `$wrap` applies one layer to the target type at hand; a macro, since each
 /// guard's layer is its own type.
 macro_rules! guard_stack {
@@ -398,6 +404,14 @@ macro_rules! guard_stack {
                 from_fn_with_state(maintenance.clone(), maintenance_middleware)
             );
         }
+        if let Some(scope) = &guards.require_client {
+            target = $wrap!(
+                target,
+                class,
+                scope,
+                axum::middleware::from_fn(crate::client_address::require)
+            );
+        }
         target
     }};
 }
@@ -446,7 +460,10 @@ impl Guards {
         fn on<T>(guard: &Option<(T, Arc<Scope>)>, class: Class) -> bool {
             guard.as_ref().is_some_and(|(_, scope)| scope.covers(class))
         }
-        on(&self.maintenance, class)
+        self.require_client
+            .as_ref()
+            .is_some_and(|scope| scope.covers(class))
+            || on(&self.maintenance, class)
             || on(&self.concurrency, class)
             || on(&self.shield, class)
             || (class.authenticates()

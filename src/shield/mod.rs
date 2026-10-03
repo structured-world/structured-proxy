@@ -28,6 +28,7 @@ use axum::http::HeaderMap;
 use axum::middleware::Next;
 use axum::response::Response;
 
+use crate::client_address::{ClientAddress, Resolution};
 use crate::config::ShieldConfig;
 use gcra::Verdict;
 use matcher::{CompiledProfile, CompiledRule, KeySource, Phase};
@@ -48,16 +49,14 @@ pub struct Shield {
     #[cfg(feature = "redis")]
     global: Option<Arc<global::GlobalCounters>>,
     store: GcraStore,
-    /// CIDR ranges whose `X-Forwarded-For` / `X-Real-IP` headers we trust.
-    trusted_proxies: Vec<ipnet::IpNet>,
 }
 
 impl Shield {
     /// Build a Shield from config, or `None` when disabled / has no rules.
     ///
     /// # Errors
-    /// Returns an error string when a glob pattern, rate, profile reference, or
-    /// trusted-proxy CIDR fails to compile.
+    /// Returns an error string when a glob pattern, rate or profile reference
+    /// fails to compile.
     pub fn build(config: &ShieldConfig) -> Result<Option<Arc<Self>>, String> {
         if !config.enabled {
             return Ok(None);
@@ -84,12 +83,6 @@ impl Shield {
                 })?),
                 None => None,
             };
-
-        let trusted_proxies = config
-            .trusted_proxies
-            .iter()
-            .map(|s| parse_cidr(s))
-            .collect::<Result<Vec<_>, _>>()?;
 
         let jwt_limits = config
             .jwt_limits
@@ -131,7 +124,6 @@ impl Shield {
             #[cfg(feature = "redis")]
             global,
             store: GcraStore::new(),
-            trusted_proxies,
         })))
     }
 
@@ -205,11 +197,21 @@ async fn enforce(shield: &Shield, phase: Phase, request: Request, next: Next) ->
         return next.run(request).await;
     };
 
-    let peer = request
-        .extensions()
-        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|ci| ci.0.ip());
-    let client = client_ip(peer, request.headers(), &shield.trusted_proxies);
+    // The proxy resolved the client address before any guard. Shield used on
+    // its own, in a router of the embedder's, falls back to what that
+    // resolution gives with no trusted proxy: the peer an axum server records.
+    let unresolved;
+    let client = match request.extensions().get::<ClientAddress>() {
+        Some(client) => client,
+        None => {
+            let peer = request
+                .extensions()
+                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                .map(|ci| ci.0);
+            unresolved = ClientAddress::from_peer(peer);
+            &unresolved
+        }
+    };
     let claims = request
         .extensions()
         .get::<crate::auth::ValidatedClaims>()
@@ -217,7 +219,7 @@ async fn enforce(shield: &Shield, phase: Phase, request: Request, next: Next) ->
     let key = rule_key(
         &rule.fingerprint,
         &rule.key,
-        &client,
+        client,
         request.headers(),
         claims,
     );
@@ -413,25 +415,25 @@ struct RuleKey {
 }
 
 /// Derive the store key and resolution identity for a matched rule. Every source
-/// falls back to the client IP when its value is absent, so a limit can't be
-/// dodged by omitting a header or authenticating anonymously (subject to the
+/// falls back to the client address when its value is absent, so a limit can't
+/// be dodged by omitting a header or authenticating anonymously (subject to the
 /// rule's phase: a `jwt_claim` rule only runs post-auth).
 fn rule_key(
     fingerprint: &str,
     key: &KeySource,
-    client: &str,
+    client: &ClientAddress,
     headers: &HeaderMap,
     claims: Option<&serde_json::Value>,
 ) -> RuleKey {
     let (tag, identity) = match key {
-        KeySource::Ip => ("ip", client.to_string()),
+        KeySource::Ip => ("ip", address_identity(client)),
         KeySource::Header(name) => match header_str(headers, name) {
             Some(v) => ("hdr", v),
-            None => ("ip", client.to_string()),
+            None => ("ip", address_identity(client)),
         },
         KeySource::JwtClaim(claim) => match claims.and_then(|c| resolve::claim_str(c, claim)) {
             Some(v) => ("jwt", v),
-            None => ("ip", client.to_string()),
+            None => ("ip", address_identity(client)),
         },
     };
     RuleKey {
@@ -440,66 +442,16 @@ fn rule_key(
     }
 }
 
-/// Parse a trusted-proxy entry as a CIDR range, accepting a bare IP as a /32
-/// or /128 host range.
-fn parse_cidr(s: &str) -> Result<ipnet::IpNet, String> {
-    if let Ok(net) = s.parse::<ipnet::IpNet>() {
-        return Ok(net);
+/// The identity a client address keys a limit by: the address, or one shared
+/// bucket per reason none resolved. A request that cannot name its client
+/// shares its budget with every other such request rather than escaping the
+/// limit, and a proxy's own address never stands in for the client's.
+fn address_identity(client: &ClientAddress) -> String {
+    match client.resolution() {
+        Resolution::Peer(ip) | Resolution::Forwarded(ip) => ip.to_string(),
+        Resolution::Invalid(_) => "invalid".to_string(),
+        Resolution::Unavailable => "unknown".to_string(),
     }
-    if let Ok(ip) = s.parse::<std::net::IpAddr>() {
-        let prefix = if ip.is_ipv4() { 32 } else { 128 };
-        return ipnet::IpNet::new(ip, prefix)
-            .map_err(|e| format!("invalid trusted_proxies entry {s:?}: {e}"));
-    }
-    Err(format!("invalid trusted_proxies CIDR/IP: {s:?}"))
-}
-
-/// Resolve the client identity for keying.
-///
-/// `X-Forwarded-For` is trusted only when the direct `peer` is a configured
-/// trusted proxy, and even then the *rightmost* hop outside the trusted ranges
-/// is used: appending load balancers (nginx, ALB, GCP) add the connecting IP on
-/// the right, so the leftmost entries are attacker-controlled. Without connection
-/// info (a server not wired with `ConnectInfo`) we fail closed to a single
-/// `"unknown"` bucket rather than trusting client-supplied forwarding headers,
-/// which an attacker could otherwise rotate to dodge the limit.
-fn client_ip(
-    peer: Option<std::net::IpAddr>,
-    headers: &HeaderMap,
-    trusted: &[ipnet::IpNet],
-) -> String {
-    match peer {
-        Some(ip) => {
-            if trusted.iter().any(|net| net.contains(&ip)) {
-                if let Some(client) = rightmost_untrusted(headers, trusted) {
-                    return client;
-                }
-            }
-            ip.to_string()
-        }
-        None => "unknown".to_string(),
-    }
-}
-
-/// Rightmost `X-Forwarded-For` hop that is not within a trusted range, i.e. the
-/// last address appended by an untrusted party. Falls back to `X-Real-IP`.
-fn rightmost_untrusted(headers: &HeaderMap, trusted: &[ipnet::IpNet]) -> Option<String> {
-    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        for hop in xff.split(',').rev() {
-            let hop = hop.trim();
-            if hop.is_empty() {
-                continue;
-            }
-            let trusted_hop = hop
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| trusted.iter().any(|net| net.contains(&ip)));
-            if !trusted_hop {
-                return Some(hop.to_string());
-            }
-        }
-    }
-    // X-Real-IP is set by the proxy to the single real client address.
-    header_str(headers, "x-real-ip")
 }
 
 /// Trimmed, non-empty value of a header.

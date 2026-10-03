@@ -7,7 +7,7 @@
 //! conversion here is what lets an embedder depend on the hook traits without
 //! ever naming `axum`.
 
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -19,6 +19,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, on, MethodFilter, MethodRouter};
 use axum::{Json, Router};
 
+use crate::client_address::ClientAddress;
 use crate::guard::{http_to_grpc_code, mark_rejection};
 use crate::hooks::{AuthDecider, Decision, ExtraRoute, OidcBackend, RequestParts, RouteRequest};
 
@@ -27,18 +28,23 @@ use crate::hooks::{AuthDecider, Decision, ExtraRoute, OidcBackend, RequestParts,
 /// single request from exhausting memory.
 const MAX_EXTRA_ROUTE_BODY: usize = 16 * 1024 * 1024;
 
-/// Fallback peer when the listener was not configured with `ConnectInfo`
-/// (e.g. in `oneshot` tests). Real serving always supplies the connecting peer.
-fn unknown_peer() -> SocketAddr {
-    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
+/// The client address the proxy resolved for `req`. A hook's route used
+/// outside the proxy's router (in tests) has none: it gets what resolution
+/// with no trusted proxy gives, the peer an axum server recorded, if any.
+fn client_of(req: &Request) -> ClientAddress {
+    match req.extensions().get::<ClientAddress>() {
+        Some(client) => client.clone(),
+        None => unresolved(req),
+    }
 }
 
-/// The connecting peer, or [`unknown_peer`] when `ConnectInfo` is absent.
-fn peer_of(req: &Request) -> SocketAddr {
-    req.extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|ci| ci.0)
-        .unwrap_or_else(unknown_peer)
+/// [`client_of`] a request the proxy did not resolve.
+fn unresolved(req: &Request) -> ClientAddress {
+    ClientAddress::from_peer(
+        req.extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|ci| ci.0),
+    )
 }
 
 /// Inline gate: run the embedder's [`AuthDecider`] on every proxied request.
@@ -51,7 +57,15 @@ pub(crate) async fn auth_decider_gate(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let peer = peer_of(&request);
+    // Borrowed when the proxy resolved it, as on every request it serves.
+    let fallback;
+    let client = match request.extensions().get::<ClientAddress>() {
+        Some(client) => client,
+        None => {
+            fallback = unresolved(&request);
+            &fallback
+        }
+    };
     let decision = {
         let uri = request.uri();
         let parts = RequestParts {
@@ -59,7 +73,7 @@ pub(crate) async fn auth_decider_gate(
             path: uri.path(),
             query: uri.query(),
             headers: request.headers(),
-            peer,
+            client,
         };
         decider.decide(&parts).await
     };
@@ -98,7 +112,7 @@ pub(crate) async fn verify_via_decider(
     decider: Arc<dyn AuthDecider>,
     request: Request,
 ) -> Response {
-    let peer = peer_of(&request);
+    let client = client_of(&request);
     let headers = request.headers().clone();
     let method = original_method(&headers).unwrap_or_else(|| request.method().clone());
     let (path, query) = original_target(&headers).unwrap_or_else(|| {
@@ -112,7 +126,7 @@ pub(crate) async fn verify_via_decider(
             path: &path,
             query: query.as_deref(),
             headers: &headers,
-            peer,
+            client: &client,
         };
         decider.decide(&parts).await
     };
@@ -215,7 +229,7 @@ where
         let service = on(filter, move |request: Request| {
             let handler = handler.clone();
             async move {
-                let peer = peer_of(&request);
+                let client = client_of(&request);
                 let (parts, body) = request.into_parts();
                 // A failed/oversized read must NOT reach the handler as an empty
                 // body: a handler that verifies or parses the body would treat
@@ -237,7 +251,7 @@ where
                         uri: parts.uri,
                         headers: parts.headers,
                         body,
-                        peer,
+                        client,
                     })
                     .await;
                 let mut response = Response::new(Body::from(resp.body));

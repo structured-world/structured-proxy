@@ -78,7 +78,10 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub metrics_classes: Vec<MetricsClassConfig>,
 
-    /// Headers to forward from HTTP to gRPC metadata.
+    /// Headers to forward from HTTP to gRPC metadata. `x-forwarded-for`,
+    /// `x-real-ip` and `forwarded` are never taken from the request: the
+    /// upstream gets the resolved client address instead (`client_address`),
+    /// listed or not.
     #[serde(default = "default_forwarded_headers")]
     pub forwarded_headers: Vec<String>,
 
@@ -97,6 +100,11 @@ pub struct ProxyConfig {
     /// Which annotated RPCs are transcoded.
     #[serde(default)]
     pub transcode: TranscodeConfig,
+
+    /// How the client's address is resolved: the proxies trusted to report
+    /// it, and the header they report it in.
+    #[serde(default)]
+    pub client_address: ClientAddressConfig,
 }
 
 impl Default for ProxyConfig {
@@ -124,8 +132,55 @@ impl Default for ProxyConfig {
             concurrency: None,
             grpc_web: GrpcWebConfig::default(),
             transcode: TranscodeConfig::default(),
+            client_address: ClientAddressConfig::default(),
         }
     }
+}
+
+/// How the client's address is resolved, for every consumer of it at once:
+/// the rate limits, the hooks, the fallback and the upstream.
+///
+/// ```yaml
+/// client_address:
+///   trusted_proxies: ["10.0.0.0/8", "192.0.2.10"]
+///   header: x_forwarded_for
+///   required: false
+/// ```
+///
+/// The connection's peer is the client unless it is a trusted proxy; only
+/// then is `header` read, so an address a client asserts itself never
+/// counts. The defaults trust no proxy: the right setting for a proxy that
+/// faces its clients directly.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientAddressConfig {
+    /// Proxies trusted to report the client's address: CIDR ranges, or bare
+    /// addresses for one host. An IPv4-mapped IPv6 peer (`::ffff:10.0.0.1`)
+    /// matches its IPv4 range. An entry that is neither stops the proxy at
+    /// startup.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
+    /// The header trusted proxies report the client's address in.
+    #[serde(default)]
+    pub header: ForwardingHeader,
+    /// Refuse a request whose client address cannot be resolved: no
+    /// connection information (`INTERNAL`, 500), or a trusted proxy's report
+    /// that cannot be read (`INVALID_ARGUMENT`, 400). Off: such a request
+    /// goes on with no address and no forwarding headers.
+    #[serde(default)]
+    pub required: bool,
+}
+
+/// The header trusted proxies report the client's address in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForwardingHeader {
+    /// `X-Forwarded-For`, every field line in order, read right to left
+    /// through the trusted proxies to the first address outside them.
+    #[default]
+    XForwardedFor,
+    /// `X-Real-IP`: one address, the trusted proxy's own peer.
+    XRealIp,
 }
 
 /// Which annotated RPCs are transcoded.
@@ -186,9 +241,7 @@ fn default_forwarded_headers() -> Vec<String> {
         "authorization".into(),
         "dpop".into(),
         "x-request-id".into(),
-        "x-forwarded-for".into(),
         "x-forwarded-proto".into(),
-        "x-real-ip".into(),
         "accept-language".into(),
         "user-agent".into(),
         "idempotency-key".into(),
@@ -327,6 +380,7 @@ pub(crate) const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "concurrency",
     "grpc_web",
     "transcode",
+    "client_address",
 ];
 
 /// Every `streaming:` key: the [`StreamingConfig`] fields plus the ones
@@ -359,6 +413,24 @@ pub(crate) fn unknown_config_keys(yaml: &str) -> Vec<String> {
         );
     }
     unknown
+}
+
+/// The error for a config that sets `shield.trusted_proxies`, which became
+/// `client_address.trusted_proxies`: the parse error alone would name an
+/// unknown field, not where its value belongs now.
+fn moved_setting(yaml: &str) -> Option<anyhow::Error> {
+    let serde_yaml::Value::Mapping(map) = serde_yaml::from_str(yaml).ok()? else {
+        return None;
+    };
+    let serde_yaml::Value::Mapping(shield) = map.get("shield")? else {
+        return None;
+    };
+    shield.contains_key("trusted_proxies").then(|| {
+        anyhow::anyhow!(
+            "shield.trusted_proxies is now client_address.trusted_proxies: the client \
+             address is resolved once for the rate limits, the hooks and the upstream"
+        )
+    })
 }
 
 impl TranscodeFileConfig {
@@ -931,13 +1003,6 @@ pub struct ShieldConfig {
     /// each instance limits locally (fleet limit ≈ N × per-instance).
     #[serde(default)]
     pub sync: Option<SyncConfig>,
-    /// CIDR ranges of trusted reverse proxies / load balancers (e.g.
-    /// "10.0.0.0/8"). `X-Forwarded-For` / `X-Real-IP` are honored only when the
-    /// direct peer falls in one of these ranges; otherwise the peer socket
-    /// address is used as the client identity. Empty (the default) means do not
-    /// trust forwarding headers; set this behind a load balancer.
-    #[serde(default)]
-    pub trusted_proxies: Vec<String>,
     /// The traffic the rules apply to. Default: `transcoded` and `endpoints`.
     #[serde(default)]
     pub scope: Option<ScopeConfig>,
@@ -985,7 +1050,8 @@ pub struct RateRuleConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum KeySourceConfig {
-    /// Client IP (trusted-proxy `X-Forwarded-For` aware). `{ type: ip }`.
+    /// The client address the proxy resolved (see
+    /// [`ClientAddressConfig`]). `{ type: ip }`.
     #[default]
     Ip,
     /// Value of a named request header (e.g. an API key).
@@ -1363,7 +1429,10 @@ impl ProxyConfig {
     /// Useful for embedding the proxy: load a baked-in config (e.g. via
     /// `include_str!`) without touching the filesystem.
     pub fn from_yaml_str(yaml: &str) -> anyhow::Result<Self> {
-        let config: Self = serde_yaml::from_str(yaml)?;
+        let config: Self = match serde_yaml::from_str(yaml) {
+            Ok(config) => config,
+            Err(error) => return Err(moved_setting(yaml).map_or_else(|| error.into(), Into::into)),
+        };
         config.validate()?;
         Ok(config)
     }
@@ -1383,6 +1452,8 @@ impl ProxyConfig {
                  gRPC cannot answer a browser's preflight for a gRPC-Web call"
             );
         }
+        crate::client_address::Resolver::build(&self.client_address)
+            .map_err(|e| anyhow::anyhow!("invalid client_address config: {e}"))?;
         self.validate_edge_paths()?;
         Ok(())
     }

@@ -12,6 +12,8 @@ use axum::http::header::{Entry, OccupiedEntry};
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use tonic::metadata::MetadataMap;
 
+use crate::client_address::{X_FORWARDED_FOR, X_REAL_IP};
+
 /// A forwarded request header whose value gRPC metadata cannot carry.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("header `{header}` has a value gRPC metadata cannot carry")]
@@ -33,6 +35,11 @@ pub struct InvalidForwardedHeader {
 /// valid `traceparent`, and every `tracestate` line only with the trace it
 /// belongs to.
 ///
+/// `x-forwarded-for`, `x-real-ip` and `forwarded` are never forwarded, listed
+/// or not: they carry what the client asserts about its address, which only
+/// the proxy's client-address resolution may turn into an address
+/// ([`ClientAddress`](crate::ClientAddress)).
+///
 /// # Errors
 /// A forwarded value gRPC metadata cannot carry: empty or outside visible
 /// ASCII and space for a text key, not base64 for a `-bin` key (gRPC PROTOCOL-HTTP2,
@@ -43,7 +50,18 @@ pub fn try_http_headers_to_grpc_metadata(
     headers: &HeaderMap,
     forwarded_headers: &[String],
 ) -> Result<MetadataMap, InvalidForwardedHeader> {
-    forward(headers, forwarded_headers, |name, value| {
+    client_metadata(headers, forwarded_headers, None)
+}
+
+/// [`try_http_headers_to_grpc_metadata`], with `client` as the one
+/// `x-forwarded-for` and `x-real-ip` value of the metadata: the address the
+/// proxy resolved, or nothing when none did.
+pub(crate) fn client_metadata(
+    headers: &HeaderMap,
+    forwarded_headers: &[String],
+    client: Option<&HeaderValue>,
+) -> Result<MetadataMap, InvalidForwardedHeader> {
+    forward(headers, forwarded_headers, client, |name, value| {
         if carries(name, value.as_bytes()) {
             Ok(())
         } else {
@@ -64,22 +82,25 @@ pub fn http_headers_to_grpc_metadata(
     headers: &HeaderMap,
     forwarded_headers: &[String],
 ) -> MetadataMap {
-    match forward::<Infallible>(headers, forwarded_headers, |_, _| Ok(())) {
+    match forward::<Infallible>(headers, forwarded_headers, None, |_, _| Ok(())) {
         Ok(metadata) => metadata,
         Err(never) => match never {},
     }
 }
 
-/// The metadata for `headers`, with `check` deciding on each forwarded value.
+/// The metadata for `headers` and the resolved `client` address, with `check`
+/// deciding on each forwarded value.
 fn forward<E>(
     headers: &HeaderMap,
     forwarded_headers: &[String],
+    client: Option<&HeaderValue>,
     mut check: impl FnMut(&HeaderName, &HeaderValue) -> Result<(), E>,
 ) -> Result<MetadataMap, E> {
     let mut forwarded = HeaderMap::new();
     for name in forwarded_headers {
-        // Trace-context propagation owns these, listed or not.
-        if is_trace_context(name) {
+        // Trace-context propagation and client-address resolution own these,
+        // listed or not.
+        if is_trace_context(name) || is_client_address(name) {
             continue;
         }
         let values = headers.get_all(name.as_str());
@@ -129,6 +150,10 @@ fn forward<E>(
             }
         }
     }
+    if let Some(client) = client {
+        forwarded.insert(X_FORWARDED_FOR, client.clone());
+        forwarded.insert(X_REAL_IP, client.clone());
+    }
     let mut metadata = MetadataMap::from_headers(forwarded);
 
     inject_trace_context(&mut metadata, headers);
@@ -161,6 +186,14 @@ pub(crate) fn is_grpc_key(name: &str) -> bool {
 /// Whether `name` is a W3C trace-context header, which propagation owns.
 fn is_trace_context(name: &str) -> bool {
     name.eq_ignore_ascii_case("traceparent") || name.eq_ignore_ascii_case("tracestate")
+}
+
+/// Whether `name` carries a client's address, which client-address
+/// resolution owns.
+fn is_client_address(name: &str) -> bool {
+    name.eq_ignore_ascii_case("x-forwarded-for")
+        || name.eq_ignore_ascii_case("x-real-ip")
+        || name.eq_ignore_ascii_case("forwarded")
 }
 
 /// `ASCII-Value → 1*( %x20-%x7E )`. An empty value is valid HTTP but not a

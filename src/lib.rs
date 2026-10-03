@@ -59,6 +59,7 @@ compile_error!(
 struct ReadmeDoctests;
 
 pub mod auth;
+pub mod client_address;
 pub mod config;
 mod cors;
 mod embed;
@@ -78,6 +79,7 @@ pub mod upstream;
 /// [`install_default_crypto_provider`] for when a call is needed.
 #[cfg(feature = "builtin_jwt")]
 pub use auth::crypto::install_default_crypto_provider;
+pub use client_address::ClientAddress;
 pub use serve::{serve, serve_with, serve_with_shutdown, ServeOptions};
 pub use service::{ConnectionInfo, ProxyService};
 
@@ -334,6 +336,35 @@ impl ProxyServer {
     /// The limit on requests in flight (`concurrency:`).
     pub fn with_concurrency_limit(mut self, concurrency: config::ConcurrencyConfig) -> Self {
         self.config.concurrency = Some(concurrency);
+        self
+    }
+
+    /// How the client's address is resolved (`client_address:`): the proxies
+    /// trusted to report it and the header they use. Every consumer reads the
+    /// result, the rate limits as much as the upstream.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use structured_proxy::config::{ClientAddressConfig, ForwardingHeader};
+    /// use structured_proxy::ProxyServer;
+    ///
+    /// # fn build() -> anyhow::Result<()> {
+    /// // Behind a load balancer in 10.0.0.0/8 that appends to X-Forwarded-For.
+    /// let service = ProxyServer::new()
+    ///     .with_client_address(ClientAddressConfig {
+    ///         trusted_proxies: vec!["10.0.0.0/8".into()],
+    ///         header: ForwardingHeader::XForwardedFor,
+    ///         required: true,
+    ///     })
+    ///     .service(tonic::service::Routes::default())?;
+    /// # let _ = service;
+    /// # Ok(())
+    /// # }
+    /// # build().unwrap();
+    /// ```
+    pub fn with_client_address(mut self, client_address: config::ClientAddressConfig) -> Self {
+        self.config.client_address = client_address;
         self
     }
 
@@ -794,7 +825,7 @@ impl ProxyServer {
         let forward_auth = auth.as_ref().and_then(|built| {
             auth::forward::ForwardAuth::build(self.config.auth.as_ref()?, built.clone())
         });
-        let guards = self.guards(auth, maintenance_exempt, &mounted)?;
+        let guards = Arc::new(self.guards(auth, maintenance_exempt, &mounted)?);
 
         // Health routes. Paths are configurable; the whole group is skippable.
         let health_routes = if self.config.health.enabled {
@@ -922,12 +953,16 @@ impl ProxyServer {
             .merge(guards.router(transcode_routes, guard::Class::Transcoded))
             .merge(guards.router(endpoints, guard::Class::Endpoints))
             .merge(guards.router(verify, guard::Class::Verify))
+            // Before every guard: they and the handlers read its result.
+            .layer(client_address::ResolveLayer {
+                guards: guards.clone(),
+            })
             .layer(TraceLayer::new_for_http());
         // Outermost: wraps every enforcement layer so short-circuited
         // responses keep CORS headers, and answers preflight before auth.
         let router = cors::layer(router, cors.clone()).with_state(state);
 
-        Ok((router, cors, Arc::new(guards)))
+        Ok((router, cors, guards))
     }
 
     /// The guards the configuration and the hooks turn on, each with its
@@ -954,7 +989,14 @@ impl ProxyServer {
         let scope = |config: Option<&ScopeConfig>, default: &[config::Traffic], what: &str| {
             guard::Scope::compile(config, default, what, &routed).map_err(anyhow::Error::msg)
         };
-        let mut guards = guard::Guards::default();
+        let mut guards = guard::Guards {
+            client_address: client_address::Resolver::build(&self.config.client_address)
+                .map_err(|e| anyhow::anyhow!("invalid client_address config: {e}"))?,
+            ..Default::default()
+        };
+        if guards.client_address.required() {
+            guards.require_client = Some(scope(None, &[config::Traffic::All], "client_address")?);
+        }
         // Mounted only while maintenance is on, so normal traffic pays nothing
         // for it.
         let maintenance = &self.config.maintenance;
