@@ -7,7 +7,7 @@
 //! conversion here is what lets an embedder depend on the hook traits without
 //! ever naming `axum`.
 
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -19,6 +19,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, on, MethodFilter, MethodRouter};
 use axum::{Json, Router};
 
+use crate::client_address::ClientAddress;
 use crate::guard::{http_to_grpc_code, mark_rejection};
 use crate::hooks::{AuthDecider, Decision, ExtraRoute, OidcBackend, RequestParts, RouteRequest};
 
@@ -27,18 +28,30 @@ use crate::hooks::{AuthDecider, Decision, ExtraRoute, OidcBackend, RequestParts,
 /// single request from exhausting memory.
 const MAX_EXTRA_ROUTE_BODY: usize = 16 * 1024 * 1024;
 
-/// Fallback peer when the listener was not configured with `ConnectInfo`
-/// (e.g. in `oneshot` tests). Real serving always supplies the connecting peer.
-fn unknown_peer() -> SocketAddr {
-    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
+/// The client address the proxy resolved for `req`. A hook's route used
+/// outside the proxy's router (in tests) has none: it gets what resolution
+/// with no trusted proxy gives, the peer an axum server recorded, if any.
+fn client_of(req: &Request) -> ClientAddress {
+    match req.extensions().get::<ClientAddress>() {
+        Some(client) => client.clone(),
+        None => unresolved(req),
+    }
 }
 
-/// The connecting peer, or [`unknown_peer`] when `ConnectInfo` is absent.
-fn peer_of(req: &Request) -> SocketAddr {
-    req.extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|ci| ci.0)
-        .unwrap_or_else(unknown_peer)
+/// [`client_of`] a request the proxy did not resolve.
+fn unresolved(req: &Request) -> ClientAddress {
+    ClientAddress::from_peer(
+        req.extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|ci| ci.0),
+    )
+}
+
+/// The embedder's [`AuthDecider`] as an inline gate, with the headers it may
+/// not set: those the client-address forwarding writes beyond the fixed ones.
+pub(crate) struct DeciderGate {
+    pub(crate) decider: Arc<dyn AuthDecider>,
+    pub(crate) reserved: Arc<[http::HeaderName]>,
 }
 
 /// Inline gate: run the embedder's [`AuthDecider`] on every proxied request.
@@ -47,11 +60,20 @@ fn peer_of(req: &Request) -> SocketAddr {
 /// after stripping any client-supplied copies (so a client cannot forge them),
 /// then the request proceeds upstream.
 pub(crate) async fn auth_decider_gate(
-    State(decider): State<Arc<dyn AuthDecider>>,
+    State(gate): State<Arc<DeciderGate>>,
     mut request: Request,
     next: Next,
 ) -> Response {
-    let peer = peer_of(&request);
+    let DeciderGate { decider, reserved } = &*gate;
+    // Borrowed when the proxy resolved it, as on every request it serves.
+    let fallback;
+    let client = match request.extensions().get::<ClientAddress>() {
+        Some(client) => client,
+        None => {
+            fallback = unresolved(&request);
+            &fallback
+        }
+    };
     let decision = {
         let uri = request.uri();
         let parts = RequestParts {
@@ -59,7 +81,7 @@ pub(crate) async fn auth_decider_gate(
             path: uri.path(),
             query: uri.query(),
             headers: request.headers(),
-            peer,
+            client,
         };
         decider.decide(&parts).await
     };
@@ -67,7 +89,7 @@ pub(crate) async fn auth_decider_gate(
     match decision {
         Decision::Allow { inject_headers } => {
             let dst = request.headers_mut();
-            strip_then_insert(dst, &inject_headers);
+            strip_then_insert(dst, &inject_headers, reserved);
             next.run(request).await
         }
         // The decider owns the HTTP answer; a gRPC caller gets the code its
@@ -98,7 +120,7 @@ pub(crate) async fn verify_via_decider(
     decider: Arc<dyn AuthDecider>,
     request: Request,
 ) -> Response {
-    let peer = peer_of(&request);
+    let client = client_of(&request);
     let headers = request.headers().clone();
     let method = original_method(&headers).unwrap_or_else(|| request.method().clone());
     let (path, query) = original_target(&headers).unwrap_or_else(|| {
@@ -112,7 +134,7 @@ pub(crate) async fn verify_via_decider(
             path: &path,
             query: query.as_deref(),
             headers: &headers,
-            peer,
+            client: &client,
         };
         decider.decide(&parts).await
     };
@@ -215,7 +237,7 @@ where
         let service = on(filter, move |request: Request| {
             let handler = handler.clone();
             async move {
-                let peer = peer_of(&request);
+                let client = client_of(&request);
                 let (parts, body) = request.into_parts();
                 // A failed/oversized read must NOT reach the handler as an empty
                 // body: a handler that verifies or parses the body would treat
@@ -237,7 +259,7 @@ where
                         uri: parts.uri,
                         headers: parts.headers,
                         body,
-                        peer,
+                        client,
                     })
                     .await;
                 let mut response = Response::new(Body::from(resp.body));
@@ -265,12 +287,19 @@ where
 
 /// Remove any incoming copies of the soon-to-be-injected header names, then
 /// insert the decider's values, so a client cannot forge them onto the upstream.
-fn strip_then_insert(dst: &mut HeaderMap, inject: &HeaderMap) {
+/// A client-address header, or one in `reserved` the client-address
+/// forwarding writes, is left alone: the decider's copy would contradict the
+/// resolved address.
+fn strip_then_insert(dst: &mut HeaderMap, inject: &HeaderMap, reserved: &[http::HeaderName]) {
     for name in inject.keys() {
+        if crate::client_address::owns(name.as_str()) || reserved.contains(name) {
+            tracing::warn!(header = %name, "auth decider header ignored: the proxy sets it from the client address");
+            continue;
+        }
         while dst.remove(name).is_some() {}
-    }
-    for (name, value) in inject {
-        dst.append(name.clone(), value.clone());
+        for value in inject.get_all(name) {
+            dst.append(name.clone(), value.clone());
+        }
     }
 }
 

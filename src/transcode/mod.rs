@@ -41,6 +41,7 @@ use std::time::Duration;
 use tonic::client::Grpc;
 use tonic::metadata::MetadataMap;
 
+use crate::client_address::ClientAddress;
 use crate::config::AliasConfig;
 use crate::service::ConnectionInfo;
 use crate::upstream::Upstream;
@@ -306,10 +307,14 @@ macro_rules! endpoint {
               path_params: Path<PathParams>,
               raw_query: RawQuery,
               connection: Option<Extension<ConnectionInfo>>,
+              address: Option<Extension<ClientAddress>>,
               body: Bytes| {
             let client = Client {
                 headers,
-                connection: connection.map(|Extension(connection)| connection),
+                origin: Origin {
+                    connection: connection.map(|Extension(connection)| connection),
+                    address: address.map(|Extension(address)| address),
+                },
             };
             handle(state, client, path_params, raw_query, body, entry)
         }
@@ -551,11 +556,17 @@ fn accept_range_selects_sse(range: &str) -> bool {
     true
 }
 
-/// Who sent a transcoded request: its headers, and the connection it came
-/// on when the server recorded one.
+/// Who sent a transcoded request: its headers and where it came from.
 struct Client {
     headers: HeaderMap,
+    origin: Origin,
+}
+
+/// Where a transcoded request came from: the connection, when the server
+/// recorded one, and the client address the proxy resolved.
+struct Origin {
     connection: Option<ConnectionInfo>,
+    address: Option<ClientAddress>,
 }
 
 /// Serve one request on a transcoded route.
@@ -568,14 +579,11 @@ async fn handle<S: TranscodeState>(
     entry: Arc<RouteEntry>,
 ) -> Response {
     let keep_alive_secs = proxy_state.sse_keep_alive_secs();
-    let Client {
-        headers,
-        connection,
-    } = client;
+    let Client { headers, origin } = client;
     let prepared = prepare(
         proxy_state,
         &headers,
-        connection,
+        origin,
         &path_params,
         raw_query.as_deref(),
         body,
@@ -652,24 +660,41 @@ impl<U: Upstream> Call<U> {
 fn prepare<S: TranscodeState>(
     proxy_state: S,
     headers: &HeaderMap,
-    connection: Option<ConnectionInfo>,
+    origin: Origin,
     path_params: &PathParams,
     raw_query: Option<&str>,
     body: Bytes,
     entry: &RouteEntry,
 ) -> Result<Call<S::Upstream>, Unmappable> {
-    let request_metadata =
-        metadata::try_http_headers_to_grpc_metadata(headers, proxy_state.forwarded_headers())
-            .map_err(|e| Unmappable(e.to_string()))?;
+    let Origin {
+        connection,
+        address,
+    } = origin;
+    // A request the proxy resolved carries the client-address headers its
+    // forwarding policy wrote; one routed here without that resolution
+    // carries only what its client asserted, which is never forwarded.
+    let request_metadata = match address {
+        Some(_) => {
+            metadata::rewritten_headers_to_grpc_metadata(headers, proxy_state.forwarded_headers())
+        }
+        None => {
+            metadata::try_http_headers_to_grpc_metadata(headers, proxy_state.forwarded_headers())
+        }
+    }
+    .map_err(|e| Unmappable(e.to_string()))?;
     let message =
         decode_request(entry, headers, path_params, raw_query, body).map_err(Unmappable)?;
     let mut request = tonic::Request::new(message);
     *request.metadata_mut() = request_metadata;
     // An upstream in process reads the HTTP client's address and TLS
-    // certificates with `Request::remote_addr` / `peer_certs`; a remote one
-    // never sees request extensions.
+    // certificates with `Request::remote_addr` / `peer_certs`, and the
+    // resolved client address as a `ClientAddress`; a remote one never sees
+    // request extensions.
     if let Some(connection) = connection {
         connection.into_tonic_extensions(request.extensions_mut());
+    }
+    if let Some(address) = address {
+        request.extensions_mut().insert(address);
     }
     // Only the client's own deadline travels upstream: a default one would
     // cut a long server stream short on an upstream that applies

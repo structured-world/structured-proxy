@@ -22,6 +22,7 @@ use presence::{has_special_json, OneEntry, Presence, Recording};
 
 /// How the HTTP request body maps onto the gRPC request message.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BodyMapping {
     /// No body is read; fields come from path + query (typical for GET/DELETE).
     None,

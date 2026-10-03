@@ -18,6 +18,7 @@ use tonic::transport::server::{Connected, TcpConnectInfo};
 use tower::{Layer, Service, ServiceExt};
 use tower_http::cors::{Cors, CorsLayer};
 
+use crate::client_address::ClientAddressLayer;
 use crate::guard::{BoxedService, Class, GrpcRejections, Guards};
 
 /// tonic's `TlsConnectInfo<TcpConnectInfo>`, the record its TLS server puts on
@@ -347,12 +348,15 @@ impl<U: Upstream> ProxyService<U> {
         F::Response: IntoResponse,
         F::Future: Send + 'static,
     {
+        // The routes' own layers do not reach a fallback set after them, so
+        // it gets the client-address resolution of its own, around its guards.
+        let resolve = ClientAddressLayer::with(self.guards.client_address.clone());
         self.routes = if self.guards.cover(Class::Fallback) {
             let fallback = BoxedService::new(fallback.map_response(IntoResponse::into_response));
             self.routes
-                .fallback_service(self.guards.service(fallback, Class::Fallback))
+                .fallback_service(resolve.layer(self.guards.service(fallback, Class::Fallback)))
         } else {
-            self.routes.fallback_service(fallback)
+            self.routes.fallback_service(resolve.layer(fallback))
         };
         self
     }
@@ -450,44 +454,43 @@ where
             Some(GrpcProtocol::WebText) => self.boxed.web_text.as_mut(),
             None => None,
         };
-        let inner = if let Some(service) = boxed {
-            // The guards read the peer as axum's `ConnectInfo`, the upstream
-            // as tonic records it.
-            if let Some(connection) = connection_of(self.connection.as_ref(), &request) {
-                let extensions = request.extensions_mut();
-                if let Some(remote) = connection.remote_addr() {
-                    extensions.insert(ConnectInfo(remote));
-                }
-                connection.into_tonic_extensions(extensions);
-            }
-            // Every service on these paths is ready at once: guards and the
-            // translator are middleware, and `Forward` waits for the upstream
-            // per request.
-            Inner::Boxed {
-                future: service.call(request.map(axum::body::Body::new)),
-            }
-        } else if let Some(protocol) = protocol {
-            // A native call carries its connection the way tonic's server
-            // hands it to a handler.
-            if let Some(connection) = connection_of(self.connection.as_ref(), &request) {
+        let inner = if let Some(protocol) = protocol {
+            // Whatever goes the upstream's way, guarded or not: its client
+            // address is resolved and its forwarding headers rewritten here,
+            // once, for the guards and the upstream alike. The call carries
+            // its connection the way tonic's server hands it to a handler.
+            let connection = connection_of(self.connection.as_ref(), &request);
+            let peer = connection.as_ref().and_then(ConnectionInfo::remote_addr);
+            self.guards.client_address.apply(&mut request, peer);
+            if let Some(connection) = connection {
                 connection.into_tonic_extensions(request.extensions_mut());
             }
-            let request = request.map(tonic::body::Body::new);
-            // A browser only speaks gRPC-Web, and the routes answered its
-            // preflight: its call gets the same CORS policy.
-            let cors = match (&mut self.grpc_web, protocol) {
-                (Some(cors), GrpcProtocol::Web) => Some(&mut cors.web),
-                (Some(cors), GrpcProtocol::WebText) => Some(&mut cors.web_text),
-                _ => None,
-            };
-            match cors {
-                // `Forward` is always ready, and so is CORS around it.
-                Some(cors) => Inner::GrpcWeb {
-                    future: cors.call(request),
+            match boxed {
+                // Every service on these paths is ready at once: guards and
+                // the translator are middleware, and `Forward` waits for the
+                // upstream per request.
+                Some(service) => Inner::Boxed {
+                    future: service.call(request.map(axum::body::Body::new)),
                 },
-                None => Inner::Grpc {
-                    call: PassThrough::new(self.upstream.clone(), request, protocol),
-                },
+                None => {
+                    let request = request.map(tonic::body::Body::new);
+                    // A browser only speaks gRPC-Web, and the routes answered
+                    // its preflight: its call gets the same CORS policy.
+                    let cors = match (&mut self.grpc_web, protocol) {
+                        (Some(cors), GrpcProtocol::Web) => Some(&mut cors.web),
+                        (Some(cors), GrpcProtocol::WebText) => Some(&mut cors.web_text),
+                        _ => None,
+                    };
+                    match cors {
+                        // `Forward` is always ready, and so is CORS around it.
+                        Some(cors) => Inner::GrpcWeb {
+                            future: cors.call(request),
+                        },
+                        None => Inner::Grpc {
+                            call: PassThrough::new(self.upstream.clone(), request, protocol),
+                        },
+                    }
+                }
             }
         } else {
             // The middleware reads the peer as axum's `ConnectInfo`; the

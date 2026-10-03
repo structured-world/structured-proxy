@@ -79,7 +79,8 @@ impl Auth {
     /// # Errors
     /// Returns an error string when the built-in verifier is required but this
     /// build has no crypto backend, when its key source is missing or unusable,
-    /// or when a policy glob fails to compile.
+    /// when a policy glob fails to compile, or when `claims_headers` names a
+    /// client-address header (`x-forwarded-for`, `x-real-ip`, `forwarded`).
     pub fn build(
         config: &AuthConfig,
         verifier: Option<Arc<dyn TokenVerifier>>,
@@ -115,6 +116,15 @@ impl Auth {
             Some(jwt) => (jwt.claims_headers.clone(), jwt.roles_claim.clone()),
             None => (HashMap::new(), default_roles_claim()),
         };
+        if let Some(header) = claims_headers
+            .values()
+            .find(|header| crate::client_address::owns(header))
+        {
+            return Err(format!(
+                "auth.jwt.claims_headers maps a claim onto {header:?}, which the proxy \
+                 sets from the resolved client address"
+            ));
+        }
 
         Ok(Some(Arc::new(Self {
             verifier,
