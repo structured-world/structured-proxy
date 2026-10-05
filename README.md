@@ -981,6 +981,26 @@ structured_proxy::serve(listener, proxy).await?;
 # }
 ```
 
+A transcoded call also carries the HTTP request it was made from as a
+`ReceivedRequest` extension: the method and the path and query as the client
+sent them, and the gRPC path of the RPC the binding selected. One RPC bound to
+several paths (`additional_bindings`, aliases) is told apart by that path, and
+a check that names the received request, such as a DPoP proof's `htm` and
+`htu` (RFC 9449 §4.3), compares against it. The path is recorded before a
+router the proxy is nested in strips its prefix, and no header the client
+sends changes it. The proxy only records it; a remote upstream never sees
+request extensions.
+
+```rust
+use structured_proxy::ReceivedRequest;
+
+fn request_line(request: &tonic::Request<()>) -> Option<(String, String)> {
+    let received = request.extensions().get::<ReceivedRequest>()?;
+    Some((received.method().to_string(), received.path_and_query().to_string()))
+}
+# let _ = request_line;
+```
+
 `ProxyServer::service` takes any gRPC tower service
 (`structured_proxy::upstream::Upstream`): `tonic::service::Routes`, a remote
 `tonic::transport::Channel` (what `ProxyServer::upstream` builds from the
