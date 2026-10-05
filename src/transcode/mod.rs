@@ -22,9 +22,9 @@ mod select;
 pub use select::RpcSelection;
 
 use axum::body::{Body, Bytes};
-use axum::extract::{Path, RawQuery, State};
+use axum::extract::{OriginalUri, Path, RawQuery, State};
 use axum::http::header::{ALLOW, CONTENT_TYPE};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodFilter, MethodRouter};
@@ -43,6 +43,7 @@ use tonic::metadata::MetadataMap;
 
 use crate::client_address::ClientAddress;
 use crate::config::AliasConfig;
+use crate::received::ReceivedRequest;
 use crate::service::ConnectionInfo;
 use crate::upstream::Upstream;
 use error::{ErrorDetailsPolicy, StatusDetails};
@@ -303,6 +304,8 @@ macro_rules! endpoint {
     ($entry:expr) => {{
         let entry: Arc<RouteEntry> = $entry;
         move |state: State<S>,
+              method: Method,
+              OriginalUri(uri): OriginalUri,
               headers: HeaderMap,
               path_params: Path<PathParams>,
               raw_query: RawQuery,
@@ -315,6 +318,7 @@ macro_rules! endpoint {
                     connection: connection.map(|Extension(connection)| connection),
                     address: address.map(|Extension(address)| address),
                 },
+                line: RequestLine { method, uri },
             };
             handle(state, client, path_params, raw_query, body, entry)
         }
@@ -556,10 +560,38 @@ fn accept_range_selects_sse(range: &str) -> bool {
     true
 }
 
-/// Who sent a transcoded request: its headers and where it came from.
+/// Who sent a transcoded request: its headers, where it came from and its
+/// request line.
 struct Client {
     headers: HeaderMap,
     origin: Origin,
+    line: RequestLine,
+}
+
+/// The method and target of a transcoded request as it was received: the
+/// target before a router the proxy is nested in strips its prefix.
+struct RequestLine {
+    method: Method,
+    uri: Uri,
+}
+
+impl RequestLine {
+    /// What an upstream in process gets of the request line. An authority-form
+    /// target has no path to record (RFC 9110 §7.1); it never matches a route,
+    /// whose paths all start with `/`, and is refused rather than recorded as
+    /// something it was not.
+    fn received(self, entry: &RouteEntry) -> Result<ReceivedRequest, Unmappable> {
+        let path_and_query = self
+            .uri
+            .into_parts()
+            .path_and_query
+            .ok_or_else(|| Unmappable("the request target has no path".to_string()))?;
+        Ok(ReceivedRequest::new(
+            self.method,
+            path_and_query,
+            entry.grpc_path.clone(),
+        ))
+    }
 }
 
 /// Where a transcoded request came from: the connection, when the server
@@ -579,16 +611,25 @@ async fn handle<S: TranscodeState>(
     entry: Arc<RouteEntry>,
 ) -> Response {
     let keep_alive_secs = proxy_state.sse_keep_alive_secs();
-    let Client { headers, origin } = client;
-    let prepared = prepare(
-        proxy_state,
-        &headers,
+    let Client {
+        headers,
         origin,
-        &path_params,
-        raw_query.as_deref(),
-        body,
-        &entry,
-    );
+        line,
+    } = client;
+    let prepared = line.received(&entry).and_then(|received| {
+        let mut call = prepare(
+            proxy_state,
+            &headers,
+            origin,
+            &path_params,
+            raw_query.as_deref(),
+            body,
+            &entry,
+        )?;
+        // Next to the extensions `prepare` sets, for an upstream in process.
+        call.request.extensions_mut().insert(received);
+        Ok(call)
+    });
     let call = match prepared {
         Ok(call) => call,
         Err(rejection) => return rejection.into_response(&entry),
@@ -687,9 +728,9 @@ fn prepare<S: TranscodeState>(
     let mut request = tonic::Request::new(message);
     *request.metadata_mut() = request_metadata;
     // An upstream in process reads the HTTP client's address and TLS
-    // certificates with `Request::remote_addr` / `peer_certs`, and the
-    // resolved client address as a `ClientAddress`; a remote one never sees
-    // request extensions.
+    // certificates with `Request::remote_addr` / `peer_certs`, the resolved
+    // client address as a `ClientAddress` and the request line as a
+    // `ReceivedRequest`; a remote one never sees request extensions.
     if let Some(connection) = connection {
         connection.into_tonic_extensions(request.extensions_mut());
     }

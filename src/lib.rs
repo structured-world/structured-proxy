@@ -68,6 +68,7 @@ mod held;
 pub mod hooks;
 pub mod oidc;
 pub mod openapi;
+pub mod received;
 mod serve;
 pub mod service;
 pub mod shield;
@@ -80,6 +81,7 @@ pub mod upstream;
 #[cfg(feature = "builtin_jwt")]
 pub use auth::crypto::install_default_crypto_provider;
 pub use client_address::ClientAddress;
+pub use received::ReceivedRequest;
 pub use serve::{serve, serve_with, serve_with_shutdown, ServeOptions};
 pub use service::{ConnectionInfo, ProxyService};
 
