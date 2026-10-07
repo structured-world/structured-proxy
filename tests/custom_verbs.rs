@@ -46,6 +46,9 @@ service Ops {
   rpc Pause(Msg) returns (Msg) {
     option (google.api.http) = { post: "/v2/ops/{name}:pause" };
   }
+  rpc Drop(Msg) returns (Msg) {
+    option (google.api.http) = { delete: "/v2/ops/{name}" };
+  }
   rpc Restore(Msg) returns (Msg) {
     option (google.api.http) = { post: "/v1/{name=publishers/*/books/*}:restore" };
   }
@@ -166,22 +169,38 @@ async fn bindings_differing_only_by_verb_reach_their_own_methods() {
 }
 
 async fn a_request_without_the_verb_does_not_reach_a_verb_binding() {
-    // Only the GET binding answers `/v2/ops/{operation}` without a verb.
+    // Only the GET and DELETE bindings answer `/v2/ops/{..}` without a verb.
     let app = proxy(UPSTREAM).await;
     let (status, allow, _) = call(&app, Method::POST, "/v2/ops/op-1").await;
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
-    assert_eq!(allow, "GET, HEAD");
+    assert_eq!(allow, "GET, DELETE, HEAD");
     let (status, _, body) = call(&app, Method::GET, "/v2/ops/op-1").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["rpc"], "Get");
     assert_eq!(body["operation"], "op-1");
 }
 
+async fn bindings_of_one_path_bind_their_own_variable_names() {
+    // `/v2/ops/{operation}` (GET) and `/v2/ops/{name}` (DELETE) are one path
+    // to the router; each binding still fills its own field.
+    let app = proxy(UPSTREAM).await;
+    let (status, _, body) = call(&app, Method::DELETE, "/v2/ops/op-3").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({"name": "op-3", "operation": "", "rpc": "Drop"}));
+}
+
+async fn head_is_answered_by_the_get_binding_without_a_body() {
+    let app = proxy(UPSTREAM).await;
+    let (status, _, body) = call(&app, Method::HEAD, "/v2/ops/op-1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, Value::Null);
+}
+
 async fn another_verb_does_not_reach_a_verb_binding() {
     let app = proxy(UPSTREAM).await;
     let (status, allow, _) = call(&app, Method::POST, "/v2/ops/op-1:delete").await;
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
-    assert_eq!(allow, "GET, HEAD");
+    assert_eq!(allow, "GET, DELETE, HEAD");
     // A binding without a verb takes the whole segment, colon included.
     let (status, _, body) = call(&app, Method::GET, "/v2/ops/op-1:delete").await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -207,12 +226,12 @@ async fn a_verb_with_an_empty_variable_does_not_match() {
 }
 
 async fn a_method_no_binding_of_the_url_answers_lists_those_that_do() {
-    // DELETE is bound nowhere; GET (without a verb) and POST (`:cancel`) both
-    // answer this URL.
+    // PUT is bound nowhere; GET and DELETE (without a verb) and POST
+    // (`:cancel`) answer this URL, POST `:archive` and `:pause` do not.
     let app = proxy(UPSTREAM).await;
-    let (status, allow, _) = call(&app, Method::DELETE, "/v2/ops/op-1:cancel").await;
+    let (status, allow, _) = call(&app, Method::PUT, "/v2/ops/op-1:cancel").await;
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
-    assert_eq!(allow, "GET, POST, HEAD");
+    assert_eq!(allow, "GET, POST, DELETE, HEAD");
 }
 
 async fn verb_after_a_multi_segment_field_template_routes() {
@@ -244,9 +263,35 @@ async fn a_template_the_router_cannot_serve_is_skipped_not_fatal() {
     // `a{name}b` puts text around a variable, which the router cannot
     // match; that binding is left out and every other one still serves.
     let app = proxy(UPSTREAM).await;
-    let (status, _, _) = call(&app, Method::GET, "/v1/broken/axb").await;
+    let request = http::Request::get("/v1/broken/axb").body(Body::empty()).unwrap();
+    let (status, _) = common::send(&app, request).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     let (status, _, body) = call(&app, Method::GET, "/v2/ops/op-1").await;
     assert_eq!(status, StatusCode::OK, "{body}");
 }
+}
+
+#[tokio::test]
+async fn a_verb_bound_twice_for_one_method_is_refused_at_startup() {
+    // Two POST `:cancel` bindings on one path cannot both serve; the proxy
+    // says so instead of serving one of them.
+    const TWICE_PROTO: &str = r#"
+syntax = "proto3";
+package test.v1;
+import "google/api/annotations.proto";
+message Msg { string name = 1; string id = 2; }
+service Twice {
+  rpc A(Msg) returns (Msg) { option (google.api.http) = { post: "/v1/x/{name}:cancel" }; }
+  rpc B(Msg) returns (Msg) { option (google.api.http) = { post: "/v1/x/{id}:cancel" }; }
+}
+"#;
+    let pool = common::compile("test/v1/twice.proto", TWICE_PROTO);
+    let err = structured_proxy::ProxyServer::from_yaml_str(
+        "upstream:\n  default: \"http://127.0.0.1:1\"\n",
+    )
+    .unwrap()
+    .with_descriptors(pool)
+    .router()
+    .expect_err("a repeated method, path and verb must be rejected");
+    assert!(err.to_string().contains("more than one endpoint"), "{err}");
 }

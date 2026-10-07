@@ -48,7 +48,7 @@ use crate::upstream::{
 /// only the guards whose scope names them (`grpc`, `fallback`); a guard's
 /// rejection of a gRPC call is a gRPC status.
 ///
-/// Serve it with [`serve`](crate::serve) or
+/// Serve it with [`serve`](crate::serve()) or
 /// [`serve_with`](crate::serve_with) (TLS, a connection limit), or hand it to
 /// any server that takes a tower service of `http` types: a Unix socket, an
 /// existing hyper or axum server. Native gRPC needs HTTP/2 on that server
@@ -339,8 +339,10 @@ impl<U: Upstream> ProxyService<U> {
     /// them; CORS and tracing are the fallback's own.
     ///
     /// A request whose path a route answers but not with its method stays with
-    /// the proxy (`405`), as does every gRPC request and every browser
-    /// preflight for a gRPC-Web call, which follows the call it announces.
+    /// the proxy (`405`), as does one whose path matches a transcoded template
+    /// but none of its custom verbs (`404`), every gRPC request and every
+    /// browser preflight for a gRPC-Web call, which follows the call it
+    /// announces.
     #[must_use]
     pub fn with_fallback<F>(mut self, fallback: F) -> Self
     where

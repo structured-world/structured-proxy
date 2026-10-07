@@ -358,8 +358,9 @@ impl Resolver {
         self.resolve_noting(peer, headers, None)
     }
 
-    /// [`resolve`](Self::resolve), noting in `hops` the trusted proxies
-    /// between the client and this proxy, nearest first.
+    /// The client address of a request from `peer` carrying `headers` (what
+    /// [`apply`](Self::apply) puts on it), noting in `hops` the trusted
+    /// proxies between the client and this proxy, nearest first.
     fn resolve_noting(
         &self,
         peer: Option<SocketAddr>,

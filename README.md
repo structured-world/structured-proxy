@@ -20,7 +20,8 @@ tonic services.
 - REST routes from the `google.api.http` annotations in your protos: path,
   query and JSON or form body mapped onto the request message
   ([Request mapping](#request-mapping)), `response_body`,
-  `additional_bindings`, and `custom` rules for any HTTP method
+  `additional_bindings`, custom verbs (`/v1/{name}:cancel`), and `custom`
+  rules for any HTTP method
 - Server streaming as NDJSON, or Server-Sent Events when the client asks for
   `text/event-stream`
 - Errors as `google.rpc.Status` JSON with the standard HTTP status mapping and
@@ -379,6 +380,23 @@ body, as the route's `google.api.http` rule says:
 
 A value that is not valid for its field, or two members of one `oneof`, is
 answered with `INVALID_ARGUMENT` (400) before the upstream is called.
+
+**Custom verbs.** A path template may end in a verb, as AIP-136 custom methods
+do (`post: "/v1/{name=operations/*}:cancel"`):
+
+- A binding with a verb answers only a request whose path ends in it, the
+  variable taking the rest of the segment. A percent-encoded colon (`%3A`) is
+  part of the value, never the verb's delimiter.
+- Bindings of one path that differ only by verb reach their own RPCs. A
+  binding without a verb takes the whole last segment, colon included, when
+  no verb of the path ends the request.
+- A request that matches the path but none of its verbs is `404`; one whose
+  verb matches but whose method does not is `405`, with the methods that
+  answer it in `Allow`.
+
+A template the router cannot match, such as text around a variable within one
+segment (`/v1/a{name}b`), is left out with an error in the log; the other
+routes still serve.
 
 ## Client address
 

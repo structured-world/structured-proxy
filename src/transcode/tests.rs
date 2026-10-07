@@ -158,6 +158,253 @@ fn multi_segment_field_template_does_not_fracture() {
     let _router: Router<()> = Router::new().route(&path, get(|| async { "ok" }));
 }
 
+#[test]
+fn custom_verb_after_a_variable_or_wildcard_is_split_off() {
+    // `Template = "/" Segments [ Verb ]`: axum cannot match text after a
+    // capture, so the verb leaves the mounted path and is kept to be matched
+    // by the transcoded router.
+    let cases = [
+        // (template, axum path, shape, captures, verb)
+        (
+            "/v2/ops/{operation}:cancel",
+            "/v2/ops/{operation}",
+            "/v2/ops/{}",
+            &["operation"][..],
+            Some(":cancel"),
+        ),
+        (
+            "/v1/{name=publishers/*/books/*}:archive",
+            "/v1/{*name}",
+            "/v1/{*}",
+            &["name"][..],
+            Some(":archive"),
+        ),
+        (
+            "/v1/{name=*}:x",
+            "/v1/{name}",
+            "/v1/{}",
+            &["name"][..],
+            Some(":x"),
+        ),
+        (
+            "/v1/files/{path=**}:x",
+            "/v1/files/{*path}",
+            "/v1/files/{*}",
+            &["path"][..],
+            Some(":x"),
+        ),
+        (
+            "/v1/*:x",
+            "/v1/{wildcard2}",
+            "/v1/{}",
+            &["wildcard2"][..],
+            Some(":x"),
+        ),
+        (
+            "/v1/**:x",
+            "/v1/{*wildcard2}",
+            "/v1/{*}",
+            &["wildcard2"][..],
+            Some(":x"),
+        ),
+        // A verb whose LITERAL holds a colon is the whole rest of the segment.
+        ("/v1/{a}:b:c", "/v1/{a}", "/v1/{}", &["a"][..], Some(":b:c")),
+    ];
+    for (template, axum, shape, captures, verb) in cases {
+        let mount = path::MountedPath::new(template);
+        assert_eq!(mount.axum, axum, "{template}");
+        assert_eq!(mount.shape, shape, "{template}");
+        assert_eq!(mount.captures, captures, "{template}");
+        assert_eq!(mount.verb.as_deref(), verb, "{template}");
+        // Policies and the log see the template's own path, verb included.
+        assert_eq!(
+            mount.display(),
+            axum.to_owned() + verb.unwrap(),
+            "{template}"
+        );
+        assert!(path::mountable(&mount.axum).is_ok(), "{template}");
+    }
+    assert_eq!(proto_path_to_axum("/v2/ops/{op}:cancel"), "/v2/ops/{op}");
+}
+
+#[test]
+fn verb_after_a_literal_or_anything_else_stays_in_the_path() {
+    // After a literal axum matches the verb as part of it.
+    let mount = path::MountedPath::new("/v1/nodes:batch");
+    assert_eq!(mount.axum, "/v1/nodes:batch");
+    assert_eq!(mount.verb, None);
+    assert!(mount.captures.is_empty());
+    // A colon before the last segment is no verb.
+    let mount = path::MountedPath::new("/v1/{a}:x/items");
+    assert_eq!(mount.verb, None);
+    assert_eq!(mount.axum, "/v1/{a}:x/items");
+    // An empty verb, and text after a variable that is not a verb, stay in the
+    // path, which the router cannot match.
+    for template in ["/v1/{a}:", "/v1/{a}x:y", "/v1/{a"] {
+        let mount = path::MountedPath::new(template);
+        assert_eq!(mount.verb, None, "{template}");
+        assert!(path::mountable(&mount.axum).is_err(), "{template}");
+    }
+}
+
+#[test]
+fn mountable_refuses_what_axum_would_panic_on() {
+    for (path, reason) in [
+        ("/v1/a{x}b", "text around a capture"),
+        ("/v1/{x}{y}", "two captures in one segment"),
+        ("/v1/{}", "a capture without a name"),
+        ("v1/items", "no leading slash"),
+        ("/v1/:items", "a segment starting with ':'"),
+        ("/v1/*items", "a segment starting with '*'"),
+    ] {
+        assert!(path::mountable(path).is_err(), "{path}: {reason}");
+        // The same path does panic axum.
+        let registered = std::panic::catch_unwind(|| {
+            let _router: Router<()> = Router::new().route(path, get(|| async { "ok" }));
+        });
+        assert!(registered.is_err(), "{path}: axum took it");
+    }
+    for path in ["/v1/{x}", "/v1/{*rest}", "/v1/nodes:batch", "/"] {
+        assert!(path::mountable(path).is_ok(), "{path}");
+    }
+}
+
+#[test]
+fn route_paths_list_one_route_for_bindings_that_differ_only_by_verb() {
+    // A verb after a variable is matched past the router, so the bindings of
+    // one method that differ only by it share a route; a repeated method,
+    // shape and verb is a real duplicate and stays visible to the caller.
+    let pool = api_pool(
+        r#"syntax = "proto3";
+package t;
+import "google/api/annotations.proto";
+message Req { string name = 1; string id = 2; }
+service S {
+  rpc Get(Req) returns (Req) { option (google.api.http) = { get: "/v1/ops/{name}" }; }
+  rpc Cancel(Req) returns (Req) { option (google.api.http) = { post: "/v1/ops/{name}:cancel" }; }
+  rpc Pause(Req) returns (Req) { option (google.api.http) = { post: "/v1/ops/{id}:pause" }; }
+  rpc Batch(Req) returns (Req) { option (google.api.http) = { post: "/v1/ops:batch" }; }
+  rpc Again(Req) returns (Req) { option (google.api.http) = { post: "/v1/ops/{id}:cancel" }; }
+}
+"#,
+    );
+    let paths = route_paths(&pool, &[], &RpcSelection::default());
+    let expected = [
+        ("GET", "/v1/ops/{name}"),
+        ("POST", "/v1/ops/{name}"),
+        ("POST", "/v1/ops:batch"),
+        ("POST", "/v1/ops/{id}"),
+    ];
+    let expected: Vec<(String, String)> = expected
+        .iter()
+        .map(|(m, p)| ((*m).to_owned(), (*p).to_owned()))
+        .collect();
+    assert_eq!(paths, expected);
+}
+
+#[test]
+fn bindings_of_one_shape_share_one_table_whatever_their_names() {
+    // The router tells `/v1/ops/{name}` and `/v1/ops/{id}` apart by shape
+    // only; registering both panicked axum. One table takes them.
+    let pool = api_pool(
+        r#"syntax = "proto3";
+package t;
+import "google/api/annotations.proto";
+message Req { string name = 1; string id = 2; }
+service S {
+  rpc Get(Req) returns (Req) { option (google.api.http) = { get: "/v1/ops/{name}" }; }
+  rpc Post(Req) returns (Req) { option (google.api.http) = { post: "/v1/ops/{id}" }; }
+  rpc Broken(Req) returns (Req) { option (google.api.http) = { get: "/v1/broken/a{name}b" }; }
+}
+"#,
+    );
+    let tables = path_tables(&pool, &[], &TranscodeOptions::default());
+    let paths: Vec<&str> = tables.iter().map(|t| t.path.as_str()).collect();
+    // The template the router cannot match is left out.
+    assert_eq!(paths, ["/v1/ops/{name}"]);
+    let table = &tables[0];
+    let post = match table.choose(&Method::POST, "/v1/ops/x") {
+        table::Choice::Route(index) => index,
+        _ => panic!("POST must be answered"),
+    };
+    assert_eq!(table.entry(post).grpc_path.path(), "/t.S/Post");
+    // The router itself builds from them.
+    let _router: Router<crate::ProxyState<tonic::transport::Channel>> = routes(&pool, &[]);
+}
+
+#[test]
+fn swapped_capture_names_bind_each_binding_its_own_values() {
+    // The table's path names its captures `a`, `b`; the POST binding names
+    // them `b`, `a`. Renaming one by one would let one value overwrite the
+    // other.
+    let pool = api_pool(
+        r#"syntax = "proto3";
+package t;
+import "google/api/annotations.proto";
+message Req { string a = 1; string b = 2; }
+service S {
+  rpc Get(Req) returns (Req) { option (google.api.http) = { get: "/x/{a}/{b}" }; }
+  rpc Post(Req) returns (Req) { option (google.api.http) = { post: "/x/{b}/{a}:go" }; }
+}
+"#,
+    );
+    let tables = path_tables(&pool, &[], &TranscodeOptions::default());
+    assert_eq!(tables.len(), 1);
+    let table = &tables[0];
+    let matched = || -> PathParams {
+        [("a", "first"), ("b", "second:go")]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect()
+    };
+    let post = match table.choose(&Method::POST, "/x/first/second:go") {
+        table::Choice::Route(index) => index,
+        _ => panic!("POST must be answered"),
+    };
+    let mut params = matched();
+    table.bind_params(post, &mut params);
+    assert_eq!(params.len(), 2);
+    assert_eq!(params["b"], "first");
+    assert_eq!(params["a"], "second");
+    // The binding with the path's own names and no verb is left as matched.
+    let get = match table.choose(&Method::GET, "/x/first/second:go") {
+        table::Choice::Route(index) => index,
+        _ => panic!("GET must be answered"),
+    };
+    let mut params = matched();
+    table.bind_params(get, &mut params);
+    assert_eq!(params, matched());
+}
+
+#[test]
+fn head_falls_back_to_get_and_the_longest_verb_wins() {
+    let pool = api_pool(
+        r#"syntax = "proto3";
+package t;
+import "google/api/annotations.proto";
+message Req { string name = 1; }
+service S {
+  rpc Get(Req) returns (Req) { option (google.api.http) = { get: "/v1/{name}" }; }
+  rpc Short(Req) returns (Req) { option (google.api.http) = { post: "/v1/{name}:c" }; }
+  rpc Long(Req) returns (Req) { option (google.api.http) = { post: "/v1/{name}:b:c" }; }
+}
+"#,
+    );
+    let tables = path_tables(&pool, &[], &TranscodeOptions::default());
+    let table = &tables[0];
+    let rpc = |method: Method, path: &str| match table.choose(&method, path) {
+        table::Choice::Route(index) => table.entry(index).grpc_path.path().to_owned(),
+        table::Choice::MethodNotAllowed(allow) => format!("405 {}", allow.to_str().unwrap()),
+        table::Choice::NotFound => "404".to_owned(),
+    };
+    assert_eq!(rpc(Method::HEAD, "/v1/x"), "/t.S/Get");
+    // Both verbs end the path; the longer one is the binding's.
+    assert_eq!(rpc(Method::POST, "/v1/x:b:c"), "/t.S/Long");
+    assert_eq!(rpc(Method::POST, "/v1/x:c"), "/t.S/Short");
+    assert_eq!(rpc(Method::POST, "/v1/x"), "405 GET, HEAD");
+    assert_eq!(rpc(Method::PUT, "/v1/x:c"), "405 GET, POST, HEAD");
+}
+
 /// Regression for the axum 0.7→0.8 migration bug: `proto_path_to_axum`
 /// emitted `:id` syntax, which axum 0.8 rejects at `Router::route()` with
 /// a startup panic ("Path segments must not start with `:`"). Building the

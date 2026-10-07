@@ -184,6 +184,9 @@ service Api {
   rpc Raw(google.api.HttpBody) returns (google.api.HttpBody) {
     option (google.api.http) = { post: "/v1/raw" body: "*" };
   }
+  rpc Archive(Item) returns (Item) {
+    option (google.api.http) = { post: "/v1/items/{name}:archive" };
+  }
 }
 "#;
 
@@ -222,6 +225,21 @@ fn custom_head_rule_is_a_head_operation() {
     let item = &spec["paths"]["/v1/items/{name}"];
     assert_eq!(item["head"]["operationId"], "Api.Head");
     assert_eq!(item["head"]["parameters"][0]["in"], "path");
+}
+
+#[test]
+fn custom_verb_after_a_variable_keeps_its_path_and_parameter() {
+    // OpenAPI path templating allows a template expression inside a segment,
+    // so the verb stays in the path and the variable is a path parameter.
+    let spec = spec(&[]);
+    let archive = &spec["paths"]["/v1/items/{name}:archive"]["post"];
+    assert_eq!(archive["operationId"], "Api.Archive");
+    let params = archive["parameters"].as_array().unwrap();
+    let path_params: Vec<&Value> = params.iter().filter(|p| p["in"] == "path").collect();
+    assert_eq!(path_params.len(), 1);
+    assert_eq!(path_params[0]["name"], "name");
+    // No path item without the verb comes from this binding.
+    assert!(spec["paths"]["/v1/items/{name}"].get("post").is_none());
 }
 
 #[test]

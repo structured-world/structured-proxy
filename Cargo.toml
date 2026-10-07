@@ -60,6 +60,10 @@ hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "s
 # in the tree through hyper-util and tonic.
 hyper = "1"
 tokio-util = { version = "0.7.16", features = ["rt"] }
+# The router axum matches paths with: a transcoded template is checked with it
+# before axum registers it, where a path it rejects would panic. Already in the
+# tree through axum, which pins the version this resolves to.
+matchit = "0.8"
 
 # gRPC client (to upstream service). `tls-connect-info` gives a rustls server
 # stream the connection record (client certificates) a tonic handler reads, so
