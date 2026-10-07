@@ -289,9 +289,10 @@ service S {
 "#,
     );
     let paths = route_paths(&pool, &[], &RpcSelection::default());
+    // A path with verbs answers every method (405 for those its verb is not
+    // bound to), so it is listed as `*`.
     let expected = [
-        ("GET", "/v1/ops/{name}"),
-        ("POST", "/v1/ops/{name}"),
+        ("*", "/v1/ops/{name}"),
         ("POST", "/v1/ops/{id}"),
         ("POST", "/v1/ops:batch"),
     ];
@@ -426,6 +427,77 @@ service S {
     assert_eq!(answer(&routes, Method::POST, "/v1/x:c"), "/t.S/Short");
     // No binding without a verb: an unbound verb has nothing to fall back on.
     assert_eq!(answer(&routes, Method::POST, "/v1/x:d"), "404");
+}
+
+#[test]
+fn a_verb_matches_whatever_the_case_of_its_escapes() {
+    // `%3A` and `%3a` are the same octet (RFC 3986 §6.2.2.1).
+    let routes = routes_of(
+        r#"syntax = "proto3";
+package t;
+import "google/api/annotations.proto";
+message Req { string name = 1; }
+service S {
+  rpc Get(Req) returns (Req) { option (google.api.http) = { get: "/v1/{name}" }; }
+  rpc RunNow(Req) returns (Req) { option (google.api.http) = { post: "/v1/{name}:run%3anow" }; }
+}
+"#,
+    );
+    assert_eq!(
+        answer(&routes, Method::POST, "/v1/job:run%3Anow"),
+        "/t.S/RunNow"
+    );
+    assert_eq!(
+        answer(&routes, Method::POST, "/v1/job:run%3anow"),
+        "/t.S/RunNow"
+    );
+}
+
+#[test]
+fn a_literal_route_keeps_its_url_over_a_verb_after_a_variable() {
+    // The router picks the exact literal for `/v1/jobs/special:cancel`; that
+    // route answers it, as a static route wins over a variable everywhere.
+    let routes = routes_of(
+        r#"syntax = "proto3";
+package t;
+import "google/api/annotations.proto";
+message Req { string name = 1; }
+service S {
+  rpc Special(Req) returns (Req) { option (google.api.http) = { get: "/v1/jobs/special:cancel" }; }
+  rpc Cancel(Req) returns (Req) { option (google.api.http) = { post: "/v1/jobs/{name}:cancel" }; }
+}
+"#,
+    );
+    assert_eq!(
+        answer(&routes, Method::GET, "/v1/jobs/special:cancel"),
+        "/t.S/Special"
+    );
+    assert_eq!(
+        answer(&routes, Method::POST, "/v1/jobs/other:cancel"),
+        "/t.S/Cancel"
+    );
+}
+
+#[test]
+fn a_path_with_only_verb_bindings_does_not_hide_a_plain_route() {
+    // `/v1/jobs/{id}` binds `:cancel` only; `GET /v1/jobs/x` has no verb, so
+    // the catch-all GET, which the router ranks lower, answers it.
+    let routes = routes_of(
+        r#"syntax = "proto3";
+package t;
+import "google/api/annotations.proto";
+message Req { string id = 1; string path = 2; }
+service S {
+  rpc Cancel(Req) returns (Req) { option (google.api.http) = { post: "/v1/jobs/{id}:cancel" }; }
+  rpc Files(Req) returns (Req) { option (google.api.http) = { get: "/v1/{path=**}" }; }
+}
+"#,
+    );
+    assert_eq!(answer(&routes, Method::GET, "/v1/jobs/x"), "/t.S/Files");
+    assert_eq!(
+        answer(&routes, Method::POST, "/v1/jobs/x:cancel"),
+        "/t.S/Cancel"
+    );
 }
 
 #[test]

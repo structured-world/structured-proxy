@@ -400,6 +400,32 @@ service Twice {
 }
 
 #[tokio::test]
+async fn an_extra_route_on_a_path_with_verbs_is_refused_at_startup() {
+    // The transcoded route of `/v1/x/{name}` answers every method of a URL
+    // ending in a bound verb; an extra GET there would take `GET
+    // /v1/x/a:cancel` past it.
+    const VERB_PROTO: &str = r#"
+syntax = "proto3";
+package test.v1;
+import "google/api/annotations.proto";
+message Msg { string name = 1; }
+service Verb {
+  rpc Cancel(Msg) returns (Msg) { option (google.api.http) = { post: "/v1/x/{name}:cancel" }; }
+}
+"#;
+    let pool = common::compile("test/v1/verb.proto", VERB_PROTO);
+    let err = structured_proxy::ProxyServer::from_yaml_str(
+        "upstream:\n  default: \"http://127.0.0.1:1\"\n",
+    )
+    .unwrap()
+    .with_descriptors(pool)
+    .with_extra_routes([ExtraRoute::new(Method::GET, "/v1/x/{id}", Arc::new(Ping))])
+    .router()
+    .expect_err("an extra route on a path with verbs must be rejected");
+    assert!(err.to_string().contains("more than one endpoint"), "{err}");
+}
+
+#[tokio::test]
 async fn a_star_rule_with_a_verb_starts_beside_another_verb() {
     // A `custom` `*` rule answers every method, but only for its own verb, so
     // it does not clash with a POST binding of another verb on its path.

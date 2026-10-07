@@ -10,6 +10,7 @@
 //! the last variable, as Envoy's transcoder and grpc-gateway leave an unbound
 //! verb.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use axum::http::{HeaderValue, Method};
@@ -25,6 +26,10 @@ pub(super) struct Routes {
     /// request to one path whatever its verb, while the verb may be bound on
     /// a path of another shape the request also matches.
     verbs: HashMap<String, matchit::Router<usize>>,
+    /// The paths of the tables with a binding without a verb: a path whose
+    /// bindings all carry verbs must not hide one of these from a request
+    /// that names no bound verb.
+    plain: matchit::Router<usize>,
 }
 
 /// Every binding the router serves at one path.
@@ -47,8 +52,8 @@ struct Binding {
 
 /// A custom verb after the last capture.
 struct Verb {
-    /// As written in the template, `:` included: compared with the request's
-    /// path as received.
+    /// As written in the template, `:` included, escapes in upper case:
+    /// compared with the request's path as received, likewise normalized.
     raw: String,
     /// `raw` percent-decoded: what ends the decoded value of the capture.
     decoded: String,
@@ -75,6 +80,35 @@ pub(super) fn split_verb(path: &str) -> Option<(&str, &str)> {
     Some(path.split_at(colon))
 }
 
+/// `text` with the hex digits of its percent-escapes in upper case: `%3a` and
+/// `%3A` are one octet (RFC 3986 §6.2.2.1). Borrowed when nothing changes.
+pub(super) fn normalize_escapes(text: &str) -> Cow<'_, str> {
+    let lower_hex = |b: &u8| b.is_ascii_hexdigit() && b.is_ascii_lowercase();
+    let bytes = text.as_bytes();
+    let lower_escape =
+        |at: usize| bytes[at] == b'%' && bytes[at + 1..].iter().take(2).any(lower_hex);
+    if !(0..bytes.len()).any(lower_escape) {
+        return Cow::Borrowed(text);
+    }
+    let mut normalized = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        normalized.push(ch);
+        if ch == '%' {
+            for digit in chars.by_ref().take(2) {
+                // Only a hex digit is part of the escape; anything else is
+                // kept as it is, so a malformed escape is not rewritten.
+                normalized.push(if digit.is_ascii_hexdigit() {
+                    digit.to_ascii_uppercase()
+                } else {
+                    digit
+                });
+            }
+        }
+    }
+    Cow::Owned(normalized)
+}
+
 /// Whether two bindings of one path cannot both serve: the same verb and the
 /// same method, or the same verb and a `custom` `*` rule, which answers every
 /// method.
@@ -84,7 +118,7 @@ pub(super) fn clash(
     other_method: &RouteMethod,
     other_verb: Option<&str>,
 ) -> bool {
-    verb == other_verb
+    verb.map(normalize_escapes) == other_verb.map(normalize_escapes)
         && (method == other_method
             || *method == RouteMethod::Any
             || *other_method == RouteMethod::Any)
@@ -96,7 +130,12 @@ impl Routes {
     /// some of them accepts it too.
     pub(super) fn new(tables: Vec<PathTable>) -> Self {
         let mut verbs: HashMap<String, matchit::Router<usize>> = HashMap::new();
+        let mut plain = matchit::Router::new();
         for (index, table) in tables.iter().enumerate() {
+            if table.bindings.iter().any(|b| b.verb.is_none()) {
+                let inserted = plain.insert(table.path.as_str(), index);
+                debug_assert!(inserted.is_ok(), "{}: {inserted:?}", table.path);
+            }
             let mut seen: Vec<&str> = Vec::new();
             for verb in table.bindings.iter().filter_map(|b| b.verb.as_ref()) {
                 if seen.contains(&verb.raw.as_str()) {
@@ -110,29 +149,60 @@ impl Routes {
                 debug_assert!(inserted.is_ok(), "{}: {inserted:?}", table.path);
             }
         }
-        Self { tables, verbs }
+        Self {
+            tables,
+            verbs,
+            plain,
+        }
     }
 
     /// The table binding the verb `path` ends in, when one of the request's
     /// path does: its index and the router's match, whose captures are that
     /// table's.
-    pub(super) fn verb_match<'r, 'p>(
-        &'r self,
-        path: &'p str,
-    ) -> Option<matchit::Match<'r, 'p, &'r usize>> {
+    fn verb_match<'r, 'p>(&'r self, path: &'p str) -> Option<matchit::Match<'r, 'p, &'r usize>> {
         let (_, verb) = split_verb(path)?;
-        self.verbs.get(verb)?.at(path).ok()
+        self.verbs
+            .get(normalize_escapes(verb).as_ref())?
+            .at(path)
+            .ok()
+    }
+
+    /// The router's match of `path` on the table at `table`, which [`choose`]
+    /// picked for it: its captures, still percent-encoded.
+    ///
+    /// [`choose`]: Self::choose
+    pub(super) fn params_of<'r, 'p>(
+        &'r self,
+        table: usize,
+        path: &'p str,
+    ) -> Option<matchit::Params<'r, 'p>> {
+        [self.verb_match(path), self.plain.at(path).ok()]
+            .into_iter()
+            .flatten()
+            .find(|found| *found.value == table)
+            .map(|found| found.params)
     }
 
     /// Which binding answers `method` on `path`, a request the router matched
-    /// to the table at `table`. A verb some table binds for this path owns the
-    /// URL: only the bindings of that verb answer it. Otherwise the bindings
-    /// without a verb of `table` do, the verb text being part of the last
-    /// variable.
+    /// to the table at `table`.
+    ///
+    /// - A path ending in a literal matched exactly: its bindings answer, as a
+    ///   static route wins over a variable everywhere.
+    /// - A verb some table binds for this path owns the URL: only the
+    ///   bindings of that verb answer it.
+    /// - Otherwise the bindings without a verb answer, of the best path that
+    ///   has some, the verb text being part of the last variable.
     pub(super) fn choose(&self, table: usize, method: &Method, path: &str) -> Choice {
+        let plain = |binding: &Binding| binding.verb.is_none();
+        if self.tables[table].literal_end() {
+            return self.tables[table]
+                .choose(table, method, plain)
+                .unwrap_or(Choice::NotFound);
+        }
         if let Some((rest, verb)) = split_verb(path) {
             if let Some(found) = self.verb_match(path) {
                 let index = *found.value;
+                let verb = normalize_escapes(verb);
                 let bound = |binding: &Binding| {
                     binding.verb.as_ref().is_some_and(|own| {
                         own.raw == verb && (own.empty_ok || !rest.ends_with('/'))
@@ -143,8 +213,18 @@ impl Routes {
                 }
             }
         }
-        self.tables[table]
-            .choose(table, method, |binding| binding.verb.is_none())
+        // The router's own table, when it has such bindings, is also the best
+        // of those that have: no second lookup for the common request.
+        let index = if self.tables[table].bindings.iter().any(plain) {
+            table
+        } else {
+            match self.plain.at(path) {
+                Ok(found) => *found.value,
+                Err(_) => return Choice::NotFound,
+            }
+        };
+        self.tables[index]
+            .choose(index, method, plain)
             .unwrap_or(Choice::NotFound)
     }
 }
@@ -196,6 +276,12 @@ impl PathTable {
             names,
             verb: mount.verb.map(|raw| Verb::new(raw, mount.empty_last)),
         });
+    }
+
+    /// Whether the path ends in a literal (a verb after a literal is part of
+    /// it), so the router matched the request's last segment exactly.
+    fn literal_end(&self) -> bool {
+        !self.path.ends_with('}')
     }
 
     /// The route entry of the binding at `index`.
@@ -293,7 +379,7 @@ impl Verb {
             .decode_utf8_lossy()
             .into_owned();
         Self {
-            raw,
+            raw: normalize_escapes(&raw).into_owned(),
             decoded,
             empty_ok,
         }

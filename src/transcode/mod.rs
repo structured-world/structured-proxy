@@ -364,9 +364,11 @@ async fn dispatch<S: TranscodeState>(
         Err(rejection) => return rejection.into_response(),
     };
     if table != matched {
-        // A verb bound on another path the request matches: its captures come
-        // from that path, the router's prefix parameters stay.
-        if let Err(rejection) = rebind(&routes, matched, parts.uri.path(), &mut path_params) {
+        // Another path the request matches answers it (a verb bound there, or
+        // the only bindings without a verb): its captures come from that path,
+        // the router's prefix parameters stay.
+        if let Err(rejection) = rebind(&routes, matched, table, parts.uri.path(), &mut path_params)
+        {
             return rejection.into_response(routes.tables[table].entry(index));
         }
     }
@@ -403,11 +405,11 @@ async fn dispatch<S: TranscodeState>(
 }
 
 /// Replace the captures of the table at `matched` in `params` with those of
-/// the table binding the verb `path` ends in, percent-decoded as the router
-/// decodes its own.
+/// the table at `chosen`, percent-decoded as the router decodes its own.
 fn rebind(
     routes: &Routes,
     matched: usize,
+    chosen: usize,
     path: &str,
     params: &mut PathParams,
 ) -> Result<(), Unmappable> {
@@ -415,9 +417,9 @@ fn rebind(
         params.remove(name);
     }
     let found = routes
-        .verb_match(path)
-        .expect("the verb's table was chosen from this match");
-    for (name, raw) in found.params.iter() {
+        .params_of(chosen, path)
+        .expect("the chosen table was found by matching this path");
+    for (name, raw) in found.iter() {
         let value = percent_encoding::percent_decode_str(raw)
             .decode_utf8()
             .map_err(|_| Unmappable(format!("path parameter {name} is not valid UTF-8")))?;
@@ -497,13 +499,13 @@ fn route_bindings(
 /// (e.g. a forward-auth endpoint).
 ///
 /// Each entry is `(method, path)` where `method` is the uppercase HTTP token,
-/// or `*` for a `custom` rule that answers every method, so callers can
-/// distinguish same-path/different-method routes from real conflicts. A
-/// custom verb after a variable is matched by the transcoded routes, not by
-/// the path, so the bindings of one path are listed as the route they share:
-/// `*` once when a `custom` `*` rule is among them, else each method once.
-/// Two bindings that cannot both serve (one method or a `*` rule, one verb)
-/// are listed both, so the caller sees the collision.
+/// or `*` for a route that answers every method, so callers can distinguish
+/// same-path/different-method routes from real conflicts. The bindings of one
+/// path are listed as the route they share: `*` once when a `custom` `*` rule
+/// or a custom verb after a variable is among them (the transcoded routes
+/// match the verb, and answer a bound verb's other methods with 405), else
+/// each method once. Two bindings that cannot both serve (one method or a `*`
+/// rule, one verb) are listed both, so the caller sees the collision.
 pub fn route_paths(
     pool: &DescriptorPool,
     aliases: &[AliasConfig],
@@ -524,9 +526,11 @@ pub fn route_paths(
     let mut paths = Vec::new();
     for bindings in &shapes {
         let listed = |method: &str, path: &str| (method.to_owned(), path.to_owned());
+        // A path with a verb after its variable answers every method: one
+        // whose verb is bound only for others is told so with 405.
         match bindings
             .iter()
-            .find(|b| b.entry.http_method == RouteMethod::Any)
+            .find(|b| b.entry.http_method == RouteMethod::Any || b.mount.verb.is_some())
         {
             Some(star) => paths.push(listed("*", &star.mount.axum)),
             None => {

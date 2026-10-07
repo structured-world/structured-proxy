@@ -393,8 +393,13 @@ do (`post: "/v1/{name=operations/*}:cancel"`):
   bindings of that verb answer it, each reaching its own RPC. A verb no
   binding binds stays part of the last variable (`/v1/items/a:b` is the item
   `a:b`), as Envoy's transcoder and grpc-gateway treat an unbound verb.
+- A template ending in a literal matches its URL exactly and wins over a
+  variable with the same verb: `get: "/v1/jobs/special:cancel"` answers that
+  URL ahead of `post: "/v1/jobs/{name}:cancel"`, as a static route does.
 - `**` before a verb may match no segment: `/v1/{name=**}:purge` answers
   `/v1/:purge` with an empty `name`.
+- A path with a verb after its variable answers every method, so an extra
+  route of yours on the same path stops the proxy at startup.
 - A URL that bindings answer, but none with the request's method, is `405`,
   with their methods in `Allow`; a path that no binding answers is `404`.
 
