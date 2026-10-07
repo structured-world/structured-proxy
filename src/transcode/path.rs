@@ -20,6 +20,9 @@ pub(crate) struct MountedPath {
     pub(crate) captures: Vec<String>,
     /// The custom verb after the last segment's variable, `:` included.
     pub(crate) verb: Option<String>,
+    /// Whether the last capture may be empty: a `**` matches zero or more
+    /// segments (google/api/http.proto), any other variable at least one.
+    pub(crate) empty_last: bool,
 }
 
 impl MountedPath {
@@ -31,6 +34,7 @@ impl MountedPath {
         let mut axum = String::with_capacity(base.len());
         let mut shape = String::with_capacity(base.len());
         let mut captures = Vec::new();
+        let empty_last = is_double_wildcard(segments[last]);
         for (idx, segment) in segments.iter().enumerate() {
             if idx > 0 {
                 axum.push('/');
@@ -57,6 +61,7 @@ impl MountedPath {
             shape,
             captures,
             verb: verb.map(str::to_owned),
+            empty_last,
         }
     }
 
@@ -131,6 +136,16 @@ fn split_verb(template: &str) -> (&str, Option<&str>) {
         }
         _ => (template, None),
     }
+}
+
+/// Whether `segment` is `**` or a variable bound to it (`{name=**}`).
+fn is_double_wildcard(segment: &str) -> bool {
+    segment == "**"
+        || segment
+            .strip_prefix('{')
+            .and_then(|s| s.strip_suffix('}'))
+            .and_then(|inner| inner.split_once('='))
+            .is_some_and(|(_, template)| template == "**")
 }
 
 /// The index of the `}` closing the `{` that opens `segment`.

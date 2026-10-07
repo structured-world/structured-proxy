@@ -292,8 +292,8 @@ service S {
     let expected = [
         ("GET", "/v1/ops/{name}"),
         ("POST", "/v1/ops/{name}"),
-        ("POST", "/v1/ops:batch"),
         ("POST", "/v1/ops/{id}"),
+        ("POST", "/v1/ops:batch"),
     ];
     let expected: Vec<(String, String)> = expected
         .iter()
@@ -322,12 +322,8 @@ service S {
     let paths: Vec<&str> = tables.iter().map(|t| t.path.as_str()).collect();
     // The template the router cannot match is left out.
     assert_eq!(paths, ["/v1/ops/{name}"]);
-    let table = &tables[0];
-    let post = match table.choose(&Method::POST, "/v1/ops/x") {
-        table::Choice::Route(index) => index,
-        _ => panic!("POST must be answered"),
-    };
-    assert_eq!(table.entry(post).grpc_path.path(), "/t.S/Post");
+    let built = table::Routes::new(tables);
+    assert_eq!(answer(&built, Method::POST, "/v1/ops/x"), "/t.S/Post");
     // The router itself builds from them.
     let _router: Router<crate::ProxyState<tonic::transport::Channel>> = routes(&pool, &[]);
 }
@@ -350,35 +346,91 @@ service S {
     );
     let tables = path_tables(&pool, &[], &TranscodeOptions::default());
     assert_eq!(tables.len(), 1);
-    let table = &tables[0];
-    let matched = || -> PathParams {
-        [("a", "first"), ("b", "second:go")]
+    let routes = table::Routes::new(tables);
+    let table = &routes.tables[0];
+    let matched = |b: &str| -> PathParams {
+        [("a", "first"), ("b", b)]
             .into_iter()
             .map(|(k, v)| (k.to_owned(), v.to_owned()))
             .collect()
     };
-    let post = match table.choose(&Method::POST, "/x/first/second:go") {
-        table::Choice::Route(index) => index,
-        _ => panic!("POST must be answered"),
-    };
-    let mut params = matched();
+    let post = bound(&routes, Method::POST, "/x/first/second:go");
+    let mut params = matched("second:go");
     table.bind_params(post, &mut params);
     assert_eq!(params.len(), 2);
     assert_eq!(params["b"], "first");
     assert_eq!(params["a"], "second");
     // The binding with the path's own names and no verb is left as matched.
-    let get = match table.choose(&Method::GET, "/x/first/second:go") {
-        table::Choice::Route(index) => index,
-        _ => panic!("GET must be answered"),
-    };
-    let mut params = matched();
+    let get = bound(&routes, Method::GET, "/x/first/second");
+    let mut params = matched("second");
     table.bind_params(get, &mut params);
-    assert_eq!(params, matched());
+    assert_eq!(params, matched("second"));
+}
+
+/// The index of the binding answering `method path`, in the routes' only table.
+fn bound(routes: &table::Routes, method: Method, path: &str) -> usize {
+    match routes.choose(0, &method, path) {
+        table::Choice::Route { table: 0, index } => index,
+        _ => panic!("{method} {path} must be answered by the only table"),
+    }
+}
+
+/// What answers `method path`: the gRPC path of the binding, or the status,
+/// with the table the router itself would match it to.
+fn answer(routes: &table::Routes, method: Method, path: &str) -> String {
+    let mut router = matchit::Router::new();
+    for (index, table) in routes.tables.iter().enumerate() {
+        router.insert(table.path.as_str(), index).unwrap();
+    }
+    let Ok(matched) = router.at(path) else {
+        return "no route".to_owned();
+    };
+    match routes.choose(*matched.value, &method, path) {
+        table::Choice::Route { table, index } => routes.tables[table]
+            .entry(index)
+            .grpc_path
+            .path()
+            .to_owned(),
+        table::Choice::MethodNotAllowed(allow) => format!("405 {}", allow.to_str().unwrap()),
+        table::Choice::NotFound => "404".to_owned(),
+    }
+}
+
+/// The routes of an annotated `.proto` source.
+fn routes_of(source: &'static str) -> table::Routes {
+    table::Routes::new(path_tables(
+        &api_pool(source),
+        &[],
+        &TranscodeOptions::default(),
+    ))
 }
 
 #[test]
-fn head_falls_back_to_get_and_the_longest_verb_wins() {
-    let pool = api_pool(
+fn the_verb_is_the_last_segment_from_its_first_colon() {
+    // Neither a variable's value nor a verb holds an unencoded colon
+    // (google/api/http.proto), so `x:b:c` is the variable `x` and the verb
+    // `:b:c`: bound for GET only, a POST is 405, not the `:c` binding.
+    let routes = routes_of(
+        r#"syntax = "proto3";
+package t;
+import "google/api/annotations.proto";
+message Req { string name = 1; }
+service S {
+  rpc Short(Req) returns (Req) { option (google.api.http) = { post: "/v1/{name}:c" }; }
+  rpc Long(Req) returns (Req) { option (google.api.http) = { get: "/v1/{name}:b:c" }; }
+}
+"#,
+    );
+    assert_eq!(answer(&routes, Method::POST, "/v1/x:b:c"), "405 GET, HEAD");
+    assert_eq!(answer(&routes, Method::GET, "/v1/x:b:c"), "/t.S/Long");
+    assert_eq!(answer(&routes, Method::POST, "/v1/x:c"), "/t.S/Short");
+    // No binding without a verb: an unbound verb has nothing to fall back on.
+    assert_eq!(answer(&routes, Method::POST, "/v1/x:d"), "404");
+}
+
+#[test]
+fn head_falls_back_to_get_and_a_bound_verb_owns_its_url() {
+    let routes = routes_of(
         r#"syntax = "proto3";
 package t;
 import "google/api/annotations.proto";
@@ -390,19 +442,16 @@ service S {
 }
 "#,
     );
-    let tables = path_tables(&pool, &[], &TranscodeOptions::default());
-    let table = &tables[0];
-    let rpc = |method: Method, path: &str| match table.choose(&method, path) {
-        table::Choice::Route(index) => table.entry(index).grpc_path.path().to_owned(),
-        table::Choice::MethodNotAllowed(allow) => format!("405 {}", allow.to_str().unwrap()),
-        table::Choice::NotFound => "404".to_owned(),
-    };
+    let rpc = |method: Method, path: &str| answer(&routes, method, path);
     assert_eq!(rpc(Method::HEAD, "/v1/x"), "/t.S/Get");
-    // Both verbs end the path; the longer one is the binding's.
     assert_eq!(rpc(Method::POST, "/v1/x:b:c"), "/t.S/Long");
     assert_eq!(rpc(Method::POST, "/v1/x:c"), "/t.S/Short");
     assert_eq!(rpc(Method::POST, "/v1/x"), "405 GET, HEAD");
-    assert_eq!(rpc(Method::PUT, "/v1/x:c"), "405 GET, POST, HEAD");
+    // `:c` is bound: the binding without a verb does not take `x:c`.
+    assert_eq!(rpc(Method::PUT, "/v1/x:c"), "405 POST");
+    assert_eq!(rpc(Method::GET, "/v1/x:c"), "405 POST");
+    // `:z` is bound nowhere: it stays in the variable.
+    assert_eq!(rpc(Method::GET, "/v1/x:z"), "/t.S/Get");
 }
 
 /// Regression for the axum 0.7→0.8 migration bug: `proto_path_to_axum`

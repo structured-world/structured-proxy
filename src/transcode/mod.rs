@@ -51,7 +51,7 @@ use error::{ErrorDetailsPolicy, StatusDetails};
 use path::MountedPath;
 use response::UpstreamHeaders;
 use rule::RouteMethod;
-use table::{Choice, PathTable};
+use table::{Choice, PathTable, Routes};
 
 /// How long the upstream may take to answer a call with its response headers
 /// when the client's `grpc-timeout` asks for no shorter deadline.
@@ -240,11 +240,12 @@ pub fn routes<S: TranscodeState>(pool: &DescriptorPool, aliases: &[AliasConfig])
 ///
 /// A binding answers the requests whose path matches its template, custom verb
 /// included (`/v1/{name}:cancel`, google/api/http.proto `Verb`), and whose
-/// method is its own; a GET binding answers HEAD too. Among the bindings whose
-/// verb a request's path ends in, the one with the longest verb serves it. A
-/// path that bindings answer, but none with the request's method, is `405`
-/// with their methods in `Allow`; a path that matches a template but no verb
-/// of it is `404`.
+/// method is its own; a GET binding answers HEAD too. A request's verb is its
+/// last segment from the first unencoded `:`: a verb some binding of its path
+/// binds owns the URL, answered by that verb's bindings alone; a verb none
+/// binds stays part of the last variable. A URL that bindings answer, but none
+/// with the request's method, is `405` with their methods in `Allow`; a path
+/// that matches a template but that no binding answers is `404`.
 ///
 /// A second binding for a method, path and verb already taken (or any binding
 /// on a path and verb a `custom` `*` rule takes, which answers every method),
@@ -262,16 +263,16 @@ pub fn routes_with_options<S: TranscodeState>(
         return Router::new();
     }
 
+    let routes = Arc::new(Routes::new(tables));
     let mut router: Router<S> = Router::new();
-    for table in tables {
-        let path = table.path.clone();
-        let table = Arc::new(table);
-        // Every method goes to the table, which answers 405 itself: the URL,
-        // not the path alone, decides which methods a path answers.
+    for (table, mounted) in routes.tables.iter().enumerate() {
+        let routes = routes.clone();
+        // Every method goes to the routes, which answer 405 themselves: the
+        // URL, not the path alone, decides which methods a path answers.
         router = router.route(
-            &path,
+            &mounted.path,
             axum::routing::any(move |State(state): State<S>, request: Request| {
-                dispatch(table, state, request)
+                dispatch(routes, table, state, request)
             }),
         );
     }
@@ -341,17 +342,18 @@ fn path_tables(
     tables
 }
 
-/// Serve `request` on `table`'s path: choose the binding before anything is
-/// extracted, so a request no binding answers gets its 404 or 405 without its
-/// body being read.
+/// Serve `request`, which the router matched to the table at `matched`:
+/// choose the binding before anything is extracted, so a request no binding
+/// answers gets its 404 or 405 without its body being read.
 async fn dispatch<S: TranscodeState>(
-    table: Arc<PathTable>,
+    routes: Arc<Routes>,
+    matched: usize,
     state: S,
     request: Request,
 ) -> Response {
     let (mut parts, body) = request.into_parts();
-    let index = match table.choose(&parts.method, parts.uri.path()) {
-        Choice::Route(index) => index,
+    let (table, index) = match routes.choose(matched, &parts.method, parts.uri.path()) {
+        Choice::Route { table, index } => (table, index),
         Choice::MethodNotAllowed(allow) => {
             return (StatusCode::METHOD_NOT_ALLOWED, [(ALLOW, allow)]).into_response()
         }
@@ -361,7 +363,14 @@ async fn dispatch<S: TranscodeState>(
         Ok(Path(params)) => params,
         Err(rejection) => return rejection.into_response(),
     };
-    table.bind_params(index, &mut path_params);
+    if table != matched {
+        // A verb bound on another path the request matches: its captures come
+        // from that path, the router's prefix parameters stay.
+        if let Err(rejection) = rebind(&routes, matched, parts.uri.path(), &mut path_params) {
+            return rejection.into_response(routes.tables[table].entry(index));
+        }
+    }
+    routes.tables[table].bind_params(index, &mut path_params);
     // The target as received, before a router the proxy is nested in strips
     // its prefix; the router records it on every request it routes.
     let uri = match parts.extensions.remove::<OriginalUri>() {
@@ -385,15 +394,45 @@ async fn dispatch<S: TranscodeState>(
         Ok(body) => body,
         Err(rejection) => return rejection.into_response(),
     };
-    handle(state, client, path_params, body, RouteRef { table, index }).await
+    let entry = RouteRef {
+        routes,
+        table,
+        index,
+    };
+    handle(state, client, path_params, body, entry).await
 }
 
-/// The binding serving a request, held through its path's table: the table
-/// is already shared with the request, so naming the binding takes no
-/// refcount of its own.
+/// Replace the captures of the table at `matched` in `params` with those of
+/// the table binding the verb `path` ends in, percent-decoded as the router
+/// decodes its own.
+fn rebind(
+    routes: &Routes,
+    matched: usize,
+    path: &str,
+    params: &mut PathParams,
+) -> Result<(), Unmappable> {
+    for name in &routes.tables[matched].captures {
+        params.remove(name);
+    }
+    let found = routes
+        .verb_match(path)
+        .expect("the verb's table was chosen from this match");
+    for (name, raw) in found.params.iter() {
+        let value = percent_encoding::percent_decode_str(raw)
+            .decode_utf8()
+            .map_err(|_| Unmappable(format!("path parameter {name} is not valid UTF-8")))?;
+        params.insert(name.to_owned(), value.into_owned());
+    }
+    Ok(())
+}
+
+/// The binding serving a request, held through the routes: they are already
+/// shared with the request, so naming the binding takes no refcount of its
+/// own.
 #[derive(Clone)]
 struct RouteRef {
-    table: Arc<PathTable>,
+    routes: Arc<Routes>,
+    table: usize,
     index: usize,
 }
 
@@ -401,7 +440,7 @@ impl std::ops::Deref for RouteRef {
     type Target = RouteEntry;
 
     fn deref(&self) -> &RouteEntry {
-        self.table.entry(self.index)
+        self.routes.tables[self.table].entry(self.index)
     }
 }
 
@@ -461,24 +500,62 @@ fn route_bindings(
 /// or `*` for a `custom` rule that answers every method, so callers can
 /// distinguish same-path/different-method routes from real conflicts. A
 /// custom verb after a variable is matched by the transcoded routes, not by
-/// the path: bindings of one method that differ only by such a verb share one
-/// route and are listed once, while a repeated method, path and verb is listed
-/// as often as it is bound.
+/// the path, so the bindings of one path are listed as the route they share:
+/// `*` once when a `custom` `*` rule is among them, else each method once.
+/// Two bindings that cannot both serve (one method or a `*` rule, one verb)
+/// are listed both, so the caller sees the collision.
 pub fn route_paths(
     pool: &DescriptorPool,
     aliases: &[AliasConfig],
     selection: &RpcSelection,
 ) -> Vec<(String, String)> {
-    // The verbs bound so far under each (method, route shape).
-    let mut verbs: HashMap<(String, String), Vec<Option<String>>> = HashMap::new();
-    let mut paths = Vec::new();
-    for RouteBinding { entry, mount } in route_bindings(pool, aliases, selection) {
-        let method = entry.http_method.as_str().to_owned();
-        let bound = verbs.entry((method.clone(), mount.shape)).or_default();
-        if bound.is_empty() || bound.contains(&mount.verb) {
-            paths.push((method, mount.axum));
+    // The bindings of each route shape, in first-binding order.
+    let mut shapes: Vec<Vec<RouteBinding>> = Vec::new();
+    let mut by_shape: HashMap<String, usize> = HashMap::new();
+    for binding in route_bindings(pool, aliases, selection) {
+        match by_shape.get(&binding.mount.shape) {
+            Some(&index) => shapes[index].push(binding),
+            None => {
+                by_shape.insert(binding.mount.shape.clone(), shapes.len());
+                shapes.push(vec![binding]);
+            }
         }
-        bound.push(mount.verb);
+    }
+    let mut paths = Vec::new();
+    for bindings in &shapes {
+        let listed = |method: &str, path: &str| (method.to_owned(), path.to_owned());
+        match bindings
+            .iter()
+            .find(|b| b.entry.http_method == RouteMethod::Any)
+        {
+            Some(star) => paths.push(listed("*", &star.mount.axum)),
+            None => {
+                let mut methods: Vec<&str> = Vec::new();
+                for binding in bindings {
+                    let method = binding.entry.http_method.as_str();
+                    if !methods.contains(&method) {
+                        methods.push(method);
+                        paths.push(listed(method, &binding.mount.axum));
+                    }
+                }
+            }
+        }
+        for (at, binding) in bindings.iter().enumerate() {
+            let clashes = bindings[..at].iter().any(|earlier| {
+                table::clash(
+                    &earlier.entry.http_method,
+                    earlier.mount.verb.as_deref(),
+                    &binding.entry.http_method,
+                    binding.mount.verb.as_deref(),
+                )
+            });
+            if clashes {
+                paths.push(listed(
+                    binding.entry.http_method.as_str(),
+                    &binding.mount.axum,
+                ));
+            }
+        }
     }
     paths
 }

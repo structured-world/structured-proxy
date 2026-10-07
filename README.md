@@ -384,15 +384,19 @@ answered with `INVALID_ARGUMENT` (400) before the upstream is called.
 **Custom verbs.** A path template may end in a verb, as AIP-136 custom methods
 do (`post: "/v1/{name=operations/*}:cancel"`):
 
-- A binding with a verb answers only a request whose path ends in it, the
-  variable taking the rest of the segment. A percent-encoded colon (`%3A`) is
-  part of the value, never the verb's delimiter.
-- Bindings of one path that differ only by verb reach their own RPCs. A
-  binding without a verb takes the whole last segment, colon included, when
-  no verb of the path ends the request.
-- A request that matches the path but none of its verbs is `404`; one whose
-  verb matches but whose method does not is `405`, with the methods that
-  answer it in `Allow`.
+- A request's verb is its last segment from the first unencoded colon: a
+  client percent-encodes the reserved characters of a variable's value, and a
+  verb writes its own reserved characters encoded too
+  (`:run%3Anow`), so neither holds a raw `:`. A percent-encoded colon (`%3A`)
+  in a request is part of a value, never the verb's delimiter.
+- A verb some binding of the request's path binds owns that URL: only the
+  bindings of that verb answer it, each reaching its own RPC. A verb no
+  binding binds stays part of the last variable (`/v1/items/a:b` is the item
+  `a:b`), as Envoy's transcoder and grpc-gateway treat an unbound verb.
+- `**` before a verb may match no segment: `/v1/{name=**}:purge` answers
+  `/v1/:purge` with an empty `name`.
+- A URL that bindings answer, but none with the request's method, is `405`,
+  with their methods in `Allow`; a path that no binding answers is `404`.
 
 A template the router cannot match, such as text around a variable within one
 segment (`/v1/a{name}b`), is left out with an error in the log; the other

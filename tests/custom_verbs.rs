@@ -13,12 +13,14 @@ mod common;
 use std::convert::Infallible;
 use std::future::{ready, Ready};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use axum::body::Body;
 use http::{Method, StatusCode};
 use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor, Value as PbValue};
 use serde_json::{json, Value};
+use structured_proxy::hooks::{ExtraRoute, ExtraRouteHandler, RouteRequest, RouteResponse};
 use structured_proxy::transcode::codec::DynamicCodec;
 use tower::ServiceExt;
 
@@ -57,6 +59,18 @@ service Ops {
   }
   rpc Broken(Msg) returns (Msg) {
     option (google.api.http) = { get: "/v1/broken/a{name}b" };
+  }
+  rpc Make(Msg) returns (Msg) {
+    option (google.api.http) = { post: "/v3/x/{name}" };
+  }
+  rpc Sweep(Msg) returns (Msg) {
+    option (google.api.http) = { post: "/v3/{operation}/{name}:sweep" };
+  }
+  rpc Purge(Msg) returns (Msg) {
+    option (google.api.http) = { post: "/v4/{name=**}:purge" };
+  }
+  rpc RunNow(Msg) returns (Msg) {
+    option (google.api.http) = { post: "/v2/jobs/{name}:run%3Anow" };
   }
 }
 "#;
@@ -109,6 +123,16 @@ impl tower::Service<http::Request<tonic::body::Body>> for Ops {
             let mut grpc = tonic::server::Grpc::new(DynamicCodec::new(msg));
             Ok(grpc.unary(Echo { rpc }, req).await)
         })
+    }
+}
+
+/// An embedder's extra route answering `pong`.
+struct Ping;
+
+#[async_trait::async_trait]
+impl ExtraRouteHandler for Ping {
+    async fn handle(&self, _req: RouteRequest) -> RouteResponse {
+        RouteResponse::new(StatusCode::OK, bytes::Bytes::from_static(b"pong"))
     }
 }
 
@@ -225,13 +249,67 @@ async fn a_verb_with_an_empty_variable_does_not_match() {
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
 }
 
-async fn a_method_no_binding_of_the_url_answers_lists_those_that_do() {
-    // PUT is bound nowhere; GET and DELETE (without a verb) and POST
-    // (`:cancel`) answer this URL, POST `:archive` and `:pause` do not.
+async fn a_bound_verb_owns_its_url_for_every_method() {
+    // `:cancel` is bound (POST), so `/v2/ops/op-1:cancel` names the verb, not
+    // an operation called `op-1:cancel`: the bindings without a verb do not
+    // answer it, whatever the method.
     let app = proxy(UPSTREAM).await;
-    let (status, allow, _) = call(&app, Method::PUT, "/v2/ops/op-1:cancel").await;
+    for method in [Method::GET, Method::PUT, Method::DELETE] {
+        let (status, allow, _) = call(&app, method.clone(), "/v2/ops/op-1:cancel").await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{method}");
+        assert_eq!(allow, "POST", "{method}");
+    }
+}
+
+async fn the_verb_starts_at_the_first_colon_of_the_last_segment() {
+    // A variable holds no unencoded colon (google/api/http.proto: a client
+    // percent-encodes it), so `op-1:b:cancel` is the verb `:b:cancel`, which
+    // no binding has; as an unbound verb it stays in the variable.
+    let app = proxy(UPSTREAM).await;
+    let (status, allow, _) = call(&app, Method::POST, "/v2/ops/op-1:b:cancel").await;
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
-    assert_eq!(allow, "GET, POST, DELETE, HEAD");
+    assert_eq!(allow, "GET, DELETE, HEAD");
+    let (status, _, body) = call(&app, Method::GET, "/v2/ops/op-1:b:cancel").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["operation"], "op-1:b:cancel");
+}
+
+async fn a_verb_of_another_path_shape_is_found() {
+    // `/v3/x/{name}` and `/v3/{operation}/{name}:sweep`: the router prefers
+    // the static `x` for `/v3/x/y:sweep`, yet the bound verb belongs to the
+    // other path, which binds its own variables.
+    let app = proxy(UPSTREAM).await;
+    let (status, _, body) = call(&app, Method::POST, "/v3/x/y:sweep").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({"name": "y", "operation": "x", "rpc": "Sweep"}));
+    let (status, _, body) = call(&app, Method::POST, "/v3/a/b:sweep").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({"name": "b", "operation": "a", "rpc": "Sweep"}));
+    let (status, _, body) = call(&app, Method::POST, "/v3/x/y").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({"name": "y", "operation": "", "rpc": "Make"}));
+}
+
+async fn a_double_wildcard_before_a_verb_may_match_no_segment() {
+    // `**` matches zero or more segments (google/api/http.proto).
+    let app = proxy(UPSTREAM).await;
+    let (status, _, body) = call(&app, Method::POST, "/v4/:purge").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rpc"], "Purge");
+    assert_eq!(body["name"], "");
+    let (status, _, body) = call(&app, Method::POST, "/v4/a/b:purge").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["name"], "a/b");
+}
+
+async fn an_encoded_character_in_the_verb_is_taken_off_decoded() {
+    // `:run%3Anow` keeps its reserved character encoded, as the template
+    // grammar asks; the variable gets the value without the decoded verb.
+    let app = proxy(UPSTREAM).await;
+    let (status, _, body) = call(&app, Method::POST, "/v2/jobs/j1:run%3Anow").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rpc"], "RunNow");
+    assert_eq!(body["name"], "j1");
 }
 
 async fn verb_after_a_multi_segment_field_template_routes() {
@@ -257,6 +335,31 @@ async fn verb_after_a_literal_routes_as_before() {
         let (status, _, body) = call(&app, Method::POST, uri).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {body}");
     }
+}
+
+async fn an_extra_route_shares_a_transcoded_path_on_another_method() {
+    // The embedder's GET and the transcoded POST on one path both serve, as
+    // they did when each method had its own route.
+    let pool: DescriptorPool = common::compile("test/v1/ops.proto", OPS_PROTO);
+    let msg = pool.get_message_by_name("test.v1.Msg").unwrap();
+    let app = common::app(UPSTREAM, Ops { msg }, |yaml| {
+        structured_proxy::ProxyServer::from_yaml_str(yaml)
+            .unwrap()
+            .with_descriptors(pool)
+            .with_extra_routes([ExtraRoute::new(
+                Method::GET,
+                "/v1/nodes:batch",
+                Arc::new(Ping),
+            )])
+    })
+    .await;
+    let request = http::Request::get("/v1/nodes:batch").body(Body::empty()).unwrap();
+    let (status, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "pong");
+    let (status, _, body) = call(&app, Method::POST, "/v1/nodes:batch").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rpc"], "Batch");
 }
 
 async fn a_template_the_router_cannot_serve_is_skipped_not_fatal() {
@@ -294,4 +397,33 @@ service Twice {
     .router()
     .expect_err("a repeated method, path and verb must be rejected");
     assert!(err.to_string().contains("more than one endpoint"), "{err}");
+}
+
+#[tokio::test]
+async fn a_star_rule_with_a_verb_starts_beside_another_verb() {
+    // A `custom` `*` rule answers every method, but only for its own verb, so
+    // it does not clash with a POST binding of another verb on its path.
+    const STAR_PROTO: &str = r#"
+syntax = "proto3";
+package test.v1;
+import "google/api/annotations.proto";
+message Msg { string name = 1; }
+service Star {
+  rpc Inspect(Msg) returns (Msg) {
+    option (google.api.http) = { custom: { kind: "*" path: "/v1/x/{name}:inspect" } };
+  }
+  rpc Cancel(Msg) returns (Msg) { option (google.api.http) = { post: "/v1/x/{name}:cancel" }; }
+}
+"#;
+    let pool = common::compile("test/v1/star.proto", STAR_PROTO);
+    let router = structured_proxy::ProxyServer::from_yaml_str(
+        "upstream:\n  default: \"http://127.0.0.1:1\"\n",
+    )
+    .unwrap()
+    .with_descriptors(pool)
+    .router();
+    assert!(
+        router.is_ok(),
+        "bindings of different verbs share their path: {router:?}"
+    );
 }
