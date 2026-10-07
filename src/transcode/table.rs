@@ -22,14 +22,32 @@ use super::{PathParams, RouteEntry};
 /// Every transcoded route, and where each custom verb is bound.
 pub(super) struct Routes {
     pub(super) tables: Vec<PathTable>,
-    /// For each verb, the paths of the tables binding it. The router matches a
-    /// request to one path whatever its verb, while the verb may be bound on
-    /// a path of another shape the request also matches.
-    verbs: HashMap<String, matchit::Router<usize>>,
-    /// The paths of the tables with a binding without a verb: a path whose
-    /// bindings all carry verbs must not hide one of these from a request
-    /// that names no bound verb.
-    plain: matchit::Router<usize>,
+    /// For each verb, the tables binding it. The router matches a request to
+    /// one path whatever its verb, while the verb may be bound on a path of
+    /// another shape the request also matches.
+    verbs: HashMap<String, Index>,
+    /// The tables with a binding without a verb: a path whose bindings all
+    /// carry verbs must not hide one of these from a request that names no
+    /// bound verb.
+    plain: Index,
+    /// Each table's path alone: whether a request matches a given table, and
+    /// with which captures, whatever ranks above it.
+    single: Vec<matchit::Router<()>>,
+}
+
+/// Some of the tables, ranked as the router ranks their paths.
+#[derive(Default)]
+struct Index {
+    router: matchit::Router<usize>,
+    tables: Vec<usize>,
+}
+
+impl Index {
+    fn insert(&mut self, path: &str, table: usize) {
+        let inserted = self.router.insert(path, table);
+        debug_assert!(inserted.is_ok(), "{path}: {inserted:?}");
+        self.tables.push(table);
+    }
 }
 
 /// Every binding the router serves at one path.
@@ -49,6 +67,9 @@ struct Binding {
     names: Option<Vec<String>>,
     verb: Option<Verb>,
     template: Option<Template>,
+    /// The positions of the captures that stand for a bare `*` or `**`,
+    /// which bind no field.
+    unbound: Vec<usize>,
 }
 
 /// The field template of a last capture the router mounts as a catch-all.
@@ -187,6 +208,15 @@ pub(super) fn clash(claim: &Claim<'_>, other: &Claim<'_>) -> bool {
             || *other.method == RouteMethod::Any)
 }
 
+/// The positions `unbound` marks.
+fn unbound_positions(unbound: &[bool]) -> Vec<usize> {
+    unbound
+        .iter()
+        .enumerate()
+        .filter_map(|(position, &bare)| bare.then_some(position))
+        .collect()
+}
+
 /// Whether the segments of `value` follow `template`: a literal itself, `*`
 /// one non-empty segment, `**` any number of segments.
 fn follows(template: &[String], value: &[&str]) -> bool {
@@ -211,12 +241,16 @@ impl Routes {
     /// already accepted by a router holding them all, so a router holding
     /// some of them accepts it too.
     pub(super) fn new(tables: Vec<PathTable>) -> Self {
-        let mut verbs: HashMap<String, matchit::Router<usize>> = HashMap::new();
-        let mut plain = matchit::Router::new();
+        let mut verbs: HashMap<String, Index> = HashMap::new();
+        let mut plain = Index::default();
+        let mut single = Vec::with_capacity(tables.len());
         for (index, table) in tables.iter().enumerate() {
+            let mut alone = matchit::Router::new();
+            let inserted = alone.insert(table.path.as_str(), ());
+            debug_assert!(inserted.is_ok(), "{}: {inserted:?}", table.path);
+            single.push(alone);
             if table.bindings.iter().any(|b| b.verb.is_none()) {
-                let inserted = plain.insert(table.path.as_str(), index);
-                debug_assert!(inserted.is_ok(), "{}: {inserted:?}", table.path);
+                plain.insert(&table.path, index);
             }
             let mut seen: Vec<&str> = Vec::new();
             for verb in table.bindings.iter().filter_map(|b| b.verb.as_ref()) {
@@ -224,29 +258,18 @@ impl Routes {
                     continue;
                 }
                 seen.push(&verb.raw);
-                let inserted = verbs
+                verbs
                     .entry(verb.raw.clone())
                     .or_default()
-                    .insert(table.path.as_str(), index);
-                debug_assert!(inserted.is_ok(), "{}: {inserted:?}", table.path);
+                    .insert(&table.path, index);
             }
         }
         Self {
             tables,
             verbs,
             plain,
+            single,
         }
-    }
-
-    /// The table binding the verb `path` ends in, when one of the request's
-    /// path does: its index and the router's match, whose captures are that
-    /// table's.
-    fn verb_match<'r, 'p>(&'r self, path: &'p str) -> Option<matchit::Match<'r, 'p, &'r usize>> {
-        let (_, verb) = split_verb(path)?;
-        self.verbs
-            .get(normalize_escapes(verb).as_ref())?
-            .at(path)
-            .ok()
     }
 
     /// The router's match of `path` on the table at `table`, which [`choose`]
@@ -258,11 +281,42 @@ impl Routes {
         table: usize,
         path: &'p str,
     ) -> Option<matchit::Params<'r, 'p>> {
-        [self.verb_match(path), self.plain.at(path).ok()]
-            .into_iter()
-            .flatten()
-            .find(|found| *found.value == table)
-            .map(|found| found.params)
+        self.single[table].at(path).ok().map(|found| found.params)
+    }
+
+    /// What answers `method` on `path` among the tables of `index`, starting
+    /// from `first`, the index's own pick: the first table, in the router's
+    /// ranking, that `admits` a binding of. A table whose bindings all refuse
+    /// the request (a field template the value does not follow) leaves it to
+    /// the next one the path also matches. `None` when no table admits one.
+    fn answer(
+        &self,
+        index: &Index,
+        first: usize,
+        method: &Method,
+        path: &str,
+        admits: impl Fn(&Binding) -> bool,
+    ) -> Option<Choice> {
+        if let Some(choice) = self.tables[first].choose(first, method, &admits) {
+            return Some(choice);
+        }
+        // Rare: only a refused template gets here. Rank what is left by
+        // building the router of the remaining tables this path matches.
+        let mut refused = vec![first];
+        loop {
+            let mut router = matchit::Router::new();
+            for &table in &index.tables {
+                if !refused.contains(&table) && self.single[table].at(path).is_ok() {
+                    let inserted = router.insert(self.tables[table].path.as_str(), table);
+                    debug_assert!(inserted.is_ok(), "{inserted:?}");
+                }
+            }
+            let next = *router.at(path).ok()?.value;
+            if let Some(choice) = self.tables[next].choose(next, method, &admits) {
+                return Some(choice);
+            }
+            refused.push(next);
+        }
     }
 
     /// Which binding answers `method` on `path`, a request the router matched
@@ -282,31 +336,32 @@ impl Routes {
                 .unwrap_or(Choice::NotFound);
         }
         if let Some((rest, verb)) = split_verb(path) {
-            if let Some(found) = self.verb_match(path) {
-                let index = *found.value;
-                let verb = normalize_escapes(verb);
-                let bound = |binding: &Binding| {
-                    binding.verb.as_ref().is_some_and(|own| {
-                        own.raw == verb && (own.empty_ok || !rest.ends_with('/'))
-                    }) && binding.fits(path)
-                };
-                if let Some(choice) = self.tables[index].choose(index, method, bound) {
-                    return choice;
+            let verb = normalize_escapes(verb);
+            if let Some(index) = self.verbs.get(verb.as_ref()) {
+                if let Ok(found) = index.router.at(path) {
+                    let bound = |binding: &Binding| {
+                        binding.verb.as_ref().is_some_and(|own| {
+                            own.raw == verb && (own.empty_ok || !rest.ends_with('/'))
+                        }) && binding.fits(path)
+                    };
+                    if let Some(choice) = self.answer(index, *found.value, method, path, bound) {
+                        return choice;
+                    }
                 }
             }
         }
-        // The router's own table, when it has such bindings, is also the best
-        // of those that have: no second lookup for the common request.
-        let index = if self.tables[table].bindings.iter().any(plain) {
+        // The router's own table, when it has bindings without a verb, ranks
+        // first among those that have: no second lookup for the common
+        // request.
+        let first = if self.tables[table].bindings.iter().any(|b| b.verb.is_none()) {
             table
         } else {
-            match self.plain.at(path) {
+            match self.plain.router.at(path) {
                 Ok(found) => *found.value,
                 Err(_) => return Choice::NotFound,
             }
         };
-        self.tables[index]
-            .choose(index, method, plain)
+        self.answer(&self.plain, first, method, path, plain)
             .unwrap_or(Choice::NotFound)
     }
 }
@@ -315,6 +370,7 @@ impl PathTable {
     /// A table for `mount`, served first by `entry`.
     pub(super) fn new(mount: MountedPath, entry: RouteEntry) -> Self {
         let template = Template::of(&mount);
+        let unbound = unbound_positions(&mount.unbound);
         let MountedPath {
             axum,
             captures,
@@ -330,6 +386,7 @@ impl PathTable {
                 names: None,
                 verb: verb.map(|raw| Verb::new(raw, empty_last)),
                 template,
+                unbound,
             }],
         }
     }
@@ -360,12 +417,14 @@ impl PathTable {
             return;
         }
         let template = Template::of(&mount);
+        let unbound = unbound_positions(&mount.unbound);
         let names = (mount.captures != self.captures).then_some(mount.captures);
         self.bindings.push(Binding {
             entry,
             names,
             verb: mount.verb.map(|raw| Verb::new(raw, mount.empty_last)),
             template,
+            unbound,
         });
     }
 
@@ -444,6 +503,10 @@ impl PathTable {
                     value.truncate(len);
                 }
             }
+        }
+        // A bare wildcard was named for the router only.
+        for &position in &binding.unbound {
+            params.remove(&self.captures[position]);
         }
         if let Some(names) = &binding.names {
             // Taken out before any goes back in: one binding's name may be

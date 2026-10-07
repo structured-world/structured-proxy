@@ -18,6 +18,9 @@ pub(crate) struct MountedPath {
     pub(crate) shape: String,
     /// The capture names of `axum`, in path order.
     pub(crate) captures: Vec<String>,
+    /// For each capture, whether it stands for a bare `*` or `**`: the router
+    /// needs a name for it, but it binds no field (google/api/http.proto).
+    pub(crate) unbound: Vec<bool>,
     /// The custom verb after the last segment's variable, `:` included.
     pub(crate) verb: Option<String>,
     /// Whether the last capture may be empty: a `**` matches zero or more
@@ -40,6 +43,7 @@ impl MountedPath {
         let mut axum = String::with_capacity(base.len());
         let mut shape = String::with_capacity(base.len());
         let mut captures = Vec::new();
+        let mut unbound = Vec::new();
         let empty_last = is_double_wildcard(segments[last]);
         let last_template = field_template(segments[last])
             .filter(|template| *template != "*" && *template != "**")
@@ -67,6 +71,7 @@ impl MountedPath {
                     shape.push_str(open);
                     shape.push('}');
                     captures.push(name);
+                    unbound.push(*segment == "*" || *segment == "**");
                 }
             }
         }
@@ -74,6 +79,7 @@ impl MountedPath {
             axum,
             shape,
             captures,
+            unbound,
             verb: verb.map(str::to_owned),
             empty_last,
             last_template,

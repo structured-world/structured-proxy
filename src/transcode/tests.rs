@@ -534,6 +534,85 @@ service S {
 }
 
 #[test]
+fn a_template_that_does_not_fit_leaves_the_url_to_a_lower_ranked_path() {
+    // The router ranks `/v1/books/{name=special/*}` first for
+    // `/v1/books/ordinary/x`; its template refuses the value, so the
+    // catch-all answers, with or without a verb.
+    let routes = routes_of(
+        r#"syntax = "proto3";
+package t;
+import "google/api/annotations.proto";
+message Req { string name = 1; string path = 2; }
+service S {
+  rpc Special(Req) returns (Req) { option (google.api.http) = { get: "/v1/books/{name=special/*}" }; }
+  rpc Files(Req) returns (Req) { option (google.api.http) = { get: "/v1/{path=**}" }; }
+  rpc SpecialGo(Req) returns (Req) { option (google.api.http) = { post: "/v2/books/{name=special/*}:go" }; }
+  rpc FilesGo(Req) returns (Req) { option (google.api.http) = { post: "/v2/{path=**}:go" }; }
+}
+"#,
+    );
+    assert_eq!(
+        answer(&routes, Method::GET, "/v1/books/special/x"),
+        "/t.S/Special"
+    );
+    assert_eq!(
+        answer(&routes, Method::GET, "/v1/books/ordinary/x"),
+        "/t.S/Files"
+    );
+    assert_eq!(
+        answer(&routes, Method::POST, "/v2/books/special/x:go"),
+        "/t.S/SpecialGo"
+    );
+    assert_eq!(
+        answer(&routes, Method::POST, "/v2/books/ordinary/x:go"),
+        "/t.S/FilesGo"
+    );
+}
+
+#[test]
+fn a_bare_wildcard_binds_no_field() {
+    // `*` matches a segment but names no field (google/api/http.proto); the
+    // name the router gives it must not reach a field that happens to share
+    // it.
+    let routes = routes_of(
+        r#"syntax = "proto3";
+package t;
+import "google/api/annotations.proto";
+message Req { string wildcard2 = 1; string wildcard3 = 2; }
+service S {
+  rpc Run(Req) returns (Req) { option (google.api.http) = { post: "/v1/*:run" }; }
+  rpc Get(Req) returns (Req) { option (google.api.http) = { get: "/v2/*/x/**" }; }
+}
+"#,
+    );
+    let run = bound_in(&routes, Method::POST, "/v1/a:run");
+    let mut params: PathParams = [("wildcard2".to_owned(), "a:run".to_owned())].into();
+    routes.tables[run.0].bind_params(run.1, &mut params);
+    assert!(params.is_empty(), "{params:?}");
+    let get = bound_in(&routes, Method::GET, "/v2/a/x/b/c");
+    let mut params: PathParams = [
+        ("wildcard2".to_owned(), "a".to_owned()),
+        ("wildcard4".to_owned(), "b/c".to_owned()),
+    ]
+    .into();
+    routes.tables[get.0].bind_params(get.1, &mut params);
+    assert!(params.is_empty(), "{params:?}");
+}
+
+/// The table and binding answering `method path`, as the router would match it.
+fn bound_in(routes: &table::Routes, method: Method, path: &str) -> (usize, usize) {
+    let mut router = matchit::Router::new();
+    for (index, table) in routes.tables.iter().enumerate() {
+        router.insert(table.path.as_str(), index).unwrap();
+    }
+    let matched = *router.at(path).unwrap().value;
+    match routes.choose(matched, &method, path) {
+        table::Choice::Route { table, index } => (table, index),
+        _ => panic!("{method} {path} must be answered"),
+    }
+}
+
+#[test]
 fn head_falls_back_to_get_and_a_bound_verb_owns_its_url() {
     let routes = routes_of(
         r#"syntax = "proto3";
