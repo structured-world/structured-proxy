@@ -12,6 +12,7 @@ use serde_json::{json, Map, Value};
 
 use crate::config::{AliasConfig, OpenApiConfig};
 use crate::transcode::httpbody;
+use crate::transcode::path;
 use crate::transcode::request::BodyMapping;
 use crate::transcode::rule::{self, HttpBinding, RouteMethod};
 use crate::transcode::RpcSelection;
@@ -86,6 +87,11 @@ pub fn generate(
                         }
                     }
                     for path in targets {
+                        // The router leaves out a template it cannot match;
+                        // documenting it would promise a URL that is 404.
+                        if path::mountable(&path::MountedPath::new(&path).axum).is_err() {
+                            continue;
+                        }
                         let mut operation = operation.clone();
                         if http_method == "head" {
                             strip_response_content(&mut operation);

@@ -14,7 +14,7 @@ pub mod codec;
 pub mod error;
 pub(crate) mod httpbody;
 pub mod metadata;
-mod path;
+pub(crate) mod path;
 pub mod request;
 pub(crate) mod response;
 pub(crate) mod rule;
@@ -453,6 +453,16 @@ struct RouteBinding {
     mount: MountedPath,
 }
 
+impl RouteBinding {
+    fn claim(&self) -> table::Claim<'_> {
+        table::Claim {
+            method: &self.entry.http_method,
+            verb: self.mount.verb.as_deref(),
+            template: self.mount.last_template.as_deref(),
+        }
+    }
+}
+
 /// The single source of truth for what [`routes`] mounts: every binding of
 /// every unary and server-streaming RPC, plus its config aliases, less the
 /// templates the router cannot match. Both [`routes`] (to build handlers) and
@@ -545,14 +555,9 @@ pub fn route_paths(
             }
         }
         for (at, binding) in bindings.iter().enumerate() {
-            let clashes = bindings[..at].iter().any(|earlier| {
-                table::clash(
-                    &earlier.entry.http_method,
-                    earlier.mount.verb.as_deref(),
-                    &binding.entry.http_method,
-                    binding.mount.verb.as_deref(),
-                )
-            });
+            let clashes = bindings[..at]
+                .iter()
+                .any(|earlier| table::clash(&earlier.claim(), &binding.claim()));
             if clashes {
                 paths.push(listed(
                     binding.entry.http_method.as_str(),
@@ -562,6 +567,25 @@ pub fn route_paths(
         }
     }
     paths
+}
+
+/// The methods the transcoded bindings for this pool, aliases and selection
+/// answer, each once: what [`route_paths`] lists under `*` for a path with
+/// verbs still names a method a route answers.
+pub(crate) fn bound_methods(
+    pool: &DescriptorPool,
+    aliases: &[AliasConfig],
+    selection: &RpcSelection,
+) -> Vec<Method> {
+    let mut methods: Vec<Method> = Vec::new();
+    for binding in route_bindings(pool, aliases, selection) {
+        if let RouteMethod::One(method) = binding.entry.http_method {
+            if !methods.contains(&method) {
+                methods.push(method);
+            }
+        }
+    }
+    methods
 }
 
 /// JSON serialization options shared by the unary and streaming response paths,

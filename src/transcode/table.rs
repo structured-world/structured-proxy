@@ -48,6 +48,64 @@ struct Binding {
     /// differ from the path's own.
     names: Option<Vec<String>>,
     verb: Option<Verb>,
+    template: Option<Template>,
+}
+
+/// The field template of a last capture the router mounts as a catch-all.
+struct Template {
+    /// Its segments as written: what tells two bindings apart.
+    raw: Vec<String>,
+    /// Its segments, escapes in upper case: what a value is compared with.
+    segments: Vec<String>,
+    /// The index of the path segment the capture starts at.
+    start: usize,
+}
+
+impl Template {
+    fn of(mount: &MountedPath) -> Option<Self> {
+        let raw = mount.last_template.clone()?;
+        let segments = raw
+            .iter()
+            .map(|segment| normalize_escapes(segment).into_owned())
+            .collect();
+        Some(Self {
+            raw,
+            segments,
+            start: mount.last_segment,
+        })
+    }
+}
+
+impl Binding {
+    /// Whether the value of the last capture in `path` (a request this
+    /// binding's path matched) follows the binding's field template.
+    fn fits(&self, path: &str) -> bool {
+        let Some(template) = &self.template else {
+            return true;
+        };
+        // The capture starts after the `start`-th slash of the path.
+        let mut at = 0;
+        for _ in 0..template.start {
+            match path[at..].find('/') {
+                Some(slash) => at += slash + 1,
+                None => return false,
+            }
+        }
+        let end = match (&self.verb, split_verb(path)) {
+            (Some(_), Some((rest, _))) => rest.len(),
+            (Some(_), None) => return false,
+            (None, _) => path.len(),
+        };
+        let Some(value) = path.get(at..end) else {
+            return false;
+        };
+        let segments: Vec<&str> = if value.is_empty() {
+            Vec::new()
+        } else {
+            value.split('/').collect()
+        };
+        follows(&template.segments, &segments)
+    }
 }
 
 /// A custom verb after the last capture.
@@ -109,19 +167,43 @@ pub(super) fn normalize_escapes(text: &str) -> Cow<'_, str> {
     Cow::Owned(normalized)
 }
 
-/// Whether two bindings of one path cannot both serve: the same verb and the
-/// same method, or the same verb and a `custom` `*` rule, which answers every
-/// method.
-pub(super) fn clash(
-    method: &RouteMethod,
-    verb: Option<&str>,
-    other_method: &RouteMethod,
-    other_verb: Option<&str>,
-) -> bool {
-    verb.map(normalize_escapes) == other_verb.map(normalize_escapes)
-        && (method == other_method
-            || *method == RouteMethod::Any
-            || *other_method == RouteMethod::Any)
+/// What a binding claims on its path: the method, the verb and the field
+/// template of its last capture.
+pub(super) struct Claim<'a> {
+    pub(super) method: &'a RouteMethod,
+    pub(super) verb: Option<&'a str>,
+    pub(super) template: Option<&'a [String]>,
+}
+
+/// Whether two bindings of one path cannot both serve: the same verb and
+/// field template, and the same method or a `custom` `*` rule, which answers
+/// every method. Bindings whose templates differ answer different values;
+/// where their values overlap, the earlier binding answers.
+pub(super) fn clash(claim: &Claim<'_>, other: &Claim<'_>) -> bool {
+    claim.verb.map(normalize_escapes) == other.verb.map(normalize_escapes)
+        && claim.template == other.template
+        && (claim.method == other.method
+            || *claim.method == RouteMethod::Any
+            || *other.method == RouteMethod::Any)
+}
+
+/// Whether the segments of `value` follow `template`: a literal itself, `*`
+/// one non-empty segment, `**` any number of segments.
+fn follows(template: &[String], value: &[&str]) -> bool {
+    match template.split_first() {
+        None => value.is_empty(),
+        Some((first, rest)) if first == "**" => {
+            (0..=value.len()).any(|taken| follows(rest, &value[taken..]))
+        }
+        Some((first, rest)) => value.split_first().is_some_and(|(segment, tail)| {
+            let fits = if first == "*" {
+                !segment.is_empty()
+            } else {
+                normalize_escapes(segment) == first.as_str()
+            };
+            fits && follows(rest, tail)
+        }),
+    }
 }
 
 impl Routes {
@@ -193,7 +275,7 @@ impl Routes {
     /// - Otherwise the bindings without a verb answer, of the best path that
     ///   has some, the verb text being part of the last variable.
     pub(super) fn choose(&self, table: usize, method: &Method, path: &str) -> Choice {
-        let plain = |binding: &Binding| binding.verb.is_none();
+        let plain = |binding: &Binding| binding.verb.is_none() && binding.fits(path);
         if self.tables[table].literal_end() {
             return self.tables[table]
                 .choose(table, method, plain)
@@ -206,7 +288,7 @@ impl Routes {
                 let bound = |binding: &Binding| {
                     binding.verb.as_ref().is_some_and(|own| {
                         own.raw == verb && (own.empty_ok || !rest.ends_with('/'))
-                    })
+                    }) && binding.fits(path)
                 };
                 if let Some(choice) = self.tables[index].choose(index, method, bound) {
                     return choice;
@@ -232,6 +314,7 @@ impl Routes {
 impl PathTable {
     /// A table for `mount`, served first by `entry`.
     pub(super) fn new(mount: MountedPath, entry: RouteEntry) -> Self {
+        let template = Template::of(&mount);
         let MountedPath {
             axum,
             captures,
@@ -246,6 +329,7 @@ impl PathTable {
                 entry,
                 names: None,
                 verb: verb.map(|raw| Verb::new(raw, empty_last)),
+                template,
             }],
         }
     }
@@ -253,13 +337,18 @@ impl PathTable {
     /// Add `entry` mounted at `mount`, a path of this table's shape, unless it
     /// [`clash`]es with a binding already there.
     pub(super) fn add(&mut self, mount: MountedPath, entry: RouteEntry) {
+        let claim = Claim {
+            method: &entry.http_method,
+            verb: mount.verb.as_deref(),
+            template: mount.last_template.as_deref(),
+        };
         let taken = self.bindings.iter().any(|existing| {
-            clash(
-                &existing.entry.http_method,
-                existing.verb.as_ref().map(|v| v.raw.as_str()),
-                &entry.http_method,
-                mount.verb.as_deref(),
-            )
+            let existing_claim = Claim {
+                method: &existing.entry.http_method,
+                verb: existing.verb.as_ref().map(|v| v.raw.as_str()),
+                template: existing.template.as_ref().map(|t| t.raw.as_slice()),
+            };
+            clash(&existing_claim, &claim)
         });
         if taken {
             tracing::error!(
@@ -270,11 +359,13 @@ impl PathTable {
             );
             return;
         }
+        let template = Template::of(&mount);
         let names = (mount.captures != self.captures).then_some(mount.captures);
         self.bindings.push(Binding {
             entry,
             names,
             verb: mount.verb.map(|raw| Verb::new(raw, mount.empty_last)),
+            template,
         });
     }
 

@@ -501,6 +501,39 @@ service S {
 }
 
 #[test]
+fn a_multi_segment_field_template_constrains_its_value() {
+    // `{name=shelves/*/books/*}` is mounted as a catch-all, yet only a value of
+    // that structure binds; other templates on the same path keep theirs.
+    let routes = routes_of(
+        r#"syntax = "proto3";
+package t;
+import "google/api/annotations.proto";
+message Req { string name = 1; }
+service S {
+  rpc Book(Req) returns (Req) { option (google.api.http) = { get: "/v1/{name=shelves/*/books/*}" }; }
+  rpc Shelf(Req) returns (Req) { option (google.api.http) = { get: "/v1/{name=shelves/*}" }; }
+  rpc Deep(Req) returns (Req) { option (google.api.http) = { get: "/v1/{name=deep/**}" }; }
+}
+"#,
+    );
+    assert_eq!(
+        answer(&routes, Method::GET, "/v1/shelves/s1/books/b1"),
+        "/t.S/Book"
+    );
+    assert_eq!(answer(&routes, Method::GET, "/v1/shelves/s1"), "/t.S/Shelf");
+    assert_eq!(answer(&routes, Method::GET, "/v1/deep/a/b/c"), "/t.S/Deep");
+    assert_eq!(answer(&routes, Method::GET, "/v1/deep"), "/t.S/Deep");
+    for path in [
+        "/v1/other/x",
+        "/v1/shelves/s1/books",
+        "/v1/shelves/s1/x/b1",
+        "/v1/shelves",
+    ] {
+        assert_eq!(answer(&routes, Method::GET, path), "404", "{path}");
+    }
+}
+
+#[test]
 fn head_falls_back_to_get_and_a_bound_verb_owns_its_url() {
     let routes = routes_of(
         r#"syntax = "proto3";

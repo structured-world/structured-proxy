@@ -841,7 +841,20 @@ impl ProxyServer {
         let forward_auth = auth.as_ref().and_then(|built| {
             auth::forward::ForwardAuth::build(self.config.auth.as_ref()?, built.clone())
         });
-        let guards = Arc::new(self.guards(resolver, auth, maintenance_exempt, &mounted)?);
+        // The methods a route answers: `*` marks a route that answers every
+        // method, not a method, and a transcoded path with verbs is listed as
+        // `*` while its bindings still name theirs.
+        let mut routed: Vec<http::Method> = mounted
+            .iter()
+            .filter(|(method, _)| method != "*")
+            .filter_map(|(method, _)| http::Method::from_bytes(method.as_bytes()).ok())
+            .collect();
+        routed.extend(transcode::bound_methods(
+            &pool,
+            &self.config.aliases,
+            &selection,
+        ));
+        let guards = Arc::new(self.guards(resolver, auth, maintenance_exempt, &routed)?);
 
         // Health routes. Paths are configurable; the whole group is skippable.
         let health_routes = if self.config.health.enabled {
@@ -984,7 +997,7 @@ impl ProxyServer {
     /// The guards the configuration and the hooks turn on, each with its
     /// scope, after the client-address resolution `resolver`;
     /// `maintenance_exempt` lists the paths maintenance mode leaves
-    /// reachable, `mounted` the `(method, path)` of every route.
+    /// reachable, `routed` the methods the routes answer.
     ///
     /// # Errors
     ///
@@ -996,17 +1009,11 @@ impl ProxyServer {
         resolver: Arc<client_address::Resolver>,
         auth: Option<Arc<auth::Auth>>,
         maintenance_exempt: Vec<String>,
-        mounted: &[(String, String)],
+        routed: &[http::Method],
     ) -> anyhow::Result<guard::Guards> {
         use config::Traffic::{Endpoints, Grpc, Transcoded};
-        // `*` marks a route that answers every method, not a method.
-        let routed: Vec<http::Method> = mounted
-            .iter()
-            .filter(|(method, _)| method != "*")
-            .filter_map(|(method, _)| http::Method::from_bytes(method.as_bytes()).ok())
-            .collect();
         let scope = |config: Option<&ScopeConfig>, default: &[config::Traffic], what: &str| {
-            guard::Scope::compile(config, default, what, &routed).map_err(anyhow::Error::msg)
+            guard::Scope::compile(config, default, what, routed).map_err(anyhow::Error::msg)
         };
         // A guard never sets what the client-address forwarding writes.
         let reserved: Arc<[http::HeaderName]> = resolver.configured_headers().cloned().collect();

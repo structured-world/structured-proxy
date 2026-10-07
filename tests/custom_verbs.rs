@@ -324,6 +324,17 @@ async fn verb_after_a_multi_segment_field_template_routes() {
         let (status, _, body) = call(&app, Method::POST, uri).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {body}");
     }
+    // The field template constrains the value: its literals and its number
+    // of segments, not just any tail.
+    for uri in [
+        "/v1/anything/else:restore",
+        "/v1/publishers/p1/shelves/b2:restore",
+        "/v1/publishers/p1/books:restore",
+        "/v1/publishers/p1/books/b2/c3:restore",
+    ] {
+        let (status, _, body) = call(&app, Method::POST, uri).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {body}");
+    }
 }
 
 async fn verb_after_a_literal_routes_as_before() {
@@ -423,6 +434,31 @@ service Verb {
     .router()
     .expect_err("an extra route on a path with verbs must be rejected");
     assert!(err.to_string().contains("more than one endpoint"), "{err}");
+}
+
+#[tokio::test]
+async fn a_guard_may_scope_an_extension_method_bound_with_a_verb() {
+    // The path is reserved for every method, yet `PROPFIND` is still a method
+    // a route answers, so a scope may name it.
+    const DAV_PROTO: &str = r#"
+syntax = "proto3";
+package test.v1;
+import "google/api/annotations.proto";
+message Msg { string name = 1; }
+service Dav {
+  rpc Inspect(Msg) returns (Msg) {
+    option (google.api.http) = { custom: { kind: "PROPFIND" path: "/v1/x/{name}:inspect" } };
+  }
+}
+"#;
+    let pool = common::compile("test/v1/dav.proto", DAV_PROTO);
+    let router = structured_proxy::ProxyServer::from_yaml_str(
+        "upstream:\n  default: \"http://127.0.0.1:1\"\nmaintenance:\n  enabled: true\n  scope:\n    traffic: [transcoded]\n    methods: [\"PROPFIND\"]\n",
+    )
+    .unwrap()
+    .with_descriptors(pool)
+    .router();
+    assert!(router.is_ok(), "PROPFIND is routed: {router:?}");
 }
 
 #[tokio::test]

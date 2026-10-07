@@ -23,6 +23,12 @@ pub(crate) struct MountedPath {
     /// Whether the last capture may be empty: a `**` matches zero or more
     /// segments (google/api/http.proto), any other variable at least one.
     pub(crate) empty_last: bool,
+    /// The field template of the last capture when the router cannot hold it
+    /// (`{name=shelves/*/books/*}` mounted as a catch-all): its segments, which
+    /// the matched value must follow.
+    pub(crate) last_template: Option<Vec<String>>,
+    /// The index of the last segment, the one the last capture starts at.
+    pub(crate) last_segment: usize,
 }
 
 impl MountedPath {
@@ -35,6 +41,14 @@ impl MountedPath {
         let mut shape = String::with_capacity(base.len());
         let mut captures = Vec::new();
         let empty_last = is_double_wildcard(segments[last]);
+        let last_template = field_template(segments[last])
+            .filter(|template| *template != "*" && *template != "**")
+            .map(|template| {
+                split_top_level(template)
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect()
+            });
         for (idx, segment) in segments.iter().enumerate() {
             if idx > 0 {
                 axum.push('/');
@@ -62,6 +76,8 @@ impl MountedPath {
             captures,
             verb: verb.map(str::to_owned),
             empty_last,
+            last_template,
+            last_segment: last,
         }
     }
 
@@ -140,12 +156,17 @@ fn split_verb(template: &str) -> (&str, Option<&str>) {
 
 /// Whether `segment` is `**` or a variable bound to it (`{name=**}`).
 fn is_double_wildcard(segment: &str) -> bool {
-    segment == "**"
-        || segment
-            .strip_prefix('{')
-            .and_then(|s| s.strip_suffix('}'))
-            .and_then(|inner| inner.split_once('='))
-            .is_some_and(|(_, template)| template == "**")
+    segment == "**" || field_template(segment) == Some("**")
+}
+
+/// The template a variable segment binds its field to: `shelves/*` of
+/// `{name=shelves/*}`, none for a plain `{name}` or a literal.
+fn field_template(segment: &str) -> Option<&str> {
+    segment
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .and_then(|inner| inner.split_once('='))
+        .map(|(_, template)| template)
 }
 
 /// The index of the `}` closing the `{` that opens `segment`.
@@ -214,18 +235,12 @@ fn convert_segment(segment: &str, idx: usize, is_last: bool) -> Segment<'_> {
                 // Multi-segment catch-all maps to axum's `{*name}` (terminal only).
                 "**" => catch_all(name, is_last),
                 // Templates with interspersed literals (`{name=shelves/*/books/*}`)
-                // have no faithful axum form: axum cannot bind literal segments
-                // into one capture. Collapse to a catch-all so routing stays
-                // deterministic and the field still binds to the matched tail,
-                // and warn so the limitation surfaces instead of mis-routing.
-                _ => {
-                    tracing::warn!(
-                        template = %inner,
-                        "google.api.http multi-segment field template is not fully \
-                         supported; routing it as a catch-all capture"
-                    );
-                    catch_all(name, is_last)
-                }
+                // have no axum form: axum cannot bind literal segments into one
+                // capture. The last segment is mounted as a catch-all and the
+                // transcoded routes check the value against the template; in
+                // any other position it degrades to one segment, which the
+                // template cannot match, so that is warned about.
+                _ => catch_all(name, is_last),
             };
         }
         // Plain `{name}` is already valid axum 0.8 syntax.

@@ -187,6 +187,9 @@ service Api {
   rpc Archive(Item) returns (Item) {
     option (google.api.http) = { post: "/v1/items/{name}:archive" };
   }
+  rpc Broken(Item) returns (Item) {
+    option (google.api.http) = { get: "/v1/broken/a{name}b" };
+  }
 }
 "#;
 
@@ -240,6 +243,19 @@ fn custom_verb_after_a_variable_keeps_its_path_and_parameter() {
     assert_eq!(path_params[0]["name"], "name");
     // No path item without the verb comes from this binding.
     assert!(spec["paths"]["/v1/items/{name}"].get("post").is_none());
+}
+
+#[test]
+fn a_template_the_router_cannot_serve_is_not_documented() {
+    // The router skips `a{name}b`; the spec must not promise it either.
+    let spec = spec(&[]);
+    let paths = spec["paths"].as_object().unwrap();
+    assert!(!paths.contains_key("/v1/broken/a{name}b"), "{paths:?}");
+    assert!(!paths.values().any(|item| item
+        .as_object()
+        .unwrap()
+        .values()
+        .any(|op| op["operationId"] == "Api.Broken")));
 }
 
 #[test]
