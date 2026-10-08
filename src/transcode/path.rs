@@ -50,7 +50,7 @@ pub(crate) struct Composite {
 /// One segment of a [`Composite`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Part {
-    /// A literal of the template, as written.
+    /// A literal of the template, percent-decoded as the captures are.
     Literal(String),
     /// A `*` of the template: the capture at this position of the path.
     Capture(usize),
@@ -120,7 +120,10 @@ impl MountedPath {
                         } else {
                             axum.push_str(part);
                             shape.push_str(part);
-                            parts.push(Part::Literal(part.to_owned()));
+                            let decoded = percent_encoding::percent_decode_str(part)
+                                .decode_utf8_lossy()
+                                .into_owned();
+                            parts.push(Part::Literal(decoded));
                         }
                     }
                     composites.push(Composite {
@@ -194,8 +197,8 @@ impl MountedPath {
 /// and rejects any segment starting with `:`):
 /// - `{name=*}`  (single segment)      -> `{name}`
 /// - `{name=**}` (multi-segment) -> `{*name}` (axum catch-all)
-/// - bare `*` segment            -> `{wildcardN}`
-/// - bare `**` segment           -> `{*wildcardN}` (axum catch-all)
+/// - bare `*` segment            -> `{N}`, N its segment index
+/// - bare `**` segment           -> `{*N}` (axum catch-all)
 ///
 /// A custom verb after a variable or wildcard (`{name}:cancel`) is not part of
 /// the result: axum cannot match it, so the transcoded router checks it
@@ -342,10 +345,12 @@ fn convert_segment(segment: &str, idx: usize, is_last: bool) -> Segment<'_> {
         return capture(inner, false);
     }
 
-    // Bare wildcards: name them by position so multiple wildcards never collide.
+    // Bare wildcards: named by position, so they never collide with each
+    // other, and starting with a digit, so never with a field path (whose
+    // names are identifiers) or a spelled-out template's `{field}.{k}`.
     match segment {
-        "**" => catch_all(&format!("wildcard{idx}"), is_last),
-        "*" => capture(&format!("wildcard{idx}"), false),
+        "**" => catch_all(&idx.to_string(), is_last),
+        "*" => capture(&idx.to_string(), false),
         literal => Segment::Literal(literal),
     }
 }

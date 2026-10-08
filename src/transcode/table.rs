@@ -548,28 +548,26 @@ impl PathTable {
                 (composite.field.clone(), parts.join("/"))
             })
             .collect();
-        // A bare wildcard, or a part of a composite, was named for the
-        // router only.
-        for &position in &binding.unbound {
-            params.remove(&self.captures[position]);
-        }
-        params.extend(composed);
-        if let Some(names) = &binding.names {
-            // Taken out before any goes back in: one binding's name may be
-            // another capture's name on the table's path.
-            let renamed: Vec<(&String, Option<String>)> = self
-                .captures
-                .iter()
-                .zip(names)
-                .filter(|(path_name, own)| path_name != own)
-                .map(|(path_name, own)| (own, params.remove(path_name)))
-                .collect();
-            for (own, value) in renamed {
-                if let Some(value) = value {
-                    params.insert(own.clone(), value);
+        // Every capture of the table's path is taken out before any field goes
+        // back in: one binding's name, or a composite's field, may be another
+        // capture's name on that path. A bare wildcard, or a part of a
+        // composite, was named for the router only and stays out.
+        let mut renamed: Vec<(&String, String)> = Vec::new();
+        for (position, path_name) in self.captures.iter().enumerate() {
+            let own = binding
+                .names
+                .as_ref()
+                .map_or(path_name, |names| &names[position]);
+            let routing_only = binding.unbound.contains(&position);
+            if routing_only || own != path_name {
+                let value = params.remove(path_name);
+                if let (false, Some(value)) = (routing_only, value) {
+                    renamed.push((own, value));
                 }
             }
         }
+        params.extend(renamed.into_iter().map(|(own, value)| (own.clone(), value)));
+        params.extend(composed);
     }
 }
 

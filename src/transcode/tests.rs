@@ -115,8 +115,11 @@ fn test_proto_path_to_axum_wildcards() {
     );
     // Bare wildcards get position-named captures so they never collide.
     // Index is the segment position after splitting on `/` (leading "" = 0).
-    assert_eq!(proto_path_to_axum("/v1/*/items"), "/v1/{wildcard2}/items");
-    assert_eq!(proto_path_to_axum("/v1/files/**"), "/v1/files/{*wildcard3}");
+    assert_eq!(proto_path_to_axum("/v1/*/items"), "/v1/{2}/items");
+    assert_eq!(proto_path_to_axum("/v1/files/**"), "/v1/files/{*3}");
+    let _router: Router<()> = Router::new()
+        .route("/v1/{2}/items", get(|| async { "ok" }))
+        .route("/v1/files/{*3}", get(|| async { "ok" }));
 }
 
 #[test]
@@ -185,6 +188,106 @@ service S {
     ]
     .into();
     assert_eq!(params, expected);
+}
+
+/// The fields `method path` reaches its binding with: the router's captures
+/// percent-decoded, as axum extracts them, then bound.
+fn bound_fields(routes: &table::Routes, method: Method, path: &str) -> PathParams {
+    let (table, index) = bound_in(routes, method, path);
+    let mut router = matchit::Router::new();
+    router
+        .insert(routes.tables[table].path.as_str(), ())
+        .unwrap();
+    let mut params: PathParams = router
+        .at(path)
+        .unwrap()
+        .params
+        .iter()
+        .map(|(name, value)| {
+            let value = percent_encoding::percent_decode_str(value)
+                .decode_utf8()
+                .unwrap();
+            (name.to_owned(), value.into_owned())
+        })
+        .collect();
+    routes.tables[table].bind_params(index, &mut params);
+    params
+}
+
+#[test]
+fn an_encoded_literal_of_a_spelled_out_template_is_decoded_in_its_field() {
+    // The captures are decoded, so the template's literals must be too:
+    // `foo%3Abar` in the field is `foo:bar`, as at the end of a path.
+    let routes = routes_of(
+        r#"syntax = "proto3";
+package t;
+import "google/api/annotations.proto";
+message Req { string parent = 1; string id = 2; }
+service S {
+  rpc Get(Req) returns (Req) { option (google.api.http) = { get: "/v1/{parent=publishers/foo%3Abar/*}/books/{id}" }; }
+}
+"#,
+    );
+    let expected: PathParams = [
+        ("parent".to_owned(), "publishers/foo:bar/p1".to_owned()),
+        ("id".to_owned(), "x".to_owned()),
+    ]
+    .into();
+    assert_eq!(
+        bound_fields(&routes, Method::GET, "/v1/publishers/foo%3Abar/p1/books/x"),
+        expected
+    );
+}
+
+#[test]
+fn a_field_named_like_a_bare_wildcard_keeps_its_value() {
+    // A bare `*` binds no field, whatever name the router gives it; a field
+    // declared after it under that same name is still bound.
+    let routes = routes_of(
+        r#"syntax = "proto3";
+package t;
+import "google/api/annotations.proto";
+message Req { string wildcard2 = 1; }
+service S {
+  rpc Get(Req) returns (Req) { option (google.api.http) = { get: "/v1/*/{wildcard2}" }; }
+}
+"#,
+    );
+    let expected: PathParams = [("wildcard2".to_owned(), "b".to_owned())].into();
+    assert_eq!(bound_fields(&routes, Method::GET, "/v1/a/b"), expected);
+}
+
+#[test]
+fn a_spelled_out_template_sharing_a_route_keeps_its_field() {
+    // Both bindings share the route `/v1/foo/{}/books/{}`, named after the
+    // first: the second must still get `a` put back together, not renamed
+    // away by the first binding's capture name.
+    let routes = routes_of(
+        r#"syntax = "proto3";
+package t;
+import "google/api/annotations.proto";
+message Req { string a = 1; string id = 2; }
+service S {
+  rpc Get(Req) returns (Req) { option (google.api.http) = { get: "/v1/foo/{a}/books/{id}" }; }
+  rpc Cancel(Req) returns (Req) { option (google.api.http) = { post: "/v1/{a=foo/*}/books/{id}:cancel" }; }
+}
+"#,
+    );
+    let get: PathParams = [
+        ("a".to_owned(), "x".to_owned()),
+        ("id".to_owned(), "y".to_owned()),
+    ]
+    .into();
+    assert_eq!(bound_fields(&routes, Method::GET, "/v1/foo/x/books/y"), get);
+    let cancel: PathParams = [
+        ("a".to_owned(), "foo/x".to_owned()),
+        ("id".to_owned(), "y".to_owned()),
+    ]
+    .into();
+    assert_eq!(
+        bound_fields(&routes, Method::POST, "/v1/foo/x/books/y:cancel"),
+        cancel
+    );
 }
 
 #[test]
@@ -257,20 +360,8 @@ fn custom_verb_after_a_variable_or_wildcard_is_split_off() {
             &["path"][..],
             Some(":x"),
         ),
-        (
-            "/v1/*:x",
-            "/v1/{wildcard2}",
-            "/v1/{}",
-            &["wildcard2"][..],
-            Some(":x"),
-        ),
-        (
-            "/v1/**:x",
-            "/v1/{*wildcard2}",
-            "/v1/{*}",
-            &["wildcard2"][..],
-            Some(":x"),
-        ),
+        ("/v1/*:x", "/v1/{2}", "/v1/{}", &["2"][..], Some(":x")),
+        ("/v1/**:x", "/v1/{*2}", "/v1/{*}", &["2"][..], Some(":x")),
         // A verb whose LITERAL holds a colon is the whole rest of the segment.
         ("/v1/{a}:b:c", "/v1/{a}", "/v1/{}", &["a"][..], Some(":b:c")),
     ];
@@ -679,18 +770,10 @@ service S {
 }
 "#,
     );
-    let run = bound_in(&routes, Method::POST, "/v1/a:run");
-    let mut params: PathParams = [("wildcard2".to_owned(), "a:run".to_owned())].into();
-    routes.tables[run.0].bind_params(run.1, &mut params);
-    assert!(params.is_empty(), "{params:?}");
-    let get = bound_in(&routes, Method::GET, "/v2/a/x/b/c");
-    let mut params: PathParams = [
-        ("wildcard2".to_owned(), "a".to_owned()),
-        ("wildcard4".to_owned(), "b/c".to_owned()),
-    ]
-    .into();
-    routes.tables[get.0].bind_params(get.1, &mut params);
-    assert!(params.is_empty(), "{params:?}");
+    let run = bound_fields(&routes, Method::POST, "/v1/a:run");
+    assert!(run.is_empty(), "{run:?}");
+    let get = bound_fields(&routes, Method::GET, "/v2/a/x/b/c");
+    assert!(get.is_empty(), "{get:?}");
 }
 
 /// The table and binding answering `method path`, as the router would match it.
