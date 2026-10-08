@@ -81,6 +81,9 @@ service Ops {
   rpc FixedMid(Msg) returns (Msg) {
     option (google.api.http) = { get: "/v8/{name=foo%2Fbar}/x" };
   }
+  rpc Literal(Msg) returns (Msg) {
+    option (google.api.http) = { get: "/v9/{name=foo%2Fbar/*}/x" };
+  }
   rpc Shelve(Msg) returns (Msg) {
     option (google.api.http) = { post: "/v5/{name=publishers/*}/books/{operation}" };
   }
@@ -349,6 +352,11 @@ async fn a_variable_over_several_segments_keeps_an_encoded_slash() {
     let (status, _, body) = call(&app, Method::POST, "/v6/a/b:run%2fnow").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["name"], "a/b");
+    // A literal of the template is taken from the request, `%2F` as received.
+    let (status, _, body) = call(&app, Method::GET, "/v9/foo%2fbar/p1/x").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rpc"], "Literal");
+    assert_eq!(body["name"], "foo%2fbar/p1");
 }
 
 async fn a_field_template_of_one_segment_is_decoded_in_full() {

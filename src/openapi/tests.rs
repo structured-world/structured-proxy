@@ -190,6 +190,12 @@ service Api {
   rpc Broken(Item) returns (Item) {
     option (google.api.http) = { get: "/v1/broken/a{name}b" };
   }
+  rpc Shelved(Item) returns (Item) {
+    option (google.api.http) = { get: "/v1/shelf/{name=foo%3Abar/*}/books" };
+  }
+  rpc Shadowed(Item) returns (Item) {
+    option (google.api.http) = { get: "/v1/shelf/{name=**}" };
+  }
 }
 "#;
 
@@ -243,6 +249,20 @@ fn custom_verb_after_a_variable_keeps_its_path_and_parameter() {
     assert_eq!(path_params[0]["name"], "name");
     // No path item without the verb comes from this binding.
     assert!(spec["paths"]["/v1/items/{name}"].get("post").is_none());
+}
+
+#[test]
+fn a_route_the_router_refuses_beside_another_is_not_documented() {
+    // The escaped literal is a variable to the router, which then refuses the
+    // catch-all after it at that position: only the route it serves is in
+    // the spec.
+    let spec = spec(&[]);
+    let paths = spec["paths"].as_object().unwrap();
+    assert!(
+        paths.contains_key("/v1/shelf/{name=foo%3Abar/*}/books"),
+        "{paths:?}"
+    );
+    assert!(!paths.contains_key("/v1/shelf/{name=**}"), "{paths:?}");
 }
 
 #[test]

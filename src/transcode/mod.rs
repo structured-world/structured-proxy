@@ -290,7 +290,7 @@ fn path_tables(
     aliases: &[AliasConfig],
     options: &TranscodeOptions,
 ) -> Vec<PathTable> {
-    let bindings = route_bindings(pool, aliases, &options.selection);
+    let bindings = route_bindings(pool, aliases, &options.selection, true);
     tracing::info!("Registering {} transcoded REST→gRPC routes", bindings.len());
 
     // At most two renderers, without and with the opaque-detail extension,
@@ -329,21 +329,56 @@ fn path_tables(
         }
     }
 
-    // A path the router refuses next to the ones before it is left out, as
-    // axum would panic on it. matchit is the router axum matches with.
-    let mut router = matchit::Router::new();
-    tables.retain(|table| match router.insert(table.path.as_str(), ()) {
-        Ok(()) => true,
-        Err(error) => {
+    retain_mountable(
+        &mut tables,
+        |table| table.path.as_str(),
+        |path, error| {
             tracing::error!(
-                path = %table.path,
+                path = %path,
                 %error,
                 "transcoded route conflicts with another; skipping its bindings"
             );
+        },
+    );
+    tables
+}
+
+/// Keep the items whose router path a router holding the ones kept before
+/// accepts, in order; `refused` hears of each left out. axum would panic on
+/// such a path, and matchit is the router axum matches with.
+fn retain_mountable<T>(
+    items: &mut Vec<T>,
+    path: impl Fn(&T) -> &str,
+    mut refused: impl FnMut(&str, matchit::InsertError),
+) {
+    let mut router = matchit::Router::new();
+    items.retain(|item| match router.insert(path(item), ()) {
+        Ok(()) => true,
+        Err(error) => {
+            refused(path(item), error);
             false
         }
     });
-    tables
+}
+
+/// The shapes of the router paths [`routes_with_options`] mounts for
+/// `selection`: what the OpenAPI document may promise.
+pub(crate) fn mounted_shapes(
+    pool: &DescriptorPool,
+    aliases: &[AliasConfig],
+    selection: &RpcSelection,
+) -> std::collections::HashSet<String> {
+    // One path per shape, the first binding's, as the tables are built.
+    let mut seen = std::collections::HashSet::new();
+    let mut paths: Vec<MountedPath> = route_bindings(pool, aliases, selection, false)
+        .into_iter()
+        .filter_map(|binding| {
+            seen.insert(binding.mount.shape.clone())
+                .then_some(binding.mount)
+        })
+        .collect();
+    retain_mountable(&mut paths, |mount| mount.axum.as_str(), |_, _| {});
+    paths.into_iter().map(|mount| mount.shape).collect()
 }
 
 /// Serve `request`, which the router matched to the table at `matched`:
@@ -487,15 +522,18 @@ impl RouteBinding {
 /// every unary and server-streaming RPC, plus its config aliases, less the
 /// templates the router cannot match. Both [`routes`] (to build handlers) and
 /// [`route_paths`] (to enumerate paths for collision checks) consume this, so
-/// the mounted set and the enumerated set cannot drift apart.
+/// the mounted set and the enumerated set cannot drift apart. A template left
+/// out is logged when `report` is set.
 fn route_bindings(
     pool: &DescriptorPool,
     aliases: &[AliasConfig],
     selection: &RpcSelection,
+    report: bool,
 ) -> Vec<RouteBinding> {
     let mut bindings = Vec::new();
     let mut push = |mount: MountedPath, entry: RouteEntry| match mount.routable() {
         Ok(()) => bindings.push(RouteBinding { entry, mount }),
+        Err(_) if !report => {}
         Err(error) => tracing::error!(
             path = %mount.display(),
             rpc = %entry.grpc_path,
@@ -544,7 +582,8 @@ pub fn route_paths(
     // The bindings of each route shape, in first-binding order.
     let mut shapes: Vec<Vec<RouteBinding>> = Vec::new();
     let mut by_shape: HashMap<String, usize> = HashMap::new();
-    for binding in route_bindings(pool, aliases, selection) {
+    // The routes themselves report a template left out.
+    for binding in route_bindings(pool, aliases, selection, false) {
         match by_shape.get(&binding.mount.shape) {
             Some(&index) => shapes[index].push(binding),
             None => {
@@ -598,7 +637,7 @@ pub(crate) fn bound_methods(
     selection: &RpcSelection,
 ) -> Vec<Method> {
     let mut methods: Vec<Method> = Vec::new();
-    for binding in route_bindings(pool, aliases, selection) {
+    for binding in route_bindings(pool, aliases, selection, false) {
         if let RouteMethod::One(method) = binding.entry.http_method {
             if !methods.contains(&method) {
                 methods.push(method);

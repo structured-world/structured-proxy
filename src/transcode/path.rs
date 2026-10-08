@@ -59,10 +59,10 @@ pub(crate) struct Composite {
 /// One segment of a [`Composite`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Part {
-    /// A literal of the template, percent-decoded as the variable's captures
-    /// are.
+    /// A literal of the template without a percent-escape.
     Literal(String),
-    /// A `*` of the template: the capture at this position of the path.
+    /// A `*` of the template, or a literal with a percent-escape: the capture
+    /// at this position of the path.
     Capture(usize),
 }
 
@@ -156,23 +156,18 @@ impl MountedPath {
                             axum.push_str(part);
                             shape.push_str(part);
                         }
-                        if part == "*" {
-                            parts.push(Part::Capture(captures.len() - 1));
-                        } else {
-                            if escaped {
-                                // The index of this segment: one per `/` before it.
-                                let at = axum.bytes().filter(|&b| b == b'/').count();
-                                literals.push((at, part.to_owned()));
-                            }
-                            let decoded = if multi {
-                                decode_multi_segment(part)
-                            } else {
-                                percent_encoding::percent_decode_str(part).into()
-                            };
-                            parts.push(Part::Literal(
-                                String::from_utf8_lossy(&decoded).into_owned(),
-                            ));
+                        if escaped {
+                            // The index of this segment: one per `/` before it.
+                            let at = axum.bytes().filter(|&b| b == b'/').count();
+                            literals.push((at, part.to_owned()));
                         }
+                        // An escaped literal is taken from the request, decoded
+                        // as the variable is: a kept `%2F` keeps its case there.
+                        parts.push(if part == "*" || escaped {
+                            Part::Capture(captures.len() - 1)
+                        } else {
+                            Part::Literal(part.to_owned())
+                        });
                     }
                     composites.push(Composite {
                         field: field.to_owned(),
