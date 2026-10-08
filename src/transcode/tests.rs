@@ -570,6 +570,36 @@ service S {
 }
 
 #[test]
+fn a_method_the_best_path_lacks_is_answered_by_a_lower_ranked_one() {
+    // `/v1/books/{name=special/*}` answers only GET; a POST of its URL goes to
+    // the catch-all POST, as a transcoder matching the method first would.
+    // With neither, the best path's 405 stands.
+    let routes = routes_of(
+        r#"syntax = "proto3";
+package t;
+import "google/api/annotations.proto";
+message Req { string name = 1; string path = 2; }
+service S {
+  rpc Special(Req) returns (Req) { option (google.api.http) = { get: "/v1/books/{name=special/*}" }; }
+  rpc Upload(Req) returns (Req) { option (google.api.http) = { post: "/v1/{path=**}" }; }
+}
+"#,
+    );
+    assert_eq!(
+        answer(&routes, Method::GET, "/v1/books/special/x"),
+        "/t.S/Special"
+    );
+    assert_eq!(
+        answer(&routes, Method::POST, "/v1/books/special/x"),
+        "/t.S/Upload"
+    );
+    assert_eq!(
+        answer(&routes, Method::PUT, "/v1/books/special/x"),
+        "405 GET, HEAD"
+    );
+}
+
+#[test]
 fn a_bare_wildcard_binds_no_field() {
     // `*` matches a segment but names no field (google/api/http.proto); the
     // name the router gives it must not reach a field that happens to share

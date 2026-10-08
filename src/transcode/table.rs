@@ -286,9 +286,12 @@ impl Routes {
 
     /// What answers `method` on `path` among the tables of `index`, starting
     /// from `first`, the index's own pick: the first table, in the router's
-    /// ranking, that `admits` a binding of. A table whose bindings all refuse
-    /// the request (a field template the value does not follow) leaves it to
-    /// the next one the path also matches. `None` when no table admits one.
+    /// ranking, with an admitted binding of that method. A table whose
+    /// bindings all refuse the request (a field template the value does not
+    /// follow), or answer it only for other methods, leaves it to the next
+    /// one the path also matches, as a transcoder matching the method first
+    /// does; the best-ranked 405 stands when none answers. `None` when no
+    /// table admits a binding.
     fn answer(
         &self,
         index: &Index,
@@ -297,25 +300,36 @@ impl Routes {
         path: &str,
         admits: impl Fn(&Binding) -> bool,
     ) -> Option<Choice> {
-        if let Some(choice) = self.tables[first].choose(first, method, &admits) {
-            return Some(choice);
+        let mut not_allowed = None;
+        match self.tables[first].choose(first, method, &admits) {
+            Some(choice @ Choice::MethodNotAllowed(_)) => not_allowed = Some(choice),
+            Some(choice) => return Some(choice),
+            None => {}
         }
-        // Rare: only a refused template gets here. Rank what is left by
-        // building the router of the remaining tables this path matches.
-        let mut refused = vec![first];
+        // Rare: only a refused template or method gets here. Rank what is
+        // left by building the router of the remaining tables this path
+        // matches.
+        let mut tried = vec![first];
         loop {
             let mut router = matchit::Router::new();
             for &table in &index.tables {
-                if !refused.contains(&table) && self.single[table].at(path).is_ok() {
+                if !tried.contains(&table) && self.single[table].at(path).is_ok() {
                     let inserted = router.insert(self.tables[table].path.as_str(), table);
                     debug_assert!(inserted.is_ok(), "{inserted:?}");
                 }
             }
-            let next = *router.at(path).ok()?.value;
-            if let Some(choice) = self.tables[next].choose(next, method, &admits) {
-                return Some(choice);
+            let Ok(found) = router.at(path) else {
+                return not_allowed;
+            };
+            let next = *found.value;
+            match self.tables[next].choose(next, method, &admits) {
+                Some(choice @ Choice::MethodNotAllowed(_)) => {
+                    not_allowed.get_or_insert(choice);
+                }
+                Some(choice) => return Some(choice),
+                None => {}
             }
-            refused.push(next);
+            tried.push(next);
         }
     }
 
