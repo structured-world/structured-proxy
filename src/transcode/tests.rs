@@ -120,26 +120,90 @@ fn test_proto_path_to_axum_wildcards() {
 }
 
 #[test]
-fn non_terminal_catch_all_degrades_to_single_capture() {
-    // A catch-all `{*name}` is only valid in axum's LAST path segment.
-    // An unsupported/multi-segment field template in a NON-terminal position
-    // (`/v1/{name=projects/*}/topics`) must NOT emit a mid-path catch-all —
-    // axum rejects `/v1/{*name}/topics` at `Router::route()`. It degrades to
-    // a single-segment capture instead.
+fn non_terminal_field_template_is_spelled_out_in_the_path() {
+    // A catch-all `{*name}` is only valid in axum's LAST path segment, so a
+    // multi-segment template before it (`/v1/{name=projects/*}/topics`) is
+    // written into the path itself: its literals as literal segments, each
+    // `*` as a capture of its own, from which the field is put back together.
     assert_eq!(
         proto_path_to_axum("/v1/{name=projects/*}/topics"),
-        "/v1/{name}/topics"
+        "/v1/projects/{name.1}/topics"
     );
     let path = proto_path_to_axum("/v1/{name=projects/*}/topics");
     let _router: Router<()> = Router::new().route(&path, get(|| async { "ok" }));
+    assert!(path::MountedPath::new("/v1/{name=projects/*}/topics")
+        .unsupported
+        .is_none());
 
-    // The same guard applies to an explicit `**` template in non-terminal
-    // position and a terminal one still yields a real catch-all.
-    assert_eq!(proto_path_to_axum("/v1/{rest=**}/tail"), "/v1/{rest}/tail");
+    // `**` before the last segment has no faithful form: the binding is
+    // left out rather than widened to one segment. A terminal one is still
+    // a real catch-all.
+    assert!(path::MountedPath::new("/v1/{rest=**}/tail")
+        .unsupported
+        .is_some());
+    assert!(path::MountedPath::new("/v1/{rest=a/**}/tail")
+        .unsupported
+        .is_some());
     assert_eq!(
         proto_path_to_axum("/v1/files/{rest=**}"),
         "/v1/files/{*rest}"
     );
+}
+
+#[test]
+fn a_non_terminal_field_template_binds_only_its_own_shape() {
+    // `{parent=publishers/*}` before `/books/{id}:cancel` matches
+    // `publishers/<one segment>` only, and binds the whole of it.
+    let routes = routes_of(
+        r#"syntax = "proto3";
+package t;
+import "google/api/annotations.proto";
+message Req { string parent = 1; string id = 2; }
+service S {
+  rpc Cancel(Req) returns (Req) { option (google.api.http) = { post: "/v1/{parent=publishers/*}/books/{id}:cancel" }; }
+}
+"#,
+    );
+    assert_eq!(
+        answer(&routes, Method::POST, "/v1/publishers/p1/books/x:cancel"),
+        "/t.S/Cancel"
+    );
+    assert_eq!(
+        answer(&routes, Method::POST, "/v1/anything/books/x:cancel"),
+        "no route"
+    );
+    let (table, index) = bound_in(&routes, Method::POST, "/v1/publishers/p1/books/x:cancel");
+    let mut params: PathParams = [
+        ("parent.1".to_owned(), "p1".to_owned()),
+        ("id".to_owned(), "x:cancel".to_owned()),
+    ]
+    .into();
+    routes.tables[table].bind_params(index, &mut params);
+    let expected: PathParams = [
+        ("parent".to_owned(), "publishers/p1".to_owned()),
+        ("id".to_owned(), "x".to_owned()),
+    ]
+    .into();
+    assert_eq!(params, expected);
+}
+
+#[test]
+fn templates_differing_only_in_escape_case_are_one_binding() {
+    // `%3A` and `%3a` are one octet (RFC 3986 §6.2.2.1): the second binding
+    // could never be reached, so it is reported as a duplicate.
+    let pool = api_pool(
+        r#"syntax = "proto3";
+package t;
+import "google/api/annotations.proto";
+message Req { string name = 1; }
+service S {
+  rpc A(Req) returns (Req) { option (google.api.http) = { get: "/v1/{name=foo%3Abar/*}" }; }
+  rpc B(Req) returns (Req) { option (google.api.http) = { get: "/v1/{name=foo%3abar/*}" }; }
+}
+"#,
+    );
+    let paths = route_paths(&pool, &[], &RpcSelection::default());
+    assert_eq!(paths.len(), 2, "the duplicate is listed twice: {paths:?}");
 }
 
 #[test]

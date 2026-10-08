@@ -477,7 +477,7 @@ fn route_bindings(
     selection: &RpcSelection,
 ) -> Vec<RouteBinding> {
     let mut bindings = Vec::new();
-    let mut push = |mount: MountedPath, entry: RouteEntry| match path::mountable(&mount.axum) {
+    let mut push = |mount: MountedPath, entry: RouteEntry| match mount.routable() {
         Ok(()) => bindings.push(RouteBinding { entry, mount }),
         Err(error) => tracing::error!(
             path = %mount.display(),

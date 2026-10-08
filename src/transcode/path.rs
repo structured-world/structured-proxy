@@ -32,6 +32,28 @@ pub(crate) struct MountedPath {
     pub(crate) last_template: Option<Vec<String>>,
     /// The index of the last segment, the one the last capture starts at.
     pub(crate) last_segment: usize,
+    /// Why the router cannot hold this template faithfully, when it cannot.
+    pub(crate) unsupported: Option<String>,
+    /// The fields bound to a multi-segment template before the last segment,
+    /// spelled out in the path: each is put back together from its parts.
+    pub(crate) composites: Vec<Composite>,
+}
+
+/// A field whose template (`{parent=publishers/*}`) the path spells out
+/// segment by segment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Composite {
+    pub(crate) field: String,
+    pub(crate) parts: Vec<Part>,
+}
+
+/// One segment of a [`Composite`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Part {
+    /// A literal of the template, as written.
+    Literal(String),
+    /// A `*` of the template: the capture at this position of the path.
+    Capture(usize),
 }
 
 impl MountedPath {
@@ -44,6 +66,10 @@ impl MountedPath {
         let mut shape = String::with_capacity(base.len());
         let mut captures = Vec::new();
         let mut unbound = Vec::new();
+        let mut composites = Vec::new();
+        let mut unsupported = None;
+        // Segments written so far: the last capture starts at this index.
+        let mut written = 0;
         let empty_last = is_double_wildcard(segments[last]);
         let last_template = field_template(segments[last])
             .filter(|template| *template != "*" && *template != "**")
@@ -53,11 +79,63 @@ impl MountedPath {
                     .map(str::to_owned)
                     .collect()
             });
+        let mut last_segment = 0;
         for (idx, segment) in segments.iter().enumerate() {
-            if idx > 0 {
-                axum.push('/');
-                shape.push('/');
+            if idx == last {
+                last_segment = written;
             }
+            let mut push_segment = |axum: &mut String, shape: &mut String| {
+                if written > 0 {
+                    axum.push('/');
+                    shape.push('/');
+                }
+                written += 1;
+            };
+            // A multi-segment template before the last segment: the router
+            // holds no capture across segments there, so its segments are
+            // written out; `**` among them has no such form.
+            let inner = segment.strip_prefix('{').and_then(|s| s.strip_suffix('}'));
+            if let Some((field, template)) = inner
+                .and_then(|inner| inner.split_once('='))
+                .filter(|(_, template)| idx != last && *template != "*")
+            {
+                if template.split('/').any(|part| part == "**") {
+                    unsupported = Some(format!(
+                        "`**` in `{segment}` before the last segment matches any number of \
+                         segments, which the router cannot hold there"
+                    ));
+                } else {
+                    let mut parts = Vec::new();
+                    for (k, part) in template.split('/').enumerate() {
+                        push_segment(&mut axum, &mut shape);
+                        if part == "*" {
+                            let name = format!("{field}.{k}");
+                            axum.push('{');
+                            axum.push_str(&name);
+                            axum.push('}');
+                            shape.push_str("{}");
+                            parts.push(Part::Capture(captures.len()));
+                            captures.push(name);
+                            unbound.push(true);
+                        } else {
+                            axum.push_str(part);
+                            shape.push_str(part);
+                            parts.push(Part::Literal(part.to_owned()));
+                        }
+                    }
+                    composites.push(Composite {
+                        field: field.to_owned(),
+                        parts,
+                    });
+                    continue;
+                }
+            } else if idx != last && is_double_wildcard(segment) {
+                unsupported = Some(format!(
+                    "`{segment}` before the last segment matches any number of segments, \
+                     which the router cannot hold there"
+                ));
+            }
+            push_segment(&mut axum, &mut shape);
             match convert_segment(segment, idx, idx == last) {
                 Segment::Literal(literal) => {
                     axum.push_str(literal);
@@ -83,7 +161,18 @@ impl MountedPath {
             verb: verb.map(str::to_owned),
             empty_last,
             last_template,
-            last_segment: last,
+            last_segment,
+            unsupported,
+            composites,
+        }
+    }
+
+    /// Whether the router can serve this template as written: a template it
+    /// cannot hold faithfully, or a path axum would refuse, is not served.
+    pub(crate) fn routable(&self) -> Result<(), String> {
+        match &self.unsupported {
+            Some(reason) => Err(reason.clone()),
+            None => mountable(&self.axum),
         }
     }
 

@@ -89,7 +89,7 @@ pub fn generate(
                     for path in targets {
                         // The router leaves out a template it cannot match;
                         // documenting it would promise a URL that is 404.
-                        if path::mountable(&path::MountedPath::new(&path).axum).is_err() {
+                        if path::MountedPath::new(&path).routable().is_err() {
                             continue;
                         }
                         let mut operation = operation.clone();

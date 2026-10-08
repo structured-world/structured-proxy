@@ -381,9 +381,11 @@ body, as the route's `google.api.http` rule says:
 A value that is not valid for its field, or two members of one `oneof`, is
 answered with `INVALID_ARGUMENT` (400) before the upstream is called.
 
-A variable bound to a multi-segment template at the end of a path
-(`{name=shelves/*/books/*}`, AIP-127) takes only a value of that shape: its
-literals, one segment per `*`, any number for `**`.
+A variable bound to a multi-segment template (`{name=shelves/*/books/*}`,
+AIP-127) takes only a value of that shape: its literals, one segment per `*`,
+any number for `**`. Before the last segment a template may not use `**`,
+which matches any number of segments there; such a binding is left out with
+an error in the log.
 
 **Custom verbs.** A path template may end in a verb, as AIP-136 custom methods
 do (`post: "/v1/{name=operations/*}:cancel"`):

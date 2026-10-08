@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use axum::http::{HeaderValue, Method};
 
-use super::path::MountedPath;
+use super::path::{Composite, MountedPath, Part};
 use super::rule::RouteMethod;
 use super::{PathParams, RouteEntry};
 
@@ -67,9 +67,11 @@ struct Binding {
     names: Option<Vec<String>>,
     verb: Option<Verb>,
     template: Option<Template>,
-    /// The positions of the captures that stand for a bare `*` or `**`,
-    /// which bind no field.
+    /// The positions of the captures that bind no field of their own: a bare
+    /// `*` or `**`, or a segment of a [`Composite`].
     unbound: Vec<usize>,
+    /// The fields put back together from several captures.
+    composites: Vec<Composite>,
 }
 
 /// The field template of a last capture the router mounts as a catch-all.
@@ -202,10 +204,16 @@ pub(super) struct Claim<'a> {
 /// where their values overlap, the earlier binding answers.
 pub(super) fn clash(claim: &Claim<'_>, other: &Claim<'_>) -> bool {
     claim.verb.map(normalize_escapes) == other.verb.map(normalize_escapes)
-        && claim.template == other.template
+        && normalized(claim.template) == normalized(other.template)
         && (claim.method == other.method
             || *claim.method == RouteMethod::Any
             || *other.method == RouteMethod::Any)
+}
+
+/// The segments of a field template with their escapes in upper case: two
+/// spellings of one octet are one template.
+fn normalized(template: Option<&[String]>) -> Option<Vec<Cow<'_, str>>> {
+    template.map(|segments| segments.iter().map(|s| normalize_escapes(s)).collect())
 }
 
 /// The positions `unbound` marks.
@@ -390,6 +398,7 @@ impl PathTable {
             captures,
             verb,
             empty_last,
+            composites,
             ..
         } = mount;
         Self {
@@ -401,6 +410,7 @@ impl PathTable {
                 verb: verb.map(|raw| Verb::new(raw, empty_last)),
                 template,
                 unbound,
+                composites,
             }],
         }
     }
@@ -439,6 +449,7 @@ impl PathTable {
             verb: mount.verb.map(|raw| Verb::new(raw, mount.empty_last)),
             template,
             unbound,
+            composites: mount.composites,
         });
     }
 
@@ -518,10 +529,31 @@ impl PathTable {
                 }
             }
         }
-        // A bare wildcard was named for the router only.
+        // A field spelled out over several segments, put back together from
+        // them before they go.
+        let composed: Vec<(String, String)> = binding
+            .composites
+            .iter()
+            .map(|composite| {
+                let parts: Vec<&str> = composite
+                    .parts
+                    .iter()
+                    .map(|part| match part {
+                        Part::Literal(literal) => literal.as_str(),
+                        Part::Capture(position) => params
+                            .get(&self.captures[*position])
+                            .map_or("", String::as_str),
+                    })
+                    .collect();
+                (composite.field.clone(), parts.join("/"))
+            })
+            .collect();
+        // A bare wildcard, or a part of a composite, was named for the
+        // router only.
         for &position in &binding.unbound {
             params.remove(&self.captures[position]);
         }
+        params.extend(composed);
         if let Some(names) = &binding.names {
             // Taken out before any goes back in: one binding's name may be
             // another capture's name on the table's path.
