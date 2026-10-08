@@ -841,20 +841,22 @@ impl ProxyServer {
         let forward_auth = auth.as_ref().and_then(|built| {
             auth::forward::ForwardAuth::build(self.config.auth.as_ref()?, built.clone())
         });
-        // The methods a route answers: `*` marks a route that answers every
-        // method, not a method, and a transcoded path with verbs is listed as
-        // `*` while its bindings still name theirs.
-        let mut routed: Vec<http::Method> = mounted
+        // The methods a route answers: `*` is not a method. It marks the
+        // verify endpoint and a `custom` `*` rule, which answer every method,
+        // and a transcoded path with verbs, whose bindings still name theirs.
+        let mut methods: Vec<http::Method> = mounted
             .iter()
             .filter(|(method, _)| method != "*")
             .filter_map(|(method, _)| http::Method::from_bytes(method.as_bytes()).ok())
             .collect();
-        routed.extend(transcode::bound_methods(
-            &pool,
-            &self.config.aliases,
-            &selection,
-        ));
-        let guards = Arc::new(self.guards(resolver, auth, maintenance_exempt, &routed)?);
+        let bound = transcode::bound_methods(&pool, &self.config.aliases, &selection);
+        methods.extend(bound.methods);
+        let routed = if bound.every || verify_path.is_some() {
+            guard::Routed::Every
+        } else {
+            guard::Routed::Methods(&methods)
+        };
+        let guards = Arc::new(self.guards(resolver, auth, maintenance_exempt, routed)?);
 
         // Health routes. Paths are configurable; the whole group is skippable.
         let health_routes = if self.config.health.enabled {
@@ -1009,7 +1011,7 @@ impl ProxyServer {
         resolver: Arc<client_address::Resolver>,
         auth: Option<Arc<auth::Auth>>,
         maintenance_exempt: Vec<String>,
-        routed: &[http::Method],
+        routed: guard::Routed<'_>,
     ) -> anyhow::Result<guard::Guards> {
         use config::Traffic::{Endpoints, Grpc, Transcoded};
         let scope = |config: Option<&ScopeConfig>, default: &[config::Traffic], what: &str| {

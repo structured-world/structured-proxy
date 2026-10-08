@@ -140,7 +140,7 @@ pub(crate) struct Scope {
 impl Scope {
     /// Compile `config` for the guard named `what`, with `default` traffic
     /// when the config names none; `routed` are the methods the proxy's
-    /// routes answer beyond the standard ones (`custom` rules, extra routes).
+    /// routes answer beyond the standard ones.
     ///
     /// # Errors
     /// A scope that covers no traffic, a path glob that is relative or does
@@ -150,7 +150,7 @@ impl Scope {
         config: Option<&ScopeConfig>,
         default: &[Traffic],
         what: &str,
-        routed: &[Method],
+        routed: Routed<'_>,
     ) -> Result<Arc<Self>, String> {
         let traffic = config.and_then(|c| c.traffic.as_deref()).unwrap_or(default);
         let classes = traffic.iter().fold(0, |acc, t| acc | traffic_bits(*t));
@@ -232,6 +232,16 @@ const STANDARD_METHODS: [Method; 9] = [
     Method::PATCH,
 ];
 
+/// The methods the proxy's routes answer beyond the standard ones.
+#[derive(Clone, Copy)]
+pub(crate) enum Routed<'a> {
+    /// These: `custom` rules, extra routes.
+    Methods(&'a [Method]),
+    /// Every method: a route answers them all (a `custom` `*` rule, the
+    /// verify endpoint).
+    Every,
+}
+
 /// One `scope.methods` entry of the guard `what`: a method some request can
 /// carry, or an error. A method no route answers would match no request and
 /// leave the guard covering nothing, unless the scope covers the fallback,
@@ -240,7 +250,7 @@ fn scope_method(
     name: &str,
     what: &str,
     covers_fallback: bool,
-    routed: &[Method],
+    routed: Routed<'_>,
 ) -> Result<Method, String> {
     if name == "*" {
         return Err(format!(
@@ -249,7 +259,11 @@ fn scope_method(
     }
     let method = Method::from_bytes(name.to_ascii_uppercase().as_bytes())
         .map_err(|_| format!("{what}.scope.methods entry {name:?} is not a method"))?;
-    if covers_fallback || STANDARD_METHODS.contains(&method) || routed.contains(&method) {
+    let answered = match routed {
+        Routed::Methods(methods) => methods.contains(&method),
+        Routed::Every => true,
+    };
+    if covers_fallback || STANDARD_METHODS.contains(&method) || answered {
         Ok(method)
     } else {
         Err(format!(

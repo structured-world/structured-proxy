@@ -521,6 +521,31 @@ service Dav {
 }
 
 #[tokio::test]
+async fn a_guard_may_scope_an_extension_method_a_star_rule_answers() {
+    // A `custom` `*` rule answers every method, `PROPFIND` included, so a
+    // scope may name it even when no rule names it on its own.
+    const ANY_PROTO: &str = r#"
+syntax = "proto3";
+package test.v1;
+import "google/api/annotations.proto";
+message Msg { string name = 1; }
+service Any {
+  rpc Inspect(Msg) returns (Msg) {
+    option (google.api.http) = { custom: { kind: "*" path: "/v1/x/{name}" } };
+  }
+}
+"#;
+    let pool = common::compile("test/v1/any.proto", ANY_PROTO);
+    let router = structured_proxy::ProxyServer::from_yaml_str(
+        "upstream:\n  default: \"http://127.0.0.1:1\"\nmaintenance:\n  enabled: true\n  scope:\n    traffic: [transcoded]\n    methods: [\"PROPFIND\"]\n",
+    )
+    .unwrap()
+    .with_descriptors(pool)
+    .router();
+    assert!(router.is_ok(), "the `*` rule answers PROPFIND: {router:?}");
+}
+
+#[tokio::test]
 async fn a_star_rule_with_a_verb_starts_beside_another_verb() {
     // A `custom` `*` rule answers every method, but only for its own verb, so
     // it does not clash with a POST binding of another verb on its path.

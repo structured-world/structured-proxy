@@ -628,23 +628,37 @@ pub fn route_paths(
     paths
 }
 
-/// The methods the transcoded bindings for this pool, aliases and selection
-/// answer, each once: what [`route_paths`] lists under `*` for a path with
-/// verbs still names a method a route answers.
+/// The methods the transcoded bindings for one pool, aliases and selection
+/// answer: what [`route_paths`] lists under `*` still names methods a route
+/// answers, or every one for a `custom` `*` rule.
+pub(crate) struct BoundMethods {
+    /// The methods the bindings name, each once.
+    pub(crate) methods: Vec<Method>,
+    /// Whether a `custom` `*` rule answers every method.
+    pub(crate) every: bool,
+}
+
+/// The [`BoundMethods`] of the transcoded bindings for this pool, aliases
+/// and selection.
 pub(crate) fn bound_methods(
     pool: &DescriptorPool,
     aliases: &[AliasConfig],
     selection: &RpcSelection,
-) -> Vec<Method> {
-    let mut methods: Vec<Method> = Vec::new();
+) -> BoundMethods {
+    let mut bound = BoundMethods {
+        methods: Vec::new(),
+        every: false,
+    };
     for binding in route_bindings(pool, aliases, selection, false) {
-        if let RouteMethod::One(method) = binding.entry.http_method {
-            if !methods.contains(&method) {
-                methods.push(method);
+        match binding.entry.http_method {
+            RouteMethod::One(method) if !bound.methods.contains(&method) => {
+                bound.methods.push(method);
             }
+            RouteMethod::One(_) => {}
+            RouteMethod::Any => bound.every = true,
         }
     }
-    methods
+    bound
 }
 
 /// JSON serialization options shared by the unary and streaming response paths,
