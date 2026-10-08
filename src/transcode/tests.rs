@@ -152,6 +152,16 @@ fn non_terminal_field_template_is_spelled_out_in_the_path() {
         "/v1/files/{*rest}"
     );
 
+    // `**` must be the last part of the path (google/api/http.proto), so a
+    // field template with another segment after it is refused.
+    for template in ["/v1/{name=**/**/x}", "/v1/{name=a/**/b}"] {
+        assert!(
+            path::MountedPath::new(template).routable().is_err(),
+            "{template}"
+        );
+    }
+    assert!(path::MountedPath::new("/v1/{name=a/**}").routable().is_ok());
+
     // A field template holds no variable (google/api/http.proto `Segments`):
     // a nested one is refused, not mounted as a capture of its own.
     for template in ["/v1/{parent=publishers/{id}}/books", "/v1/{name=a/{id}}"] {
@@ -281,6 +291,31 @@ service S {
         answer(&routes, Method::GET, "/v1/foo%3abar/x/books"),
         "/t.S/Books"
     );
+}
+
+#[test]
+fn a_constrained_binding_of_a_shared_path_wins_over_an_earlier_open_one() {
+    // An open binding declared first must not take the values a binding of
+    // the same router path specifically claims, whether by an escaped
+    // literal before the last segment or by a field template at its end.
+    let routes = routes_of(
+        r#"syntax = "proto3";
+package t;
+import "google/api/annotations.proto";
+message Req { string parent = 1; string x = 2; string y = 3; string path = 4; string name = 5; }
+service S {
+  rpc Open(Req) returns (Req) { option (google.api.http) = { get: "/v1/{x}/{y}/books" }; }
+  rpc Books(Req) returns (Req) { option (google.api.http) = { get: "/v1/{parent=foo%3Abar/*}/books" }; }
+  rpc All(Req) returns (Req) { option (google.api.http) = { get: "/v2/{path=**}" }; }
+  rpc Shelf(Req) returns (Req) { option (google.api.http) = { get: "/v2/{name=shelves/*}" }; }
+}
+"#,
+    );
+    let rpc = |path: &str| answer(&routes, Method::GET, path);
+    assert_eq!(rpc("/v1/foo%3Abar/p1/books"), "/t.S/Books");
+    assert_eq!(rpc("/v1/a/b/books"), "/t.S/Open");
+    assert_eq!(rpc("/v2/shelves/1"), "/t.S/Shelf");
+    assert_eq!(rpc("/v2/x/y"), "/t.S/All");
 }
 
 #[test]

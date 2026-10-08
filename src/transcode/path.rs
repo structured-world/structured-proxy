@@ -111,6 +111,16 @@ impl MountedPath {
                     "`{segment}` nests a variable in a field template, which holds none"
                 ));
             }
+            // `**` must be the last part of the path (google/api/http.proto);
+            // anywhere else it would also make matching try every split.
+            if idx == last
+                && field_template(segment)
+                    .is_some_and(|template| template.split('/').rev().skip(1).any(|p| p == "**"))
+            {
+                unsupported = Some(format!(
+                    "`{segment}` puts `**` before another segment; it must be the last one"
+                ));
+            }
             let inner = segment.strip_prefix('{').and_then(|s| s.strip_suffix('}'));
             if let Some((field, template)) = inner
                 .and_then(|inner| inner.split_once('='))

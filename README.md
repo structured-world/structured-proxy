@@ -383,9 +383,10 @@ answered with `INVALID_ARGUMENT` (400) before the upstream is called.
 
 A variable bound to a multi-segment template (`{name=shelves/*/books/*}`,
 AIP-127) takes only a value of that shape: its literals, one segment per `*`,
-any number for `**`. Before the last segment a template may not use `**`,
-which matches any number of segments there; such a binding is left out with
-an error in the log. The value of such a variable, and of `{name=**}`, is
+any number for `**`. `**` must be the last part of the path: a template that
+uses it before the last segment, or puts another segment after it, is left
+out with an error in the log. Of the bindings of one router path, those such
+a template or an escaped literal constrains are tried before the open ones. The value of such a variable, and of `{name=**}`, is
 percent-decoded except for `%2F`, which reaches the field as received, so an
 encoded slash stays distinct from a segment boundary; a single-segment
 variable decodes it. A literal of such a template that holds a percent-escape

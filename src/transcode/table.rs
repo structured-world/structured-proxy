@@ -107,6 +107,12 @@ impl Template {
 }
 
 impl Binding {
+    /// Whether the binding answers only some of the values its router path
+    /// matches: it has an escaped literal or a field template to follow.
+    fn constrained(&self) -> bool {
+        !self.literals.is_empty() || self.template.is_some()
+    }
+
     /// Whether `path` (a request this binding's path matched) has the
     /// binding's literals mounted as captures, and the value of its last
     /// capture follows the binding's field template.
@@ -488,7 +494,7 @@ impl PathTable {
         let multi_segment = positions(&mount.multi_segment);
         let literals = normalized_literals(&mount.literals);
         let names = (mount.captures != self.captures).then_some(mount.captures);
-        self.bindings.push(Binding {
+        let binding = Binding {
             entry,
             names,
             verb: mount.verb.map(|raw| Verb::new(raw, mount.empty_last)),
@@ -497,7 +503,19 @@ impl PathTable {
             multi_segment,
             literals,
             composites: mount.composites,
-        });
+        };
+        // A binding constrained by a literal or a field template answers
+        // only the values it claims: it goes before the open bindings of the
+        // path, which would otherwise take those values by declaration order.
+        let at = if binding.constrained() {
+            self.bindings
+                .iter()
+                .position(|existing| !existing.constrained())
+                .unwrap_or(self.bindings.len())
+        } else {
+            self.bindings.len()
+        };
+        self.bindings.insert(at, binding);
     }
 
     /// Whether the path ends in a literal (a verb after a literal is part of
