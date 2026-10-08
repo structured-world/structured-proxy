@@ -72,6 +72,9 @@ service Ops {
   rpc RunNow(Msg) returns (Msg) {
     option (google.api.http) = { post: "/v2/jobs/{name}:run%3Anow" };
   }
+  rpc Shelve(Msg) returns (Msg) {
+    option (google.api.http) = { post: "/v5/{name=publishers/*}/books/{operation}" };
+  }
 }
 "#;
 
@@ -310,6 +313,24 @@ async fn an_encoded_character_in_the_verb_is_taken_off_decoded() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["rpc"], "RunNow");
     assert_eq!(body["name"], "j1");
+}
+
+async fn a_variable_over_several_segments_keeps_an_encoded_slash() {
+    // A variable that matches several segments is decoded except for `%2F`,
+    // which stays as received; a one-segment variable decodes it
+    // (google/api/http.proto).
+    let app = proxy(UPSTREAM).await;
+    let (status, _, body) = call(&app, Method::POST, "/v5/publishers/a%2Fb%20c/books/x%2Fy").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rpc"], "Shelve");
+    assert_eq!(body["name"], "publishers/a%2Fb c");
+    assert_eq!(body["operation"], "x/y");
+    let (status, _, body) = call(&app, Method::POST, "/v4/a%2fb%20c/d:purge").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["name"], "a%2fb c/d");
+    let (status, _, body) = call(&app, Method::POST, "/v1/publishers/p%2F1/books/b2:restore").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["name"], "publishers/p%2F1/books/b2");
 }
 
 async fn verb_after_a_multi_segment_field_template_routes() {

@@ -70,6 +70,9 @@ struct Binding {
     /// The positions of the captures that bind no field of their own: a bare
     /// `*` or `**`, or a segment of a [`Composite`].
     unbound: Vec<usize>,
+    /// The positions of the captures of a variable matching several
+    /// segments, whose `%2F` stays encoded.
+    multi_segment: Vec<usize>,
     /// The fields put back together from several captures.
     composites: Vec<Composite>,
 }
@@ -216,9 +219,9 @@ fn normalized(template: Option<&[String]>) -> Option<Vec<Cow<'_, str>>> {
     template.map(|segments| segments.iter().map(|s| normalize_escapes(s)).collect())
 }
 
-/// The positions `unbound` marks.
-fn unbound_positions(unbound: &[bool]) -> Vec<usize> {
-    unbound
+/// The positions `marked` marks.
+fn positions(marked: &[bool]) -> Vec<usize> {
+    marked
         .iter()
         .enumerate()
         .filter_map(|(position, &bare)| bare.then_some(position))
@@ -392,7 +395,8 @@ impl PathTable {
     /// A table for `mount`, served first by `entry`.
     pub(super) fn new(mount: MountedPath, entry: RouteEntry) -> Self {
         let template = Template::of(&mount);
-        let unbound = unbound_positions(&mount.unbound);
+        let unbound = positions(&mount.unbound);
+        let multi_segment = positions(&mount.multi_segment);
         let MountedPath {
             axum,
             captures,
@@ -410,6 +414,7 @@ impl PathTable {
                 verb: verb.map(|raw| Verb::new(raw, empty_last)),
                 template,
                 unbound,
+                multi_segment,
                 composites,
             }],
         }
@@ -441,7 +446,8 @@ impl PathTable {
             return;
         }
         let template = Template::of(&mount);
-        let unbound = unbound_positions(&mount.unbound);
+        let unbound = positions(&mount.unbound);
+        let multi_segment = positions(&mount.multi_segment);
         let names = (mount.captures != self.captures).then_some(mount.captures);
         self.bindings.push(Binding {
             entry,
@@ -449,6 +455,7 @@ impl PathTable {
             verb: mount.verb.map(|raw| Verb::new(raw, mount.empty_last)),
             template,
             unbound,
+            multi_segment,
             composites: mount.composites,
         });
     }
@@ -514,6 +521,13 @@ impl PathTable {
         }
         HeaderValue::from_str(&methods.join(", "))
             .expect("method tokens are valid header value characters")
+    }
+
+    /// The positions of the binding at `index`'s captures that keep `%2F`
+    /// encoded: decoded from the request's path by the transcoder, since the
+    /// router decodes every escape.
+    pub(super) fn multi_segment(&self, index: usize) -> &[usize] {
+        &self.bindings[index].multi_segment
     }
 
     /// Turn the path parameters matched on this table's path into those of

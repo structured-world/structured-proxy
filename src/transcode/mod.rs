@@ -36,6 +36,7 @@ use prost_reflect::{
     DescriptorPool, DynamicMessage, FieldDescriptor, MessageDescriptor, MethodDescriptor,
     SerializeOptions,
 };
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -366,12 +367,21 @@ async fn dispatch<S: TranscodeState>(
         Ok(Path(params)) => params,
         Err(rejection) => return rejection.into_response(),
     };
-    if table != matched {
+    let multi_segment = routes.tables[table].multi_segment(index);
+    if table != matched || !multi_segment.is_empty() {
         // Another path the request matches answers it (a verb bound there, or
-        // the only bindings without a verb): its captures come from that path,
-        // the router's prefix parameters stay.
-        if let Err(rejection) = rebind(&routes, matched, table, parts.uri.path(), &mut path_params)
-        {
+        // the only bindings without a verb), or a variable over several
+        // segments keeps `%2F` the router decoded: the captures come from the
+        // request's path, the router's prefix parameters stay.
+        let path = parts.uri.path();
+        if let Err(rejection) = rebind(
+            &routes,
+            matched,
+            table,
+            multi_segment,
+            path,
+            &mut path_params,
+        ) {
             return rejection.into_response(routes.tables[table].entry(index));
         }
     }
@@ -408,11 +418,13 @@ async fn dispatch<S: TranscodeState>(
 }
 
 /// Replace the captures of the table at `matched` in `params` with those of
-/// the table at `chosen`, percent-decoded as the router decodes its own.
+/// the table at `chosen`, percent-decoded as the router decodes its own except
+/// at the positions of `multi_segment`, which keep `%2F`.
 fn rebind(
     routes: &Routes,
     matched: usize,
     chosen: usize,
+    multi_segment: &[usize],
     path: &str,
     params: &mut PathParams,
 ) -> Result<(), Unmappable> {
@@ -422,11 +434,15 @@ fn rebind(
     let found = routes
         .params_of(chosen, path)
         .expect("the chosen table was found by matching this path");
-    for (name, raw) in found.iter() {
-        let value = percent_encoding::percent_decode_str(raw)
-            .decode_utf8()
+    for (position, (name, raw)) in found.iter().enumerate() {
+        let decoded: Cow<'_, [u8]> = if multi_segment.contains(&position) {
+            path::decode_multi_segment(raw)
+        } else {
+            percent_encoding::percent_decode_str(raw).into()
+        };
+        let value = String::from_utf8(decoded.into_owned())
             .map_err(|_| Unmappable(format!("path parameter {name} is not valid UTF-8")))?;
-        params.insert(name.to_owned(), value.into_owned());
+        params.insert(name.to_owned(), value);
     }
     Ok(())
 }

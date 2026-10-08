@@ -385,7 +385,10 @@ A variable bound to a multi-segment template (`{name=shelves/*/books/*}`,
 AIP-127) takes only a value of that shape: its literals, one segment per `*`,
 any number for `**`. Before the last segment a template may not use `**`,
 which matches any number of segments there; such a binding is left out with
-an error in the log.
+an error in the log. The value of such a variable, and of `{name=**}`, is
+percent-decoded except for `%2F`, which reaches the field as received, so an
+encoded slash stays distinct from a segment boundary; a single-segment
+variable decodes it.
 
 **Custom verbs.** A path template may end in a verb, as AIP-136 custom methods
 do (`post: "/v1/{name=operations/*}:cancel"`):

@@ -425,6 +425,19 @@ fn mountable_refuses_what_axum_would_panic_on() {
 }
 
 #[test]
+fn a_route_with_more_captures_than_the_router_holds_is_refused() {
+    // The router names its captures `a` to `z` and panics on a 26th; a
+    // spelled-out field template reaches that from one variable.
+    let captures = |count: usize| (0..count).map(|k| format!("/{{c{k}}}")).collect::<String>();
+    assert!(path::mountable(&captures(25)).is_ok());
+    assert!(path::mountable(&format!("{}/{{*rest}}", captures(25))).is_ok());
+    assert!(path::mountable(&captures(26)).is_err());
+    let stars = vec!["*"; 26].join("/");
+    let mount = path::MountedPath::new(&format!("/v1/{{parent={stars}}}/books"));
+    assert!(mount.routable().is_err());
+}
+
+#[test]
 fn route_paths_list_one_route_for_bindings_that_differ_only_by_verb() {
     // A verb after a variable is matched past the router, so the bindings of
     // one method that differ only by it share a route; a repeated method,

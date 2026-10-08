@@ -21,6 +21,9 @@ pub(crate) struct MountedPath {
     /// For each capture, whether it stands for a bare `*` or `**`: the router
     /// needs a name for it, but it binds no field (google/api/http.proto).
     pub(crate) unbound: Vec<bool>,
+    /// For each capture, whether it is (part of) a variable matching several
+    /// segments, whose value keeps `%2F` encoded (google/api/http.proto).
+    pub(crate) multi_segment: Vec<bool>,
     /// The custom verb after the last segment's variable, `:` included.
     pub(crate) verb: Option<String>,
     /// Whether the last capture may be empty: a `**` matches zero or more
@@ -50,7 +53,8 @@ pub(crate) struct Composite {
 /// One segment of a [`Composite`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Part {
-    /// A literal of the template, percent-decoded as the captures are.
+    /// A literal of the template, percent-decoded as the captures of a
+    /// variable over several segments are.
     Literal(String),
     /// A `*` of the template: the capture at this position of the path.
     Capture(usize),
@@ -66,6 +70,7 @@ impl MountedPath {
         let mut shape = String::with_capacity(base.len());
         let mut captures = Vec::new();
         let mut unbound = Vec::new();
+        let mut multi_segment = Vec::new();
         let mut composites = Vec::new();
         let mut unsupported = None;
         // Segments written so far: the last capture starts at this index.
@@ -117,12 +122,12 @@ impl MountedPath {
                             parts.push(Part::Capture(captures.len()));
                             captures.push(name);
                             unbound.push(true);
+                            multi_segment.push(true);
                         } else {
                             axum.push_str(part);
                             shape.push_str(part);
-                            let decoded = percent_encoding::percent_decode_str(part)
-                                .decode_utf8_lossy()
-                                .into_owned();
+                            let decoded =
+                                String::from_utf8_lossy(&decode_multi_segment(part)).into_owned();
                             parts.push(Part::Literal(decoded));
                         }
                     }
@@ -153,6 +158,7 @@ impl MountedPath {
                     shape.push('}');
                     captures.push(name);
                     unbound.push(*segment == "*" || *segment == "**");
+                    multi_segment.push(catch_all);
                 }
             }
         }
@@ -161,6 +167,7 @@ impl MountedPath {
             shape,
             captures,
             unbound,
+            multi_segment,
             verb: verb.map(str::to_owned),
             empty_last,
             last_template,
@@ -221,6 +228,28 @@ pub(crate) fn mountable(axum_path: &str) -> Result<(), String> {
     {
         return Err("a path segment must not start with ':' or '*'".to_string());
     }
+    // A variable is a whole segment (google/api/http.proto `Segment`), checked
+    // here rather than left to the router, which may accept text around one.
+    let mut captures = 0usize;
+    for segment in axum_path.split('/') {
+        let Some(at) = segment.find(['{', '}']) else {
+            continue;
+        };
+        let inner = segment.strip_prefix('{').and_then(|s| s.strip_suffix('}'));
+        if at != 0 || inner.is_none_or(|inner| inner.contains(['{', '}'])) {
+            return Err(format!("`{segment}` is not a whole-segment variable"));
+        }
+        if !segment.starts_with("{*") {
+            captures += 1;
+        }
+    }
+    // The router renames captures `a` to `z` and panics on a 26th (catch-alls
+    // are not renamed).
+    if captures > 25 {
+        return Err(format!(
+            "{captures} variables; the router holds at most 25 before the last"
+        ));
+    }
     matchit::Router::new()
         .insert(axum_path, ())
         .map_err(|e| e.to_string())
@@ -250,6 +279,27 @@ fn split_verb(template: &str) -> (&str, Option<&str>) {
         }
         _ => (template, None),
     }
+}
+
+/// `raw` percent-decoded as the value of a variable matching several segments
+/// is: every escape but `%2F` and `%2f`, which stay as written
+/// (google/api/http.proto). Borrowed when there is nothing to decode.
+pub(crate) fn decode_multi_segment(raw: &str) -> Cow<'_, [u8]> {
+    let is_slash =
+        |escape: &[u8]| escape[0] == b'%' && escape[1] == b'2' && escape[2] | 0x20 == b'f';
+    let bytes = raw.as_bytes();
+    if !bytes.windows(3).any(is_slash) {
+        return percent_encoding::percent_decode(bytes).into();
+    }
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut rest = bytes;
+    while let Some(at) = rest.windows(3).position(is_slash) {
+        decoded.extend(percent_encoding::percent_decode(&rest[..at]));
+        decoded.extend_from_slice(&rest[at..at + 3]);
+        rest = &rest[at + 3..];
+    }
+    decoded.extend(percent_encoding::percent_decode(rest));
+    Cow::Owned(decoded)
 }
 
 /// Whether `segment` is `**` or a variable bound to it (`{name=**}`).
