@@ -75,6 +75,12 @@ service Ops {
   rpc RunSlash(Msg) returns (Msg) {
     option (google.api.http) = { post: "/v6/{name=**}:run%2Fnow" };
   }
+  rpc Fixed(Msg) returns (Msg) {
+    option (google.api.http) = { get: "/v7/{name=foo%2Fbar}" };
+  }
+  rpc FixedMid(Msg) returns (Msg) {
+    option (google.api.http) = { get: "/v8/{name=foo%2Fbar}/x" };
+  }
   rpc Shelve(Msg) returns (Msg) {
     option (google.api.http) = { post: "/v5/{name=publishers/*}/books/{operation}" };
   }
@@ -339,6 +345,22 @@ async fn a_variable_over_several_segments_keeps_an_encoded_slash() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["rpc"], "RunSlash");
     assert_eq!(body["name"], "a/b");
+    // Whatever the case of its escape.
+    let (status, _, body) = call(&app, Method::POST, "/v6/a/b:run%2fnow").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["name"], "a/b");
+}
+
+async fn a_field_template_of_one_segment_is_decoded_in_full() {
+    // A template of one segment is a one-segment variable: `%2F` is decoded
+    // like any other escape (google/api/http.proto).
+    let app = proxy(UPSTREAM).await;
+    for (uri, rpc) in [("/v7/foo%2Fbar", "Fixed"), ("/v8/foo%2fbar/x", "FixedMid")] {
+        let (status, _, body) = call(&app, Method::GET, uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert_eq!(body["rpc"], rpc, "{uri}");
+        assert_eq!(body["name"], "foo/bar", "{uri}");
+    }
 }
 
 async fn verb_after_a_multi_segment_field_template_routes() {

@@ -152,8 +152,8 @@ struct Verb {
     raw: String,
     /// `raw` percent-decoded: what ends the decoded value of the capture.
     decoded: String,
-    /// `raw` decoded as a variable over several segments is, `%2F` kept:
-    /// what ends the value of such a capture.
+    /// `raw` decoded as a variable over several segments is, `%2F` kept in
+    /// upper case: what ends the value of such a capture, escapes' case aside.
     multi_segment: String,
     /// Whether the capture before it may be empty (`**`).
     empty_ok: bool,
@@ -575,14 +575,21 @@ impl PathTable {
     pub(super) fn bind_params(&self, index: usize, params: &mut PathParams) {
         let binding = &self.bindings[index];
         if let (Some(verb), Some(last)) = (&binding.verb, self.captures.last()) {
-            // The verb comes off decoded as the capture was.
-            let suffix = if binding.multi_segment.contains(&(self.captures.len() - 1)) {
-                &verb.multi_segment
-            } else {
-                &verb.decoded
-            };
+            // The verb comes off decoded as the capture was; a kept `%2F` may
+            // be spelled in either case.
+            let multi = binding.multi_segment.contains(&(self.captures.len() - 1));
             if let Some(value) = params.get_mut(last) {
-                if let Some(len) = value.strip_suffix(suffix.as_str()).map(str::len) {
+                let len = if multi {
+                    let suffix = verb.multi_segment.len();
+                    value.len().checked_sub(suffix).filter(|&start| {
+                        value.get(start..).is_some_and(|tail| {
+                            normalize_escapes(tail) == verb.multi_segment.as_str()
+                        })
+                    })
+                } else {
+                    value.strip_suffix(verb.decoded.as_str()).map(str::len)
+                };
+                if let Some(len) = len {
                     value.truncate(len);
                 }
             }
@@ -634,7 +641,8 @@ impl Verb {
         let decoded = percent_encoding::percent_decode_str(&raw)
             .decode_utf8_lossy()
             .into_owned();
-        let multi_segment = String::from_utf8_lossy(&decode_multi_segment(&raw)).into_owned();
+        let multi_segment =
+            normalize_escapes(&String::from_utf8_lossy(&decode_multi_segment(&raw))).into_owned();
         Self {
             raw: normalize_escapes(&raw).into_owned(),
             decoded,

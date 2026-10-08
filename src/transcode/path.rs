@@ -59,8 +59,8 @@ pub(crate) struct Composite {
 /// One segment of a [`Composite`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Part {
-    /// A literal of the template, percent-decoded as the captures of a
-    /// variable over several segments are.
+    /// A literal of the template, percent-decoded as the variable's captures
+    /// are.
     Literal(String),
     /// A `*` of the template: the capture at this position of the path.
     Capture(usize),
@@ -106,6 +106,11 @@ impl MountedPath {
             // A multi-segment template before the last segment: the router
             // holds no capture across segments there, so its segments are
             // written out; `**` among them has no such form.
+            if field_template(segment).is_some_and(|template| template.contains(['{', '}'])) {
+                unsupported = Some(format!(
+                    "`{segment}` nests a variable in a field template, which holds none"
+                ));
+            }
             let inner = segment.strip_prefix('{').and_then(|s| s.strip_suffix('}'));
             if let Some((field, template)) = inner
                 .and_then(|inner| inner.split_once('='))
@@ -117,6 +122,9 @@ impl MountedPath {
                          segments, which the router cannot hold there"
                     ));
                 } else {
+                    // A template of one segment (`{name=foo}`) is a variable of
+                    // one segment, decoded in full.
+                    let multi = template.contains('/');
                     let mut parts = Vec::new();
                     for (k, part) in template.split('/').enumerate() {
                         push_segment(&mut axum, &mut shape);
@@ -129,7 +137,7 @@ impl MountedPath {
                             shape.push_str("{}");
                             captures.push(name);
                             unbound.push(true);
-                            multi_segment.push(true);
+                            multi_segment.push(multi);
                         } else {
                             axum.push_str(part);
                             shape.push_str(part);
@@ -142,9 +150,14 @@ impl MountedPath {
                                 let at = axum.bytes().filter(|&b| b == b'/').count();
                                 literals.push((at, part.to_owned()));
                             }
-                            let decoded =
-                                String::from_utf8_lossy(&decode_multi_segment(part)).into_owned();
-                            parts.push(Part::Literal(decoded));
+                            let decoded = if multi {
+                                decode_multi_segment(part)
+                            } else {
+                                percent_encoding::percent_decode_str(part).into()
+                            };
+                            parts.push(Part::Literal(
+                                String::from_utf8_lossy(&decoded).into_owned(),
+                            ));
                         }
                     }
                     composites.push(Composite {
@@ -174,7 +187,9 @@ impl MountedPath {
                     shape.push('}');
                     captures.push(name);
                     unbound.push(*segment == "*" || *segment == "**");
-                    multi_segment.push(catch_all);
+                    // A catch-all may hold a template of one segment; what
+                    // counts is the template.
+                    multi_segment.push(catch_all && spans_segments(segment));
                 }
             }
         }
@@ -317,6 +332,14 @@ pub(crate) fn decode_multi_segment(raw: &str) -> Cow<'_, [u8]> {
     }
     decoded.extend(percent_encoding::percent_decode(rest));
     Cow::Owned(decoded)
+}
+
+/// Whether `segment` is a variable over several segments: `**`, or a field
+/// template with more than one segment or a `**`.
+fn spans_segments(segment: &str) -> bool {
+    segment == "**"
+        || field_template(segment)
+            .is_some_and(|template| template.contains('/') || template == "**")
 }
 
 /// Whether `segment` is `**` or a variable bound to it (`{name=**}`).

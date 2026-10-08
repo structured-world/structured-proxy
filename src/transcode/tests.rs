@@ -151,6 +151,15 @@ fn non_terminal_field_template_is_spelled_out_in_the_path() {
         proto_path_to_axum("/v1/files/{rest=**}"),
         "/v1/files/{*rest}"
     );
+
+    // A field template holds no variable (google/api/http.proto `Segments`):
+    // a nested one is refused, not mounted as a capture of its own.
+    for template in ["/v1/{parent=publishers/{id}}/books", "/v1/{name=a/{id}}"] {
+        assert!(
+            path::MountedPath::new(template).routable().is_err(),
+            "{template}"
+        );
+    }
 }
 
 #[test]
