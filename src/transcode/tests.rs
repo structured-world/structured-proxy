@@ -259,6 +259,31 @@ service S {
 }
 
 #[test]
+fn a_path_ending_in_a_literal_its_bindings_refuse_leaves_the_url_to_others() {
+    // The escaped literal makes `/books` a path ending in a literal whose
+    // binding refuses `other`: the lower-ranked path still answers.
+    let routes = routes_of(
+        r#"syntax = "proto3";
+package t;
+import "google/api/annotations.proto";
+message Req { string parent = 1; string x = 2; string y = 3; string z = 4; }
+service S {
+  rpc Books(Req) returns (Req) { option (google.api.http) = { get: "/v1/{parent=foo%3Abar/*}/books" }; }
+  rpc Any(Req) returns (Req) { option (google.api.http) = { get: "/v1/{x}/{y}/{z}" }; }
+}
+"#,
+    );
+    assert_eq!(
+        answer(&routes, Method::GET, "/v1/other/x/books"),
+        "/t.S/Any"
+    );
+    assert_eq!(
+        answer(&routes, Method::GET, "/v1/foo%3abar/x/books"),
+        "/t.S/Books"
+    );
+}
+
+#[test]
 fn spelled_out_templates_differing_only_in_an_encoded_literal_both_serve() {
     // Neither binding repeats the other: each answers its own literal.
     let routes = routes_of(

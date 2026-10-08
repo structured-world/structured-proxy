@@ -380,7 +380,9 @@ impl Routes {
     /// to the table at `table`.
     ///
     /// - A path ending in a literal matched exactly: its bindings answer, as a
-    ///   static route wins over a variable everywhere.
+    ///   static route wins over a variable everywhere, unless none of them
+    ///   fits (an escaped literal of a field template is a capture to the
+    ///   router): then the URL is the other paths'.
     /// - A verb some table binds for this path owns the URL: only the
     ///   bindings of that verb answer it.
     /// - Otherwise the bindings without a verb answer, of the best path that
@@ -388,9 +390,9 @@ impl Routes {
     pub(super) fn choose(&self, table: usize, method: &Method, path: &str) -> Choice {
         let plain = |binding: &Binding| binding.verb.is_none() && binding.fits(path);
         if self.tables[table].literal_end() {
-            return self.tables[table]
-                .choose(table, method, plain)
-                .unwrap_or(Choice::NotFound);
+            if let Some(choice) = self.tables[table].choose(table, method, plain) {
+                return choice;
+            }
         }
         if let Some((rest, verb)) = split_verb(path) {
             let verb = normalize_escapes(verb);
