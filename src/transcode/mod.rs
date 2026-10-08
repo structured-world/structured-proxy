@@ -258,13 +258,28 @@ pub fn routes_with_options<S: TranscodeState>(
     aliases: &[AliasConfig],
     options: &TranscodeOptions,
 ) -> Router<S> {
+    let (router, chooser) = routes_and_chooser(pool, aliases, options);
+    match chooser {
+        Some(chooser) => chooser.layer(router),
+        None => router,
+    }
+}
+
+/// The routes of [`routes_with_options`] without their [`Chooser`], which
+/// the caller lays over them outside its own layers.
+pub(crate) fn routes_and_chooser<S: TranscodeState>(
+    pool: &DescriptorPool,
+    aliases: &[AliasConfig],
+    options: &TranscodeOptions,
+) -> (Router<S>, Option<Chooser>) {
     let tables = path_tables(pool, aliases, options);
     if tables.is_empty() {
         tracing::warn!("No HTTP-annotated RPCs found in proto descriptors");
-        return Router::new();
+        return (Router::new(), None);
     }
 
     let routes = Arc::new(Routes::new(tables));
+    let chooser = Chooser(routes.clone());
     let mut router: Router<S> = Router::new();
     for (table, mounted) in routes.tables.iter().enumerate() {
         let routes = routes.clone();
@@ -280,7 +295,57 @@ pub fn routes_with_options<S: TranscodeState>(
             }),
         );
     }
-    router
+    (router, Some(chooser))
+}
+
+/// Chooses the binding a request reaches before any layer under it runs: a
+/// URL no binding answers (its field template, its custom verb) is handed
+/// back as [`Unrouted`] without passing the transcoded routes' guards.
+#[derive(Clone)]
+pub(crate) struct Chooser(Arc<Routes>);
+
+impl Chooser {
+    /// `router`, the transcoded routes, with this chooser outside its layers.
+    pub(crate) fn layer<S: TranscodeState>(self, router: Router<S>) -> Router<S> {
+        router.layer(axum::middleware::from_fn_with_state(self, choose_first))
+    }
+}
+
+/// The binding chosen for a request before the layers under the
+/// [`Chooser`], for [`dispatch`].
+#[derive(Clone)]
+struct Chosen(Choice);
+
+/// A request the transcoded routes matched by path but no binding answers,
+/// on the `404` they return: a fallback set after them takes it instead.
+#[derive(Clone)]
+pub(crate) struct Unrouted(Arc<std::sync::Mutex<Option<Request>>>);
+
+impl Unrouted {
+    /// The request, the first time it is taken.
+    pub(crate) fn take(&self) -> Option<Request> {
+        self.0.lock().map_or(None, |mut request| request.take())
+    }
+}
+
+async fn choose_first(
+    State(Chooser(routes)): State<Chooser>,
+    mut request: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    match routes.route(request.method(), request.uri().path()) {
+        Some((_, Choice::NotFound)) => {
+            let mut response = StatusCode::NOT_FOUND.into_response();
+            let request = Unrouted(Arc::new(std::sync::Mutex::new(Some(request))));
+            response.extensions_mut().insert(request);
+            response
+        }
+        Some((_, choice)) => {
+            request.extensions_mut().insert(Chosen(choice));
+            next.run(request).await
+        }
+        None => next.run(request).await,
+    }
 }
 
 /// The tables [`routes_with_options`] mounts, one per router path, each
@@ -391,7 +456,11 @@ async fn dispatch<S: TranscodeState>(
     request: Request,
 ) -> Response {
     let (mut parts, body) = request.into_parts();
-    let (table, index) = match routes.choose(matched, &parts.method, parts.uri.path()) {
+    let choice = match parts.extensions.remove::<Chosen>() {
+        Some(Chosen(choice)) => choice,
+        None => routes.choose(matched, &parts.method, parts.uri.path()),
+    };
+    let (table, index) = match choice {
         Choice::Route { table, index } => (table, index),
         Choice::MethodNotAllowed(allow) => {
             return (StatusCode::METHOD_NOT_ALLOWED, [(ALLOW, allow)]).into_response()

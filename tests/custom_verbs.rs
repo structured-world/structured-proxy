@@ -521,6 +521,33 @@ service Dav {
 }
 
 #[tokio::test]
+async fn a_url_no_binding_answers_reaches_the_fallback() {
+    // The router matches these paths, yet no template takes the URL: not its
+    // field template, not its verb. It belongs to the embedder's fallback,
+    // while a URL a binding answers for another method stays a 405.
+    let pool: DescriptorPool = common::compile("test/v1/ops.proto", OPS_PROTO);
+    let msg = pool.get_message_by_name("test.v1.Msg").unwrap();
+    let fallback = axum::Router::new().fallback(|| async { (StatusCode::IM_A_TEAPOT, "yours") });
+    let service = structured_proxy::ProxyServer::new()
+        .with_descriptors(pool)
+        .service(tonic::service::Routes::new(Ops { msg }))
+        .unwrap()
+        .with_fallback(fallback);
+    let app = common::App::new(service);
+    for uri in ["/v1/anything/else:restore", "/v2/jobs/j1:other"] {
+        let request = http::Request::post(uri).body(Body::empty()).unwrap();
+        let (status, body) = common::send(&app, request).await;
+        assert_eq!(status, StatusCode::IM_A_TEAPOT, "{uri}");
+        assert_eq!(body, "yours", "{uri}");
+    }
+    let (status, _, _) = call(&app, Method::GET, "/v2/jobs/j1:run%3Anow").await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    let (status, _, body) = call(&app, Method::POST, "/v1/publishers/p1/books/b2:restore").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rpc"], "Restore");
+}
+
+#[tokio::test]
 async fn a_guard_may_scope_an_extension_method_a_star_rule_answers() {
     // A `custom` `*` rule answers every method, `PROPFIND` included, so a
     // scope may name it even when no rule names it on its own.

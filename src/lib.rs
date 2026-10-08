@@ -825,7 +825,7 @@ impl ProxyServer {
         let cors = self.build_cors()?;
 
         // Build transcoding routes from descriptor pool.
-        let transcode_routes = transcode::routes_with_options(
+        let (transcode_routes, chooser) = transcode::routes_and_chooser(
             &pool,
             &self.config.aliases,
             &self.transcode.clone().with_selection(selection.clone()),
@@ -980,8 +980,16 @@ impl ProxyServer {
         // Each class of traffic behind the guards that cover it, so a request
         // runs only the guards of its own class. A path no route answers
         // reaches the plain 404 (or the fallback's own guards).
+        // The binding is chosen before the transcoded guards: a URL no
+        // binding answers is no transcoded request, and goes past them to the
+        // fallback's own guards (or the plain 404).
+        let transcoded = guards.router(transcode_routes, guard::Class::Transcoded);
+        let transcoded = match chooser {
+            Some(chooser) => chooser.layer(transcoded),
+            None => transcoded,
+        };
         let router = Router::new()
-            .merge(guards.router(transcode_routes, guard::Class::Transcoded))
+            .merge(transcoded)
             .merge(guards.router(endpoints, guard::Class::Endpoints))
             .merge(guards.router(verify, guard::Class::Verify))
             // Before every guard: they and the handlers read its result.

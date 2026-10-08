@@ -414,7 +414,9 @@ do (`post: "/v1/{name=operations/*}:cancel"`):
 - A path with a verb after its variable answers every method, so an extra
   route of yours on the same path stops the proxy at startup.
 - A URL that bindings answer, but none with the request's method, is `405`,
-  with their methods in `Allow`; a path that no binding answers is `404`.
+  with their methods in `Allow`. A URL that no binding answers, its field
+  template or verb not fitting, is no route of the proxy: `404`, or your
+  fallback's.
 
 A template the router cannot match, such as text around a variable within one
 segment (`/v1/a{name}b`), is left out with an error in the log; the other
@@ -1221,7 +1223,8 @@ A plain TCP connection passes `stream.connect_info()` directly
 ### What passes through
 
 A request no route matches gets `404`, or goes to your own service with
-`ProxyService::with_fallback(my_axum_app)`. Native gRPC calls and the fallback
+`ProxyService::with_fallback(my_axum_app)`; so does a URL whose path a
+transcoded route matches but no binding answers. Native gRPC calls and the fallback
 pass only the guards whose scope names `grpc` or `fallback` (see
 [Guards and scopes](#guards-and-scopes)); by default none does. The fallback
 keeps its own CORS and tracing.

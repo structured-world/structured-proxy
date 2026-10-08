@@ -33,6 +33,8 @@ pub(super) struct Routes {
     /// Each table's path alone: whether a request matches a given table, and
     /// with which captures, whatever ranks above it.
     single: Vec<matchit::Router<()>>,
+    /// Every table's path: the one the router matches a request to.
+    all: matchit::Router<usize>,
 }
 
 /// Some of the tables, ranked as the router ranks their paths.
@@ -166,6 +168,7 @@ struct Verb {
 }
 
 /// What answers a request.
+#[derive(Clone)]
 pub(super) enum Choice {
     /// The binding at `index` of the table at `table`.
     Route { table: usize, index: usize },
@@ -293,7 +296,10 @@ impl Routes {
         let mut verbs: HashMap<String, Index> = HashMap::new();
         let mut plain = Index::default();
         let mut single = Vec::with_capacity(tables.len());
+        let mut all = matchit::Router::new();
         for (index, table) in tables.iter().enumerate() {
+            let inserted = all.insert(table.path.as_str(), index);
+            debug_assert!(inserted.is_ok(), "{}: {inserted:?}", table.path);
             let mut alone = matchit::Router::new();
             let inserted = alone.insert(table.path.as_str(), ());
             debug_assert!(inserted.is_ok(), "{}: {inserted:?}", table.path);
@@ -318,7 +324,15 @@ impl Routes {
             verbs,
             plain,
             single,
+            all,
         }
+    }
+
+    /// What answers `method` on `path`, with the table the router matches
+    /// it to; `None` when it matches no table.
+    pub(super) fn route(&self, method: &Method, path: &str) -> Option<(usize, Choice)> {
+        let matched = *self.all.at(path).ok()?.value;
+        Some((matched, self.choose(matched, method, path)))
     }
 
     /// The router's match of `path` on the table at `table`, which [`choose`]
