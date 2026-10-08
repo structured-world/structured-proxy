@@ -237,6 +237,34 @@ service S {
         bound_fields(&routes, Method::GET, "/v1/publishers/foo%3Abar/p1/books/x"),
         expected
     );
+    // `%3a` is the same octet (RFC 3986 §6.2.2.1); another literal is not.
+    assert_eq!(
+        bound_fields(&routes, Method::GET, "/v1/publishers/foo%3abar/p1/books/x"),
+        expected
+    );
+    // The escaped literal is a capture to the router: the binding refuses it.
+    assert_eq!(
+        answer(&routes, Method::GET, "/v1/publishers/foo/p1/books/x"),
+        "404"
+    );
+}
+
+#[test]
+fn spelled_out_templates_differing_only_in_an_encoded_literal_both_serve() {
+    // Neither binding repeats the other: each answers its own literal.
+    let routes = routes_of(
+        r#"syntax = "proto3";
+package t;
+import "google/api/annotations.proto";
+message Req { string p = 1; string q = 2; }
+service S {
+  rpc A(Req) returns (Req) { option (google.api.http) = { get: "/v1/{p=a%3Ab/*}/x" }; }
+  rpc C(Req) returns (Req) { option (google.api.http) = { get: "/v1/{q=c%3Ad/*}/x" }; }
+}
+"#,
+    );
+    assert_eq!(answer(&routes, Method::GET, "/v1/a%3Ab/1/x"), "/t.S/A");
+    assert_eq!(answer(&routes, Method::GET, "/v1/c%3ad/1/x"), "/t.S/C");
 }
 
 #[test]

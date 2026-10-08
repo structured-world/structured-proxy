@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use axum::http::{HeaderValue, Method};
 
-use super::path::{Composite, MountedPath, Part};
+use super::path::{decode_multi_segment, Composite, MountedPath, Part};
 use super::rule::RouteMethod;
 use super::{PathParams, RouteEntry};
 
@@ -75,6 +75,10 @@ struct Binding {
     multi_segment: Vec<usize>,
     /// The fields put back together from several captures.
     composites: Vec<Composite>,
+    /// The literals of those fields mounted as captures, escapes in upper
+    /// case, with the index of their path segment: what that segment must
+    /// equal.
+    literals: Vec<(usize, String)>,
 }
 
 /// The field template of a last capture the router mounts as a catch-all.
@@ -103,9 +107,16 @@ impl Template {
 }
 
 impl Binding {
-    /// Whether the value of the last capture in `path` (a request this
-    /// binding's path matched) follows the binding's field template.
+    /// Whether `path` (a request this binding's path matched) has the
+    /// binding's literals mounted as captures, and the value of its last
+    /// capture follows the binding's field template.
     fn fits(&self, path: &str) -> bool {
+        for (at, literal) in &self.literals {
+            let segment = path.split('/').nth(*at);
+            if segment.is_none_or(|segment| normalize_escapes(segment) != literal.as_str()) {
+                return false;
+            }
+        }
         let Some(template) = &self.template else {
             return true;
         };
@@ -141,6 +152,9 @@ struct Verb {
     raw: String,
     /// `raw` percent-decoded: what ends the decoded value of the capture.
     decoded: String,
+    /// `raw` decoded as a variable over several segments is, `%2F` kept:
+    /// what ends the value of such a capture.
+    multi_segment: String,
     /// Whether the capture before it may be empty (`**`).
     empty_ok: bool,
 }
@@ -193,21 +207,30 @@ pub(super) fn normalize_escapes(text: &str) -> Cow<'_, str> {
     Cow::Owned(normalized)
 }
 
-/// What a binding claims on its path: the method, the verb and the field
-/// template of its last capture.
+/// What a binding claims on its path: the method, the verb, the field
+/// template of its last capture and the literals mounted as captures.
 pub(super) struct Claim<'a> {
     pub(super) method: &'a RouteMethod,
     pub(super) verb: Option<&'a str>,
     pub(super) template: Option<&'a [String]>,
+    pub(super) literals: &'a [(usize, String)],
 }
 
-/// Whether two bindings of one path cannot both serve: the same verb and
-/// field template, and the same method or a `custom` `*` rule, which answers
-/// every method. Bindings whose templates differ answer different values;
-/// where their values overlap, the earlier binding answers.
+/// Whether two bindings of one path cannot both serve: the same verb, field
+/// template and literals, and the same method or a `custom` `*` rule, which
+/// answers every method. Bindings whose templates differ answer different
+/// values; where their values overlap, the earlier binding answers.
 pub(super) fn clash(claim: &Claim<'_>, other: &Claim<'_>) -> bool {
     claim.verb.map(normalize_escapes) == other.verb.map(normalize_escapes)
         && normalized(claim.template) == normalized(other.template)
+        && claim.literals.len() == other.literals.len()
+        && claim
+            .literals
+            .iter()
+            .zip(other.literals)
+            .all(|((at, a), (other_at, b))| {
+                at == other_at && normalize_escapes(a) == normalize_escapes(b)
+            })
         && (claim.method == other.method
             || *claim.method == RouteMethod::Any
             || *other.method == RouteMethod::Any)
@@ -217,6 +240,15 @@ pub(super) fn clash(claim: &Claim<'_>, other: &Claim<'_>) -> bool {
 /// spellings of one octet are one template.
 fn normalized(template: Option<&[String]>) -> Option<Vec<Cow<'_, str>>> {
     template.map(|segments| segments.iter().map(|s| normalize_escapes(s)).collect())
+}
+
+/// `literals` with their escapes in upper case, as request segments are
+/// compared with them.
+fn normalized_literals(literals: &[(usize, String)]) -> Vec<(usize, String)> {
+    literals
+        .iter()
+        .map(|(at, literal)| (*at, normalize_escapes(literal).into_owned()))
+        .collect()
 }
 
 /// The positions `marked` marks.
@@ -318,21 +350,22 @@ impl Routes {
             None => {}
         }
         // Rare: only a refused template or method gets here. Rank what is
-        // left by building the router of the remaining tables this path
-        // matches.
-        let mut tried = vec![first];
-        loop {
-            let mut router = matchit::Router::new();
-            for &table in &index.tables {
-                if !tried.contains(&table) && self.single[table].at(path).is_ok() {
-                    let inserted = router.insert(self.tables[table].path.as_str(), table);
-                    debug_assert!(inserted.is_ok(), "{inserted:?}");
-                }
+        // left with one router of the other tables this path matches, each
+        // taken out once tried: one insertion and one removal per candidate.
+        let mut router = matchit::Router::new();
+        for &table in &index.tables {
+            if table != first && self.single[table].at(path).is_ok() {
+                let inserted = router.insert(self.tables[table].path.as_str(), table);
+                debug_assert!(inserted.is_ok(), "{inserted:?}");
             }
+        }
+        loop {
             let Ok(found) = router.at(path) else {
                 return not_allowed;
             };
             let next = *found.value;
+            let removed = router.remove(self.tables[next].path.as_str());
+            debug_assert_eq!(removed, Some(next));
             match self.tables[next].choose(next, method, &admits) {
                 Some(choice @ Choice::MethodNotAllowed(_)) => {
                     not_allowed.get_or_insert(choice);
@@ -340,7 +373,6 @@ impl Routes {
                 Some(choice) => return Some(choice),
                 None => {}
             }
-            tried.push(next);
         }
     }
 
@@ -397,6 +429,7 @@ impl PathTable {
         let template = Template::of(&mount);
         let unbound = positions(&mount.unbound);
         let multi_segment = positions(&mount.multi_segment);
+        let literals = normalized_literals(&mount.literals);
         let MountedPath {
             axum,
             captures,
@@ -416,6 +449,7 @@ impl PathTable {
                 unbound,
                 multi_segment,
                 composites,
+                literals,
             }],
         }
     }
@@ -427,12 +461,14 @@ impl PathTable {
             method: &entry.http_method,
             verb: mount.verb.as_deref(),
             template: mount.last_template.as_deref(),
+            literals: &mount.literals,
         };
         let taken = self.bindings.iter().any(|existing| {
             let existing_claim = Claim {
                 method: &existing.entry.http_method,
                 verb: existing.verb.as_ref().map(|v| v.raw.as_str()),
                 template: existing.template.as_ref().map(|t| t.raw.as_slice()),
+                literals: &existing.literals,
             };
             clash(&existing_claim, &claim)
         });
@@ -448,6 +484,7 @@ impl PathTable {
         let template = Template::of(&mount);
         let unbound = positions(&mount.unbound);
         let multi_segment = positions(&mount.multi_segment);
+        let literals = normalized_literals(&mount.literals);
         let names = (mount.captures != self.captures).then_some(mount.captures);
         self.bindings.push(Binding {
             entry,
@@ -456,6 +493,7 @@ impl PathTable {
             template,
             unbound,
             multi_segment,
+            literals,
             composites: mount.composites,
         });
     }
@@ -537,8 +575,14 @@ impl PathTable {
     pub(super) fn bind_params(&self, index: usize, params: &mut PathParams) {
         let binding = &self.bindings[index];
         if let (Some(verb), Some(last)) = (&binding.verb, self.captures.last()) {
+            // The verb comes off decoded as the capture was.
+            let suffix = if binding.multi_segment.contains(&(self.captures.len() - 1)) {
+                &verb.multi_segment
+            } else {
+                &verb.decoded
+            };
             if let Some(value) = params.get_mut(last) {
-                if let Some(len) = value.strip_suffix(verb.decoded.as_str()).map(str::len) {
+                if let Some(len) = value.strip_suffix(suffix.as_str()).map(str::len) {
                     value.truncate(len);
                 }
             }
@@ -590,9 +634,11 @@ impl Verb {
         let decoded = percent_encoding::percent_decode_str(&raw)
             .decode_utf8_lossy()
             .into_owned();
+        let multi_segment = String::from_utf8_lossy(&decode_multi_segment(&raw)).into_owned();
         Self {
             raw: normalize_escapes(&raw).into_owned(),
             decoded,
+            multi_segment,
             empty_ok,
         }
     }

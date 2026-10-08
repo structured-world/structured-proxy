@@ -40,6 +40,12 @@ pub(crate) struct MountedPath {
     /// The fields bound to a multi-segment template before the last segment,
     /// spelled out in the path: each is put back together from its parts.
     pub(crate) composites: Vec<Composite>,
+    /// The literals of those templates that hold a percent-escape, as
+    /// written, with the index of their path segment. The router compares a
+    /// literal byte for byte, while `%3a` and `%3A` are one octet (RFC 3986
+    /// §6.2.2.1), so such a segment is mounted as a capture and compared by
+    /// the transcoded routes.
+    pub(crate) literals: Vec<(usize, String)>,
 }
 
 /// A field whose template (`{parent=publishers/*}`) the path spells out
@@ -72,6 +78,7 @@ impl MountedPath {
         let mut unbound = Vec::new();
         let mut multi_segment = Vec::new();
         let mut composites = Vec::new();
+        let mut literals = Vec::new();
         let mut unsupported = None;
         // Segments written so far: the last capture starts at this index.
         let mut written = 0;
@@ -113,19 +120,28 @@ impl MountedPath {
                     let mut parts = Vec::new();
                     for (k, part) in template.split('/').enumerate() {
                         push_segment(&mut axum, &mut shape);
-                        if part == "*" {
+                        let escaped = part.contains('%');
+                        if part == "*" || escaped {
                             let name = format!("{field}.{k}");
                             axum.push('{');
                             axum.push_str(&name);
                             axum.push('}');
                             shape.push_str("{}");
-                            parts.push(Part::Capture(captures.len()));
                             captures.push(name);
                             unbound.push(true);
                             multi_segment.push(true);
                         } else {
                             axum.push_str(part);
                             shape.push_str(part);
+                        }
+                        if part == "*" {
+                            parts.push(Part::Capture(captures.len() - 1));
+                        } else {
+                            if escaped {
+                                // The index of this segment: one per `/` before it.
+                                let at = axum.bytes().filter(|&b| b == b'/').count();
+                                literals.push((at, part.to_owned()));
+                            }
                             let decoded =
                                 String::from_utf8_lossy(&decode_multi_segment(part)).into_owned();
                             parts.push(Part::Literal(decoded));
@@ -174,6 +190,7 @@ impl MountedPath {
             last_segment,
             unsupported,
             composites,
+            literals,
         }
     }
 

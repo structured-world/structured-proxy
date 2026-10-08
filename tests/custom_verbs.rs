@@ -72,6 +72,9 @@ service Ops {
   rpc RunNow(Msg) returns (Msg) {
     option (google.api.http) = { post: "/v2/jobs/{name}:run%3Anow" };
   }
+  rpc RunSlash(Msg) returns (Msg) {
+    option (google.api.http) = { post: "/v6/{name=**}:run%2Fnow" };
+  }
   rpc Shelve(Msg) returns (Msg) {
     option (google.api.http) = { post: "/v5/{name=publishers/*}/books/{operation}" };
   }
@@ -331,6 +334,11 @@ async fn a_variable_over_several_segments_keeps_an_encoded_slash() {
     let (status, _, body) = call(&app, Method::POST, "/v1/publishers/p%2F1/books/b2:restore").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["name"], "publishers/p%2F1/books/b2");
+    // The verb comes off such a value decoded the same way.
+    let (status, _, body) = call(&app, Method::POST, "/v6/a/b:run%2Fnow").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rpc"], "RunSlash");
+    assert_eq!(body["name"], "a/b");
 }
 
 async fn verb_after_a_multi_segment_field_template_routes() {

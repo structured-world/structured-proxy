@@ -478,6 +478,7 @@ impl RouteBinding {
             method: &self.entry.http_method,
             verb: self.mount.verb.as_deref(),
             template: self.mount.last_template.as_deref(),
+            literals: &self.mount.literals,
         }
     }
 }
