@@ -268,7 +268,10 @@ pub fn routes_with_options<S: TranscodeState>(
     for (table, mounted) in routes.tables.iter().enumerate() {
         let routes = routes.clone();
         // Every method goes to the routes, which answer 405 themselves: the
-        // URL, not the path alone, decides which methods a path answers.
+        // URL, not the path alone, decides which methods a path answers. A
+        // HEAD a GET binding serves still goes out without a body: axum's
+        // route future empties the body of every HEAD response, `any` routes
+        // included.
         router = router.route(
             &mounted.path,
             axum::routing::any(move |State(state): State<S>, request: Request| {
