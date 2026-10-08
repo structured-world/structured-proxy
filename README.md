@@ -388,7 +388,10 @@ which matches any number of segments there; such a binding is left out with
 an error in the log. The value of such a variable, and of `{name=**}`, is
 percent-decoded except for `%2F`, which reaches the field as received, so an
 encoded slash stays distinct from a segment boundary; a single-segment
-variable decodes it.
+variable decodes it. A literal of such a template that holds a percent-escape
+matches whatever the case of its hex digits, so to the router it is a
+variable: like any variable, it cannot share its position with a `**` of
+another binding, and the later of the two is left out with an error.
 
 **Custom verbs.** A path template may end in a verb, as AIP-136 custom methods
 do (`post: "/v1/{name=operations/*}:cancel"`):

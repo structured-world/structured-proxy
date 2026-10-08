@@ -128,6 +128,10 @@ impl MountedPath {
                     let mut parts = Vec::new();
                     for (k, part) in template.split('/').enumerate() {
                         push_segment(&mut axum, &mut shape);
+                        // An escaped literal is a capture to the router, so its
+                        // case does not matter (RFC 3986 §6.2.2.1); like any
+                        // capture, it cannot share its position with a
+                        // catch-all, which the router then refuses.
                         let escaped = part.contains('%');
                         if part == "*" || escaped {
                             let name = format!("{field}.{k}");
