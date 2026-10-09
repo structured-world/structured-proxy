@@ -65,6 +65,7 @@ fn the_index_ranks_the_tables_a_path_matches_as_the_router_does() {
         "/s/{*rest}",
         "/s/x/y",
         "/s/x",
+        "/m/{key}",
     ];
     let mut index = Index::default();
     for (table, path) in paths.iter().enumerate() {
@@ -93,6 +94,11 @@ fn the_index_ranks_the_tables_a_path_matches_as_the_router_does() {
         "/s/",
         "/s",
         "/s/x/y/z",
+        // An empty last segment, which a variable takes there too (axum's
+        // `captures_match_empty_trailing_segment`).
+        "/m/",
+        "/m",
+        "/m/abc/",
         "",
         "a/b",
     ] {

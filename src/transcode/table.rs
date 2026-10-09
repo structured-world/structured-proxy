@@ -49,6 +49,19 @@ pub(super) struct Routes {
 struct Index {
     /// `nodes[0]` is the root, before the first segment.
     nodes: Vec<Node>,
+    /// [`empty_last_matches`], read once.
+    empty_last: bool,
+}
+
+/// Whether the router lets a variable take an empty last segment (`/m/` for
+/// `/m/{key}`): matchit 0.8.4 does not, later 0.8 releases do. The router is
+/// asked, as the proxy links the one version axum routes with.
+fn empty_last_matches() -> bool {
+    static MATCHES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MATCHES.get_or_init(|| {
+        let mut router = matchit::Router::new();
+        router.insert("/m/{key}", ()).is_ok() && router.at("/m/").is_ok()
+    })
 }
 
 #[derive(Default)]
@@ -65,6 +78,7 @@ impl Default for Index {
     fn default() -> Self {
         Self {
             nodes: vec![Node::default()],
+            empty_last: empty_last_matches(),
         }
     }
 }
@@ -147,14 +161,16 @@ impl Index {
     }
 
     /// `rest` is what follows the segments `node` stands for, `None` past the
-    /// last one. As in the router, a variable takes an empty segment only
-    /// before another one, and a catch-all a non-empty rest.
+    /// last one. As in the router, a variable takes an empty segment before
+    /// another one, and the last one when the router's version does (see
+    /// [`empty_last_matches`]); a catch-all takes a non-empty rest.
     fn visit<B>(
         &self,
         node: usize,
         rest: Option<&str>,
         found: &mut impl FnMut(usize) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
+        let empty_last = self.empty_last;
         let node = &self.nodes[node];
         let Some(rest) = rest else {
             return node.table.map_or(ControlFlow::Continue(()), found);
@@ -168,7 +184,7 @@ impl Index {
         }
         if let Some(next) = node
             .variable
-            .filter(|_| !segment.is_empty() || tail.is_some())
+            .filter(|_| !segment.is_empty() || tail.is_some() || empty_last)
         {
             self.visit(next, tail, found)?;
         }

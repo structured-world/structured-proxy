@@ -671,6 +671,16 @@ impl ProxyServer {
     /// [`service`](Self::service) for native gRPC on the same listener, or for
     /// an upstream in process.
     ///
+    /// A URL whose path a transcoded route matches but which no binding
+    /// answers (its field template or custom verb does not fit) goes to the
+    /// proxy's other routes, extra routes included, and is answered `404`
+    /// when none of them answers it. An axum router routes a request to one
+    /// route, so routes merged after this one are not tried for it: serve the
+    /// application's own routes through
+    /// [`with_extra_routes`](Self::with_extra_routes), or use
+    /// [`service`](Self::service) with
+    /// [`with_fallback`](ProxyService::with_fallback).
+    ///
     /// # Errors
     ///
     /// No valid upstream address, or a configuration [`service`](Self::service)

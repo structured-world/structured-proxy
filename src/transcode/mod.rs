@@ -510,7 +510,10 @@ where
         // The other routes route it again: the route the first routing
         // matched goes, so theirs is reported. Its captures stay, unread: no
         // other route of the proxy takes path parameters, and an extra
-        // route's handler sees no extensions.
+        // route's handler sees no extensions. Routes an application merged
+        // after the proxy's are not among them: the router has routed the
+        // request to this route and tries no other, so they are reached only
+        // as extra routes, or behind a proxy service's fallback.
         request
             .extensions_mut()
             .remove::<axum::extract::MatchedPath>();
