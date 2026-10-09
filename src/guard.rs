@@ -6,6 +6,7 @@
 //! status ([`GrpcRejections`]).
 
 mod concurrency;
+mod gate;
 mod grpc;
 
 use std::borrow::Cow;
@@ -13,8 +14,8 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use axum::extract::{Request, State};
-use axum::middleware::{from_fn_with_state, Next};
+use axum::extract::Request;
+use axum::middleware::from_fn_with_state;
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 use futures::future::Either;
@@ -406,48 +407,21 @@ macro_rules! guard_stack {
                 );
             }
         }
-        if let Some((shield, scope)) = guards
-            .shield
-            .as_ref()
-            .filter(|(shield, _)| shield.enforces(crate::shield::matcher::Phase::PreAuth))
-        {
-            target = $wrap!(
-                target,
-                class,
-                scope,
-                from_fn_with_state(shield.clone(), crate::shield::pre_auth_middleware)
-            );
-        }
-        if let Some((concurrency, scope)) = &guards.concurrency {
-            target = $wrap!(
-                target,
-                class,
-                scope,
-                from_fn_with_state(concurrency.clone(), concurrency::middleware)
-            );
-        }
-        if let Some((maintenance, scope)) = &guards.maintenance {
-            target = $wrap!(
-                target,
-                class,
-                scope,
-                from_fn_with_state(maintenance.clone(), maintenance_middleware)
-            );
-        }
-        if let Some(scope) = &guards.require_client {
-            target = $wrap!(
-                target,
-                class,
-                scope,
-                axum::middleware::from_fn(crate::client_address::require)
-            );
+        // A required client address, maintenance, concurrency and the rate
+        // limits before auth decide as the request arrives: one layer.
+        if let Some(gate) = gate::Gate::layer(guards, class) {
+            target = $wrap!(@all target, gate);
         }
         target
     }};
 }
 
-/// One guard layer on a router, when its scope covers the class.
+/// One guard layer on a router, when its scope covers the class; with `@all`,
+/// a layer that applies its scopes itself.
 macro_rules! wrap_router {
+    (@all $target:expr, $layer:expr) => {
+        $target.layer($layer)
+    };
     ($target:expr, $class:expr, $scope:expr, $layer:expr) => {{
         let scope: &Arc<Scope> = $scope;
         if !scope.covers($class) {
@@ -463,8 +437,12 @@ macro_rules! wrap_router {
     }};
 }
 
-/// One guard layer on a boxed service, when its scope covers the class.
+/// One guard layer on a boxed service, when its scope covers the class; with
+/// `@all`, a layer that applies its scopes itself.
 macro_rules! wrap_service {
+    (@all $target:expr, $layer:expr) => {
+        BoxedService::new($layer.layer($target))
+    };
     ($target:expr, $class:expr, $scope:expr, $layer:expr) => {{
         let scope: &Arc<Scope> = $scope;
         let target: BoxedService = $target;
@@ -535,24 +513,6 @@ impl Maintenance {
                 None => path == pattern,
             })
     }
-}
-
-/// Maintenance mode middleware: `UNAVAILABLE` with a five-minute
-/// `Retry-After` for every request outside the exempt paths.
-async fn maintenance_middleware(
-    State(maintenance): State<Arc<Maintenance>>,
-    request: Request,
-    next: Next,
-) -> Response {
-    if maintenance.exempts(request.uri().path()) {
-        return next.run(request).await;
-    }
-    let mut response = reject(tonic::Code::Unavailable, maintenance.message.clone());
-    response.headers_mut().insert(
-        http::header::RETRY_AFTER,
-        http::HeaderValue::from_static("300"),
-    );
-    response
 }
 
 #[cfg(test)]

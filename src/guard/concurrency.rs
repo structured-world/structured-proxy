@@ -4,10 +4,8 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Request, State};
-use axum::middleware::Next;
 use axum::response::Response;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::reject;
 use crate::config::ConcurrencyConfig;
@@ -37,23 +35,21 @@ impl Concurrency {
     }
 }
 
-/// Take a slot for the request and hold it until its response body ends, so
-/// a stream counts for its whole life; with none free, `UNAVAILABLE` and a
-/// one-second `Retry-After`.
-pub(super) async fn middleware(
-    State(concurrency): State<Arc<Concurrency>>,
-    request: Request,
-    next: Next,
-) -> Response {
-    let Ok(slot) = concurrency.slots.clone().try_acquire_owned() else {
+impl Concurrency {
+    /// A slot for a request, held until its response body ends, so a stream
+    /// counts for its whole life; `None` when none is free.
+    pub(super) fn take(&self) -> Option<OwnedSemaphorePermit> {
+        self.slots.clone().try_acquire_owned().ok()
+    }
+
+    /// The answer to a request no slot is free for: `UNAVAILABLE` and a
+    /// one-second `Retry-After`.
+    pub(super) fn full() -> Response {
         let mut response = reject(tonic::Code::Unavailable, "too many requests in flight");
         response.headers_mut().insert(
             http::header::RETRY_AFTER,
             http::HeaderValue::from_static("1"),
         );
-        return response;
-    };
-    next.run(request)
-        .await
-        .map(|body| crate::held::until_end(body, slot))
+        response
+    }
 }

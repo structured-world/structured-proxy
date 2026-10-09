@@ -283,7 +283,25 @@ async fn the_concurrency_limit_holds_a_slot_until_the_response_body_ends() {
             }),
         )
         .route("/x", axum::routing::get(|| async { "x" }))
-        .layer(from_fn_with_state(concurrency, concurrency::middleware));
+        .layer(
+            gate::Gate::layer(
+                &Guards {
+                    concurrency: Some((
+                        concurrency,
+                        Scope::compile(
+                            None,
+                            &[Traffic::Transcoded],
+                            "concurrency",
+                            Routed::new(&[]),
+                        )
+                        .unwrap(),
+                    )),
+                    ..Guards::default()
+                },
+                Class::Transcoded,
+            )
+            .unwrap(),
+        );
     let get = |path: &str| {
         http::Request::get(path)
             .body(axum::body::Body::empty())

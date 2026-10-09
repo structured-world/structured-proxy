@@ -198,112 +198,160 @@ pub async fn post_auth_middleware(
 
 /// Match a phase's rule for the request, apply its limit, and attach headers.
 async fn enforce(shield: &Shield, phase: Phase, request: Request, next: Next) -> Response {
-    let path = request.uri().path();
-    let Some(rule) = shield.match_rule(path, phase) else {
-        return next.run(request).await;
-    };
-
-    // The proxy resolved the client address before any guard. Shield used on
-    // its own, in a router of the embedder's, gets it from a
-    // `ClientAddressLayer` in front of it; without one it falls back to what
-    // resolution gives with no trusted proxy: the peer an axum server records.
-    let unresolved;
-    let client = match request.extensions().get::<ClientAddress>() {
-        Some(client) => client,
-        None => {
-            let peer = request
-                .extensions()
-                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-                .map(|ci| ci.0);
-            unresolved = ClientAddress::from_peer(peer);
-            &unresolved
+    match shield.decide(phase, &request) {
+        Decision::Pass => next.run(request).await,
+        Decision::Reject(response) => response,
+        Decision::Report(report) => {
+            let mut response = next.run(request).await;
+            report.apply(&mut response);
+            response
         }
-    };
-    let claims = request
-        .extensions()
-        .get::<crate::auth::ValidatedClaims>()
-        .map(|c| c.0.as_ref());
-    let key = rule_key(
-        &rule.fingerprint,
-        &rule.key,
-        client,
-        request.headers(),
-        claims,
-    );
+    }
+}
 
-    // The limit service resolves per-principal, so it needs the real identity;
-    // the store / shared counter only need the de-identified `store` key.
-    let Some(profile) = shield.resolve_limit(rule, claims, key.identity.as_str()) else {
-        // No limit resolves for this rule (JWT/service/profile/default all
-        // absent): allow the request unmetered.
-        return next.run(request).await;
-    };
+/// What a phase's limit makes of a request.
+pub(crate) enum Decision {
+    /// No limit applies.
+    Pass,
+    /// Over the limit: the answer.
+    Reject(Response),
+    /// Admitted: the budget its response reports.
+    Report(Report),
+}
 
-    // Fleet gate first (read-only, cached), so the local shaper is not charged
-    // for a request the fleet-wide budget will reject. The fleet budget is the
-    // sustained rate (`profile.limit`); `burst` is deliberately a per-instance
-    // smoothing allowance, not a fleet-wide entitlement (honouring it fleet-wide
-    // would multiply the effective limit by N). A single instance's burst is
-    // therefore capped by the shared budget when the fleet is near it.
-    //
-    // Consequence for a `burst > limit` profile (e.g. `rate: "1/min", burst: 5`):
-    // under reconciliation the shared counter caps the key at the sustained
-    // `limit`, so the extra burst headroom that a local-only deployment would
-    // allow is not granted fleet-wide. This is intentional, not an oversight:
-    // gating on `burst` instead would let the fleet sustain `burst`-per-window,
-    // loosening the sustained cap by the burst factor. The conservative choice
-    // (never over-admit the fleet's sustained budget) wins; the local GCRA still
-    // smooths per-instance traffic.
-    #[cfg(feature = "redis")]
-    let fleet_remaining = shield
-        .global
-        .as_ref()
-        .map(|g| g.fleet_remaining(key.store.as_str(), profile.limit, profile.window));
-    #[cfg(feature = "redis")]
-    if fleet_remaining == Some(0) {
-        return global_reject(profile.limit, profile.window);
+/// The budget an admitted request's response reports.
+pub(crate) struct Report {
+    limit: u64,
+    remaining: u64,
+    verdict: Verdict,
+}
+
+impl Report {
+    /// Report the budget on `response`: the tightest one across phases. With
+    /// defense-in-depth (a pre-auth and a post-auth rule on the same path), an
+    /// inner limiter may already have set headers on the way out; they are
+    /// overwritten only when this (outer) phase's remaining is smaller, so the
+    /// client always sees the budget that will bite first. An inner rejection
+    /// carries remaining 0, so it is never overwritten.
+    pub(crate) fn apply(&self, response: &mut Response) {
+        maybe_tighten_rate_headers(
+            response.headers_mut(),
+            self.limit,
+            self.remaining,
+            &self.verdict,
+        );
+    }
+}
+
+impl Shield {
+    /// Match a phase's rule for `request` and charge its limit.
+    pub(crate) fn decide<B>(&self, phase: Phase, request: &http::Request<B>) -> Decision {
+        let path = request.uri().path();
+        let Some(rule) = self.match_rule(path, phase) else {
+            return Decision::Pass;
+        };
+        self.charge(rule, request)
     }
 
-    // The store key intentionally excludes the profile's numbers, so if a key's
-    // resolved tier changes (a JWT/service tier upgrade), the existing TAT is
-    // reused with the new emission interval. The TAT is an absolute time, so this
-    // only causes a brief transient at the change and self-corrects within one
-    // window. Keying by the tier's numbers instead would reset the budget on
-    // every tier flip, which a client could exploit to shed its own limit.
-    let verdict = shield.store.check(key.store.as_str(), &profile.gcra);
-    if !verdict.allowed {
-        return too_many_requests(profile.limit, verdict.remaining, &verdict);
-    }
-
-    // Report the tighter of the local and (when reconciled) fleet budgets, so a
-    // client near the fleet cap isn't told it has ample local room.
-    #[cfg(not(feature = "redis"))]
-    let (reported, header_verdict) = reconciled_headers(verdict, None, profile.window);
-    #[cfg(feature = "redis")]
-    let (reported, header_verdict) = {
-        // Record the admit for the next reconciliation push (whenever the fleet
-        // gate is active, i.e. `fleet_remaining` was computed).
-        if fleet_remaining.is_some() {
-            if let Some(global) = &shield.global {
-                global.record(key.store.as_str(), profile.window);
+    /// Charge `request` to the limit of `rule`, which its path matched.
+    fn charge<B>(&self, rule: &CompiledRule, request: &http::Request<B>) -> Decision {
+        // The proxy resolved the client address before any guard. Shield used on
+        // its own, in a router of the embedder's, gets it from a
+        // `ClientAddressLayer` in front of it; without one it falls back to what
+        // resolution gives with no trusted proxy: the peer an axum server records.
+        let unresolved;
+        let client = match request.extensions().get::<ClientAddress>() {
+            Some(client) => client,
+            None => {
+                let peer = request
+                    .extensions()
+                    .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                    .map(|ci| ci.0);
+                unresolved = ClientAddress::from_peer(peer);
+                &unresolved
             }
-        }
-        reconciled_headers(verdict, fleet_remaining, profile.window)
-    };
+        };
+        let claims = request
+            .extensions()
+            .get::<crate::auth::ValidatedClaims>()
+            .map(|c| c.0.as_ref());
+        let key = rule_key(
+            &rule.fingerprint,
+            &rule.key,
+            client,
+            request.headers(),
+            claims,
+        );
 
-    let mut response = next.run(request).await;
-    // Report the tightest budget across phases. With defense-in-depth (a pre-auth
-    // and a post-auth rule on the same path), an inner limiter may already have
-    // set headers on the way out; overwrite them only when this (outer) phase's
-    // remaining is smaller, so the client always sees the budget that will bite
-    // first. An inner rejection carries remaining 0, so it is never overwritten.
-    maybe_tighten_rate_headers(
-        response.headers_mut(),
-        profile.limit,
-        reported,
-        &header_verdict,
-    );
-    response
+        // The limit service resolves per-principal, so it needs the real identity;
+        // the store / shared counter only need the de-identified `store` key.
+        let Some(profile) = self.resolve_limit(rule, claims, key.identity.as_str()) else {
+            // No limit resolves for this rule (JWT/service/profile/default all
+            // absent): allow the request unmetered.
+            return Decision::Pass;
+        };
+
+        // Fleet gate first (read-only, cached), so the local shaper is not charged
+        // for a request the fleet-wide budget will reject. The fleet budget is the
+        // sustained rate (`profile.limit`); `burst` is deliberately a per-instance
+        // smoothing allowance, not a fleet-wide entitlement (honouring it fleet-wide
+        // would multiply the effective limit by N). A single instance's burst is
+        // therefore capped by the shared budget when the fleet is near it.
+        //
+        // Consequence for a `burst > limit` profile (e.g. `rate: "1/min", burst: 5`):
+        // under reconciliation the shared counter caps the key at the sustained
+        // `limit`, so the extra burst headroom that a local-only deployment would
+        // allow is not granted fleet-wide. This is intentional, not an oversight:
+        // gating on `burst` instead would let the fleet sustain `burst`-per-window,
+        // loosening the sustained cap by the burst factor. The conservative choice
+        // (never over-admit the fleet's sustained budget) wins; the local GCRA still
+        // smooths per-instance traffic.
+        #[cfg(feature = "redis")]
+        let fleet_remaining = self
+            .global
+            .as_ref()
+            .map(|g| g.fleet_remaining(key.store.as_str(), profile.limit, profile.window));
+        #[cfg(feature = "redis")]
+        if fleet_remaining == Some(0) {
+            return Decision::Reject(global_reject(profile.limit, profile.window));
+        }
+
+        // The store key intentionally excludes the profile's numbers, so if a key's
+        // resolved tier changes (a JWT/service tier upgrade), the existing TAT is
+        // reused with the new emission interval. The TAT is an absolute time, so this
+        // only causes a brief transient at the change and self-corrects within one
+        // window. Keying by the tier's numbers instead would reset the budget on
+        // every tier flip, which a client could exploit to shed its own limit.
+        let verdict = self.store.check(key.store.as_str(), &profile.gcra);
+        if !verdict.allowed {
+            return Decision::Reject(too_many_requests(
+                profile.limit,
+                verdict.remaining,
+                &verdict,
+            ));
+        }
+
+        // Report the tighter of the local and (when reconciled) fleet budgets, so a
+        // client near the fleet cap isn't told it has ample local room.
+        #[cfg(not(feature = "redis"))]
+        let (reported, header_verdict) = reconciled_headers(verdict, None, profile.window);
+        #[cfg(feature = "redis")]
+        let (reported, header_verdict) = {
+            // Record the admit for the next reconciliation push (whenever the fleet
+            // gate is active, i.e. `fleet_remaining` was computed).
+            if fleet_remaining.is_some() {
+                if let Some(global) = &self.global {
+                    global.record(key.store.as_str(), profile.window);
+                }
+            }
+            reconciled_headers(verdict, fleet_remaining, profile.window)
+        };
+        Decision::Report(Report {
+            limit: profile.limit,
+            remaining: reported,
+            verdict: header_verdict,
+        })
+    }
 }
 
 /// Combine the local GCRA `verdict` with the optional fleet remaining into the

@@ -97,9 +97,7 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use axum::extract::{ConnectInfo, Request};
-use axum::middleware::Next;
-use axum::response::Response;
+use axum::extract::ConnectInfo;
 use http::header::{HeaderName, FORWARDED};
 use http::{HeaderMap, HeaderValue};
 use ipnet::IpNet;
@@ -746,27 +744,6 @@ where
             .map(|ConnectInfo(peer)| *peer);
         self.resolver.apply(&mut request, peer);
         self.inner.call(request)
-    }
-}
-
-/// The guard of `client_address.required`: a request whose address did not
-/// resolve is refused, `INVALID_ARGUMENT` when a trusted proxy forwarded
-/// something unreadable, `INTERNAL` when the server recorded no connection.
-pub(crate) async fn require(request: Request, next: Next) -> Response {
-    let resolution = request
-        .extensions()
-        .get::<ClientAddress>()
-        .map_or(Resolution::Unavailable, ClientAddress::resolution);
-    match resolution {
-        Resolution::Peer(_) | Resolution::Forwarded(_) => next.run(request).await,
-        Resolution::Invalid(invalid) => crate::guard::reject(
-            tonic::Code::InvalidArgument,
-            format!("the client address a trusted proxy forwarded is {invalid}"),
-        ),
-        Resolution::Unavailable => crate::guard::reject(
-            tonic::Code::Internal,
-            "no connection information to resolve the client address from",
-        ),
     }
 }
 
