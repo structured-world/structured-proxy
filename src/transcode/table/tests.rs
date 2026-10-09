@@ -20,6 +20,31 @@ fn ranked_by_matchit(paths: &[&str], path: &str) -> Vec<usize> {
 }
 
 #[test]
+fn a_received_text_compares_as_its_normalized_form() {
+    // `same_octets` compares without building the normalized text, so it
+    // must agree with comparing `normalize_escapes`: hex digits of an escape
+    // in either case, anything else (a malformed escape, a `%` taken as a
+    // digit) as written.
+    let normalized = [
+        "%3A", "a%3Ab", "%2F%2F", "%G1", "%%3a", "%", "%3", "plain", "é%3A", "",
+    ];
+    let received = [
+        "%3a", "%3A", "a%3ab", "%2f%2F", "%g1", "%G1", "%%3a", "%%3A", "%", "%3", "PLAIN", "plain",
+        "é%3a", "",
+    ];
+    for normalized in normalized {
+        assert_eq!(normalize_escapes(normalized), normalized);
+        for received in received {
+            assert_eq!(
+                same_octets(received, normalized),
+                normalize_escapes(received) == normalized,
+                "{received} as {normalized}"
+            );
+        }
+    }
+}
+
+#[test]
 fn the_index_ranks_the_tables_a_path_matches_as_the_router_does() {
     // Every table a method miss falls back to must come in the router's own
     // order: a literal before a variable before a catch-all at the first

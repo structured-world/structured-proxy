@@ -524,15 +524,14 @@ where
             // The binding is chosen before the routes route the request, so a
             // URL none answers reaches the other routes, and the fallback, as
             // if the transcoded ones were not there.
-            let routes = match &mut self.chooser {
+            let future = match &self.chooser {
+                // A router is always ready; this one is a reference count.
                 Some(chooser) if !chooser.choose_before_routing(&mut request) => {
-                    chooser.elsewhere_mut()
+                    chooser.elsewhere().clone().call(request)
                 }
-                _ => &mut self.routes,
+                _ => self.routes.call(request),
             };
-            Inner::Routes {
-                future: routes.call(request),
-            }
+            Inner::Routes { future }
         };
         ResponseFuture { inner }
     }

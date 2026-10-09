@@ -25,7 +25,7 @@ pub use path::proto_path_to_axum;
 pub use select::RpcSelection;
 
 use axum::body::{Body, Bytes};
-use axum::extract::{FromRequest, FromRequestParts, OriginalUri, Path, Request, State};
+use axum::extract::{FromRequest, FromRequestParts, OriginalUri, RawPathParams, Request, State};
 use axum::http::header::{ALLOW, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -87,8 +87,10 @@ impl<U: Upstream> TranscodeState for crate::ProxyState<U> {
     }
 }
 
-/// Path parameters of a matched route.
-type PathParams = HashMap<String, String>;
+/// Path parameters of a matched route, in path order: each name with its
+/// value, borrowed from the router's captures and the routes wherever the
+/// binding leaves them as they are.
+type PathParams<'a> = Vec<(&'a str, Cow<'a, str>)>;
 
 /// How the HTTP request body reaches the RPC's input message.
 #[derive(Debug, Clone)]
@@ -300,9 +302,7 @@ pub(crate) fn routes_and_choices<S: TranscodeState>(
 /// made before any layer of the routes runs. A URL no binding answers (its
 /// field template, its custom verb) is no transcoded request: it goes to the
 /// proxy's other routes instead.
-#[derive(Clone)]
 pub(crate) struct Choices {
-    // Shared: the middleware clones its state for every request.
     routes: Arc<Routes>,
 }
 
@@ -310,58 +310,60 @@ impl Choices {
     /// These choices, handing a URL no binding answers to `elsewhere`: a
     /// router of the proxy's other routes.
     pub(crate) fn with_elsewhere(self, elsewhere: Router) -> Chooser {
-        Chooser {
-            choices: self,
+        Chooser(Arc::new(Choosing {
+            routes: self.routes,
             elsewhere,
-        }
+        }))
     }
+}
 
-    /// Choose for `request`, which the router matches (or matched) to the
-    /// table at `table`: `false` when no binding answers it, otherwise the
-    /// choice rides on the request to [`dispatch`].
-    fn choose<B>(&self, table: usize, request: &mut http::Request<B>) -> bool {
-        match self
-            .routes
-            .choose(table, request.method(), request.uri().path())
-        {
-            Choice::NotFound => false,
-            choice => {
-                request.extensions_mut().insert(Chosen(choice));
-                true
-            }
+/// Choose among `routes` for `request`, which the router matches (or
+/// matched) to the table at `table`: `false` when no binding answers it,
+/// otherwise the choice rides on the request to [`dispatch`].
+fn choose<B>(routes: &Routes, table: usize, request: &mut http::Request<B>) -> bool {
+    match routes.choose(table, request.method(), request.uri().path()) {
+        Choice::NotFound => false,
+        choice => {
+            request.extensions_mut().insert(Chosen(choice));
+            true
         }
     }
 }
 
-/// [`Choices`] with the routes a URL no binding answers goes to.
+/// [`Choices`] with the routes a URL no binding answers goes to. One
+/// reference count: the router clones its routes' layers for every request.
 #[derive(Clone)]
-pub(crate) struct Chooser {
-    choices: Choices,
+pub(crate) struct Chooser(Arc<Choosing>);
+
+struct Choosing {
+    routes: Arc<Routes>,
     elsewhere: Router,
 }
 
 impl Chooser {
     /// Choose for `request` before the router routes it: `false` when its
     /// path matches a transcoded route but no binding answers it, a request
-    /// for [`elsewhere_mut`](Self::elsewhere_mut) then. Nothing of the routing is on
+    /// for [`elsewhere`](Self::elsewhere) then. Nothing of the routing is on
     /// it yet, so the other routes, and a fallback after them, route it as if
     /// the transcoded ones were not there.
     pub(crate) fn choose_before_routing<B>(&self, request: &mut http::Request<B>) -> bool {
-        match self.choices.routes.table_of(request.uri().path()) {
-            Some(table) => self.choices.choose(table, request),
+        match self.0.routes.table_of(request.uri().path()) {
+            Some(table) => choose(&self.0.routes, table, request),
             None => true,
         }
     }
 
     /// The proxy's other routes, for the URLs no binding answers.
-    pub(crate) fn elsewhere_mut(&mut self) -> &mut Router {
-        &mut self.elsewhere
+    pub(crate) fn elsewhere(&self) -> &Router {
+        &self.0.elsewhere
     }
 
     /// The other routes, with `fallback` answering what they do not.
-    pub(crate) fn with_fallback(mut self, fallback: crate::guard::BoxedService) -> Self {
-        self.elsewhere = self.elsewhere.fallback_service(fallback);
-        self
+    pub(crate) fn with_fallback(self, fallback: crate::guard::BoxedService) -> Self {
+        Self(Arc::new(Choosing {
+            routes: self.0.routes.clone(),
+            elsewhere: self.0.elsewhere.clone().fallback_service(fallback),
+        }))
     }
 
     /// `router`, holding the transcoded routes, choosing outside its layers
@@ -369,7 +371,95 @@ impl Chooser {
     /// is past the routing then, and the router reports the route it matched
     /// with the paths it is nested at in front.
     pub(crate) fn layer(self, router: Router) -> Router {
-        router.layer(axum::middleware::from_fn_with_state(self, choose_routed))
+        router.layer(self)
+    }
+}
+
+impl<S> tower::Layer<S> for Chooser {
+    type Service = ChooseRouted<S>;
+
+    fn layer(&self, route: S) -> ChooseRouted<S> {
+        ChooseRouted {
+            chooser: self.clone(),
+            route,
+        }
+    }
+}
+
+/// A transcoded route, with the choice among its bindings made before its
+/// layers: a request no binding answers goes to the other routes.
+#[derive(Clone)]
+pub(crate) struct ChooseRouted<S> {
+    chooser: Chooser,
+    route: S,
+}
+
+impl<S> tower::Service<Request> for ChooseRouted<S>
+where
+    S: tower::Service<Request, Response = Response, Error = std::convert::Infallible>,
+{
+    type Response = Response;
+    type Error = std::convert::Infallible;
+    type Future = ChooseFuture<S::Future>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.route.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut request: Request) -> Self::Future {
+        let choosing = &*self.chooser.0;
+        let extensions = request.extensions();
+        let matched = extensions
+            .get::<axum::extract::MatchedPath>()
+            .and_then(|matched| {
+                let nested = extensions.get::<axum::extract::NestedPath>();
+                local_path(matched.as_str(), nested.map(|nested| nested.as_str()))
+            })
+            .and_then(|path| choosing.routes.table_at(path));
+        if matched.is_none_or(|matched| choose(&choosing.routes, matched, &mut request)) {
+            return ChooseFuture::Route {
+                future: self.route.call(request),
+            };
+        }
+        // The other routes route it again: the route the first routing
+        // matched goes, so theirs is reported. Its captures stay, unread: no
+        // other route of the proxy takes path parameters, and an extra
+        // route's handler sees no extensions.
+        request
+            .extensions_mut()
+            .remove::<axum::extract::MatchedPath>();
+        ChooseFuture::Elsewhere {
+            future: tower::ServiceExt::oneshot(choosing.elsewhere.clone(), request),
+        }
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// The response future of [`ChooseRouted`].
+    #[project = ChooseProjection]
+    pub(crate) enum ChooseFuture<F> {
+        Route { #[pin] future: F },
+        Elsewhere { #[pin] future: tower::util::Oneshot<Router, Request> },
+    }
+}
+
+impl<F> std::future::Future for ChooseFuture<F>
+where
+    F: std::future::Future<Output = Result<Response, std::convert::Infallible>>,
+{
+    type Output = Result<Response, std::convert::Infallible>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        match self.project() {
+            ChooseProjection::Route { future } => future.poll(cx),
+            ChooseProjection::Elsewhere { future } => future.poll(cx),
+        }
     }
 }
 
@@ -377,38 +467,6 @@ impl Chooser {
 /// [`dispatch`].
 #[derive(Clone)]
 struct Chosen(Choice);
-
-async fn choose_routed(
-    State(chooser): State<Chooser>,
-    mut request: Request,
-    next: axum::middleware::Next,
-) -> Response {
-    let extensions = request.extensions();
-    let matched = extensions
-        .get::<axum::extract::MatchedPath>()
-        .and_then(|matched| {
-            let nested = extensions.get::<axum::extract::NestedPath>();
-            local_path(matched.as_str(), nested.map(|nested| nested.as_str()))
-        })
-        .and_then(|path| chooser.choices.routes.table_at(path));
-    let Some(matched) = matched else {
-        return next.run(request).await;
-    };
-    if chooser.choices.choose(matched, &mut request) {
-        return next.run(request).await;
-    }
-    // The other routes route it again: the route the first routing matched
-    // goes, so theirs is reported. Its captures stay, unread: no other route
-    // of the proxy takes path parameters, and an extra route's handler sees
-    // no extensions.
-    request
-        .extensions_mut()
-        .remove::<axum::extract::MatchedPath>();
-    match tower::ServiceExt::oneshot(chooser.elsewhere, request).await {
-        Ok(response) => response,
-        Err(never) => match never {},
-    }
-}
 
 /// The router path `matched` names in the router nested at `nested`, which
 /// writes the paths it is nested at in front of it.
@@ -542,10 +600,15 @@ async fn dispatch<S: TranscodeState>(
         // Only routes served without a `Chooser` get here.
         Choice::NotFound => return StatusCode::NOT_FOUND.into_response(),
     };
-    let mut path_params = match Path::<PathParams>::from_request_parts(&mut parts, &state).await {
-        Ok(Path(params)) => params,
+    // The router's captures, decoded, shared with it rather than copied.
+    let captured = match RawPathParams::from_request_parts(&mut parts, &state).await {
+        Ok(captured) => captured,
         Err(rejection) => return rejection.into_response(),
     };
+    let mut path_params: PathParams<'_> = captured
+        .iter()
+        .map(|(name, value)| (name, Cow::Borrowed(value)))
+        .collect();
     let multi_segment = routes.tables[table].multi_segment(index);
     if table != matched || !multi_segment.is_empty() {
         // Another path the request matches answers it (a verb bound there, or
@@ -588,28 +651,43 @@ async fn dispatch<S: TranscodeState>(
         Ok(body) => body,
         Err(rejection) => return rejection.into_response(),
     };
+    let started = start(
+        state,
+        client,
+        &path_params,
+        body,
+        routes.tables[table].entry(index),
+    );
+    let (call, sse, keep_alive_secs) = match started {
+        Ok(started) => started,
+        Err(rejection) => return rejection.into_response(routes.tables[table].entry(index)),
+    };
+    // The parameters are bound: the routes go on with the call.
     let entry = RouteRef {
         routes,
         table,
         index,
     };
-    handle(state, client, path_params, body, entry).await
+    if entry.streaming {
+        streaming_call(call, entry, sse, keep_alive_secs).await
+    } else {
+        unary_call(call, &entry).await
+    }
 }
 
 /// Replace the captures of the table at `matched` in `params` with those of
 /// the table at `chosen`, percent-decoded as the router decodes its own except
 /// at the positions of `multi_segment`, which keep `%2F`.
-fn rebind(
-    routes: &Routes,
+fn rebind<'r>(
+    routes: &'r Routes,
     matched: usize,
     chosen: usize,
     multi_segment: &[usize],
     path: &str,
-    params: &mut PathParams,
+    params: &mut PathParams<'r>,
 ) -> Result<(), Unmappable> {
-    for name in &routes.tables[matched].captures {
-        params.remove(name);
-    }
+    let captures = &routes.tables[matched].captures;
+    params.retain(|(name, _)| !captures.iter().any(|capture| capture == name));
     let found = routes
         .params_of(chosen, path)
         .expect("the chosen table was found by matching this path");
@@ -619,9 +697,10 @@ fn rebind(
         } else {
             percent_encoding::percent_decode_str(raw).into()
         };
+        // Owned: the request's path goes on with the request.
         let value = String::from_utf8(decoded.into_owned())
             .map_err(|_| Unmappable(format!("path parameter {name} is not valid UTF-8")))?;
-        params.insert(name.to_owned(), value);
+        params.push((name, Cow::Owned(value)));
     }
     Ok(())
 }
@@ -946,14 +1025,16 @@ struct Origin {
     address: Option<ClientAddress>,
 }
 
-/// Serve one request on a transcoded route.
-async fn handle<S: TranscodeState>(
+/// The upstream call one request on a transcoded route makes, with whether a
+/// streamed answer goes out as SSE and its keep-alive; or why the request
+/// cannot be mapped onto the RPC.
+fn start<S: TranscodeState>(
     proxy_state: S,
     client: Client,
-    path_params: PathParams,
+    path_params: &[(&str, Cow<'_, str>)],
     body: Bytes,
-    entry: RouteRef,
-) -> Response {
+    entry: &RouteEntry,
+) -> Result<(Call<S::Upstream>, bool, u64), Unmappable> {
     let keep_alive_secs = proxy_state.sse_keep_alive_secs();
     let Client {
         headers,
@@ -966,25 +1047,22 @@ async fn handle<S: TranscodeState>(
         proxy_state,
         &headers,
         origin,
-        &path_params,
+        path_params,
         line.uri.query(),
         body,
-        &entry,
+        entry,
     )
     .and_then(|mut call| {
         // Next to the extensions `prepare` sets, for an upstream in process.
-        call.request.extensions_mut().insert(line.received(&entry)?);
+        call.request.extensions_mut().insert(line.received(entry)?);
         Ok(call)
     });
-    let call = match prepared {
-        Ok(call) => call,
-        Err(rejection) => return rejection.into_response(&entry),
-    };
-    if entry.streaming {
-        streaming_call(call, entry, wants_sse(&headers), keep_alive_secs).await
-    } else {
-        unary_call(call, &entry).await
-    }
+    let call = prepared?;
+    Ok((
+        call,
+        entry.streaming && wants_sse(&headers),
+        keep_alive_secs,
+    ))
 }
 
 /// Why a request ends before the upstream is called: it cannot be mapped onto
@@ -1048,7 +1126,7 @@ fn prepare<S: TranscodeState>(
     proxy_state: S,
     headers: &HeaderMap,
     origin: Origin,
-    path_params: &PathParams,
+    path_params: &[(&str, Cow<'_, str>)],
     raw_query: Option<&str>,
     body: Bytes,
     entry: &RouteEntry,
@@ -1464,7 +1542,7 @@ static NO_PARSED_BODY: request::BodyMapping = request::BodyMapping::None;
 fn decode_request(
     entry: &RouteEntry,
     headers: &HeaderMap,
-    path_params: &PathParams,
+    path_params: &[(&str, Cow<'_, str>)],
     raw_query: Option<&str>,
     body_bytes: Bytes,
 ) -> Result<DynamicMessage, String> {
@@ -1485,13 +1563,8 @@ fn decode_request(
         RequestBody::RawField { mapping, .. } => (mapping, request::Body::Absent, raw_query),
     };
 
-    let mut message = request::build_request_message(
-        &entry.method.input(),
-        mapping,
-        body,
-        path_params,
-        raw_query,
-    )?;
+    let mut message =
+        request::build_message(&entry.method.input(), mapping, body, path_params, raw_query)?;
     match &entry.request_body {
         RequestBody::Parsed(_) => {}
         RequestBody::RawRoot => {

@@ -195,42 +195,55 @@ service S {
         "no route"
     );
     let (table, index) = bound_in(&routes, Method::POST, "/v1/publishers/p1/books/x:cancel");
-    let mut params: PathParams = [
-        ("parent.1".to_owned(), "p1".to_owned()),
-        ("id".to_owned(), "x:cancel".to_owned()),
-    ]
-    .into();
+    let mut params: PathParams<'_> = vec![("parent.1", "p1".into()), ("id", "x:cancel".into())];
     routes.tables[table].bind_params(index, &mut params);
-    let expected: PathParams = [
-        ("parent".to_owned(), "publishers/p1".to_owned()),
-        ("id".to_owned(), "x".to_owned()),
-    ]
-    .into();
-    assert_eq!(params, expected);
+    let expected = named(&[("parent", "publishers/p1"), ("id", "x")]);
+    assert_eq!(by_name(&params), expected);
+}
+
+/// Fields by name.
+fn named(fields: &[(&str, &str)]) -> HashMap<String, String> {
+    fields
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect()
+}
+
+/// `params` by name: a name bound twice fails.
+fn by_name(params: &PathParams<'_>) -> HashMap<String, String> {
+    let by_name: HashMap<String, String> = params
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+    assert_eq!(
+        by_name.len(),
+        params.len(),
+        "a name bound twice: {params:?}"
+    );
+    by_name
 }
 
 /// The fields `method path` reaches its binding with: the router's captures
 /// percent-decoded, as axum extracts them, then bound.
-fn bound_fields(routes: &table::Routes, method: Method, path: &str) -> PathParams {
+fn bound_fields(routes: &table::Routes, method: Method, path: &str) -> HashMap<String, String> {
     let (table, index) = bound_in(routes, method, path);
     let mut router = matchit::Router::new();
     router
         .insert(routes.tables[table].path.as_str(), ())
         .unwrap();
-    let mut params: PathParams = router
-        .at(path)
-        .unwrap()
+    let matched = router.at(path).unwrap();
+    let mut params: PathParams<'_> = matched
         .params
         .iter()
         .map(|(name, value)| {
             let value = percent_encoding::percent_decode_str(value)
                 .decode_utf8()
                 .unwrap();
-            (name.to_owned(), value.into_owned())
+            (name, value)
         })
         .collect();
     routes.tables[table].bind_params(index, &mut params);
-    params
+    by_name(&params)
 }
 
 #[test]
@@ -247,11 +260,7 @@ service S {
 }
 "#,
     );
-    let expected: PathParams = [
-        ("parent".to_owned(), "publishers/foo:bar/p1".to_owned()),
-        ("id".to_owned(), "x".to_owned()),
-    ]
-    .into();
+    let expected = named(&[("parent", "publishers/foo:bar/p1"), ("id", "x")]);
     assert_eq!(
         bound_fields(&routes, Method::GET, "/v1/publishers/foo%3Abar/p1/books/x"),
         expected
@@ -350,7 +359,7 @@ service S {
 }
 "#,
     );
-    let expected: PathParams = [("wildcard2".to_owned(), "b".to_owned())].into();
+    let expected = named(&[("wildcard2", "b")]);
     assert_eq!(bound_fields(&routes, Method::GET, "/v1/a/b"), expected);
 }
 
@@ -370,17 +379,9 @@ service S {
 }
 "#,
     );
-    let get: PathParams = [
-        ("a".to_owned(), "x".to_owned()),
-        ("id".to_owned(), "y".to_owned()),
-    ]
-    .into();
+    let get = named(&[("a", "x"), ("id", "y")]);
     assert_eq!(bound_fields(&routes, Method::GET, "/v1/foo/x/books/y"), get);
-    let cancel: PathParams = [
-        ("a".to_owned(), "foo/x".to_owned()),
-        ("id".to_owned(), "y".to_owned()),
-    ]
-    .into();
+    let cancel = named(&[("a", "foo/x"), ("id", "y")]);
     assert_eq!(
         bound_fields(&routes, Method::POST, "/v1/foo/x/books/y:cancel"),
         cancel
@@ -614,18 +615,12 @@ service S {
     assert_eq!(tables.len(), 1);
     let routes = table::Routes::new(tables);
     let table = &routes.tables[0];
-    let matched = |b: &str| -> PathParams {
-        [("a", "first"), ("b", b)]
-            .into_iter()
-            .map(|(k, v)| (k.to_owned(), v.to_owned()))
-            .collect()
-    };
+    let matched =
+        |b: &'static str| -> PathParams<'static> { vec![("a", "first".into()), ("b", b.into())] };
     let post = bound(&routes, Method::POST, "/x/first/second:go");
     let mut params = matched("second:go");
     table.bind_params(post, &mut params);
-    assert_eq!(params.len(), 2);
-    assert_eq!(params["b"], "first");
-    assert_eq!(params["a"], "second");
+    assert_eq!(by_name(&params), named(&[("b", "first"), ("a", "second")]));
     // The binding with the path's own names and no verb is left as matched.
     let get = bound(&routes, Method::GET, "/x/first/second");
     let mut params = matched("second");

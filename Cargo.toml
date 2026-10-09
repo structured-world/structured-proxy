@@ -64,6 +64,11 @@ tokio-util = { version = "0.7.16", features = ["rt"] }
 # before axum registers it, where a path it rejects would panic. Already in the
 # tree through axum, which pins the version this resolves to.
 matchit = "0.8"
+# The hash of the routing maps a request is looked up in. Their keys are the
+# paths and segments the proxy binds, fixed at startup, so a request can only
+# look up, never fill a map with colliding keys: no randomized hash is needed,
+# and FxHash looks up short strings faster than SipHash.
+rustc-hash = "2"
 # Decodes the path parameters of a custom verb bound on another route the
 # request matches, as axum decodes its own; already in the tree through axum.
 percent-encoding = "2"

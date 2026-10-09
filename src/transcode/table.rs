@@ -11,10 +11,10 @@
 //! verb.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::ops::ControlFlow;
 
 use axum::http::{HeaderValue, Method};
+use rustc_hash::FxHashMap;
 
 use super::path::{decode_multi_segment, Composite, MountedPath, Part};
 use super::rule::RouteMethod;
@@ -26,7 +26,7 @@ pub(super) struct Routes {
     /// For each verb, the tables binding it. The router matches a request to
     /// one path whatever its verb, while the verb may be bound on a path of
     /// another shape the request also matches.
-    verbs: HashMap<String, Index>,
+    verbs: FxHashMap<String, Index>,
     /// The tables with a binding without a verb: a path whose bindings all
     /// carry verbs must not hide one of these from a request that names no
     /// bound verb.
@@ -35,7 +35,7 @@ pub(super) struct Routes {
     all: Index,
     /// Each table by its router path, as the router reports the route it
     /// matched.
-    by_path: HashMap<String, usize>,
+    by_path: FxHashMap<String, usize>,
     /// Each table's path alone: with which captures a request matches it.
     single: Vec<matchit::Router<()>>,
 }
@@ -55,7 +55,7 @@ struct Index {
 
 #[derive(Default)]
 struct Node {
-    literals: HashMap<String, usize>,
+    literals: FxHashMap<String, usize>,
     variable: Option<usize>,
     /// The table whose path ends in a catch-all here.
     rest: Option<usize>,
@@ -159,6 +159,8 @@ pub(super) struct PathTable {
     /// The capture names of `path`, in path order.
     pub(super) captures: Vec<String>,
     bindings: Vec<Binding>,
+    /// Whether a binding has no verb.
+    plain: bool,
 }
 
 /// One binding of a [`PathTable`].
@@ -219,9 +221,13 @@ impl Binding {
     /// binding's literals mounted as captures, and the value of its last
     /// capture follows the binding's field template.
     fn fits(&self, path: &str) -> bool {
+        // The literals come in path order: one pass over the segments.
+        let mut segments = path.split('/');
+        let mut next = 0;
         for (at, literal) in &self.literals {
-            let segment = path.split('/').nth(*at);
-            if segment.is_none_or(|segment| normalize_escapes(segment) != literal.as_str()) {
+            let segment = segments.nth(at - next);
+            next = at + 1;
+            if segment.is_none_or(|segment| !same_octets(segment, literal)) {
                 return false;
             }
         }
@@ -244,12 +250,7 @@ impl Binding {
         let Some(value) = path.get(at..end) else {
             return false;
         };
-        let segments: Vec<&str> = if value.is_empty() {
-            Vec::new()
-        } else {
-            value.split('/').collect()
-        };
-        follows(&template.segments, &segments)
+        follows(&template.segments, Some(value).filter(|v| !v.is_empty()))
     }
 }
 
@@ -287,33 +288,46 @@ pub(super) fn split_verb(path: &str) -> Option<(&str, &str)> {
     Some(path.split_at(colon))
 }
 
+/// The bytes of `text` with the hex digits of its percent-escapes in upper
+/// case: the two bytes after a `%` are its digits, and only a hex digit among
+/// them changes, so a malformed escape is not rewritten.
+fn normalized_bytes(text: &str) -> impl Iterator<Item = u8> + '_ {
+    let mut digits = 0u8;
+    text.bytes().map(move |byte| {
+        if digits > 0 {
+            digits -= 1;
+            if byte.is_ascii_hexdigit() {
+                byte.to_ascii_uppercase()
+            } else {
+                byte
+            }
+        } else {
+            if byte == b'%' {
+                digits = 2;
+            }
+            byte
+        }
+    })
+}
+
 /// `text` with the hex digits of its percent-escapes in upper case: `%3a` and
 /// `%3A` are one octet (RFC 3986 §6.2.2.1). Borrowed when nothing changes.
 pub(super) fn normalize_escapes(text: &str) -> Cow<'_, str> {
-    let lower_hex = |b: &u8| b.is_ascii_hexdigit() && b.is_ascii_lowercase();
-    let bytes = text.as_bytes();
-    let lower_escape =
-        |at: usize| bytes[at] == b'%' && bytes[at + 1..].iter().take(2).any(lower_hex);
-    if !(0..bytes.len()).any(lower_escape) {
+    if normalized_bytes(text).eq(text.bytes()) {
         return Cow::Borrowed(text);
     }
-    let mut normalized = String::with_capacity(text.len());
-    let mut chars = text.chars();
-    while let Some(ch) = chars.next() {
-        normalized.push(ch);
-        if ch == '%' {
-            for digit in chars.by_ref().take(2) {
-                // Only a hex digit is part of the escape; anything else is
-                // kept as it is, so a malformed escape is not rewritten.
-                normalized.push(if digit.is_ascii_hexdigit() {
-                    digit.to_ascii_uppercase()
-                } else {
-                    digit
-                });
-            }
-        }
-    }
-    Cow::Owned(normalized)
+    // Only ASCII letters change, never a byte of a multi-byte character.
+    Cow::Owned(
+        String::from_utf8(normalized_bytes(text).collect())
+            .expect("upper-casing ASCII letters keeps UTF-8 valid"),
+    )
+}
+
+/// Whether `received` is `normalized`, a text with its escapes in upper case,
+/// up to the case of its own escapes: `normalize_escapes(received) ==
+/// normalized`, without building the normalized text.
+fn same_octets(received: &str, normalized: &str) -> bool {
+    received.len() == normalized.len() && normalized_bytes(received).eq(normalized.bytes())
 }
 
 /// What a binding claims on its path: the method, the verb, the field
@@ -370,18 +384,33 @@ fn positions(marked: &[bool]) -> Vec<usize> {
 }
 
 /// Whether the segments of `value` follow `template`: a literal itself, `*`
-/// one non-empty segment, `**` any number of segments.
-fn follows(template: &[String], value: &[&str]) -> bool {
+/// one non-empty segment, `**` any number of segments. `value` is `None` with
+/// no segments left, otherwise one or more separated by `/`.
+fn follows(template: &[String], value: Option<&str>) -> bool {
     match template.split_first() {
-        None => value.is_empty(),
+        None => value.is_none(),
         Some((first, rest)) if first == "**" => {
-            (0..=value.len()).any(|taken| follows(rest, &value[taken..]))
+            // Taking none, then one segment more each time.
+            let mut left = value;
+            loop {
+                if follows(rest, left) {
+                    return true;
+                }
+                match left {
+                    Some(segments) => left = segments.split_once('/').map(|(_, tail)| tail),
+                    None => return false,
+                }
+            }
         }
-        Some((first, rest)) => value.split_first().is_some_and(|(segment, tail)| {
+        Some((first, rest)) => value.is_some_and(|segments| {
+            let (segment, tail) = match segments.split_once('/') {
+                Some((segment, tail)) => (segment, Some(tail)),
+                None => (segments, None),
+            };
             let fits = if first == "*" {
                 !segment.is_empty()
             } else {
-                normalize_escapes(segment) == first.as_str()
+                same_octets(segment, first)
             };
             fits && follows(rest, tail)
         }),
@@ -393,10 +422,11 @@ impl Routes {
     /// already accepted by a router holding them all, so a router holding
     /// some of them accepts it too.
     pub(super) fn new(tables: Vec<PathTable>) -> Self {
-        let mut verbs: HashMap<String, Index> = HashMap::new();
+        let mut verbs: FxHashMap<String, Index> = FxHashMap::default();
         let mut plain = Index::default();
         let mut all = Index::default();
-        let mut by_path = HashMap::with_capacity(tables.len());
+        let mut by_path =
+            FxHashMap::with_capacity_and_hasher(tables.len(), rustc_hash::FxBuildHasher);
         let mut single = Vec::with_capacity(tables.len());
         for (index, table) in tables.iter().enumerate() {
             let mut alone = matchit::Router::new();
@@ -405,7 +435,7 @@ impl Routes {
             single.push(alone);
             all.insert(&table.path, index);
             by_path.insert(table.path.clone(), index);
-            if table.bindings.iter().any(|b| b.verb.is_none()) {
+            if table.plain {
                 plain.insert(&table.path, index);
             }
             let mut seen: Vec<&str> = Vec::new();
@@ -532,7 +562,7 @@ impl Routes {
         // The router's own table, when it has bindings without a verb, ranks
         // first among those that have: no second lookup for the common
         // request.
-        let first = if self.tables[table].bindings.iter().any(|b| b.verb.is_none()) {
+        let first = if self.tables[table].plain {
             table
         } else {
             match self.plain.first(path) {
@@ -563,6 +593,7 @@ impl PathTable {
         Self {
             path: axum,
             captures,
+            plain: verb.is_none(),
             bindings: vec![Binding {
                 entry,
                 names: None,
@@ -629,6 +660,7 @@ impl PathTable {
         } else {
             self.bindings.len()
         };
+        self.plain |= binding.verb.is_none();
         self.bindings.insert(at, binding);
     }
 
@@ -653,12 +685,18 @@ impl PathTable {
         answers: impl Fn(&Binding) -> bool,
     ) -> Option<Choice> {
         let mut head: Option<usize> = None;
+        // The admitted bindings among the first 64, for the `Allow` of a 405;
+        // a later one is asked again then.
+        let mut admitted = 0u64;
         let mut answered = false;
         for (index, binding) in self.bindings.iter().enumerate() {
             if !answers(binding) {
                 continue;
             }
             answered = true;
+            if index < 64 {
+                admitted |= 1 << index;
+            }
             match &binding.entry.http_method {
                 RouteMethod::Any => return Some(Choice::Route { table, index }),
                 RouteMethod::One(bound) if bound == method => {
@@ -673,26 +711,46 @@ impl PathTable {
         }
         match head {
             Some(index) => Some(Choice::Route { table, index }),
-            None if answered => Some(Choice::MethodNotAllowed(self.allow(&answers))),
+            None if answered => Some(Choice::MethodNotAllowed(self.allow(|index| {
+                if index < 64 {
+                    admitted & (1 << index) != 0
+                } else {
+                    answers(&self.bindings[index])
+                }
+            }))),
             None => None,
         }
     }
 
-    /// The methods of the bindings `answers` admits, in binding order, with
-    /// HEAD after them when a GET binding answers it.
-    fn allow(&self, answers: &impl Fn(&Binding) -> bool) -> HeaderValue {
-        let mut methods: Vec<&str> = Vec::new();
-        for binding in self.bindings.iter().filter(|b| answers(b)) {
-            let method = binding.entry.http_method.as_str();
-            if !methods.contains(&method) {
-                methods.push(method);
+    /// The methods of the bindings at the indexes `admitted` takes, in
+    /// binding order, with HEAD after them when a GET binding answers it.
+    fn allow(&self, admitted: impl Fn(usize) -> bool) -> HeaderValue {
+        let mut value = String::new();
+        let (mut get, mut head) = (false, false);
+        for (index, binding) in self.bindings.iter().enumerate() {
+            if !admitted(index) {
+                continue;
             }
+            let method = binding.entry.http_method.as_str();
+            let listed = self.bindings[..index]
+                .iter()
+                .enumerate()
+                .any(|(earlier, b)| b.entry.http_method.as_str() == method && admitted(earlier));
+            if listed {
+                continue;
+            }
+            if !value.is_empty() {
+                value.push_str(", ");
+            }
+            value.push_str(method);
+            get |= method == "GET";
+            head |= method == "HEAD";
         }
-        if methods.contains(&"GET") && !methods.contains(&"HEAD") {
-            methods.push("HEAD");
+        if get && !head {
+            value.push_str(", HEAD");
         }
-        HeaderValue::from_str(&methods.join(", "))
-            .expect("method tokens are valid header value characters")
+        // Taken as it is, not copied.
+        HeaderValue::try_from(value).expect("method tokens are valid header value characters")
     }
 
     /// The positions of the binding at `index`'s captures that keep `%2F`
@@ -706,67 +764,78 @@ impl PathTable {
     /// the binding at `index`: its verb taken off the last capture, and the
     /// captures under its own names. A parameter the table's path does not
     /// capture (a prefix the router is nested under) is left as it is.
-    pub(super) fn bind_params(&self, index: usize, params: &mut PathParams) {
+    pub(super) fn bind_params<'p>(&'p self, index: usize, params: &mut PathParams<'p>) {
         let binding = &self.bindings[index];
+        let value_of =
+            |params: &PathParams<'p>, name: &str| params.iter().position(|(own, _)| *own == name);
         if let (Some(verb), Some(last)) = (&binding.verb, self.captures.last()) {
             // The verb comes off decoded as the capture was; a kept `%2F` may
             // be spelled in either case.
             let multi = binding.multi_segment.contains(&(self.captures.len() - 1));
-            if let Some(value) = params.get_mut(last) {
+            if let Some(at) = value_of(params, last) {
+                let value = &mut params[at].1;
                 let len = if multi {
                     let suffix = verb.multi_segment.len();
                     value.len().checked_sub(suffix).filter(|&start| {
-                        value.get(start..).is_some_and(|tail| {
-                            normalize_escapes(tail) == verb.multi_segment.as_str()
-                        })
+                        value
+                            .get(start..)
+                            .is_some_and(|tail| same_octets(tail, &verb.multi_segment))
                     })
                 } else {
                     value.strip_suffix(verb.decoded.as_str()).map(str::len)
                 };
-                if let Some(len) = len {
-                    value.truncate(len);
+                match (len, value) {
+                    (Some(len), Cow::Borrowed(value)) => *value = &value[..len],
+                    (Some(len), Cow::Owned(value)) => value.truncate(len),
+                    (None, _) => {}
                 }
             }
         }
+        let matched = params.len();
         // A field spelled out over several segments, put back together from
-        // them before they go.
-        let composed: Vec<(String, String)> = binding
-            .composites
-            .iter()
-            .map(|composite| {
-                let parts: Vec<&str> = composite
-                    .parts
-                    .iter()
-                    .map(|part| match part {
-                        Part::Literal(literal) => literal.as_str(),
-                        Part::Capture(position) => params
-                            .get(&self.captures[*position])
-                            .map_or("", String::as_str),
-                    })
-                    .collect();
-                (composite.field.clone(), parts.join("/"))
-            })
-            .collect();
-        // Every capture of the table's path is taken out before any field goes
-        // back in: one binding's name, or a composite's field, may be another
-        // capture's name on that path. A bare wildcard, or a part of a
-        // composite, was named for the router only and stays out.
-        let mut renamed: Vec<(&String, String)> = Vec::new();
-        for (position, path_name) in self.captures.iter().enumerate() {
-            let own = binding
-                .names
-                .as_ref()
-                .map_or(path_name, |names| &names[position]);
-            let routing_only = binding.unbound.contains(&position);
-            if routing_only || own != path_name {
-                let value = params.remove(path_name);
-                if let (false, Some(value)) = (routing_only, value) {
-                    renamed.push((own, value));
+        // them before they go, after the captures.
+        for composite in &binding.composites {
+            let mut value = String::new();
+            for (at, part) in composite.parts.iter().enumerate() {
+                if at > 0 {
+                    value.push('/');
                 }
+                value.push_str(match part {
+                    Part::Literal(literal) => literal,
+                    Part::Capture(position) => {
+                        value_of(params, &self.captures[*position]).map_or("", |at| &params[at].1)
+                    }
+                });
+            }
+            params.push((composite.field.as_str(), Cow::Owned(value)));
+        }
+        // Each capture of the table's path takes the binding's name for it, in
+        // place: names are compared before any changes, so one binding's name,
+        // or a composite's field, may be another capture's name on that path.
+        // A bare wildcard, or a part of a composite, was named for the router
+        // only and goes. Kept parameters keep their order.
+        let mut kept = 0;
+        for at in 0..matched {
+            let name = params[at].0;
+            let keep = match self.captures.iter().position(|capture| capture == name) {
+                // A prefix the router is nested under.
+                None => true,
+                Some(position) if binding.unbound.contains(&position) => false,
+                Some(position) => {
+                    params[at].0 = binding
+                        .names
+                        .as_ref()
+                        .map_or(&self.captures[position], |names| &names[position])
+                        .as_str();
+                    true
+                }
+            };
+            if keep {
+                params.swap(kept, at);
+                kept += 1;
             }
         }
-        params.extend(renamed.into_iter().map(|(own, value)| (own.clone(), value)));
-        params.extend(composed);
+        params.drain(kept..matched);
     }
 }
 
