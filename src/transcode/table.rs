@@ -704,6 +704,32 @@ impl Ranked {
             || (*method == Method::HEAD && !self.head[table] && shared.contains(&Method::GET))
     }
 
+    /// `allow`, the `Allow` of the bindings of `table`, with the methods the
+    /// other routes at its path answer after them (RFC 9110 §10.2.1: every
+    /// method the target answers), HEAD with a GET among them.
+    pub(super) fn allow(&self, table: usize, allow: HeaderValue) -> HeaderValue {
+        let shared = &self.shared[table];
+        if shared.is_empty() {
+            return allow;
+        }
+        let mut value = allow.to_str().unwrap_or_default().to_owned();
+        let mut add = |method: &str| {
+            if !value.split(", ").any(|listed| listed == method) {
+                if !value.is_empty() {
+                    value.push_str(", ");
+                }
+                value.push_str(method);
+            }
+        };
+        for method in shared {
+            add(method.as_str());
+        }
+        if shared.contains(&Method::GET) {
+            add(Method::HEAD.as_str());
+        }
+        HeaderValue::from_str(&value).expect("method names are header values")
+    }
+
     /// Whether `table`, whose path `path` matches, ranks before every other
     /// route a request for `method` on `path` reaches: whether it may answer
     /// a request a better-ranked table refused.

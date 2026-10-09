@@ -808,13 +808,14 @@ impl ProxyServer {
             }
             methods.insert(method.as_str());
         }
-        // Paths of different shapes may still be ones the router cannot hold
-        // together, a variable and a catch-all at one position: refused here,
-        // one path per shape, with the router axum routes with.
+        // Paths the router cannot hold together are refused here, with the
+        // router axum routes with: a variable and a catch-all at one position,
+        // or one shape spelled with other variable names (routes of other
+        // methods merge into one path only under the same spelling).
         let mut router = matchit::Router::new();
-        let mut shapes = std::collections::HashSet::new();
+        let mut paths = std::collections::HashSet::new();
         for (_, path) in &mounted {
-            if shapes.insert(normalize_route_shape(path)) {
+            if paths.insert(path.as_str()) {
                 if let Err(error) = router.insert(path.as_str(), ()) {
                     anyhow::bail!("route path {path:?} conflicts with another route: {error}");
                 }

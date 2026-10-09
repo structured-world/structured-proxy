@@ -443,9 +443,13 @@ fn choose<B>(
 ) -> bool {
     let (method, path) = (request.method(), request.uri().path());
     let choice = match ranked {
-        Some(ranked) => routes.choose_ranked(table, method, path, &|other| {
+        Some(ranked) => match routes.choose_ranked(table, method, path, &|other| {
             ranked.ranks_first(other, method, path)
-        }),
+        }) {
+            // The other routes at the path answer methods too.
+            Choice::MethodNotAllowed(allow) => Choice::MethodNotAllowed(ranked.allow(table, allow)),
+            choice => choice,
+        },
         None => routes.choose(table, method, path),
     };
     match choice {

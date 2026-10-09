@@ -506,6 +506,27 @@ async fn a_refused_binding_passes_to_the_next_route_in_rank_not_the_next_transco
     assert_eq!((status, &body["rpc"]), (StatusCode::OK, &json!("Below")));
 }
 
+async fn a_405_allows_the_methods_of_an_extra_route_at_the_same_path() {
+    // RFC 9110 §15.5.6: `Allow` lists every method the target answers, those
+    // of an extra route sharing the transcoded path included.
+    let pool: DescriptorPool = common::compile("test/v1/ranked.proto", RANKED_PROTO);
+    let msg = pool.get_message_by_name("test.v1.Msg").unwrap();
+    let app = common::app(UPSTREAM, Ops { msg }, |yaml| {
+        structured_proxy::ProxyServer::from_yaml_str(yaml)
+            .unwrap()
+            .with_descriptors(pool)
+            .with_extra_routes([ExtraRoute::new(
+                Method::POST,
+                "/v1/{name}/b/{operation}",
+                Arc::new(Ping),
+            )])
+    })
+    .await;
+    let (status, allow, _) = call(&app, Method::DELETE, "/v1/x/b/y").await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(allow, "GET, HEAD, POST");
+}
+
 async fn a_transcoded_head_binding_keeps_head_beside_an_extra_get() {
     // A route's own HEAD comes before a GET answering HEAD, as a router's
     // method route holds it: the transcoded `custom` HEAD keeps HEAD, the
@@ -767,6 +788,53 @@ async fn a_preflight_for_a_url_no_binding_answers_reaches_the_fallback() {
     let (status, body) = common::send(&app, request).await;
     assert_eq!(status, StatusCode::IM_A_TEAPOT);
     assert_eq!(body, "yours");
+}
+
+#[tokio::test]
+async fn an_extra_route_spelling_a_transcoded_path_otherwise_is_refused() {
+    // One shape under other variable names: the router merges routes of
+    // other methods only under one spelling, so a startup error, not a panic.
+    let pool = common::compile("test/v1/ranked.proto", RANKED_PROTO);
+    let err = structured_proxy::ProxyServer::from_yaml_str(
+        "upstream:\n  default: \"http://127.0.0.1:1\"\n",
+    )
+    .unwrap()
+    .with_descriptors(pool)
+    .with_extra_routes([ExtraRoute::new(
+        Method::POST,
+        "/v1/{kind}/b/{id}",
+        Arc::new(Ping),
+    )])
+    .router()
+    .expect_err("a second spelling of one path must be rejected");
+    assert!(
+        err.to_string().contains("conflicts with another route"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn a_routed_405_allows_the_methods_of_an_extra_route_at_the_same_path() {
+    // The same through `router()`.
+    let pool = common::compile("test/v1/ranked.proto", RANKED_PROTO);
+    let router = structured_proxy::ProxyServer::from_yaml_str(
+        "upstream:\n  default: \"http://127.0.0.1:1\"\n",
+    )
+    .unwrap()
+    .with_descriptors(pool)
+    .with_extra_routes([ExtraRoute::new(
+        Method::POST,
+        "/v1/{name}/b/{operation}",
+        Arc::new(Ping),
+    )])
+    .router()
+    .unwrap();
+    let request = http::Request::delete("/v1/x/b/y")
+        .body(Body::empty())
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(response.headers()[http::header::ALLOW], "GET, HEAD, POST");
 }
 
 #[tokio::test]
