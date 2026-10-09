@@ -11,10 +11,10 @@ use prost_reflect::{DescriptorPool, FieldDescriptor, Kind, MessageDescriptor, Me
 use serde_json::{json, Map, Value};
 
 use crate::config::{AliasConfig, OpenApiConfig};
-use crate::transcode::httpbody;
 use crate::transcode::request::BodyMapping;
 use crate::transcode::rule::{self, HttpBinding, RouteMethod};
 use crate::transcode::RpcSelection;
+use crate::transcode::{self, httpbody, path};
 
 /// The operations an OpenAPI 3.0 path item can hold, in the order a `*` rule
 /// lists them.
@@ -38,6 +38,9 @@ pub fn generate(
     let mut tags = Vec::new();
     let mut operation_ids = HashSet::new();
     let http_ext = pool.get_extension_by_name("google.api.http");
+    // The router paths the routes mount: a template the router cannot match,
+    // or one it refuses beside another, would promise a URL that is 404.
+    let mounted = transcode::mounted_shapes(pool, aliases, selection);
 
     for service in pool.services() {
         if !selection.is_all() && !service.methods().any(|m| selection.selects(&m)) {
@@ -86,6 +89,10 @@ pub fn generate(
                         }
                     }
                     for path in targets {
+                        let mount = path::MountedPath::new(&path);
+                        if mount.routable().is_err() || !mounted.contains(&mount.shape) {
+                            continue;
+                        }
                         let mut operation = operation.clone();
                         if http_method == "head" {
                             strip_response_content(&mut operation);

@@ -20,6 +20,29 @@ use serde_json::Value as JsonValue;
 
 use presence::{has_special_json, OneEntry, Presence, Recording};
 
+/// The path parameters of a request: each dotted field path the path binds,
+/// with its value.
+pub(crate) trait PathFields {
+    fn fields(&self) -> impl Iterator<Item = (&str, &str)>;
+
+    fn is_empty(&self) -> bool {
+        self.fields().next().is_none()
+    }
+}
+
+impl PathFields for HashMap<String, String> {
+    fn fields(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+    }
+}
+
+impl PathFields for [(&str, Cow<'_, str>)] {
+    fn fields(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.iter().map(|(key, value)| (*key, value.as_ref()))
+    }
+}
+
 /// How the HTTP request body maps onto the gRPC request message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -157,6 +180,17 @@ pub fn build_request_message(
     path_params: &HashMap<String, String>,
     raw_query: Option<&str>,
 ) -> Result<DynamicMessage, String> {
+    build_message(input, mapping, body, path_params, raw_query)
+}
+
+/// [`build_request_message`] for any form of the path parameters.
+pub(crate) fn build_message<P: PathFields + ?Sized>(
+    input: &MessageDescriptor,
+    mapping: &BodyMapping,
+    body: Body<'_>,
+    path_params: &P,
+    raw_query: Option<&str>,
+) -> Result<DynamicMessage, String> {
     // Parsed without allocating wherever nothing needs unescaping.
     let query: Vec<(Cow<'_, str>, Cow<'_, str>)> = match raw_query {
         Some(q) => url::form_urlencoded::parse(q.as_bytes()).collect(),
@@ -174,11 +208,11 @@ enum Binding {
     Fill,
 }
 
-fn build(
+fn build<P: PathFields + ?Sized>(
     input: &MessageDescriptor,
     mapping: &BodyMapping,
     body: Body<'_>,
-    path_params: &HashMap<String, String>,
+    path_params: &P,
     query: &[(Cow<'_, str>, Cow<'_, str>)],
 ) -> Result<DynamicMessage, String> {
     // What the body and the path set matters only when a query can fill.
@@ -223,13 +257,13 @@ fn build(
 
     let root_inside = has_special_json(input);
     // Path params win over everything (the router already matched them).
-    for (key, raw) in path_params {
+    for (key, raw) in path_params.fields() {
         let target = Target {
             root: input,
             inside: root_inside,
             prefix: None,
             key,
-            values: &[raw.as_str()],
+            values: &[raw],
         };
         inside |= bind(
             &mut message,
@@ -252,7 +286,7 @@ fn build(
             start,
             Binding::Fill,
             Some(presence),
-            None,
+            None::<&P>,
             &mut path,
         )?;
     }
@@ -342,11 +376,11 @@ struct Target<'a> {
 /// never decides the request, even when it is not a valid value of that field.
 /// Such a body fails the one pass; it is then read again without those keys.
 /// Only a failing body pays for the second read.
-fn json_body(
+fn json_body<P: PathFields + ?Sized>(
     input: &MessageDescriptor,
     mapping: &BodyMapping,
     bytes: &[u8],
-    path_params: &HashMap<String, String>,
+    path_params: &P,
     mut presence: Option<&mut Presence>,
 ) -> Result<DynamicMessage, String> {
     // A `null` body sets nothing, like `{}`.
@@ -377,13 +411,13 @@ fn json_body(
 
 /// Remove from `body` every key the path binds, under its JSON or proto name:
 /// the path sets those fields whatever the body holds.
-fn strip_path_fields(
+fn strip_path_fields<P: PathFields + ?Sized>(
     body: &mut JsonValue,
     input: &MessageDescriptor,
     mapping: &BodyMapping,
-    path_params: &HashMap<String, String>,
+    path_params: &P,
 ) {
-    for key in path_params.keys() {
+    for (key, _) in path_params.fields() {
         let mut segments = key.split('.');
         let desc = match mapping {
             BodyMapping::Root => input.clone(),
@@ -483,10 +517,10 @@ fn deserialize_input<'de, D: Deserializer<'de>>(
 
 /// Bind a form body field by field, into the input message or the message
 /// field the mapping names.
-fn form_body(
+fn form_body<P: PathFields + ?Sized>(
     input: &MessageDescriptor,
     mapping: &BodyMapping,
-    form: Form<'_, '_>,
+    form: Form<'_, '_, P>,
     mut presence: Option<&mut Presence>,
     path: &mut Vec<FieldDescriptor>,
 ) -> Result<(DynamicMessage, bool), String> {
@@ -529,10 +563,9 @@ fn form_body(
 }
 
 /// A form body and the path parameters that override it.
-#[derive(Clone, Copy)]
-struct Form<'p, 'q> {
+struct Form<'p, 'q, P: ?Sized> {
     pairs: &'p [(Cow<'q, str>, Cow<'q, str>)],
-    path_params: &'p HashMap<String, String>,
+    path_params: &'p P,
 }
 
 /// Whether the dotted path key `bound` names the field at the end of `path`
@@ -562,13 +595,13 @@ struct Start<'a> {
 /// Keys are grouped by the field they name, not by spelling: `tag_ids` and
 /// `tagIds` are one field, and binding them apart would let one replace the
 /// other's values.
-fn bind_pairs(
+fn bind_pairs<P: PathFields + ?Sized>(
     message: &mut DynamicMessage,
     pairs: &[(Cow<'_, str>, Cow<'_, str>)],
     start: Start<'_>,
     binding: Binding,
     mut presence: Option<&mut Presence>,
-    path_params: Option<&HashMap<String, String>>,
+    path_params: Option<&P>,
     path: &mut Vec<FieldDescriptor>,
 ) -> Result<bool, String> {
     // A stable sort keeps the values of each spelling in request order.
@@ -668,17 +701,17 @@ fn bind_pairs(
 
 /// Assign `values` to the resolved `path` unless a path parameter binds it.
 /// True when it was assigned.
-fn bind_resolved(
+fn bind_resolved<P: PathFields + ?Sized>(
     message: &mut DynamicMessage,
     path: &[FieldDescriptor],
     values: &[&str],
     binding: Binding,
     presence: Option<&mut Presence>,
-    path_params: Option<&HashMap<String, String>>,
+    path_params: Option<&P>,
 ) -> Result<bool, String> {
     // The path sets these fields whatever the form holds, so their form
     // values are never decoded, as a JSON body's are not.
-    if path_params.is_some_and(|bound| bound.keys().any(|key| covers(key, path))) {
+    if path_params.is_some_and(|bound| bound.fields().any(|(key, _)| covers(key, path))) {
         return Ok(false);
     }
     assign(message, path, values, binding, presence)?;

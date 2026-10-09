@@ -39,7 +39,7 @@ doc = false
 axum = { version = "0.8", features = ["macros"] }
 # `util`: the guarded gRPC and fallback paths are boxed services.
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.7", features = ["cors", "trace"] }
+tower-http = { version = "0.7", features = ["trace"] }
 # Foundational HTTP types, used directly by the framework-agnostic embedding
 # hooks (src/hooks.rs) so an embedder never names `axum`. Already in the tree
 # transitively via both axum and tonic; pinned here to make the public API deps
@@ -60,6 +60,18 @@ hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "s
 # in the tree through hyper-util and tonic.
 hyper = "1"
 tokio-util = { version = "0.7.16", features = ["rt"] }
+# The router axum matches paths with: a transcoded template is checked with it
+# before axum registers it, where a path it rejects would panic. Already in the
+# tree through axum, which pins the version this resolves to.
+matchit = "0.8"
+# The hash of the routing maps a request is looked up in. Their keys are the
+# paths and segments the proxy binds, fixed at startup, so a request can only
+# look up, never fill a map with colliding keys: no randomized hash is needed,
+# and FxHash looks up short strings faster than SipHash.
+rustc-hash = "2"
+# Decodes the path parameters of a custom verb bound on another route the
+# request matches, as axum decodes its own; already in the tree through axum.
+percent-encoding = "2"
 
 # gRPC client (to upstream service). `tls-connect-info` gives a rustls server
 # stream the connection record (client certificates) a tonic handler reads, so
@@ -186,6 +198,8 @@ cli = ["dep:clap", "dep:tracing-subscriber", "redis"]
 # `test-util`: deadline tests run on a paused clock instead of waiting.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 tower = { version = "0.5", features = ["util", "limit"] }
+# An embedder's own CORS around the proxy (tests/edge.rs).
+tower-http = { version = "0.7", features = ["cors"] }
 http-body-util = "0.1"
 # `hyper::upgrade::on`: a fallback that upgrades its connection (src/serve/tests.rs).
 hyper = "1"

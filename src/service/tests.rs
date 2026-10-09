@@ -61,7 +61,13 @@ impl Service<http::Request<tonic::body::Body>> for Recorder {
 /// A proxy with one HTTP route, `GET /route`, in front of `upstream`.
 fn service(upstream: Recorder) -> ProxyService<Recorder> {
     let routes = axum::Router::new().route("/route", get(|| async { "route" }));
-    ProxyService::new(upstream, routes, None, Arc::default(), false)
+    ProxyService::new(
+        upstream,
+        Routing::routed(routes, None),
+        None,
+        Arc::default(),
+        false,
+    )
 }
 
 fn grpc_request(path: &str) -> http::Request<Body> {
@@ -289,7 +295,7 @@ fn peer_routes() -> axum::Router {
 async fn an_http_request_carries_its_peer_for_the_middleware() {
     let proxy = ProxyService::new(
         Recorder::default(),
-        peer_routes(),
+        Routing::routed(peer_routes(), None),
         None,
         Arc::default(),
         false,
@@ -306,7 +312,7 @@ async fn an_http_request_carries_its_peer_for_the_middleware() {
 async fn an_http_request_carries_its_connection_for_the_transcoder() {
     let proxy = ProxyService::new(
         Recorder::default(),
-        peer_routes(),
+        Routing::routed(peer_routes(), None),
         None,
         Arc::default(),
         false,
@@ -327,7 +333,7 @@ async fn an_http_request_carries_its_connection_for_the_transcoder() {
 async fn an_http_request_without_a_connection_carries_none() {
     let proxy = ProxyService::new(
         Recorder::default(),
-        peer_routes(),
+        Routing::routed(peer_routes(), None),
         None,
         Arc::default(),
         false,
@@ -361,7 +367,7 @@ async fn a_grpc_request_on_an_axum_server_carries_its_peer_to_the_upstream() {
 async fn an_http_request_on_an_axum_server_carries_its_peer_for_the_transcoder() {
     let proxy = ProxyService::new(
         Recorder::default(),
-        peer_routes(),
+        Routing::routed(peer_routes(), None),
         None,
         Arc::default(),
         false,

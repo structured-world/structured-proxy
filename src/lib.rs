@@ -90,9 +90,9 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
+use cors::CorsLayer;
 use prost_reflect::DescriptorPool;
 use std::net::SocketAddr;
-use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use std::sync::Arc;
@@ -109,8 +109,27 @@ pub(crate) struct ProxyState<U> {
     pub(crate) upstream: U,
     /// Headers to forward from HTTP to gRPC.
     pub(crate) forwarded_headers: Arc<[String]>,
+    /// The same, as header names.
+    pub(crate) forwarded_names: Arc<[http::HeaderName]>,
     /// SSE keep-alive interval (seconds) for server-streaming responses.
     pub(crate) sse_keep_alive_secs: u64,
+}
+
+/// What [`ProxyServer::routes`] builds.
+struct Built {
+    /// Every route behind its layers, for a router.
+    router: Router,
+    /// The choice among the transcoded bindings, made outside the router's
+    /// layers; `None` without transcoded routes.
+    chooser: Option<transcode::Chooser>,
+    /// The transcoded routes served past any router, and the other routes;
+    /// `None` without transcoded routes, or when an other route's path is
+    /// one they cannot be ranked among.
+    direct: Option<(transcode::Direct, Router)>,
+    /// The CORS policy the routes answer under.
+    cors: CorsLayer,
+    /// The guards, for the traffic outside the routes.
+    guards: Arc<guard::Guards>,
 }
 
 /// Universal proxy server.
@@ -577,21 +596,19 @@ impl ProxyServer {
         })
     }
 
-    /// Every `(method, path)` route mounted before the verify endpoint, used to
-    /// reject a real collision with a clear error instead of an axum
-    /// duplicate-route panic. `method` is the uppercase HTTP token; same-path
-    /// routes with different methods do NOT collide (the extra-route adapter and
-    /// axum merge them), so the key is the pair, not the path alone.
+    /// Every `(method, path)` route of the proxy's own endpoints and the
+    /// embedder's extra routes, the verify endpoint aside. With the
+    /// transcoded routes, it checks the mounted edge for a real collision,
+    /// reported as a clear error instead of an axum duplicate-route panic,
+    /// and ranks the transcoded paths among the others for the proxy
+    /// service. `method` is the uppercase HTTP token; same-path routes with
+    /// different methods do NOT collide (the extra-route adapter and axum
+    /// merge them), so the key is the pair, not the path alone.
     ///
     /// Must stay exhaustive: health probes, metrics, OpenAPI spec/docs, the OIDC
-    /// surface (injected backend or config-driven static discovery), embedder
-    /// extra routes, and the transcoded REST routes. All built-in surfaces here
-    /// are `GET`.
-    fn reserved_routes(
-        &self,
-        pool: &DescriptorPool,
-        selection: &transcode::RpcSelection,
-    ) -> anyhow::Result<Vec<(String, String)>> {
+    /// surface (injected backend or config-driven static discovery) and
+    /// embedder extra routes. All built-in surfaces here are `GET`.
+    fn endpoint_routes(&self) -> anyhow::Result<Vec<(String, String)>> {
         let mut routes = Vec::new();
         let mut get = |path: String| routes.push(("GET".to_string(), path));
         if self.config.health.enabled {
@@ -623,14 +640,14 @@ impl ProxyServer {
                 }
             }
         }
-        for route in &self.extra_routes {
+        // Only the extra routes mounted: one the router skips answers nothing.
+        for route in self
+            .extra_routes
+            .iter()
+            .filter(|route| embed::mountable(route))
+        {
             routes.push((route.method.as_str().to_string(), route.path.clone()));
         }
-        routes.extend(transcode::route_paths(
-            pool,
-            &self.config.aliases,
-            selection,
-        ));
         Ok(routes)
     }
 
@@ -659,13 +676,28 @@ impl ProxyServer {
     /// [`service`](Self::service) for native gRPC on the same listener, or for
     /// an upstream in process.
     ///
+    /// A URL whose path a transcoded route matches but which no binding
+    /// answers (its field template or custom verb does not fit) goes to the
+    /// proxy's other routes, extra routes included, and is answered `404`
+    /// when none of them answers it. An axum router routes a request to one
+    /// route, so routes merged after this one are not tried for it: serve the
+    /// application's own routes through
+    /// [`with_extra_routes`](Self::with_extra_routes), or use
+    /// [`service`](Self::service) with
+    /// [`with_fallback`](ProxyService::with_fallback).
+    ///
     /// # Errors
     ///
     /// No valid upstream address, or a configuration [`service`](Self::service)
     /// rejects.
     pub fn router(&self) -> anyhow::Result<Router> {
-        let (router, _, _) = self.routes(self.upstream()?)?;
-        Ok(router)
+        let Built {
+            router, chooser, ..
+        } = self.routes(self.upstream()?)?;
+        Ok(match chooser {
+            Some(chooser) => chooser.layer(router),
+            None => router,
+        })
     }
 
     /// The whole proxy as one tower service in front of `upstream`: native
@@ -698,25 +730,33 @@ impl ProxyServer {
     /// # build().unwrap();
     /// ```
     pub fn service<U: Upstream>(&self, upstream: U) -> anyhow::Result<ProxyService<U>> {
-        let (routes, cors, guards) = self.routes(upstream.clone())?;
+        let Built {
+            router,
+            chooser,
+            direct,
+            cors,
+            guards,
+        } = self.routes(upstream.clone())?;
         // The routes answer a browser's preflight for gRPC-Web too, so its
         // call carries the same policy unless the upstream sets its own.
         let grpc_web_cors = self.config.cors.grpc_web.then_some(cors);
+        let routing = match direct {
+            Some((direct, others)) => service::Routing::Direct { direct, others },
+            None => service::Routing::routed(router, chooser),
+        };
         Ok(ProxyService::new(
             upstream,
-            routes,
+            routing,
             grpc_web_cors,
             guards,
             self.config.grpc_web.translate,
         ))
     }
 
-    /// Build the axum router with all endpoints, calling `upstream`, the CORS
-    /// policy it answers under, and the guards, for the traffic outside it.
-    fn routes<U: Upstream>(
-        &self,
-        upstream: U,
-    ) -> anyhow::Result<(Router, CorsLayer, Arc<guard::Guards>)> {
+    /// Build the axum router with all endpoints, calling `upstream`; the
+    /// choice among its transcoded bindings, made before its layers; the CORS
+    /// policy it answers under; and the guards, for the traffic outside it.
+    fn routes<U: Upstream>(&self, upstream: U) -> anyhow::Result<Built> {
         // Enforce cross-field invariants on the embedded path too, where the
         // config is built directly instead of through `from_yaml_str`.
         self.config.validate()?;
@@ -737,7 +777,13 @@ impl ProxyServer {
         // routes with different methods are legal (they merge), so only a
         // repeated (method, path) — or any overlap with the verify endpoint,
         // which answers ALL methods (`*`) — is a real conflict.
-        let mut mounted = self.reserved_routes(&pool, &selection)?;
+        let endpoints_mounted = self.endpoint_routes()?;
+        let mut mounted = endpoints_mounted.clone();
+        mounted.extend(transcode::route_paths(
+            &pool,
+            &self.config.aliases,
+            &selection,
+        ));
         if let Some(vp) = &verify_path {
             mounted.push(("*".to_string(), vp.clone()));
         }
@@ -766,6 +812,19 @@ impl ProxyServer {
                 anyhow::bail!("route path {path:?} is registered by more than one endpoint");
             }
             methods.insert(method.as_str());
+        }
+        // Paths the router cannot hold together are refused here, with the
+        // router axum routes with: a variable and a catch-all at one position,
+        // or one shape spelled with other variable names (routes of other
+        // methods merge into one path only under the same spelling).
+        let mut router = matchit::Router::new();
+        let mut paths = std::collections::HashSet::new();
+        for (_, path) in &mounted {
+            if paths.insert(path.as_str()) {
+                if let Err(error) = router.insert(path.as_str(), ()) {
+                    anyhow::bail!("route path {path:?} conflicts with another route: {error}");
+                }
+            }
         }
 
         // Keep the actually-configured probe / metrics / verify paths reachable
@@ -816,16 +875,23 @@ impl ProxyServer {
             .cloned()
             .chain(resolver.forwarded_headers().map(str::to_owned))
             .collect();
+        // Parsed once rather than for every request; every entry is a gRPC
+        // metadata key, so a header name.
+        let forwarded_names = forwarded_headers
+            .iter()
+            .filter_map(|name| http::HeaderName::from_bytes(name.as_bytes()).ok())
+            .collect();
         let state = ProxyState {
             upstream,
             forwarded_headers,
+            forwarded_names,
             sse_keep_alive_secs: self.config.streaming.sse_keep_alive_secs,
         };
 
         let cors = self.build_cors()?;
 
         // Build transcoding routes from descriptor pool.
-        let transcode_routes = transcode::routes_with_options(
+        let (transcode_routes, choices) = transcode::routes_and_choices(
             &pool,
             &self.config.aliases,
             &self.transcode.clone().with_selection(selection.clone()),
@@ -841,7 +907,24 @@ impl ProxyServer {
         let forward_auth = auth.as_ref().and_then(|built| {
             auth::forward::ForwardAuth::build(self.config.auth.as_ref()?, built.clone())
         });
-        let guards = Arc::new(self.guards(resolver, auth, maintenance_exempt, &mounted)?);
+        // The methods a route answers: `*` is not a method. It marks the
+        // verify endpoint and a `custom` `*` rule, which answer every method,
+        // and a transcoded path with verbs, whose bindings still name theirs.
+        let mut methods: Vec<http::Method> = mounted
+            .iter()
+            .filter(|(method, _)| method != "*")
+            .filter_map(|(method, _)| http::Method::from_bytes(method.as_bytes()).ok())
+            .collect();
+        let bound = transcode::bound_methods(&pool, &self.config.aliases, &selection);
+        methods.extend(bound.methods);
+        let mut routed = guard::Routed::new(&methods);
+        if bound.every {
+            routed = routed.every(guard::Class::Transcoded);
+        }
+        if verify_path.is_some() {
+            routed = routed.every(guard::Class::Verify);
+        }
+        let guards = Arc::new(self.guards(resolver, auth, maintenance_exempt, routed)?);
 
         // Health routes. Paths are configurable; the whole group is skippable.
         let health_routes = if self.config.health.enabled {
@@ -965,26 +1048,89 @@ impl ProxyServer {
         // Each class of traffic behind the guards that cover it, so a request
         // runs only the guards of its own class. A path no route answers
         // reaches the plain 404 (or the fallback's own guards).
-        let router = Router::new()
-            .merge(guards.router(transcode_routes, guard::Class::Transcoded))
-            .merge(guards.router(endpoints, guard::Class::Endpoints))
-            .merge(guards.router(verify, guard::Class::Verify))
-            // Before every guard: they and the handlers read its result.
-            .layer(client_address::ClientAddressLayer::with(
-                guards.client_address.clone(),
+        let endpoints = guards.router(endpoints, guard::Class::Endpoints);
+        let verify = guards.router(verify, guard::Class::Verify);
+        // One stack, outermost first, applied at once: each layer applied on
+        // its own would box every route again, and the router clones a
+        // route's boxes for every request.
+        let layered = |router: Router<ProxyState<U>>| {
+            router.layer((
+                // Every request, preflights included.
+                TraceLayer::new_for_http(),
+                // Wraps every enforcement layer so short-circuited responses
+                // keep CORS headers, and answers preflight before auth.
+                cors.clone(),
+                // Before every guard: they and the handlers read its result.
+                client_address::ClientAddressLayer::with(guards.client_address.clone()),
             ))
-            .layer(TraceLayer::new_for_http());
-        // Outermost: wraps every enforcement layer so short-circuited
-        // responses keep CORS headers, and answers preflight before auth.
-        let router = cors::layer(router, cors.clone()).with_state(state);
+        };
+        let router = layered(
+            Router::new()
+                .merge(guards.router(transcode_routes, guard::Class::Transcoded))
+                .merge(endpoints.clone())
+                .merge(verify.clone()),
+        );
+        // The binding is chosen before every layer: a URL no binding answers
+        // (its field template, its custom verb) is no transcoded request. It
+        // goes to the proxy's other routes, which a router without the
+        // transcoded ones ranks for it, and on to the fallback (or the plain
+        // 404) when none answers it either, past the layers like any path no
+        // route answers.
+        let elsewhere =
+            layered(Router::new().merge(endpoints).merge(verify)).with_state(state.clone());
+        // The transcoded paths are ranked among the paths of every other
+        // route: a binding refused at a better-ranked path passes the request
+        // on only to a transcoded path above them all.
+        let mut others: Vec<(Option<http::Method>, String)> = endpoints_mounted
+            .iter()
+            .map(|(method, path)| {
+                (
+                    http::Method::from_bytes(method.as_bytes()).ok(),
+                    path.clone(),
+                )
+            })
+            .collect();
+        if let Some(path) = &verify_path {
+            others.push((None, path.clone()));
+        }
+        let choices = choices.map(|choices| choices.among(&others));
+        // Served by the proxy service, the transcoded routes are matched by
+        // the proxy itself and reached behind the same layers past any
+        // router.
+        let direct = choices.as_ref().and_then(|choices| {
+            let layered = |service: guard::BoxedService| {
+                guard::BoxedService::new(
+                    tower::ServiceBuilder::new()
+                        .map_response(|response: http::Response<_>| {
+                            response.map(axum::body::Body::new)
+                        })
+                        .layer((
+                            TraceLayer::new_for_http(),
+                            cors.clone(),
+                            client_address::ClientAddressLayer::with(guards.client_address.clone()),
+                        ))
+                        .service(guards.service(service, guard::Class::Transcoded)),
+                )
+            };
+            let direct = choices.direct(state.clone(), layered)?;
+            Some((direct, elsewhere.clone()))
+        });
+        let chooser = choices.map(|choices| choices.with_elsewhere(elsewhere.clone()));
+        let router = router.with_state(state);
 
-        Ok((router, cors, guards))
+        Ok(Built {
+            router,
+            chooser,
+            direct,
+            cors,
+            guards,
+        })
     }
 
     /// The guards the configuration and the hooks turn on, each with its
     /// scope, after the client-address resolution `resolver`;
     /// `maintenance_exempt` lists the paths maintenance mode leaves
-    /// reachable, `mounted` the `(method, path)` of every route.
+    /// reachable, `routed` the methods the routes answer.
     ///
     /// # Errors
     ///
@@ -996,17 +1142,11 @@ impl ProxyServer {
         resolver: Arc<client_address::Resolver>,
         auth: Option<Arc<auth::Auth>>,
         maintenance_exempt: Vec<String>,
-        mounted: &[(String, String)],
+        routed: guard::Routed<'_>,
     ) -> anyhow::Result<guard::Guards> {
         use config::Traffic::{Endpoints, Grpc, Transcoded};
-        // `*` marks a route that answers every method, not a method.
-        let routed: Vec<http::Method> = mounted
-            .iter()
-            .filter(|(method, _)| method != "*")
-            .filter_map(|(method, _)| http::Method::from_bytes(method.as_bytes()).ok())
-            .collect();
         let scope = |config: Option<&ScopeConfig>, default: &[config::Traffic], what: &str| {
-            guard::Scope::compile(config, default, what, &routed).map_err(anyhow::Error::msg)
+            guard::Scope::compile(config, default, what, routed).map_err(anyhow::Error::msg)
         };
         // A guard never sets what the client-address forwarding writes.
         let reserved: Arc<[http::HeaderName]> = resolver.configured_headers().cloned().collect();
@@ -1171,10 +1311,10 @@ impl ProxyServer {
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let layer = if config.origins.is_empty() {
+        if config.origins.is_empty() {
             tracing::warn!("CORS origins not set — using permissive CORS (dev mode)");
             // Exposes every header already.
-            CorsLayer::permissive()
+            Ok(CorsLayer::any(config.max_age_secs))
         } else {
             let origins = config
                 .origins
@@ -1200,17 +1340,12 @@ impl ProxyServer {
             // With credentials the Fetch standard (§3.2.5) forbids `*` for
             // methods and headers, so the preflight's own request is echoed
             // back instead: what the browser asked for, from an allowed origin.
-            CorsLayer::new()
-                .allow_origin(AllowOrigin::list(origins))
-                .allow_methods(AllowMethods::mirror_request())
-                .allow_headers(AllowHeaders::mirror_request())
-                .allow_credentials(true)
-                .expose_headers(exposed.collect::<Vec<_>>())
-        };
-        Ok(match config.max_age_secs {
-            Some(secs) => layer.max_age(std::time::Duration::from_secs(secs)),
-            None => layer,
-        })
+            Ok(CorsLayer::listed(
+                origins,
+                &exposed.collect::<Vec<_>>(),
+                config.max_age_secs,
+            ))
+        }
     }
 
     /// The [`ServeOptions`] of `listen:`: TLS from `listen.tls` (mTLS with its
@@ -1340,6 +1475,7 @@ pub(crate) fn test_state() -> ProxyState<tonic::transport::Channel> {
             .connect_timeout(std::time::Duration::from_millis(100))
             .connect_lazy(),
         forwarded_headers: Arc::from([]),
+        forwarded_names: Arc::from([]),
         sse_keep_alive_secs: 15,
     }
 }

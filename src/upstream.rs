@@ -215,13 +215,15 @@ pub(crate) fn grpc_protocol(headers: &http::HeaderMap) -> Option<GrpcProtocol> {
 }
 
 /// Whether a request is a browser's CORS preflight for a gRPC-Web call: an
-/// `OPTIONS` with an `Origin` (Fetch §3.2.2) whose
-/// `Access-Control-Request-Headers` names `x-grpc-web`, the header gRPC-Web
-/// clients send with every call (gRPC PROTOCOL-WEB). It carries no gRPC
-/// content type, so only these headers tell it apart from a REST preflight.
+/// `OPTIONS` with an `Origin` and an `Access-Control-Request-Method` (Fetch
+/// §3.2.2) whose `Access-Control-Request-Headers` names `x-grpc-web`, the
+/// header gRPC-Web clients send with every call (gRPC PROTOCOL-WEB). It
+/// carries no gRPC content type, so only these headers tell it apart from a
+/// REST preflight.
 pub(crate) fn is_grpc_web_preflight(method: &http::Method, headers: &http::HeaderMap) -> bool {
     method == http::Method::OPTIONS
         && headers.contains_key(http::header::ORIGIN)
+        && headers.contains_key(http::header::ACCESS_CONTROL_REQUEST_METHOD)
         && headers
             .get_all(http::header::ACCESS_CONTROL_REQUEST_HEADERS)
             .iter()

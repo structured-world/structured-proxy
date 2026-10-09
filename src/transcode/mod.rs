@@ -14,27 +14,29 @@ pub mod codec;
 pub mod error;
 pub(crate) mod httpbody;
 pub mod metadata;
+pub(crate) mod path;
 pub mod request;
 pub(crate) mod response;
 pub(crate) mod rule;
 mod select;
+mod table;
 
+pub use path::proto_path_to_axum;
 pub use select::RpcSelection;
 
 use axum::body::{Body, Bytes};
-use axum::extract::{OriginalUri, Path, RawQuery, State};
+use axum::extract::{FromRequest, FromRequestParts, OriginalUri, RawPathParams, Request, State};
 use axum::http::header::{ALLOW, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{MethodFilter, MethodRouter};
-use axum::Extension;
 use axum::Router;
 use futures::{StreamExt, TryStreamExt};
 use prost_reflect::{
     DescriptorPool, DynamicMessage, FieldDescriptor, MessageDescriptor, MethodDescriptor,
     SerializeOptions,
 };
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,12 +45,15 @@ use tonic::metadata::MetadataMap;
 
 use crate::client_address::ClientAddress;
 use crate::config::AliasConfig;
+use crate::guard::BoxedService;
 use crate::received::ReceivedRequest;
 use crate::service::ConnectionInfo;
 use crate::upstream::Upstream;
 use error::{ErrorDetailsPolicy, StatusDetails};
+use path::MountedPath;
 use response::UpstreamHeaders;
 use rule::RouteMethod;
+use table::{Choice, PathTable, Routes};
 
 /// How long the upstream may take to answer a call with its response headers
 /// when the client's `grpc-timeout` asks for no shorter deadline.
@@ -66,6 +71,12 @@ pub trait TranscodeState: Clone + Send + Sync + 'static {
     fn into_upstream(self) -> Self::Upstream;
     /// Headers to forward from HTTP to gRPC metadata.
     fn forwarded_headers(&self) -> &[String];
+    /// [`forwarded_headers`](Self::forwarded_headers) as header names, when
+    /// the state holds them parsed: a request then skips parsing each name.
+    /// `None` by default.
+    fn forwarded_header_names(&self) -> Option<&[HeaderName]> {
+        None
+    }
     /// SSE keep-alive interval (seconds) for server-streaming responses.
     fn sse_keep_alive_secs(&self) -> u64;
 }
@@ -78,13 +89,18 @@ impl<U: Upstream> TranscodeState for crate::ProxyState<U> {
     fn forwarded_headers(&self) -> &[String] {
         &self.forwarded_headers
     }
+    fn forwarded_header_names(&self) -> Option<&[HeaderName]> {
+        Some(&self.forwarded_names)
+    }
     fn sse_keep_alive_secs(&self) -> u64 {
         self.sse_keep_alive_secs
     }
 }
 
-/// Path parameters of a matched route.
-type PathParams = HashMap<String, String>;
+/// Path parameters of a matched route, in path order: each name with its
+/// value, borrowed from the router's captures and the routes wherever the
+/// binding leaves them as they are.
+type PathParams<'a> = Vec<(&'a str, Cow<'a, str>)>;
 
 /// How the HTTP request body reaches the RPC's input message.
 #[derive(Debug, Clone)]
@@ -235,34 +251,383 @@ pub fn routes<S: TranscodeState>(pool: &DescriptorPool, aliases: &[AliasConfig])
 
 /// [`routes`], built as `options` describe.
 ///
-/// A second binding for a method and path already taken (or any binding on a
-/// path a `custom` `*` rule takes, which answers every method) is skipped with
-/// an error in the log.
+/// A binding answers the requests whose path matches its template, custom verb
+/// included (`/v1/{name}:cancel`, google/api/http.proto `Verb`), and whose
+/// method is its own; a GET binding answers HEAD too. A request's verb is its
+/// last segment from the first unencoded `:`: a verb some binding of its path
+/// binds owns the URL, answered by that verb's bindings alone; a verb none
+/// binds stays part of the last variable. A URL that bindings answer, but none
+/// with the request's method, is `405` with their methods in `Allow`; a path
+/// that matches a template but that no binding answers is `404`.
+///
+/// A second binding for a method, path and verb already taken (or any binding
+/// on a path and verb a `custom` `*` rule takes, which answers every method),
+/// and a template the router cannot match (text around a variable within one
+/// segment, a path that does not start with `/`), are skipped with an error in
+/// the log.
 pub fn routes_with_options<S: TranscodeState>(
     pool: &DescriptorPool,
     aliases: &[AliasConfig],
     options: &TranscodeOptions,
 ) -> Router<S> {
-    let bindings = route_bindings(pool, aliases, &options.selection);
-    if bindings.is_empty() {
+    routes_and_choices(pool, aliases, options).0
+}
+
+/// The routes of [`routes_with_options`], with the [`Choices`] among their
+/// bindings that the caller makes before its own layers.
+pub(crate) fn routes_and_choices<S: TranscodeState>(
+    pool: &DescriptorPool,
+    aliases: &[AliasConfig],
+    options: &TranscodeOptions,
+) -> (Router<S>, Option<Choices>) {
+    let tables = path_tables(pool, aliases, options);
+    if tables.is_empty() {
         tracing::warn!("No HTTP-annotated RPCs found in proto descriptors");
-        return Router::new();
+        return (Router::new(), None);
     }
 
+    let routes = Arc::new(Routes::new(tables));
+    let choices = Choices {
+        routes: routes.clone(),
+        ranked: None,
+    };
+    let mut router: Router<S> = Router::new();
+    for (table, mounted) in routes.tables.iter().enumerate() {
+        let routes = routes.clone();
+        // Every method goes to the routes, which answer 405 themselves: the
+        // URL, not the path alone, decides which methods a path answers. A
+        // HEAD a GET binding serves still goes out without a body: axum's
+        // route future empties the body of every HEAD response, `any` routes
+        // included.
+        let handler =
+            move |State(state): State<S>, request: Request| dispatch(routes, table, state, request);
+        let mut route = axum::routing::any(handler.clone());
+        // A binding answering HEAD itself is the path's HEAD route, before
+        // the GET of another route merged at the path answers HEAD.
+        if mounted.binds_head() {
+            route = route.head(handler);
+        }
+        router = router.route(&mounted.path, route);
+    }
+    (router, Some(choices))
+}
+
+/// The choice of the binding a request reaches among the transcoded routes,
+/// made before any layer of the routes runs. A URL no binding answers (its
+/// field template, its custom verb) is no transcoded request: it goes to the
+/// proxy's other routes instead.
+pub(crate) struct Choices {
+    routes: Arc<Routes>,
+    /// The transcoded paths among the proxy's other routes, when known.
+    ranked: Option<Arc<table::Ranked>>,
+}
+
+impl Choices {
+    /// These choices among `others`: the router paths of the proxy's other
+    /// routes, each with the method it answers (`None`: every one). A table
+    /// answers a request a better-ranked one refused only when no other
+    /// route ranks before it. Ranked among none of them when an other path
+    /// is one the proxy cannot rank as the router does.
+    pub(crate) fn among(mut self, others: &[(Option<Method>, String)]) -> Self {
+        self.ranked = table::Ranked::new(&self.routes, others).map(Arc::new);
+        self
+    }
+
+    /// These choices, handing a URL no binding answers to `elsewhere`: a
+    /// router of the proxy's other routes.
+    pub(crate) fn with_elsewhere(self, elsewhere: Router) -> Chooser {
+        Chooser(Arc::new(Choosing {
+            routes: self.routes,
+            ranked: self.ranked,
+            elsewhere,
+        }))
+    }
+
+    /// The transcoded routes served past any router, calling with `state`;
+    /// `layered` puts the layers of the transcoded routes around them.
+    /// `None` without a ranking among the other routes.
+    pub(crate) fn direct<S: TranscodeState>(
+        &self,
+        state: S,
+        layered: impl FnOnce(BoxedService) -> BoxedService,
+    ) -> Option<Direct> {
+        let ranked = self.ranked.clone()?;
+        let dispatcher = BoxedService::new(Dispatcher {
+            routes: self.routes.clone(),
+            state,
+        });
+        Some(Direct {
+            ranking: Arc::new(Ranking {
+                ranked,
+                routes: self.routes.clone(),
+            }),
+            service: layered(dispatcher),
+        })
+    }
+}
+
+/// The transcoded routes served straight from the proxy's own match of a
+/// request's path, past any router.
+#[derive(Clone)]
+pub(crate) struct Direct {
+    ranking: Arc<Ranking>,
+    /// The routes behind their layers.
+    service: BoxedService,
+}
+
+struct Ranking {
+    ranked: Arc<table::Ranked>,
+    routes: Arc<Routes>,
+}
+
+impl Direct {
+    /// Whether `request` is one of the transcoded routes', whose binding
+    /// then rides on it: its path's best match among every route of the
+    /// proxy is a transcoded path, the method not another route's there, and
+    /// a binding answers the URL. A request for none goes to the other
+    /// routes, which a fallback follows, as if the transcoded ones were not
+    /// there.
+    pub(crate) fn takes<B>(&self, request: &mut http::Request<B>) -> bool {
+        let ranking = &*self.ranking;
+        match ranking.ranked.table(request.method(), request.uri().path()) {
+            Some(table) => choose(&ranking.routes, Some(&ranking.ranked), table, request),
+            None => false,
+        }
+    }
+
+    /// The routes behind their layers, for a request [`takes`](Self::takes)
+    /// took.
+    pub(crate) fn service(&self) -> &BoxedService {
+        &self.service
+    }
+}
+
+/// The transcoded routes as one service, for requests whose binding rides on
+/// them.
+#[derive(Clone)]
+struct Dispatcher<S> {
+    routes: Arc<Routes>,
+    state: S,
+}
+
+impl<S: TranscodeState> tower::Service<Request> for Dispatcher<S> {
+    type Response = Response;
+    type Error = std::convert::Infallible;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Response, std::convert::Infallible>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: Request) -> Self::Future {
+        let routes = self.routes.clone();
+        let state = self.state.clone();
+        Box::pin(async move { Ok(serve(routes, state, request).await) })
+    }
+}
+
+/// Choose among `routes` for `request`, which the router matches (or
+/// matched) to the table at `table`, ranked among the proxy's other routes
+/// by `ranked` when known: `false` when no binding answers it, otherwise the
+/// choice rides on the request to [`dispatch`].
+fn choose<B>(
+    routes: &Routes,
+    ranked: Option<&table::Ranked>,
+    table: usize,
+    request: &mut http::Request<B>,
+) -> bool {
+    let (method, path) = (request.method(), request.uri().path());
+    let choice = match ranked {
+        Some(ranked) => match routes.choose_ranked(table, method, path, &|other| {
+            ranked.ranks_first(other, method, path)
+        }) {
+            // The other routes at the path answer methods too.
+            // The table that answered, not the one the path matched first:
+            // a refused binding passes the request on.
+            Choice::MethodNotAllowed { table, allow } => Choice::MethodNotAllowed {
+                table,
+                allow: ranked.allow(table, allow),
+            },
+            choice => choice,
+        },
+        None => routes.choose(table, method, path),
+    };
+    match choice {
+        Choice::NotFound => false,
+        choice => {
+            request.extensions_mut().insert(Chosen(choice));
+            true
+        }
+    }
+}
+
+/// [`Choices`] with the routes a URL no binding answers goes to. One
+/// reference count: the router clones its routes' layers for every request.
+#[derive(Clone)]
+pub(crate) struct Chooser(Arc<Choosing>);
+
+struct Choosing {
+    routes: Arc<Routes>,
+    ranked: Option<Arc<table::Ranked>>,
+    elsewhere: Router,
+}
+
+impl Chooser {
+    /// The other routes, with `fallback` answering what they do not.
+    pub(crate) fn with_fallback(self, fallback: BoxedService) -> Self {
+        Self(Arc::new(Choosing {
+            routes: self.0.routes.clone(),
+            ranked: self.0.ranked.clone(),
+            elsewhere: self.0.elsewhere.clone().fallback_service(fallback),
+        }))
+    }
+
+    /// `router`, holding the transcoded routes, choosing outside its layers
+    /// for a router that is served on its own, merged or nested: the request
+    /// is past the routing then, and the router reports the route it matched
+    /// with the paths it is nested at in front.
+    pub(crate) fn layer(self, router: Router) -> Router {
+        router.layer(self)
+    }
+}
+
+impl<S> tower::Layer<S> for Chooser {
+    type Service = ChooseRouted<S>;
+
+    fn layer(&self, route: S) -> ChooseRouted<S> {
+        ChooseRouted {
+            chooser: self.clone(),
+            route,
+        }
+    }
+}
+
+/// A transcoded route, with the choice among its bindings made before its
+/// layers: a request no binding answers goes to the other routes.
+#[derive(Clone)]
+pub(crate) struct ChooseRouted<S> {
+    chooser: Chooser,
+    route: S,
+}
+
+impl<S> tower::Service<Request> for ChooseRouted<S>
+where
+    S: tower::Service<Request, Response = Response, Error = std::convert::Infallible>,
+{
+    type Response = Response;
+    type Error = std::convert::Infallible;
+    type Future = ChooseFuture<S::Future>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.route.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut request: Request) -> Self::Future {
+        let choosing = &*self.chooser.0;
+        let extensions = request.extensions();
+        let matched = extensions
+            .get::<axum::extract::MatchedPath>()
+            .and_then(|matched| {
+                let nested = extensions.get::<axum::extract::NestedPath>();
+                local_path(matched.as_str(), nested.map(|nested| nested.as_str()))
+            })
+            .and_then(|path| choosing.routes.table_at(path));
+        let ranked = choosing.ranked.as_deref();
+        if matched.is_none_or(|matched| choose(&choosing.routes, ranked, matched, &mut request)) {
+            return ChooseFuture::Route {
+                future: self.route.call(request),
+            };
+        }
+        // The other routes route it again: the route the first routing
+        // matched goes, so theirs is reported. Its captures stay, unread: no
+        // other route of the proxy takes path parameters, and an extra
+        // route's handler sees no extensions. Routes an application merged
+        // after the proxy's are not among them: the router has routed the
+        // request to this route and tries no other, so they are reached only
+        // as extra routes, or behind a proxy service's fallback.
+        request
+            .extensions_mut()
+            .remove::<axum::extract::MatchedPath>();
+        ChooseFuture::Elsewhere {
+            future: tower::ServiceExt::oneshot(choosing.elsewhere.clone(), request),
+        }
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// The response future of [`ChooseRouted`].
+    #[project = ChooseProjection]
+    pub(crate) enum ChooseFuture<F> {
+        Route { #[pin] future: F },
+        Elsewhere { #[pin] future: tower::util::Oneshot<Router, Request> },
+    }
+}
+
+impl<F> std::future::Future for ChooseFuture<F>
+where
+    F: std::future::Future<Output = Result<Response, std::convert::Infallible>>,
+{
+    type Output = Result<Response, std::convert::Infallible>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        match self.project() {
+            ChooseProjection::Route { future } => future.poll(cx),
+            ChooseProjection::Elsewhere { future } => future.poll(cx),
+        }
+    }
+}
+
+/// The binding chosen for a request before the layers of the routes, for
+/// [`dispatch`].
+#[derive(Clone)]
+struct Chosen(Choice);
+
+/// The router path `matched` names in the router nested at `nested`, which
+/// writes the paths it is nested at in front of it.
+fn local_path<'p>(matched: &'p str, nested: Option<&str>) -> Option<&'p str> {
+    let Some(nested) = nested else {
+        return Some(matched);
+    };
+    // A prefix ending in `/` is joined to the path without its leading `/`,
+    // and a path of `/` alone is the prefix itself (axum's nesting).
+    let local = matched.strip_prefix(nested.trim_end_matches('/'))?;
+    Some(if local.is_empty() { "/" } else { local })
+}
+
+/// The tables [`routes_with_options`] mounts, one per router path, each
+/// holding every binding of that path in binding order.
+fn path_tables(
+    pool: &DescriptorPool,
+    aliases: &[AliasConfig],
+    options: &TranscodeOptions,
+) -> Vec<PathTable> {
+    let bindings = route_bindings(pool, aliases, &options.selection, true);
     tracing::info!("Registering {} transcoded REST→gRPC routes", bindings.len());
 
     // At most two renderers, without and with the opaque-detail extension,
     // each shared by every route that uses it and built only when one does.
     // The second is a copy of the first: the descriptor pool inside is shared.
     let mut status_details: [Option<Arc<StatusDetails>>; 2] = [None, None];
-    // Every binding of one path goes into the same method router, in binding
-    // order.
-    let mut paths: Vec<PathRoutes> = Vec::new();
-    let mut path_index: HashMap<String, usize> = HashMap::new();
+    // The router tells paths apart by shape only, so every binding of one
+    // shape goes into one table, whatever its capture names.
+    let mut tables: Vec<PathTable> = Vec::new();
+    let mut by_shape: HashMap<String, usize> = HashMap::new();
     for mut binding in bindings {
         let policy = &options.error_details;
-        if policy.enabled_for(&binding.axum_path) {
-            let opaque = policy.opaque_for(&binding.axum_path);
+        let route = binding.mount.display();
+        if policy.enabled_for(&route) {
+            let opaque = policy.opaque_for(&route);
             let slot = usize::from(opaque);
             if status_details[slot].is_none() {
                 let base = status_details
@@ -277,163 +642,405 @@ pub fn routes_with_options<S: TranscodeState>(
         }
         binding.entry.ndjson_envelope = options.ndjson_envelope;
         binding.entry.denied_headers = options.denied_response_headers.clone();
-        let index = match path_index.get(&binding.axum_path) {
-            Some(&index) => index,
+        match by_shape.get(&binding.mount.shape) {
+            Some(&index) => tables[index].add(binding.mount, binding.entry),
             None => {
-                path_index.insert(binding.axum_path.clone(), paths.len());
-                paths.push(PathRoutes {
-                    path: binding.axum_path,
-                    methods: Vec::new(),
-                });
-                paths.len() - 1
+                by_shape.insert(binding.mount.shape.clone(), tables.len());
+                tables.push(PathTable::new(binding.mount, binding.entry));
             }
-        };
-        paths[index].add(Arc::new(binding.entry));
-    }
-
-    let mut router: Router<S> = Router::new();
-    for path in &paths {
-        router = router.route(&path.path, path.method_router());
-    }
-    router
-}
-
-/// The axum handler serving the route entry `$entry`, for the state type `S`
-/// in scope. A macro because the closure's handler type cannot be named.
-macro_rules! endpoint {
-    ($entry:expr) => {{
-        let entry: Arc<RouteEntry> = $entry;
-        move |state: State<S>,
-              method: Method,
-              OriginalUri(uri): OriginalUri,
-              headers: HeaderMap,
-              path_params: Path<PathParams>,
-              raw_query: RawQuery,
-              connection: Option<Extension<ConnectionInfo>>,
-              address: Option<Extension<ClientAddress>>,
-              body: Bytes| {
-            let client = Client {
-                headers,
-                origin: Origin {
-                    connection: connection.map(|Extension(connection)| connection),
-                    address: address.map(|Extension(address)| address),
-                },
-                line: RequestLine { method, uri },
-            };
-            handle(state, client, path_params, raw_query, body, entry)
         }
-    }};
-}
+    }
 
-/// The bindings mounted at one axum path.
-struct PathRoutes {
-    path: String,
-    methods: Vec<Arc<RouteEntry>>,
-}
-
-impl PathRoutes {
-    /// Add `entry` unless its method is already answered on this path.
-    fn add(&mut self, entry: Arc<RouteEntry>) {
-        let taken = self.methods.iter().any(|existing| {
-            existing.http_method == entry.http_method
-                || existing.http_method == RouteMethod::Any
-                || entry.http_method == RouteMethod::Any
-        });
-        if taken {
+    retain_mountable(
+        &mut tables,
+        |table| table.path.as_str(),
+        |path, error| {
             tracing::error!(
-                method = entry.http_method.as_str(),
-                path = %self.path,
-                rpc = %entry.grpc_path,
-                "HTTP method and path already bound to another RPC; skipping this binding"
+                path = %path,
+                %error,
+                "transcoded route conflicts with another; skipping its bindings"
             );
-            return;
-        }
-        self.methods.push(entry);
-    }
+        },
+    );
+    tables
+}
 
-    /// One method router for every binding of the path. Methods axum routes by
-    /// itself are registered directly; any other token (a `custom` rule such
-    /// as `PROPFIND`) is dispatched by a fallback that answers `405` with the
-    /// full `Allow` list (RFC 9110 §15.5.6) for a method nobody binds.
-    fn method_router<S: TranscodeState>(&self) -> MethodRouter<S> {
-        let mut router = MethodRouter::new();
-        let mut extension: Vec<(Method, Arc<RouteEntry>)> = Vec::new();
-        let mut allow: Vec<&str> = Vec::new();
-        for entry in &self.methods {
-            match &entry.http_method {
-                // `add` keeps a `*` binding alone on its path.
-                RouteMethod::Any => return axum::routing::any(endpoint!(entry.clone())),
-                RouteMethod::One(method) => {
-                    allow.push(method.as_str());
-                    match MethodFilter::try_from(method.clone()) {
-                        Ok(filter) => router = router.on(filter, endpoint!(entry.clone())),
-                        Err(_) => extension.push((method.clone(), entry.clone())),
-                    }
+/// Keep the items whose router path a router holding the ones kept before
+/// accepts, in order; `refused` hears of each left out. axum would panic on
+/// such a path, and matchit is the router axum matches with.
+fn retain_mountable<T>(
+    items: &mut Vec<T>,
+    path: impl Fn(&T) -> &str,
+    mut refused: impl FnMut(&str, matchit::InsertError),
+) {
+    let mut router = matchit::Router::new();
+    items.retain(|item| match router.insert(path(item), ()) {
+        Ok(()) => true,
+        Err(error) => {
+            refused(path(item), error);
+            false
+        }
+    });
+}
+
+/// The shapes of the router paths [`routes_with_options`] mounts for
+/// `selection`: what the OpenAPI document may promise.
+pub(crate) fn mounted_shapes(
+    pool: &DescriptorPool,
+    aliases: &[AliasConfig],
+    selection: &RpcSelection,
+) -> std::collections::HashSet<String> {
+    // One path per shape, the first binding's, as the tables are built.
+    let mut seen = std::collections::HashSet::new();
+    let mut paths: Vec<MountedPath> = route_bindings(pool, aliases, selection, false)
+        .into_iter()
+        .filter_map(|binding| {
+            seen.insert(binding.mount.shape.clone())
+                .then_some(binding.mount)
+        })
+        .collect();
+    retain_mountable(&mut paths, |mount| mount.axum.as_str(), |_, _| {});
+    paths.into_iter().map(|mount| mount.shape).collect()
+}
+
+/// Serve `request`, which the router matched to the table at `matched`:
+/// choose the binding before anything is extracted, so a request no binding
+/// answers gets its 404 or 405 without its body being read.
+async fn dispatch<S: TranscodeState>(
+    routes: Arc<Routes>,
+    matched: usize,
+    state: S,
+    request: Request,
+) -> Response {
+    let (mut parts, body) = request.into_parts();
+    let choice = match parts.extensions.remove::<Chosen>() {
+        Some(Chosen(choice)) => choice,
+        None => routes.choose(matched, &parts.method, parts.uri.path()),
+    };
+    let (table, index) = match choice {
+        Choice::Route { table, index } => (table, index),
+        Choice::MethodNotAllowed { allow, .. } => {
+            return (StatusCode::METHOD_NOT_ALLOWED, [(ALLOW, allow)]).into_response()
+        }
+        // Only routes served without a `Chooser` get here.
+        Choice::NotFound => return StatusCode::NOT_FOUND.into_response(),
+    };
+    // The router's captures, decoded, shared with it rather than copied.
+    let captured = match RawPathParams::from_request_parts(&mut parts, &state).await {
+        Ok(captured) => captured,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let mut path_params: PathParams<'_> = captured
+        .iter()
+        .map(|(name, value)| (name, Cow::Borrowed(value)))
+        .collect();
+    let multi_segment = routes.tables[table].multi_segment(index);
+    // The path the router matched, kept past the parts going on with the
+    // body when the captures are read from it.
+    let local;
+    if table != matched || !multi_segment.is_empty() {
+        // Another path the request matches answers it (a verb bound there, or
+        // the only bindings without a verb), or a variable over several
+        // segments keeps `%2F` the router decoded: the captures come from the
+        // request's path, the router's prefix parameters stay.
+        local = parts.uri.clone();
+        // The matched path's captures are the router's last parameters, after
+        // those of the prefixes it is nested under, which may share their
+        // names: they go by position, the prefixes' stay.
+        let prefixes = path_params
+            .len()
+            .checked_sub(routes.tables[matched].captures.len())
+            .expect("the router captures every variable of the path it matched");
+        path_params.truncate(prefixes);
+        if let Err(rejection) = capture(
+            &routes,
+            table,
+            multi_segment,
+            local.path(),
+            &mut path_params,
+        ) {
+            return rejection.into_response(routes.tables[table].entry(index));
+        }
+    }
+    // The target as received, before a router the proxy is nested in strips
+    // its prefix; the router records it on every request it routes.
+    let uri = match parts.extensions.remove::<OriginalUri>() {
+        Some(OriginalUri(uri)) => uri,
+        None => parts.uri.clone(),
+    };
+    let begun = begin(
+        &routes,
+        (table, index),
+        &state,
+        (parts, body),
+        path_params,
+        uri,
+    )
+    .await;
+    serve_begun(begun, routes, table, index).await
+}
+
+/// Serve `request`, which the proxy matched to a transcoded binding itself,
+/// with no router: the choice rides on it.
+async fn serve<S: TranscodeState>(routes: Arc<Routes>, state: S, request: Request) -> Response {
+    let (mut parts, body) = request.into_parts();
+    let head = parts.method == Method::HEAD;
+    let connect = parts.method == Method::CONNECT;
+    let choice = match parts.extensions.remove::<Chosen>() {
+        Some(Chosen(choice)) => choice,
+        None => Choice::NotFound,
+    };
+    let mut response = match choice {
+        Choice::Route { table, index } => {
+            // The path the proxy matched, what the captures are read from.
+            let local = parts.uri.clone();
+            // The target as received, before a router the proxy is nested in
+            // strips its prefix.
+            let uri = match parts.extensions.remove::<OriginalUri>() {
+                Some(OriginalUri(uri)) => uri,
+                None => local.clone(),
+            };
+            let multi_segment = routes.tables[table].multi_segment(index);
+            let mut path_params = Vec::with_capacity(routes.tables[table].captures.len());
+            match capture(
+                &routes,
+                table,
+                multi_segment,
+                local.path(),
+                &mut path_params,
+            ) {
+                Ok(()) => {
+                    let begun = begin(
+                        &routes,
+                        (table, index),
+                        &state,
+                        (parts, body),
+                        path_params,
+                        uri,
+                    )
+                    .await;
+                    serve_begun(begun, routes, table, index).await
                 }
+                Err(rejection) => rejection.into_response(routes.tables[table].entry(index)),
             }
         }
-        if extension.is_empty() {
-            return router;
+        Choice::MethodNotAllowed { allow, .. } => {
+            (StatusCode::METHOD_NOT_ALLOWED, [(ALLOW, allow)]).into_response()
         }
-        // A GET route answers HEAD too.
-        if allow.contains(&"GET") && !allow.contains(&"HEAD") {
-            allow.push("HEAD");
+        Choice::NotFound => StatusCode::NOT_FOUND.into_response(),
+    };
+    let status = response.status();
+    // A 2xx answer to CONNECT has no content and no Content-Length (RFC 9110
+    // §9.3.6, §8.6), as a router's route answers it too.
+    if connect && status.is_success() {
+        response.headers_mut().remove(http::header::CONTENT_LENGTH);
+        *response.body_mut() = axum::body::Body::empty();
+        return response;
+    }
+    // As a router's route answers: the length of a body whose size is known,
+    // and none sent for a HEAD. Not on a 204, which has no Content-Length, nor
+    // on a 304, whose length could only describe the selected representation
+    // (RFC 9110 §8.6), never the empty body sent.
+    if status != StatusCode::NO_CONTENT
+        && status != StatusCode::NOT_MODIFIED
+        && !response
+            .headers()
+            .contains_key(http::header::CONTENT_LENGTH)
+    {
+        if let Some(length) = http_body::Body::size_hint(response.body()).exact() {
+            response
+                .headers_mut()
+                .insert(http::header::CONTENT_LENGTH, HeaderValue::from(length));
         }
-        let allow = HeaderValue::from_str(&allow.join(", "))
-            .expect("method tokens are valid header value characters");
-        let extension: Arc<[(Method, Arc<RouteEntry>)]> = extension.into();
-        // The method decides before anything is extracted, so a request no
-        // binding answers gets its 405 without its body being read.
-        router.fallback(
-            move |State(state): State<S>, request: axum::extract::Request| async move {
-                match extension
-                    .iter()
-                    .find(|(bound, _)| bound == request.method())
-                {
-                    Some((_, entry)) => {
-                        axum::handler::Handler::call(endpoint!(entry.clone()), request, state).await
-                    }
-                    None => (StatusCode::METHOD_NOT_ALLOWED, [(ALLOW, allow)]).into_response(),
-                }
-            },
-        )
+    }
+    if head {
+        *response.body_mut() = axum::body::Body::empty();
+    }
+    response
+}
+
+/// How far [`begin`] got: the upstream call to make, or the answer already.
+enum Begun<U> {
+    Call {
+        call: Call<U>,
+        sse: bool,
+        keep_alive_secs: u64,
+    },
+    Answered(Response),
+}
+
+/// Bind the request of `parts` and `body` to the binding at `binding` (table,
+/// index) with its path parameters `path_params`, its target as received
+/// `uri`: read its body and map it onto the RPC.
+async fn begin<S: TranscodeState>(
+    routes: &Routes,
+    (table, index): (usize, usize),
+    state: &S,
+    (mut parts, body): (http::request::Parts, axum::body::Body),
+    mut path_params: PathParams<'_>,
+    uri: Uri,
+) -> Begun<S::Upstream> {
+    routes.tables[table].bind_params(index, &mut path_params);
+    // Taken rather than copied: reading the body needs only its limit, which
+    // stays in the extensions.
+    let client = Client {
+        headers: std::mem::take(&mut parts.headers),
+        origin: Origin {
+            connection: parts.extensions.remove::<ConnectionInfo>(),
+            address: parts.extensions.remove::<ClientAddress>(),
+        },
+        line: RequestLine {
+            method: std::mem::replace(&mut parts.method, Method::GET),
+            uri,
+        },
+    };
+    let body = match Bytes::from_request(Request::from_parts(parts, body), state).await {
+        Ok(body) => body,
+        Err(rejection) => return Begun::Answered(rejection.into_response()),
+    };
+    let entry = routes.tables[table].entry(index);
+    match start(state.clone(), client, &path_params, body, entry) {
+        Ok((call, sse, keep_alive_secs)) => Begun::Call {
+            call,
+            sse,
+            keep_alive_secs,
+        },
+        Err(rejection) => Begun::Answered(rejection.into_response(entry)),
     }
 }
 
-/// One transcode route to mount: the RPC entry that serves it and the axum path
-/// to register it at.
+/// Make the call [`begin`] got to, the parameters bound: the routes go on
+/// with it.
+async fn serve_begun<U: crate::upstream::Upstream>(
+    begun: Begun<U>,
+    routes: Arc<Routes>,
+    table: usize,
+    index: usize,
+) -> Response {
+    let (call, sse, keep_alive_secs) = match begun {
+        Begun::Call {
+            call,
+            sse,
+            keep_alive_secs,
+        } => (call, sse, keep_alive_secs),
+        Begun::Answered(response) => return response,
+    };
+    let entry = RouteRef {
+        routes,
+        table,
+        index,
+    };
+    if entry.streaming {
+        streaming_call(call, entry, sse, keep_alive_secs).await
+    } else {
+        unary_call(call, &entry).await
+    }
+}
+
+/// Add the captures of the table at `table` matching `path` to `params`,
+/// percent-decoded as the router decodes its own except at the positions of
+/// `multi_segment`, which keep `%2F`; borrowed from `path` where nothing is
+/// decoded.
+fn capture<'p>(
+    routes: &'p Routes,
+    table: usize,
+    multi_segment: &[usize],
+    path: &'p str,
+    params: &mut PathParams<'p>,
+) -> Result<(), Unmappable> {
+    let found = routes
+        .params_of(table, path)
+        .expect("the chosen table was found by matching this path");
+    for (position, (name, raw)) in found.iter().enumerate() {
+        let decoded: Cow<'p, [u8]> = if multi_segment.contains(&position) {
+            path::decode_multi_segment(raw)
+        } else {
+            percent_encoding::percent_decode_str(raw).into()
+        };
+        let not_utf8 = || Unmappable(format!("path parameter {name} is not valid UTF-8"));
+        let value = match decoded {
+            Cow::Borrowed(bytes) => {
+                Cow::Borrowed(std::str::from_utf8(bytes).map_err(|_| not_utf8())?)
+            }
+            Cow::Owned(bytes) => Cow::Owned(String::from_utf8(bytes).map_err(|_| not_utf8())?),
+        };
+        params.push((name, value));
+    }
+    Ok(())
+}
+
+/// The binding serving a request, held through the routes: they are already
+/// shared with the request, so naming the binding takes no refcount of its
+/// own.
+#[derive(Clone)]
+struct RouteRef {
+    routes: Arc<Routes>,
+    table: usize,
+    index: usize,
+}
+
+impl std::ops::Deref for RouteRef {
+    type Target = RouteEntry;
+
+    fn deref(&self) -> &RouteEntry {
+        self.routes.tables[self.table].entry(self.index)
+    }
+}
+
+/// One transcode route to mount: the RPC entry that serves it and where it is
+/// mounted.
 struct RouteBinding {
     entry: RouteEntry,
-    axum_path: String,
+    mount: MountedPath,
+}
+
+impl RouteBinding {
+    fn claim(&self) -> table::Claim<'_> {
+        table::Claim {
+            method: &self.entry.http_method,
+            verb: self.mount.verb.as_deref(),
+            template: self.mount.last_template.as_deref(),
+            literals: &self.mount.literals,
+        }
+    }
 }
 
 /// The single source of truth for what [`routes`] mounts: every binding of
-/// every unary and server-streaming RPC, plus its config aliases. Both
-/// [`routes`] (to build handlers) and [`route_paths`] (to enumerate paths for
-/// collision checks) consume this, so the mounted set and the enumerated set
-/// cannot drift apart.
+/// every unary and server-streaming RPC, plus its config aliases, less the
+/// templates the router cannot match. Both [`routes`] (to build handlers) and
+/// [`route_paths`] (to enumerate paths for collision checks) consume this, so
+/// the mounted set and the enumerated set cannot drift apart. A template left
+/// out is logged when `report` is set.
 fn route_bindings(
     pool: &DescriptorPool,
     aliases: &[AliasConfig],
     selection: &RpcSelection,
+    report: bool,
 ) -> Vec<RouteBinding> {
     let mut bindings = Vec::new();
+    let mut push = |mount: MountedPath, entry: RouteEntry| match mount.routable() {
+        Ok(()) => bindings.push(RouteBinding { entry, mount }),
+        Err(_) if !report => {}
+        Err(error) => tracing::error!(
+            path = %mount.display(),
+            rpc = %entry.grpc_path,
+            %error,
+            "google.api.http path template cannot be routed; skipping this binding"
+        ),
+    };
     for entry in extract_routes(pool, selection) {
         for alias in aliases {
             if let Some(suffix) = entry.http_path.strip_prefix(&alias.to) {
                 if alias.from.ends_with("/{path}") {
                     let prefix = alias.from.trim_end_matches("/{path}");
-                    bindings.push(RouteBinding {
-                        axum_path: proto_path_to_axum(&format!("{prefix}{suffix}")),
-                        entry: entry.clone(),
-                    });
+                    push(
+                        MountedPath::new(&format!("{prefix}{suffix}")),
+                        entry.clone(),
+                    );
                 }
             }
         }
-        bindings.push(RouteBinding {
-            axum_path: proto_path_to_axum(&entry.http_path),
-            entry,
-        });
+        push(MountedPath::new(&entry.http_path), entry);
     }
     bindings
 }
@@ -447,17 +1054,115 @@ fn route_bindings(
 /// (e.g. a forward-auth endpoint).
 ///
 /// Each entry is `(method, path)` where `method` is the uppercase HTTP token,
-/// or `*` for a `custom` rule that answers every method, so callers can
-/// distinguish same-path/different-method routes from real conflicts.
+/// or `*` for a route that answers every method, so callers can distinguish
+/// same-path/different-method routes from real conflicts. The bindings of one
+/// path are listed as the route they share: `*` once when a `custom` `*` rule
+/// or a custom verb after a variable is among them (the transcoded routes
+/// match the verb, and answer a bound verb's other methods with 405), else
+/// each method once. Two bindings that cannot both serve (one method or a `*`
+/// rule, one verb) are listed both, so the caller sees the collision.
 pub fn route_paths(
     pool: &DescriptorPool,
     aliases: &[AliasConfig],
     selection: &RpcSelection,
 ) -> Vec<(String, String)> {
-    route_bindings(pool, aliases, selection)
+    let mut paths = Vec::new();
+    for bindings in &shape_bindings(pool, aliases, selection) {
+        // The route the shape shares, under the spelling it is mounted with:
+        // that of its first binding, whatever names the others capture under.
+        let path = bindings[0].mount.axum.as_str();
+        let listed = |method: &str| (method.to_owned(), path.to_owned());
+        // A path with a verb after its variable answers every method: one
+        // whose verb is bound only for others is told so with 405.
+        if bindings
+            .iter()
+            .any(|b| b.entry.http_method == RouteMethod::Any || b.mount.verb.is_some())
+        {
+            paths.push(listed("*"));
+        } else {
+            let mut methods: Vec<&str> = Vec::new();
+            for binding in bindings {
+                let method = binding.entry.http_method.as_str();
+                if !methods.contains(&method) {
+                    methods.push(method);
+                    paths.push(listed(method));
+                }
+            }
+        }
+        for (at, binding) in bindings.iter().enumerate() {
+            let clashes = bindings[..at]
+                .iter()
+                .any(|earlier| table::clash(&earlier.claim(), &binding.claim()));
+            if clashes {
+                paths.push(listed(binding.entry.http_method.as_str()));
+            }
+        }
+    }
+    paths
+}
+
+/// The bindings of each route shape the router mounts, in first-binding
+/// order: a shape it refuses beside the ones before it is skipped, as the
+/// tables are, and answers nothing. The routes themselves report a template
+/// left out.
+fn shape_bindings(
+    pool: &DescriptorPool,
+    aliases: &[AliasConfig],
+    selection: &RpcSelection,
+) -> Vec<Vec<RouteBinding>> {
+    let mut shapes: Vec<Vec<RouteBinding>> = Vec::new();
+    let mut by_shape: HashMap<String, usize> = HashMap::new();
+    for binding in route_bindings(pool, aliases, selection, false) {
+        match by_shape.get(&binding.mount.shape) {
+            Some(&index) => shapes[index].push(binding),
+            None => {
+                by_shape.insert(binding.mount.shape.clone(), shapes.len());
+                shapes.push(vec![binding]);
+            }
+        }
+    }
+    retain_mountable(
+        &mut shapes,
+        |bindings| bindings[0].mount.axum.as_str(),
+        |_, _| {},
+    );
+    shapes
+}
+
+/// The methods the transcoded bindings for one pool, aliases and selection
+/// answer: what [`route_paths`] lists under `*` still names methods a route
+/// answers, or every one for a `custom` `*` rule.
+pub(crate) struct BoundMethods {
+    /// The methods the bindings name, each once.
+    pub(crate) methods: Vec<Method>,
+    /// Whether a `custom` `*` rule answers every method.
+    pub(crate) every: bool,
+}
+
+/// The [`BoundMethods`] of the transcoded bindings for this pool, aliases
+/// and selection that the router mounts: a skipped route answers none.
+pub(crate) fn bound_methods(
+    pool: &DescriptorPool,
+    aliases: &[AliasConfig],
+    selection: &RpcSelection,
+) -> BoundMethods {
+    let mut bound = BoundMethods {
+        methods: Vec::new(),
+        every: false,
+    };
+    for binding in shape_bindings(pool, aliases, selection)
         .into_iter()
-        .map(|b| (b.entry.http_method.as_str().to_string(), b.axum_path))
-        .collect()
+        .flatten()
+    {
+        match binding.entry.http_method {
+            RouteMethod::One(method) if !bound.methods.contains(&method) => {
+                bound.methods.push(method);
+            }
+            RouteMethod::One(_) => {}
+            RouteMethod::Any => bound.every = true,
+        }
+    }
+    bound
 }
 
 /// JSON serialization options shared by the unary and streaming response paths,
@@ -601,44 +1306,44 @@ struct Origin {
     address: Option<ClientAddress>,
 }
 
-/// Serve one request on a transcoded route.
-async fn handle<S: TranscodeState>(
-    State(proxy_state): State<S>,
+/// The upstream call one request on a transcoded route makes, with whether a
+/// streamed answer goes out as SSE and its keep-alive; or why the request
+/// cannot be mapped onto the RPC.
+fn start<S: TranscodeState>(
+    proxy_state: S,
     client: Client,
-    Path(path_params): Path<PathParams>,
-    RawQuery(raw_query): RawQuery,
+    path_params: &[(&str, Cow<'_, str>)],
     body: Bytes,
-    entry: Arc<RouteEntry>,
-) -> Response {
+    entry: &RouteEntry,
+) -> Result<(Call<S::Upstream>, bool, u64), Unmappable> {
     let keep_alive_secs = proxy_state.sse_keep_alive_secs();
     let Client {
         headers,
         origin,
         line,
     } = client;
-    let prepared = line.received(&entry).and_then(|received| {
-        let mut call = prepare(
-            proxy_state,
-            &headers,
-            origin,
-            &path_params,
-            raw_query.as_deref(),
-            body,
-            &entry,
-        )?;
+    // The query is read where it was received, before the request line is
+    // handed on.
+    let prepared = prepare(
+        proxy_state,
+        &headers,
+        origin,
+        path_params,
+        line.uri.query(),
+        body,
+        entry,
+    )
+    .and_then(|mut call| {
         // Next to the extensions `prepare` sets, for an upstream in process.
-        call.request.extensions_mut().insert(received);
+        call.request.extensions_mut().insert(line.received(entry)?);
         Ok(call)
     });
-    let call = match prepared {
-        Ok(call) => call,
-        Err(rejection) => return rejection.into_response(&entry),
-    };
-    if entry.streaming {
-        streaming_call(call, entry, wants_sse(&headers), keep_alive_secs).await
-    } else {
-        unary_call(call, &entry).await
-    }
+    let call = prepared?;
+    Ok((
+        call,
+        entry.streaming && wants_sse(&headers),
+        keep_alive_secs,
+    ))
 }
 
 /// Why a request ends before the upstream is called: it cannot be mapped onto
@@ -702,7 +1407,7 @@ fn prepare<S: TranscodeState>(
     proxy_state: S,
     headers: &HeaderMap,
     origin: Origin,
-    path_params: &PathParams,
+    path_params: &[(&str, Cow<'_, str>)],
     raw_query: Option<&str>,
     body: Bytes,
     entry: &RouteEntry,
@@ -714,15 +1419,12 @@ fn prepare<S: TranscodeState>(
     // A request the proxy resolved carries the client-address headers its
     // forwarding policy wrote; one routed here without that resolution
     // carries only what its client asserted, which is never forwarded.
-    let request_metadata = match address {
-        Some(_) => {
-            metadata::rewritten_headers_to_grpc_metadata(headers, proxy_state.forwarded_headers())
-        }
-        None => {
-            metadata::try_http_headers_to_grpc_metadata(headers, proxy_state.forwarded_headers())
-        }
-    }
-    .map_err(|e| Unmappable(e.to_string()))?;
+    let forwarded = match proxy_state.forwarded_header_names() {
+        Some(names) => metadata::Forwarded::Named(names),
+        None => metadata::Forwarded::Listed(proxy_state.forwarded_headers()),
+    };
+    let request_metadata = metadata::forwarded_metadata(headers, forwarded, address.is_some())
+        .map_err(|e| Unmappable(e.to_string()))?;
     let message =
         decode_request(entry, headers, path_params, raw_query, body).map_err(Unmappable)?;
     let mut request = tonic::Request::new(message);
@@ -905,7 +1607,7 @@ fn upstream_error(mut status: tonic::Status, entry: &RouteEntry) -> Response {
 /// sent and are not forwarded.
 async fn streaming_call<U: Upstream>(
     call: Call<U>,
-    entry: Arc<RouteEntry>,
+    entry: RouteRef,
     use_sse: bool,
     keep_alive_secs: u64,
 ) -> Response {
@@ -946,7 +1648,7 @@ async fn streaming_call<U: Upstream>(
 /// and the client sees a truncated transfer instead of a clean end.
 async fn http_body_stream(
     mut stream: tonic::Streaming<DynamicMessage>,
-    entry: Arc<RouteEntry>,
+    entry: RouteRef,
     initial: MetadataMap,
 ) -> Response {
     let first = match stream.message().await {
@@ -1118,7 +1820,7 @@ static NO_PARSED_BODY: request::BodyMapping = request::BodyMapping::None;
 fn decode_request(
     entry: &RouteEntry,
     headers: &HeaderMap,
-    path_params: &PathParams,
+    path_params: &[(&str, Cow<'_, str>)],
     raw_query: Option<&str>,
     body_bytes: Bytes,
 ) -> Result<DynamicMessage, String> {
@@ -1139,13 +1841,8 @@ fn decode_request(
         RequestBody::RawField { mapping, .. } => (mapping, request::Body::Absent, raw_query),
     };
 
-    let mut message = request::build_request_message(
-        &entry.method.input(),
-        mapping,
-        body,
-        path_params,
-        raw_query,
-    )?;
+    let mut message =
+        request::build_message(&entry.method.input(), mapping, body, path_params, raw_query)?;
     match &entry.request_body {
         RequestBody::Parsed(_) => {}
         RequestBody::RawRoot => {
@@ -1268,119 +1965,6 @@ fn response_shape(output: &MessageDescriptor, response_body: Option<String>) -> 
             Some(fields) => ResponseShape::HttpBody(fields),
             None => ResponseShape::Json(Some(path)),
         },
-    }
-}
-
-/// Convert a `google.api.http` path template to axum 0.8 path syntax.
-///
-/// The proto `{param}` form IS axum 0.8's native capture syntax, so plain
-/// single-segment params pass through verbatim. Only field-path templates and
-/// bare wildcards need rewriting (axum 0.7 used `:param`; 0.8 uses `{param}`
-/// and rejects any segment starting with `:`):
-/// - `{name=*}`  (single segment)      -> `{name}`
-/// - `{name=**}` (multi-segment) -> `{*name}` (axum catch-all)
-/// - bare `*` segment            -> `{wildcardN}`
-/// - bare `**` segment           -> `{*wildcardN}` (axum catch-all)
-pub fn proto_path_to_axum(path: &str) -> String {
-    let mut out = String::with_capacity(path.len());
-
-    let segments = split_top_level(path);
-    let last = segments.len().saturating_sub(1);
-    for (idx, segment) in segments.iter().enumerate() {
-        if idx > 0 {
-            out.push('/');
-        }
-        out.push_str(&convert_segment(segment, idx, idx == last));
-    }
-
-    out
-}
-
-/// Split a path on `/` boundaries that are NOT inside a `{...}` brace span.
-///
-/// google.api.http field templates can embed slashes inside a single capture
-/// (e.g. the AIP-127 resource name `{name=shelves/*/books/*}`), so a naive
-/// `str::split('/')` would fracture the brace span into invalid fragments.
-/// Tracking brace depth keeps each capture intact.
-fn split_top_level(path: &str) -> Vec<&str> {
-    let mut segments = Vec::new();
-    let mut depth = 0usize;
-    let mut start = 0usize;
-
-    for (i, ch) in path.char_indices() {
-        match ch {
-            '{' => depth += 1,
-            // Decrement only on a matched brace; a stray `}` (malformed input)
-            // is treated as a literal rather than driving depth negative.
-            '}' if depth > 0 => depth -= 1,
-            '/' if depth == 0 => {
-                segments.push(&path[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    segments.push(&path[start..]);
-    segments
-}
-
-/// Convert a single top-level path segment from proto template to axum 0.8 form.
-///
-/// `is_last` indicates the terminal segment: axum permits a catch-all capture
-/// (`{*name}`) only there, so catch-alls in any other position must degrade.
-fn convert_segment(segment: &str, idx: usize, is_last: bool) -> String {
-    if let Some(inner) = segment.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
-        // Brace capture, possibly with a `name=template` field path.
-        if let Some((name, template)) = inner.split_once('=') {
-            return match template {
-                // Single-segment field path collapses to a plain capture.
-                "*" => format!("{{{name}}}"),
-                // Multi-segment catch-all maps to axum's `{*name}` (terminal only).
-                "**" => catch_all(name, is_last),
-                // Templates with interspersed literals (`{name=shelves/*/books/*}`)
-                // have no faithful axum form: axum cannot bind literal segments
-                // into one capture. Collapse to a catch-all so routing stays
-                // deterministic and the field still binds to the matched tail,
-                // and warn so the limitation surfaces instead of mis-routing.
-                _ => {
-                    tracing::warn!(
-                        template = %inner,
-                        "google.api.http multi-segment field template is not fully \
-                         supported; routing it as a catch-all capture"
-                    );
-                    catch_all(name, is_last)
-                }
-            };
-        }
-        // Plain `{name}` is already valid axum 0.8 syntax.
-        return format!("{{{inner}}}");
-    }
-
-    // Bare wildcards: name them by position so multiple wildcards never collide.
-    match segment {
-        "**" => catch_all(&format!("wildcard{idx}"), is_last),
-        "*" => format!("{{wildcard{idx}}}"),
-        literal => literal.to_string(),
-    }
-}
-
-/// Emit an axum catch-all `{*name}` when `is_last`, else degrade to a
-/// single-segment `{name}` capture.
-///
-/// axum accepts a catch-all only in the final path segment; a mid-path
-/// `{*name}` is rejected at `Router::route()`. A non-terminal catch-all comes
-/// from a malformed or unsupported google.api.http template, so we degrade
-/// (capturing one segment) and warn rather than panic the whole router.
-fn catch_all(name: &str, is_last: bool) -> String {
-    if is_last {
-        format!("{{*{name}}}")
-    } else {
-        tracing::warn!(
-            capture = %name,
-            "catch-all in a non-terminal path segment is unrepresentable in axum; \
-             degrading to a single-segment capture"
-        );
-        format!("{{{name}}}")
     }
 }
 

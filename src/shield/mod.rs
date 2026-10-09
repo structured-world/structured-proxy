@@ -24,7 +24,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::Request;
-use axum::http::HeaderMap;
+use axum::http::header::RETRY_AFTER;
+use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use axum::middleware::Next;
 use axum::response::Response;
 
@@ -136,6 +137,11 @@ impl Shield {
             .find(|r| r.phase == phase && r.matcher.is_match(path))
     }
 
+    /// Whether a rule runs in `phase`: a phase without one needs no layer.
+    pub(crate) fn enforces(&self, phase: Phase) -> bool {
+        self.rules.iter().any(|rule| rule.phase == phase)
+    }
+
     /// Resolve the limit tier for a matched rule, in priority order: the JWT
     /// itself (validated claims), then the external service (cached), then the
     /// rule's pinned profile, then the default profile. `None` means no limit
@@ -192,112 +198,160 @@ pub async fn post_auth_middleware(
 
 /// Match a phase's rule for the request, apply its limit, and attach headers.
 async fn enforce(shield: &Shield, phase: Phase, request: Request, next: Next) -> Response {
-    let path = request.uri().path();
-    let Some(rule) = shield.match_rule(path, phase) else {
-        return next.run(request).await;
-    };
-
-    // The proxy resolved the client address before any guard. Shield used on
-    // its own, in a router of the embedder's, gets it from a
-    // `ClientAddressLayer` in front of it; without one it falls back to what
-    // resolution gives with no trusted proxy: the peer an axum server records.
-    let unresolved;
-    let client = match request.extensions().get::<ClientAddress>() {
-        Some(client) => client,
-        None => {
-            let peer = request
-                .extensions()
-                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-                .map(|ci| ci.0);
-            unresolved = ClientAddress::from_peer(peer);
-            &unresolved
+    match shield.decide(phase, &request) {
+        Decision::Pass => next.run(request).await,
+        Decision::Reject(response) => response,
+        Decision::Report(report) => {
+            let mut response = next.run(request).await;
+            report.apply(&mut response);
+            response
         }
-    };
-    let claims = request
-        .extensions()
-        .get::<crate::auth::ValidatedClaims>()
-        .map(|c| c.0.as_ref());
-    let key = rule_key(
-        &rule.fingerprint,
-        &rule.key,
-        client,
-        request.headers(),
-        claims,
-    );
+    }
+}
 
-    // The limit service resolves per-principal, so it needs the real identity;
-    // the store / shared counter only need the de-identified `store` key.
-    let Some(profile) = shield.resolve_limit(rule, claims, &key.identity) else {
-        // No limit resolves for this rule (JWT/service/profile/default all
-        // absent): allow the request unmetered.
-        return next.run(request).await;
-    };
+/// What a phase's limit makes of a request.
+pub(crate) enum Decision {
+    /// No limit applies.
+    Pass,
+    /// Over the limit: the answer.
+    Reject(Response),
+    /// Admitted: the budget its response reports.
+    Report(Report),
+}
 
-    // Fleet gate first (read-only, cached), so the local shaper is not charged
-    // for a request the fleet-wide budget will reject. The fleet budget is the
-    // sustained rate (`profile.limit`); `burst` is deliberately a per-instance
-    // smoothing allowance, not a fleet-wide entitlement (honouring it fleet-wide
-    // would multiply the effective limit by N). A single instance's burst is
-    // therefore capped by the shared budget when the fleet is near it.
-    //
-    // Consequence for a `burst > limit` profile (e.g. `rate: "1/min", burst: 5`):
-    // under reconciliation the shared counter caps the key at the sustained
-    // `limit`, so the extra burst headroom that a local-only deployment would
-    // allow is not granted fleet-wide. This is intentional, not an oversight:
-    // gating on `burst` instead would let the fleet sustain `burst`-per-window,
-    // loosening the sustained cap by the burst factor. The conservative choice
-    // (never over-admit the fleet's sustained budget) wins; the local GCRA still
-    // smooths per-instance traffic.
-    #[cfg(feature = "redis")]
-    let fleet_remaining = shield
-        .global
-        .as_ref()
-        .map(|g| g.fleet_remaining(&key.store, profile.limit, profile.window));
-    #[cfg(feature = "redis")]
-    if fleet_remaining == Some(0) {
-        return global_reject(profile.limit, profile.window);
+/// The budget an admitted request's response reports.
+pub(crate) struct Report {
+    limit: u64,
+    remaining: u64,
+    verdict: Verdict,
+}
+
+impl Report {
+    /// Report the budget on `response`: the tightest one across phases. With
+    /// defense-in-depth (a pre-auth and a post-auth rule on the same path), an
+    /// inner limiter may already have set headers on the way out; they are
+    /// overwritten only when this (outer) phase's remaining is smaller, so the
+    /// client always sees the budget that will bite first. An inner rejection
+    /// carries remaining 0, so it is never overwritten.
+    pub(crate) fn apply(&self, response: &mut Response) {
+        maybe_tighten_rate_headers(
+            response.headers_mut(),
+            self.limit,
+            self.remaining,
+            &self.verdict,
+        );
+    }
+}
+
+impl Shield {
+    /// Match a phase's rule for `request` and charge its limit.
+    pub(crate) fn decide<B>(&self, phase: Phase, request: &http::Request<B>) -> Decision {
+        let path = request.uri().path();
+        let Some(rule) = self.match_rule(path, phase) else {
+            return Decision::Pass;
+        };
+        self.charge(rule, request)
     }
 
-    // The store key intentionally excludes the profile's numbers, so if a key's
-    // resolved tier changes (a JWT/service tier upgrade), the existing TAT is
-    // reused with the new emission interval. The TAT is an absolute time, so this
-    // only causes a brief transient at the change and self-corrects within one
-    // window. Keying by the tier's numbers instead would reset the budget on
-    // every tier flip, which a client could exploit to shed its own limit.
-    let verdict = shield.store.check(&key.store, &profile.gcra);
-    if !verdict.allowed {
-        return too_many_requests(profile.limit, verdict.remaining, &verdict);
-    }
-
-    // Report the tighter of the local and (when reconciled) fleet budgets, so a
-    // client near the fleet cap isn't told it has ample local room.
-    #[cfg(not(feature = "redis"))]
-    let (reported, header_verdict) = reconciled_headers(verdict, None, profile.window);
-    #[cfg(feature = "redis")]
-    let (reported, header_verdict) = {
-        // Record the admit for the next reconciliation push (whenever the fleet
-        // gate is active, i.e. `fleet_remaining` was computed).
-        if fleet_remaining.is_some() {
-            if let Some(global) = &shield.global {
-                global.record(&key.store, profile.window);
+    /// Charge `request` to the limit of `rule`, which its path matched.
+    fn charge<B>(&self, rule: &CompiledRule, request: &http::Request<B>) -> Decision {
+        // The proxy resolved the client address before any guard. Shield used on
+        // its own, in a router of the embedder's, gets it from a
+        // `ClientAddressLayer` in front of it; without one it falls back to what
+        // resolution gives with no trusted proxy: the peer an axum server records.
+        let unresolved;
+        let client = match request.extensions().get::<ClientAddress>() {
+            Some(client) => client,
+            None => {
+                let peer = request
+                    .extensions()
+                    .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                    .map(|ci| ci.0);
+                unresolved = ClientAddress::from_peer(peer);
+                &unresolved
             }
-        }
-        reconciled_headers(verdict, fleet_remaining, profile.window)
-    };
+        };
+        let claims = request
+            .extensions()
+            .get::<crate::auth::ValidatedClaims>()
+            .map(|c| c.0.as_ref());
+        let key = rule_key(
+            &rule.fingerprint,
+            &rule.key,
+            client,
+            request.headers(),
+            claims,
+        );
 
-    let mut response = next.run(request).await;
-    // Report the tightest budget across phases. With defense-in-depth (a pre-auth
-    // and a post-auth rule on the same path), an inner limiter may already have
-    // set headers on the way out; overwrite them only when this (outer) phase's
-    // remaining is smaller, so the client always sees the budget that will bite
-    // first. An inner rejection carries remaining 0, so it is never overwritten.
-    maybe_tighten_rate_headers(
-        response.headers_mut(),
-        profile.limit,
-        reported,
-        &header_verdict,
-    );
-    response
+        // The limit service resolves per-principal, so it needs the real identity;
+        // the store / shared counter only need the de-identified `store` key.
+        let Some(profile) = self.resolve_limit(rule, claims, key.identity.as_str()) else {
+            // No limit resolves for this rule (JWT/service/profile/default all
+            // absent): allow the request unmetered.
+            return Decision::Pass;
+        };
+
+        // Fleet gate first (read-only, cached), so the local shaper is not charged
+        // for a request the fleet-wide budget will reject. The fleet budget is the
+        // sustained rate (`profile.limit`); `burst` is deliberately a per-instance
+        // smoothing allowance, not a fleet-wide entitlement (honouring it fleet-wide
+        // would multiply the effective limit by N). A single instance's burst is
+        // therefore capped by the shared budget when the fleet is near it.
+        //
+        // Consequence for a `burst > limit` profile (e.g. `rate: "1/min", burst: 5`):
+        // under reconciliation the shared counter caps the key at the sustained
+        // `limit`, so the extra burst headroom that a local-only deployment would
+        // allow is not granted fleet-wide. This is intentional, not an oversight:
+        // gating on `burst` instead would let the fleet sustain `burst`-per-window,
+        // loosening the sustained cap by the burst factor. The conservative choice
+        // (never over-admit the fleet's sustained budget) wins; the local GCRA still
+        // smooths per-instance traffic.
+        #[cfg(feature = "redis")]
+        let fleet_remaining = self
+            .global
+            .as_ref()
+            .map(|g| g.fleet_remaining(key.store.as_str(), profile.limit, profile.window));
+        #[cfg(feature = "redis")]
+        if fleet_remaining == Some(0) {
+            return Decision::Reject(global_reject(profile.limit, profile.window));
+        }
+
+        // The store key intentionally excludes the profile's numbers, so if a key's
+        // resolved tier changes (a JWT/service tier upgrade), the existing TAT is
+        // reused with the new emission interval. The TAT is an absolute time, so this
+        // only causes a brief transient at the change and self-corrects within one
+        // window. Keying by the tier's numbers instead would reset the budget on
+        // every tier flip, which a client could exploit to shed its own limit.
+        let verdict = self.store.check(key.store.as_str(), &profile.gcra);
+        if !verdict.allowed {
+            return Decision::Reject(too_many_requests(
+                profile.limit,
+                verdict.remaining,
+                &verdict,
+            ));
+        }
+
+        // Report the tighter of the local and (when reconciled) fleet budgets, so a
+        // client near the fleet cap isn't told it has ample local room.
+        #[cfg(not(feature = "redis"))]
+        let (reported, header_verdict) = reconciled_headers(verdict, None, profile.window);
+        #[cfg(feature = "redis")]
+        let (reported, header_verdict) = {
+            // Record the admit for the next reconciliation push (whenever the fleet
+            // gate is active, i.e. `fleet_remaining` was computed).
+            if fleet_remaining.is_some() {
+                if let Some(global) = &self.global {
+                    global.record(key.store.as_str(), profile.window);
+                }
+            }
+            reconciled_headers(verdict, fleet_remaining, profile.window)
+        };
+        Decision::Report(Report {
+            limit: profile.limit,
+            remaining: reported,
+            verdict: header_verdict,
+        })
+    }
 }
 
 /// Combine the local GCRA `verdict` with the optional fleet remaining into the
@@ -348,18 +402,18 @@ fn maybe_tighten_rate_headers(
     remaining: u64,
     verdict: &Verdict,
 ) {
-    let header_u64 = |name: &str| {
+    let header_u64 = |name: &HeaderName| {
         headers
             .get(name)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok())
     };
-    let keep_inner = match header_u64("ratelimit-remaining") {
+    let keep_inner = match header_u64(&RATELIMIT_REMAINING) {
         Some(inner) if inner < remaining => true,
         // Tie on remaining: keep the inner headers only if their reset is at
         // least as long as this phase's, so the longer-binding budget survives.
         Some(inner) if inner == remaining => {
-            header_u64("ratelimit-reset").unwrap_or(0) >= secs_ceil(verdict.reset_after)
+            header_u64(&RATELIMIT_RESET).unwrap_or(0) >= secs_ceil(verdict.reset_after)
         }
         _ => false,
     };
@@ -372,15 +426,13 @@ fn maybe_tighten_rate_headers(
         // Only ever widen: a 200 has no `Retry-After` to touch, and an already
         // longer wait is left intact.
         if let Some(current) = headers
-            .get("retry-after")
+            .get(RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok())
         {
             let reset = secs_ceil(verdict.reset_after);
             if reset > current {
-                if let Ok(v) = reset.to_string().parse() {
-                    headers.insert("retry-after", v);
-                }
+                headers.insert(RETRY_AFTER, HeaderValue::from(reset));
             }
         }
     }
@@ -404,41 +456,118 @@ fn global_reject(limit: u64, window: Duration) -> Response {
 }
 
 /// The keys a matched rule derives for one request.
-struct RuleKey {
+struct RuleKey<'r> {
     /// De-identified key for the local store and shared counter: the rule's
     /// stable fingerprint, the source tag, and a hash of the value. Raw client
     /// values (API keys, principals, IPs) never reach the shared store or its
     /// logs. Deterministic across instances so reconciliation keys agree.
-    store: String,
+    store: StoreKey,
     /// The raw identity for per-principal limit-service resolution (the service
     /// must see the real principal to resolve its tier). Not persisted.
-    identity: String,
+    identity: Identity<'r>,
+}
+
+/// A store key, `fingerprint:tag:hash`, held inline: the fingerprint and the
+/// hash are 32 hex digits each and the tag at most three letters.
+struct StoreKey {
+    bytes: [u8; 72],
+    len: usize,
+}
+
+impl StoreKey {
+    fn new(fingerprint: &str, tag: &str, hash: &[u8; 32]) -> Self {
+        let mut key = Self {
+            bytes: [0; 72],
+            len: 0,
+        };
+        for part in [fingerprint.as_bytes(), b":", tag.as_bytes(), b":", hash] {
+            key.bytes[key.len..key.len + part.len()].copy_from_slice(part);
+            key.len += part.len();
+        }
+        key
+    }
+
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..self.len]).expect("hex digits, a tag and colons")
+    }
+}
+
+/// The value a rule keys a request's limit by, borrowed from the request where
+/// it can be.
+enum Identity<'r> {
+    Address(AddressText),
+    Borrowed(&'r str),
+    Owned(String),
+}
+
+impl Identity<'_> {
+    fn as_str(&self) -> &str {
+        match self {
+            Identity::Address(address) => address.as_str(),
+            Identity::Borrowed(text) => text,
+            Identity::Owned(text) => text,
+        }
+    }
+}
+
+/// An IP address as text, held inline: an IPv6 address is at most 45
+/// characters (RFC 4291 §2.2, with an embedded IPv4 address).
+struct AddressText {
+    bytes: [u8; 45],
+    len: usize,
+}
+
+impl AddressText {
+    fn new(ip: std::net::IpAddr) -> Self {
+        use std::fmt::Write;
+        let mut text = Self {
+            bytes: [0; 45],
+            len: 0,
+        };
+        write!(text, "{ip}").expect("an IP address fits in 45 characters");
+        text
+    }
+
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..self.len]).expect("an address is written as text")
+    }
+}
+
+impl std::fmt::Write for AddressText {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let end = self.len + s.len();
+        let slot = self.bytes.get_mut(self.len..end).ok_or(std::fmt::Error)?;
+        slot.copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
 }
 
 /// Derive the store key and resolution identity for a matched rule. Every source
 /// falls back to the client address when its value is absent, so a limit can't
 /// be dodged by omitting a header or authenticating anonymously (subject to the
 /// rule's phase: a `jwt_claim` rule only runs post-auth).
-fn rule_key(
+fn rule_key<'r>(
     fingerprint: &str,
     key: &KeySource,
     client: &ClientAddress,
-    headers: &HeaderMap,
+    headers: &'r HeaderMap,
     claims: Option<&serde_json::Value>,
-) -> RuleKey {
+) -> RuleKey<'r> {
     let (tag, identity) = match key {
         KeySource::Ip => ("ip", address_identity(client)),
         KeySource::Header(name) => match header_str(headers, name) {
-            Some(v) => ("hdr", v),
+            Some(v) => ("hdr", Identity::Borrowed(v)),
             None => ("ip", address_identity(client)),
         },
         KeySource::JwtClaim(claim) => match claims.and_then(|c| resolve::claim_str(c, claim)) {
-            Some(v) => ("jwt", v),
+            Some(v) => ("jwt", Identity::Owned(v)),
             None => ("ip", address_identity(client)),
         },
     };
+    let hash = matcher::short_hash_hex(identity.as_str().as_bytes());
     RuleKey {
-        store: format!("{fingerprint}:{tag}:{}", matcher::short_hash(&identity)),
+        store: StoreKey::new(fingerprint, tag, &hash),
         identity,
     }
 }
@@ -447,37 +576,37 @@ fn rule_key(
 /// bucket per reason none resolved. A request that cannot name its client
 /// shares its budget with every other such request rather than escaping the
 /// limit, and a proxy's own address never stands in for the client's.
-fn address_identity(client: &ClientAddress) -> String {
+fn address_identity(client: &ClientAddress) -> Identity<'static> {
     match client.resolution() {
-        Resolution::Peer(ip) | Resolution::Forwarded(ip) => ip.to_string(),
-        Resolution::Invalid(_) => "invalid".to_string(),
-        Resolution::Unavailable => "unknown".to_string(),
+        Resolution::Peer(ip) | Resolution::Forwarded(ip) => Identity::Address(AddressText::new(ip)),
+        Resolution::Invalid(_) => Identity::Borrowed("invalid"),
+        Resolution::Unavailable => Identity::Borrowed("unknown"),
     }
 }
 
 /// Trimmed, non-empty value of a header.
-fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
+fn header_str<'h>(headers: &'h HeaderMap, name: &str) -> Option<&'h str> {
     headers
         .get(name)
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
 }
+
+static RATELIMIT_LIMIT: HeaderName = HeaderName::from_static("ratelimit-limit");
+static RATELIMIT_REMAINING: HeaderName = HeaderName::from_static("ratelimit-remaining");
+static RATELIMIT_RESET: HeaderName = HeaderName::from_static("ratelimit-reset");
 
 /// Attach the draft-ietf `RateLimit-*` headers describing the remaining budget.
 /// `remaining` is passed explicitly (rather than read from the verdict) so the
 /// caller can report the tighter of the local and fleet budgets.
 fn attach_rate_headers(headers: &mut HeaderMap, limit: u64, remaining: u64, verdict: &Verdict) {
-    if let Ok(v) = limit.to_string().parse() {
-        headers.insert("ratelimit-limit", v);
-    }
-    if let Ok(v) = remaining.to_string().parse() {
-        headers.insert("ratelimit-remaining", v);
-    }
-    if let Ok(v) = secs_ceil(verdict.reset_after).to_string().parse() {
-        headers.insert("ratelimit-reset", v);
-    }
+    headers.insert(RATELIMIT_LIMIT.clone(), HeaderValue::from(limit));
+    headers.insert(RATELIMIT_REMAINING.clone(), HeaderValue::from(remaining));
+    headers.insert(
+        RATELIMIT_RESET.clone(),
+        HeaderValue::from(secs_ceil(verdict.reset_after)),
+    );
 }
 
 /// A `429` response carrying the rate-limit headers plus `Retry-After`.
@@ -485,9 +614,10 @@ fn too_many_requests(limit: u64, remaining: u64, verdict: &Verdict) -> Response 
     let mut response = crate::guard::reject(tonic::Code::ResourceExhausted, "rate limit exceeded");
     let headers = response.headers_mut();
     attach_rate_headers(headers, limit, remaining, verdict);
-    if let Ok(v) = secs_ceil(verdict.retry_after).to_string().parse() {
-        headers.insert("retry-after", v);
-    }
+    headers.insert(
+        RETRY_AFTER,
+        HeaderValue::from(secs_ceil(verdict.retry_after)),
+    );
     response
 }
 

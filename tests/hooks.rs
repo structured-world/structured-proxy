@@ -281,6 +281,22 @@ async fn verify_path_defaults_when_not_configured() {
 }
 
 #[tokio::test]
+async fn the_verify_endpoint_answers_every_method_only_for_its_own_traffic() {
+    // The verify endpoint answers every method, but a scope over transcoded
+    // traffic never sees it: a method no transcoded route answers is still a
+    // typo there.
+    let config = ProxyConfig::from_yaml_str(
+        "upstream:\n  default: \"http://127.0.0.1:50051\"\nmaintenance:\n  enabled: true\n  scope:\n    traffic: [transcoded]\n    methods: [\"PSOT\"]\n",
+    )
+    .unwrap();
+    let err = ProxyServer::from_config(config)
+        .with_auth_decider(Arc::new(DemoDecider))
+        .router()
+        .expect_err("PSOT is answered by no route a transcoded scope covers");
+    assert!(err.to_string().contains("\"PSOT\""), "{err}");
+}
+
+#[tokio::test]
 async fn health_and_metrics_paths_are_configurable() {
     // Relocate the probes and metrics, and confirm the defaults no longer exist.
     let config = ProxyConfig::from_yaml_str(

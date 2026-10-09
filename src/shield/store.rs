@@ -67,6 +67,14 @@ impl GcraStore {
         let now = self.now();
         self.maybe_sweep(now);
 
+        // A key seen before is updated in place, with no owned copy of it.
+        if let Some(mut tat) = self.tats.get_mut(key) {
+            let verdict = gcra.check(Some(Duration::from_nanos(*tat)), now);
+            if verdict.allowed {
+                *tat = dur_nanos(verdict.new_tat);
+            }
+            return verdict;
+        }
         match self.tats.entry(key.to_string()) {
             Entry::Occupied(mut o) => {
                 let stored = Some(Duration::from_nanos(*o.get()));
