@@ -64,9 +64,26 @@ pub struct CompiledRule {
 /// fingerprint rules and to de-identify key values before they reach the shared
 /// store, and deterministic across instances so reconciliation keys agree.
 pub fn short_hash(input: &str) -> String {
+    let hex = short_hash_hex(input.as_bytes());
+    // The hex digits are ASCII.
+    String::from_utf8(hex.to_vec()).expect("hex digits are ASCII")
+}
+
+/// [`short_hash`] of `input` as its 32 lower-case hex digits, built without
+/// allocating.
+pub(crate) fn short_hash_hex(input: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(input.as_bytes());
-    digest[..16].iter().map(|b| format!("{b:02x}")).collect()
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(input);
+    let mut hex = [0u8; 32];
+    let (pairs, _) = hex.as_chunks_mut::<2>();
+    for (pair, byte) in pairs.iter_mut().zip(&digest[..16]) {
+        *pair = [
+            DIGITS[usize::from(byte >> 4)],
+            DIGITS[usize::from(byte & 0x0f)],
+        ];
+    }
+    hex
 }
 
 /// Build a glob matcher where `*` stays within a path segment and `**` spans

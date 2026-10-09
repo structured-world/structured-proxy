@@ -385,7 +385,11 @@ macro_rules! guard_stack {
         }
         if class.authenticates() {
             // Keyed by claims only the JWT gate verifies.
-            if let Some((shield, scope)) = &guards.shield {
+            if let Some((shield, scope)) = guards
+                .shield
+                .as_ref()
+                .filter(|(shield, _)| shield.enforces(crate::shield::matcher::Phase::PostAuth))
+            {
                 target = $wrap!(
                     target,
                     class,
@@ -402,7 +406,11 @@ macro_rules! guard_stack {
                 );
             }
         }
-        if let Some((shield, scope)) = &guards.shield {
+        if let Some((shield, scope)) = guards
+            .shield
+            .as_ref()
+            .filter(|(shield, _)| shield.enforces(crate::shield::matcher::Phase::PreAuth))
+        {
             target = $wrap!(
                 target,
                 class,
