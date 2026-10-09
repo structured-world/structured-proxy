@@ -6,18 +6,29 @@ use axum::routing::any;
 use axum::Router;
 use tower::ServiceExt;
 
-/// A router whose only route answers every method with the method it saw.
-fn app() -> Router {
+/// A router whose only route answers every method with the method it saw, a
+/// `Vary` of its own on it, behind `cors`.
+fn app_with(cors: CorsLayer) -> Router {
     Router::new()
         .route(
             "/x",
-            any(|method: Method| async move { method.as_str().to_owned() }),
+            any(|method: Method| async move {
+                ([(VARY, "accept-encoding")], method.as_str().to_owned())
+            }),
         )
-        .layer(layers(CorsLayer::permissive()))
+        .layer(cors)
+}
+
+fn app() -> Router {
+    app_with(CorsLayer::any(None))
 }
 
 async fn send(request: Request) -> (StatusCode, axum::http::HeaderMap, String) {
-    let response = app().oneshot(request).await.unwrap();
+    send_to(app(), request).await
+}
+
+async fn send_to(app: Router, request: Request) -> (StatusCode, axum::http::HeaderMap, String) {
+    let response = app.oneshot(request).await.unwrap();
     let (parts, body) = response.into_parts();
     let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
     (
@@ -89,13 +100,96 @@ async fn other_methods_are_untouched() {
 }
 
 #[tokio::test]
-async fn stand_in_method_sent_by_a_client_is_not_turned_into_options() {
-    let request = Request::builder()
-        .method(stand_in())
-        .uri("/x")
+async fn every_origin_gets_wildcards_and_no_credentials() {
+    let (_, headers, _) = send(options(&[
+        ("origin", "https://a.example"),
+        ("access-control-request-method", "PUT"),
+    ]))
+    .await;
+    assert_eq!(headers["access-control-allow-origin"], "*");
+    assert_eq!(headers["access-control-allow-methods"], "*");
+    assert_eq!(headers["access-control-allow-headers"], "*");
+    assert!(!headers.contains_key("access-control-allow-credentials"));
+    assert!(!headers.contains_key("vary"));
+    let request = Request::get("/x")
+        .header("origin", "https://a.example")
         .body(Body::empty())
         .unwrap();
-    let (status, _, body) = send(request).await;
+    let (_, headers, _) = send(request).await;
+    assert_eq!(headers["access-control-expose-headers"], "*");
+    let vary: Vec<_> = headers.get_all("vary").iter().collect();
+    assert_eq!(vary, ["accept-encoding"]);
+}
+
+/// The configured origins with credentials, exposing two headers, a preflight
+/// cached for ten minutes.
+fn listed() -> Router {
+    app_with(CorsLayer::listed(
+        vec![HeaderValue::from_static("https://a.example")],
+        &[
+            HeaderName::from_static("grpc-status"),
+            HeaderName::from_static("x-custom"),
+        ],
+        Some(600),
+    ))
+}
+
+#[tokio::test]
+async fn a_listed_origin_preflight_gets_back_what_it_asked_for() {
+    // With credentials the Fetch standard (§3.2.5) forbids `*`: the method
+    // and headers asked for are echoed, for the listed origin only.
+    let request = options(&[
+        ("origin", "https://a.example"),
+        ("access-control-request-method", "PUT"),
+        ("access-control-request-headers", "x-a,x-b"),
+    ]);
+    let (status, headers, body) = send_to(listed(), request).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, "X-SP-OPTIONS");
+    assert!(body.is_empty(), "{body}");
+    assert_eq!(headers["access-control-allow-origin"], "https://a.example");
+    assert_eq!(headers["access-control-allow-methods"], "PUT");
+    assert_eq!(headers["access-control-allow-headers"], "x-a,x-b");
+    assert_eq!(headers["access-control-allow-credentials"], "true");
+    assert_eq!(headers["access-control-max-age"], "600");
+    assert_eq!(
+        headers["vary"],
+        "origin, access-control-request-method, access-control-request-headers"
+    );
+}
+
+#[tokio::test]
+async fn a_listed_origin_reads_the_exposed_headers() {
+    let request = Request::get("/x")
+        .header("origin", "https://a.example")
+        .body(Body::empty())
+        .unwrap();
+    let (_, headers, body) = send_to(listed(), request).await;
+    assert_eq!(body, "GET");
+    assert_eq!(headers["access-control-allow-origin"], "https://a.example");
+    assert_eq!(headers["access-control-allow-credentials"], "true");
+    assert_eq!(
+        headers["access-control-expose-headers"],
+        "grpc-status,x-custom"
+    );
+    // The response's own `Vary` stays beside the CORS one.
+    let vary: Vec<_> = headers.get_all("vary").iter().collect();
+    assert_eq!(
+        vary,
+        [
+            "accept-encoding",
+            "origin, access-control-request-method, access-control-request-headers"
+        ]
+    );
+    assert!(!headers.contains_key("access-control-max-age"));
+}
+
+#[tokio::test]
+async fn an_origin_not_listed_is_not_allowed() {
+    let request = Request::get("/x")
+        .header("origin", "https://b.example")
+        .body(Body::empty())
+        .unwrap();
+    let (status, headers, body) = send_to(listed(), request).await;
+    assert_eq!((status, body.as_str()), (StatusCode::OK, "GET"));
+    assert!(!headers.contains_key("access-control-allow-origin"));
 }

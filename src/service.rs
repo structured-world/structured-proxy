@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use crate::cors::{Cors, CorsFuture, CorsLayer};
 use axum::extract::connect_info::ConnectInfo;
 use axum::response::IntoResponse;
 use axum::routing::future::RouteFuture;
@@ -16,7 +17,6 @@ use pin_project_lite::pin_project;
 use rustls::pki_types::CertificateDer;
 use tonic::transport::server::{Connected, TcpConnectInfo};
 use tower::{Layer, Service, ServiceExt};
-use tower_http::cors::{Cors, CorsLayer};
 
 use crate::client_address::ClientAddressLayer;
 use crate::guard::{BoxedService, Class, GrpcRejections, Guards};
@@ -605,7 +605,7 @@ pin_project! {
         },
         GrpcWeb {
             #[pin]
-            future: tower_http::cors::ResponseFuture<PassThrough<U>>,
+            future: CorsFuture<PassThrough<U>, axum::body::Body>,
         },
         Boxed {
             #[pin]

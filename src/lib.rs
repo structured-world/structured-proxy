@@ -90,9 +90,9 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
+use cors::CorsLayer;
 use prost_reflect::DescriptorPool;
 use std::net::SocketAddr;
-use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use std::sync::Arc;
@@ -1022,7 +1022,7 @@ impl ProxyServer {
                 TraceLayer::new_for_http(),
                 // Wraps every enforcement layer so short-circuited responses
                 // keep CORS headers, and answers preflight before auth.
-                cors::layers(cors.clone()),
+                cors.clone(),
                 // Before every guard: they and the handlers read its result.
                 client_address::ClientAddressLayer::with(guards.client_address.clone()),
             ))
@@ -1065,7 +1065,7 @@ impl ProxyServer {
                         })
                         .layer((
                             TraceLayer::new_for_http(),
-                            cors::layers(cors.clone()),
+                            cors.clone(),
                             client_address::ClientAddressLayer::with(guards.client_address.clone()),
                         ))
                         .service(guards.service(service, guard::Class::Transcoded)),
@@ -1270,10 +1270,10 @@ impl ProxyServer {
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let layer = if config.origins.is_empty() {
+        if config.origins.is_empty() {
             tracing::warn!("CORS origins not set — using permissive CORS (dev mode)");
             // Exposes every header already.
-            CorsLayer::permissive()
+            Ok(CorsLayer::any(config.max_age_secs))
         } else {
             let origins = config
                 .origins
@@ -1299,17 +1299,12 @@ impl ProxyServer {
             // With credentials the Fetch standard (§3.2.5) forbids `*` for
             // methods and headers, so the preflight's own request is echoed
             // back instead: what the browser asked for, from an allowed origin.
-            CorsLayer::new()
-                .allow_origin(AllowOrigin::list(origins))
-                .allow_methods(AllowMethods::mirror_request())
-                .allow_headers(AllowHeaders::mirror_request())
-                .allow_credentials(true)
-                .expose_headers(exposed.collect::<Vec<_>>())
-        };
-        Ok(match config.max_age_secs {
-            Some(secs) => layer.max_age(std::time::Duration::from_secs(secs)),
-            None => layer,
-        })
+            Ok(CorsLayer::listed(
+                origins,
+                &exposed.collect::<Vec<_>>(),
+                config.max_age_secs,
+            ))
+        }
     }
 
     /// The [`ServeOptions`] of `listen:`: TLS from `listen.tls` (mTLS with its

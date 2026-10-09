@@ -88,6 +88,7 @@ fn a_preflight_announcing_x_grpc_web_is_a_grpc_web_preflight() {
     ] {
         let headers = preflight(&[
             ("origin", "https://app.example"),
+            ("access-control-request-method", "POST"),
             ("access-control-request-headers", requested),
         ]);
         assert!(
@@ -98,6 +99,7 @@ fn a_preflight_announcing_x_grpc_web_is_a_grpc_web_preflight() {
     // Split over several header lines, as a list may be.
     let headers = preflight(&[
         ("origin", "https://app.example"),
+        ("access-control-request-method", "POST"),
         ("access-control-request-headers", "content-type"),
         ("access-control-request-headers", "x-grpc-web"),
     ]);
@@ -105,20 +107,37 @@ fn a_preflight_announcing_x_grpc_web_is_a_grpc_web_preflight() {
 }
 
 #[test]
+fn an_options_without_a_request_method_is_no_preflight() {
+    // A CORS-preflight request names the method it asks for (Fetch §3.2.2):
+    // without it, an OPTIONS announcing `x-grpc-web` is an ordinary request,
+    // the routes', never a call for the upstream.
+    let headers = preflight(&[
+        ("origin", "https://app.example"),
+        ("access-control-request-headers", "x-grpc-web"),
+    ]);
+    assert!(!is_grpc_web_preflight(&http::Method::OPTIONS, &headers));
+}
+
+#[test]
 fn other_requests_are_not_grpc_web_preflights() {
     let announcing = preflight(&[
         ("origin", "https://app.example"),
+        ("access-control-request-method", "POST"),
         ("access-control-request-headers", "x-grpc-web"),
     ]);
     // Not an OPTIONS request.
     assert!(!is_grpc_web_preflight(&http::Method::POST, &announcing));
     // No Origin: not a CORS request at all.
-    let no_origin = preflight(&[("access-control-request-headers", "x-grpc-web")]);
+    let no_origin = preflight(&[
+        ("access-control-request-method", "POST"),
+        ("access-control-request-headers", "x-grpc-web"),
+    ]);
     assert!(!is_grpc_web_preflight(&http::Method::OPTIONS, &no_origin));
     // A REST preflight, or a header that only shares the prefix.
     for requested in ["content-type,authorization", "x-grpc-webx", "x-grpc"] {
         let headers = preflight(&[
             ("origin", "https://app.example"),
+            ("access-control-request-method", "POST"),
             ("access-control-request-headers", requested),
         ]);
         assert!(

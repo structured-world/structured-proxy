@@ -39,7 +39,7 @@ doc = false
 axum = { version = "0.8", features = ["macros"] }
 # `util`: the guarded gRPC and fallback paths are boxed services.
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.7", features = ["cors", "trace"] }
+tower-http = { version = "0.7", features = ["trace"] }
 # Foundational HTTP types, used directly by the framework-agnostic embedding
 # hooks (src/hooks.rs) so an embedder never names `axum`. Already in the tree
 # transitively via both axum and tonic; pinned here to make the public API deps
@@ -198,6 +198,8 @@ cli = ["dep:clap", "dep:tracing-subscriber", "redis"]
 # `test-util`: deadline tests run on a paused clock instead of waiting.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 tower = { version = "0.5", features = ["util", "limit"] }
+# An embedder's own CORS around the proxy (tests/edge.rs).
+tower-http = { version = "0.7", features = ["cors"] }
 http-body-util = "0.1"
 # `hyper::upgrade::on`: a fallback that upgrades its connection (src/serve/tests.rs).
 hyper = "1"
