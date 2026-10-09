@@ -657,6 +657,46 @@ fn answer(routes: &table::Routes, method: Method, path: &str) -> String {
     }
 }
 
+#[test]
+fn the_transcoded_paths_rank_among_the_other_routes_as_one_router_does() {
+    // The proxy service matches a request's path itself, among the paths of
+    // every route, as one router holding them all would: another route's
+    // static path ranks before a transcoded variable, a method another route
+    // answers at the very path of a transcoded one is that route's (a HEAD
+    // with its GET), and every other method stays with the transcoded path.
+    let routes = routes_of(
+        r#"syntax = "proto3";
+package t;
+import "google/api/annotations.proto";
+message Req { string name = 1; }
+service S {
+  rpc Get(Req) returns (Req) { option (google.api.http) = { get: "/v1/{name}" }; }
+  rpc Batch(Req) returns (Req) { option (google.api.http) = { post: "/v1/nodes:batch" }; }
+}
+"#,
+    );
+    let table = |path: &str| routes.tables.iter().position(|t| t.path == path).unwrap();
+    let (get, batch) = (table("/v1/{name}"), table("/v1/nodes:batch"));
+    let others = [
+        (Some(Method::GET), "/v1/health".to_owned()),
+        (Some(Method::GET), "/v1/nodes:batch".to_owned()),
+        (None, "/verify".to_owned()),
+    ];
+    let ranked = table::Ranked::new(&routes, &others).unwrap();
+    assert_eq!(ranked.table(&Method::GET, "/v1/a"), Some(get));
+    assert_eq!(ranked.table(&Method::GET, "/v1/health"), None);
+    assert_eq!(ranked.table(&Method::POST, "/v1/health"), None);
+    assert_eq!(ranked.table(&Method::POST, "/v1/nodes:batch"), Some(batch));
+    assert_eq!(ranked.table(&Method::GET, "/v1/nodes:batch"), None);
+    assert_eq!(ranked.table(&Method::HEAD, "/v1/nodes:batch"), None);
+    assert_eq!(ranked.table(&Method::DELETE, "/verify"), None);
+    assert_eq!(ranked.table(&Method::GET, "/v2/a"), None);
+    // A path the ranking cannot hold, text around a variable, leaves every
+    // request to the router.
+    let partial = [(Some(Method::GET), "/v1/{a}.json".to_owned())];
+    assert!(table::Ranked::new(&routes, &partial).is_none());
+}
+
 /// The routes of an annotated `.proto` source.
 fn routes_of(source: &'static str) -> table::Routes {
     table::Routes::new(path_tables(

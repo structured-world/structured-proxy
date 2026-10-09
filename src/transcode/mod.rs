@@ -45,6 +45,7 @@ use tonic::metadata::MetadataMap;
 
 use crate::client_address::ClientAddress;
 use crate::config::AliasConfig;
+use crate::guard::BoxedService;
 use crate::received::ReceivedRequest;
 use crate::service::ConnectionInfo;
 use crate::upstream::Upstream;
@@ -315,6 +316,96 @@ impl Choices {
             elsewhere,
         }))
     }
+
+    /// The transcoded routes served past any router, calling with `state`,
+    /// among `others`: the router paths of the proxy's other routes, each
+    /// with the method it answers (`None`: every one). `layered` puts the
+    /// layers of the transcoded routes around them. `None` when an other path
+    /// is one the proxy cannot rank as the router does.
+    pub(crate) fn direct<S: TranscodeState>(
+        &self,
+        state: S,
+        others: &[(Option<Method>, String)],
+        layered: impl FnOnce(BoxedService) -> BoxedService,
+    ) -> Option<Direct> {
+        let ranked = table::Ranked::new(&self.routes, others)?;
+        let dispatcher = BoxedService::new(Dispatcher {
+            routes: self.routes.clone(),
+            state,
+        });
+        Some(Direct {
+            ranking: Arc::new(Ranking {
+                ranked,
+                routes: self.routes.clone(),
+            }),
+            service: layered(dispatcher),
+        })
+    }
+}
+
+/// The transcoded routes served straight from the proxy's own match of a
+/// request's path, past any router.
+#[derive(Clone)]
+pub(crate) struct Direct {
+    ranking: Arc<Ranking>,
+    /// The routes behind their layers.
+    service: BoxedService,
+}
+
+struct Ranking {
+    ranked: table::Ranked,
+    routes: Arc<Routes>,
+}
+
+impl Direct {
+    /// Whether `request` is one of the transcoded routes', whose binding
+    /// then rides on it: its path's best match among every route of the
+    /// proxy is a transcoded path, the method not another route's there, and
+    /// a binding answers the URL. A request for none goes to the other
+    /// routes, which a fallback follows, as if the transcoded ones were not
+    /// there.
+    pub(crate) fn takes<B>(&self, request: &mut http::Request<B>) -> bool {
+        let ranking = &*self.ranking;
+        match ranking.ranked.table(request.method(), request.uri().path()) {
+            Some(table) => choose(&ranking.routes, table, request),
+            None => false,
+        }
+    }
+
+    /// The routes behind their layers, for a request [`takes`](Self::takes)
+    /// took.
+    pub(crate) fn service(&mut self) -> &mut BoxedService {
+        &mut self.service
+    }
+}
+
+/// The transcoded routes as one service, for requests whose binding rides on
+/// them.
+#[derive(Clone)]
+struct Dispatcher<S> {
+    routes: Arc<Routes>,
+    state: S,
+}
+
+impl<S: TranscodeState> tower::Service<Request> for Dispatcher<S> {
+    type Response = Response;
+    type Error = std::convert::Infallible;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Response, std::convert::Infallible>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: Request) -> Self::Future {
+        let routes = self.routes.clone();
+        let state = self.state.clone();
+        Box::pin(async move { Ok(serve(routes, state, request).await) })
+    }
 }
 
 /// Choose among `routes` for `request`, which the router matches (or
@@ -341,25 +432,8 @@ struct Choosing {
 }
 
 impl Chooser {
-    /// Choose for `request` before the router routes it: `false` when its
-    /// path matches a transcoded route but no binding answers it, a request
-    /// for [`elsewhere`](Self::elsewhere) then. Nothing of the routing is on
-    /// it yet, so the other routes, and a fallback after them, route it as if
-    /// the transcoded ones were not there.
-    pub(crate) fn choose_before_routing<B>(&self, request: &mut http::Request<B>) -> bool {
-        match self.0.routes.table_of(request.uri().path()) {
-            Some(table) => choose(&self.0.routes, table, request),
-            None => true,
-        }
-    }
-
-    /// The proxy's other routes, for the URLs no binding answers.
-    pub(crate) fn elsewhere(&self) -> &Router {
-        &self.0.elsewhere
-    }
-
     /// The other routes, with `fallback` answering what they do not.
-    pub(crate) fn with_fallback(self, fallback: crate::guard::BoxedService) -> Self {
+    pub(crate) fn with_fallback(self, fallback: BoxedService) -> Self {
         Self(Arc::new(Choosing {
             routes: self.0.routes.clone(),
             elsewhere: self.0.elsewhere.clone().fallback_service(fallback),
@@ -610,30 +684,133 @@ async fn dispatch<S: TranscodeState>(
         .map(|(name, value)| (name, Cow::Borrowed(value)))
         .collect();
     let multi_segment = routes.tables[table].multi_segment(index);
+    // The path the router matched, kept past the parts going on with the
+    // body when the captures are read from it.
+    let local;
     if table != matched || !multi_segment.is_empty() {
         // Another path the request matches answers it (a verb bound there, or
         // the only bindings without a verb), or a variable over several
         // segments keeps `%2F` the router decoded: the captures come from the
         // request's path, the router's prefix parameters stay.
-        let path = parts.uri.path();
-        if let Err(rejection) = rebind(
+        local = parts.uri.clone();
+        let captures = &routes.tables[matched].captures;
+        path_params.retain(|(name, _)| !captures.iter().any(|capture| capture == name));
+        if let Err(rejection) = capture(
             &routes,
-            matched,
             table,
             multi_segment,
-            path,
+            local.path(),
             &mut path_params,
         ) {
             return rejection.into_response(routes.tables[table].entry(index));
         }
     }
-    routes.tables[table].bind_params(index, &mut path_params);
     // The target as received, before a router the proxy is nested in strips
     // its prefix; the router records it on every request it routes.
     let uri = match parts.extensions.remove::<OriginalUri>() {
         Some(OriginalUri(uri)) => uri,
         None => parts.uri.clone(),
     };
+    let begun = begin(
+        &routes,
+        (table, index),
+        &state,
+        (parts, body),
+        path_params,
+        uri,
+    )
+    .await;
+    serve_begun(begun, routes, table, index).await
+}
+
+/// Serve `request`, which the proxy matched to a transcoded binding itself,
+/// with no router: the choice rides on it.
+async fn serve<S: TranscodeState>(routes: Arc<Routes>, state: S, request: Request) -> Response {
+    let (mut parts, body) = request.into_parts();
+    let head = parts.method == Method::HEAD;
+    let choice = match parts.extensions.remove::<Chosen>() {
+        Some(Chosen(choice)) => choice,
+        None => Choice::NotFound,
+    };
+    let mut response = match choice {
+        Choice::Route { table, index } => {
+            // The path the proxy matched, what the captures are read from.
+            let local = parts.uri.clone();
+            // The target as received, before a router the proxy is nested in
+            // strips its prefix.
+            let uri = match parts.extensions.remove::<OriginalUri>() {
+                Some(OriginalUri(uri)) => uri,
+                None => local.clone(),
+            };
+            let multi_segment = routes.tables[table].multi_segment(index);
+            let mut path_params = Vec::with_capacity(routes.tables[table].captures.len());
+            match capture(
+                &routes,
+                table,
+                multi_segment,
+                local.path(),
+                &mut path_params,
+            ) {
+                Ok(()) => {
+                    let begun = begin(
+                        &routes,
+                        (table, index),
+                        &state,
+                        (parts, body),
+                        path_params,
+                        uri,
+                    )
+                    .await;
+                    serve_begun(begun, routes, table, index).await
+                }
+                Err(rejection) => rejection.into_response(routes.tables[table].entry(index)),
+            }
+        }
+        Choice::MethodNotAllowed(allow) => {
+            (StatusCode::METHOD_NOT_ALLOWED, [(ALLOW, allow)]).into_response()
+        }
+        Choice::NotFound => StatusCode::NOT_FOUND.into_response(),
+    };
+    // As a router's route answers: the length of a body whose size is known,
+    // and none sent for a HEAD.
+    if !response
+        .headers()
+        .contains_key(http::header::CONTENT_LENGTH)
+    {
+        if let Some(length) = http_body::Body::size_hint(response.body()).exact() {
+            response
+                .headers_mut()
+                .insert(http::header::CONTENT_LENGTH, HeaderValue::from(length));
+        }
+    }
+    if head {
+        *response.body_mut() = axum::body::Body::empty();
+    }
+    response
+}
+
+/// How far [`begin`] got: the upstream call to make, or the answer already.
+enum Begun<U> {
+    Call {
+        call: Call<U>,
+        sse: bool,
+        keep_alive_secs: u64,
+    },
+    Answered(Response),
+}
+
+/// Bind the request of `parts` and `body` to the binding at `binding` (table,
+/// index) with its path parameters `path_params`, its target as received
+/// `uri`: read its body and map it onto the RPC.
+async fn begin<S: TranscodeState>(
+    routes: &Routes,
+    (table, index): (usize, usize),
+    state: &S,
+    (mut parts, body): (http::request::Parts, axum::body::Body),
+    mut path_params: PathParams<'_>,
+    uri: Uri,
+) -> Begun<S::Upstream> {
+    routes.tables[table].bind_params(index, &mut path_params);
     // Taken rather than copied: reading the body needs only its limit, which
     // stays in the extensions.
     let client = Client {
@@ -647,22 +824,37 @@ async fn dispatch<S: TranscodeState>(
             uri,
         },
     };
-    let body = match Bytes::from_request(Request::from_parts(parts, body), &state).await {
+    let body = match Bytes::from_request(Request::from_parts(parts, body), state).await {
         Ok(body) => body,
-        Err(rejection) => return rejection.into_response(),
+        Err(rejection) => return Begun::Answered(rejection.into_response()),
     };
-    let started = start(
-        state,
-        client,
-        &path_params,
-        body,
-        routes.tables[table].entry(index),
-    );
-    let (call, sse, keep_alive_secs) = match started {
-        Ok(started) => started,
-        Err(rejection) => return rejection.into_response(routes.tables[table].entry(index)),
+    let entry = routes.tables[table].entry(index);
+    match start(state.clone(), client, &path_params, body, entry) {
+        Ok((call, sse, keep_alive_secs)) => Begun::Call {
+            call,
+            sse,
+            keep_alive_secs,
+        },
+        Err(rejection) => Begun::Answered(rejection.into_response(entry)),
+    }
+}
+
+/// Make the call [`begin`] got to, the parameters bound: the routes go on
+/// with it.
+async fn serve_begun<U: crate::upstream::Upstream>(
+    begun: Begun<U>,
+    routes: Arc<Routes>,
+    table: usize,
+    index: usize,
+) -> Response {
+    let (call, sse, keep_alive_secs) = match begun {
+        Begun::Call {
+            call,
+            sse,
+            keep_alive_secs,
+        } => (call, sse, keep_alive_secs),
+        Begun::Answered(response) => return response,
     };
-    // The parameters are bound: the routes go on with the call.
     let entry = RouteRef {
         routes,
         table,
@@ -675,32 +867,34 @@ async fn dispatch<S: TranscodeState>(
     }
 }
 
-/// Replace the captures of the table at `matched` in `params` with those of
-/// the table at `chosen`, percent-decoded as the router decodes its own except
-/// at the positions of `multi_segment`, which keep `%2F`.
-fn rebind<'r>(
-    routes: &'r Routes,
-    matched: usize,
-    chosen: usize,
+/// Add the captures of the table at `table` matching `path` to `params`,
+/// percent-decoded as the router decodes its own except at the positions of
+/// `multi_segment`, which keep `%2F`; borrowed from `path` where nothing is
+/// decoded.
+fn capture<'p>(
+    routes: &'p Routes,
+    table: usize,
     multi_segment: &[usize],
-    path: &str,
-    params: &mut PathParams<'r>,
+    path: &'p str,
+    params: &mut PathParams<'p>,
 ) -> Result<(), Unmappable> {
-    let captures = &routes.tables[matched].captures;
-    params.retain(|(name, _)| !captures.iter().any(|capture| capture == name));
     let found = routes
-        .params_of(chosen, path)
+        .params_of(table, path)
         .expect("the chosen table was found by matching this path");
     for (position, (name, raw)) in found.iter().enumerate() {
-        let decoded: Cow<'_, [u8]> = if multi_segment.contains(&position) {
+        let decoded: Cow<'p, [u8]> = if multi_segment.contains(&position) {
             path::decode_multi_segment(raw)
         } else {
             percent_encoding::percent_decode_str(raw).into()
         };
-        // Owned: the request's path goes on with the request.
-        let value = String::from_utf8(decoded.into_owned())
-            .map_err(|_| Unmappable(format!("path parameter {name} is not valid UTF-8")))?;
-        params.push((name, Cow::Owned(value)));
+        let not_utf8 = || Unmappable(format!("path parameter {name} is not valid UTF-8"));
+        let value = match decoded {
+            Cow::Borrowed(bytes) => {
+                Cow::Borrowed(std::str::from_utf8(bytes).map_err(|_| not_utf8())?)
+            }
+            Cow::Owned(bytes) => Cow::Owned(String::from_utf8(bytes).map_err(|_| not_utf8())?),
+        };
+        params.push((name, value));
     }
     Ok(())
 }

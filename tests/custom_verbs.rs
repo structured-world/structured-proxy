@@ -432,6 +432,43 @@ async fn an_extra_route_shares_a_transcoded_path_on_another_method() {
     assert_eq!(body["rpc"], "Batch");
 }
 
+async fn a_request_goes_where_one_router_of_every_route_sends_it() {
+    // The proxy matches a transcoded request itself, yet each one still goes
+    // where one router holding every route sends it: the extra route's static
+    // `/v3/x/ping` ranks before the variable of the transcoded `/v3/x/{name}`
+    // for every method, and a HEAD on the path of an extra GET route next to
+    // a transcoded POST is that route's.
+    let pool: DescriptorPool = common::compile("test/v1/ops.proto", OPS_PROTO);
+    let msg = pool.get_message_by_name("test.v1.Msg").unwrap();
+    let app = common::app(UPSTREAM, Ops { msg }, |yaml| {
+        structured_proxy::ProxyServer::from_yaml_str(yaml)
+            .unwrap()
+            .with_descriptors(pool)
+            .with_extra_routes([
+                ExtraRoute::new(Method::GET, "/v3/x/ping", Arc::new(Ping)),
+                ExtraRoute::new(Method::GET, "/v1/nodes:batch", Arc::new(Ping)),
+            ])
+    })
+    .await;
+    let request = http::Request::get("/v3/x/ping").body(Body::empty()).unwrap();
+    assert_eq!(
+        common::send(&app, request).await,
+        (StatusCode::OK, "pong".to_owned())
+    );
+    let (status, _, _) = call(&app, Method::POST, "/v3/x/ping").await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    let (status, _, body) = call(&app, Method::POST, "/v3/x/pong").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rpc"], "Make");
+    let request = http::Request::head("/v1/nodes:batch")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        common::send(&app, request).await,
+        (StatusCode::OK, String::new())
+    );
+}
+
 async fn a_template_the_router_cannot_serve_is_skipped_not_fatal() {
     // `a{name}b` puts text around a variable, which the router cannot
     // match; that binding is left out and every other one still serves.

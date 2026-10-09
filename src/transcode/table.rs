@@ -31,8 +31,6 @@ pub(super) struct Routes {
     /// carry verbs must not hide one of these from a request that names no
     /// bound verb.
     plain: Index,
-    /// Every table: the one the router matches a request to.
-    all: Index,
     /// Each table by its router path, as the router reports the route it
     /// matched.
     by_path: FxHashMap<String, usize>,
@@ -73,12 +71,42 @@ impl Default for Index {
 
 impl Index {
     fn insert(&mut self, path: &str, table: usize) {
+        let slot = self.slot(path);
+        debug_assert!(slot.is_none(), "{path}");
+        *slot = Some(table);
+    }
+
+    /// Whether `path`, a router path, is one this index holds: whole-segment
+    /// literals and variables, and a catch-all only last.
+    fn holds(path: &str) -> bool {
+        let Some(segments) = path.strip_prefix('/') else {
+            return false;
+        };
+        let mut segments = segments.split('/').peekable();
+        while let Some(segment) = segments.next() {
+            let last = segments.peek().is_none();
+            let variable = segment
+                .strip_prefix('{')
+                .and_then(|inner| inner.strip_suffix('}'));
+            match variable {
+                Some(name) if name.starts_with('*') && !last => return false,
+                Some(name) if name.contains(['{', '}']) => return false,
+                Some(_) => {}
+                None if segment.contains(['{', '}']) => return false,
+                None => {}
+            }
+        }
+        true
+    }
+
+    /// The entry of `path`, made on the way: where a table ending there, or
+    /// in a catch-all there, is held.
+    fn slot(&mut self, path: &str) -> &mut Option<usize> {
         let mut node = 0;
-        for segment in path.strip_prefix('/').unwrap_or(path).split('/') {
+        let segments = path.strip_prefix('/').unwrap_or(path).split('/');
+        for segment in segments {
             if segment.starts_with("{*") {
-                debug_assert!(self.nodes[node].rest.is_none(), "{path}");
-                self.nodes[node].rest = Some(table);
-                return;
+                return &mut self.nodes[node].rest;
             }
             let next = self.nodes.len();
             let child = if segment.starts_with('{') {
@@ -94,8 +122,7 @@ impl Index {
             }
             node = child;
         }
-        debug_assert!(self.nodes[node].table.is_none(), "{path}");
-        self.nodes[node].table = Some(table);
+        &mut self.nodes[node].table
     }
 
     /// The best-ranked table `path` matches.
@@ -424,7 +451,6 @@ impl Routes {
     pub(super) fn new(tables: Vec<PathTable>) -> Self {
         let mut verbs: FxHashMap<String, Index> = FxHashMap::default();
         let mut plain = Index::default();
-        let mut all = Index::default();
         let mut by_path =
             FxHashMap::with_capacity_and_hasher(tables.len(), rustc_hash::FxBuildHasher);
         let mut single = Vec::with_capacity(tables.len());
@@ -433,7 +459,6 @@ impl Routes {
             let inserted = alone.insert(table.path.as_str(), ());
             debug_assert!(inserted.is_ok(), "{}: {inserted:?}", table.path);
             single.push(alone);
-            all.insert(&table.path, index);
             by_path.insert(table.path.clone(), index);
             if table.plain {
                 plain.insert(&table.path, index);
@@ -454,7 +479,6 @@ impl Routes {
             tables,
             verbs,
             plain,
-            all,
             by_path,
             single,
         }
@@ -463,12 +487,6 @@ impl Routes {
     /// The table mounted at `router_path`.
     pub(super) fn table_at(&self, router_path: &str) -> Option<usize> {
         self.by_path.get(router_path).copied()
-    }
-
-    /// The table the router matches `path` to, before it routes the request:
-    /// the best-ranked one among the transcoded paths.
-    pub(super) fn table_of(&self, path: &str) -> Option<usize> {
-        self.all.first(path)
     }
 
     /// The router's match of `path` on the table at `table`, which [`choose`]
@@ -572,6 +590,66 @@ impl Routes {
         };
         self.answer(&self.plain, first, method, path, plain)
             .unwrap_or(Choice::NotFound)
+    }
+}
+
+/// The transcoded paths among every route of the proxy, ranked as one router
+/// holding them all ranks them: a request whose best match is another route
+/// goes there.
+pub(super) struct Ranked {
+    index: Index,
+    /// The ids below this are tables; the one at it, another route.
+    tables: usize,
+    /// For each table, the methods another route answers at the very same
+    /// path: such a request is that route's, as a method route is before a
+    /// route answering any method there.
+    shared: Vec<Vec<Method>>,
+}
+
+impl Ranked {
+    /// `routes` among `others`, the router paths of the proxy's other routes
+    /// with the method each answers (`None`: every method). `None` when one
+    /// of them is a path this ranking cannot hold.
+    pub(super) fn new(routes: &Routes, others: &[(Option<Method>, String)]) -> Option<Self> {
+        let tables = routes.tables.len();
+        let mut index = Index::default();
+        for (table, mounted) in routes.tables.iter().enumerate() {
+            index.insert(&mounted.path, table);
+        }
+        let mut shared = vec![Vec::new(); tables];
+        for (method, path) in others {
+            if !Index::holds(path) {
+                return None;
+            }
+            let slot = index.slot(path);
+            match (*slot, method) {
+                (None, _) => *slot = Some(tables),
+                (Some(table), Some(method)) if table < tables => shared[table].push(method.clone()),
+                // A route answering every method where a table is: the
+                // router could not hold both.
+                (Some(table), None) if table < tables => return None,
+                (Some(_), _) => {}
+            }
+        }
+        Some(Self {
+            index,
+            tables,
+            shared,
+        })
+    }
+
+    /// The table a request for `method` on `path` is routed to, or `None`
+    /// when it is another route's, or no route's.
+    pub(super) fn table(&self, method: &Method, path: &str) -> Option<usize> {
+        let table = self.index.first(path)?;
+        if table >= self.tables {
+            return None;
+        }
+        let shared = &self.shared[table];
+        // A HEAD goes to the GET route when no route answers HEAD itself.
+        let theirs =
+            shared.contains(method) || (*method == Method::HEAD && shared.contains(&Method::GET));
+        (!theirs).then_some(table)
     }
 }
 

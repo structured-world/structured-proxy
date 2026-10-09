@@ -20,7 +20,7 @@ use tower_http::cors::{Cors, CorsLayer};
 
 use crate::client_address::ClientAddressLayer;
 use crate::guard::{BoxedService, Class, GrpcRejections, Guards};
-use crate::transcode::Chooser;
+use crate::transcode::{Chooser, Direct};
 
 /// tonic's `TlsConnectInfo<TcpConnectInfo>`, the record its TLS server puts on
 /// a request and `Request::peer_certs` reads. tonic exports the name only with
@@ -74,10 +74,8 @@ use crate::upstream::{
 #[derive(Clone)]
 pub struct ProxyService<U> {
     upstream: U,
-    routes: axum::Router,
-    /// The choice among the transcoded bindings, made before the routes route
-    /// a request; `None` without transcoded routes.
-    chooser: Option<Chooser>,
+    /// Where the requests that are not gRPC go.
+    routing: Routing,
     /// Binary and text gRPC-Web to the upstream under the CORS policy, each
     /// built once; `None` when the upstream owns CORS for gRPC-Web.
     grpc_web: Option<GrpcWebCors<U>>,
@@ -98,6 +96,56 @@ impl<U> std::fmt::Debug for ProxyService<U> {
             .field("boxed_grpc_web", &self.boxed.web.is_some())
             .field("connection", &self.connection)
             .finish_non_exhaustive()
+    }
+}
+
+/// How the requests that are not gRPC reach the proxy's routes.
+#[derive(Clone)]
+pub(crate) enum Routing {
+    /// The transcoded routes are matched by the proxy and served past any
+    /// router; the other routes by theirs.
+    Direct {
+        direct: Direct,
+        others: axum::Router,
+    },
+    /// Every route by one router, which `chooser` (with transcoded routes)
+    /// chooses a binding after; `served` is the router with it.
+    Routed {
+        router: axum::Router,
+        chooser: Option<Chooser>,
+        served: axum::Router,
+    },
+}
+
+impl Routing {
+    /// Every route by `router`, choosing among its transcoded bindings with
+    /// `chooser`.
+    pub(crate) fn routed(router: axum::Router, chooser: Option<Chooser>) -> Self {
+        let served = match &chooser {
+            Some(chooser) => chooser.clone().layer(router.clone()),
+            None => router.clone(),
+        };
+        Self::Routed {
+            router,
+            chooser,
+            served,
+        }
+    }
+
+    /// These routes, with `fallback` answering what none does.
+    fn with_fallback(self, fallback: BoxedService) -> Self {
+        match self {
+            Self::Direct { direct, others } => Self::Direct {
+                direct,
+                others: others.fallback_service(fallback),
+            },
+            Self::Routed {
+                router, chooser, ..
+            } => Self::routed(
+                router.fallback_service(fallback.clone()),
+                chooser.map(|chooser| chooser.with_fallback(fallback)),
+            ),
+        }
     }
 }
 
@@ -276,14 +324,12 @@ impl ConnectionInfo {
 }
 
 impl<U: Upstream> ProxyService<U> {
-    /// The service over `upstream` and `routes`, choosing among their
-    /// transcoded bindings with `chooser`; gRPC-Web answers carry
-    /// `grpc_web_cors` when set, and gRPC-Web calls are translated to gRPC
-    /// when `translate_grpc_web`.
+    /// The service over `upstream` and the routes of `routing`; gRPC-Web
+    /// answers carry `grpc_web_cors` when set, and gRPC-Web calls are
+    /// translated to gRPC when `translate_grpc_web`.
     pub(crate) fn new(
         upstream: U,
-        routes: axum::Router,
-        chooser: Option<Chooser>,
+        routing: Routing,
         grpc_web_cors: Option<CorsLayer>,
         guards: Arc<Guards>,
         translate_grpc_web: bool,
@@ -331,8 +377,7 @@ impl<U: Upstream> ProxyService<U> {
         });
         Self {
             upstream,
-            routes,
-            chooser,
+            routing,
             grpc_web,
             boxed,
             guards,
@@ -370,10 +415,7 @@ impl<U: Upstream> ProxyService<U> {
         // hand what they do not answer to the same fallback.
         let resolve = ClientAddressLayer::with(self.guards.client_address.clone());
         let fallback = BoxedService::new(resolve.layer(guarded));
-        self.chooser = self
-            .chooser
-            .map(|chooser| chooser.with_fallback(fallback.clone()));
-        self.routes = self.routes.fallback_service(fallback);
+        self.routing = self.routing.with_fallback(fallback);
         self
     }
 
@@ -412,8 +454,7 @@ impl<U: Upstream> ProxyService<U> {
     pub fn for_connection(&self, connection: impl Into<ConnectionInfo>) -> Self {
         Self {
             upstream: self.upstream.clone(),
-            routes: self.routes.clone(),
-            chooser: self.chooser.clone(),
+            routing: self.routing.clone(),
             grpc_web: self.grpc_web.clone(),
             boxed: self.boxed.clone(),
             guards: self.guards.clone(),
@@ -521,17 +562,23 @@ where
             } else if let Some(connection) = connection_of(None, &request) {
                 request.extensions_mut().insert(connection);
             }
-            // The binding is chosen before the routes route the request, so a
-            // URL none answers reaches the other routes, and the fallback, as
-            // if the transcoded ones were not there.
-            let future = match &self.chooser {
-                // A router is always ready; this one is a reference count.
-                Some(chooser) if !chooser.choose_before_routing(&mut request) => {
-                    chooser.elsewhere().clone().call(request)
+            // A router and the transcoded routes' layers are always ready.
+            match &mut self.routing {
+                Routing::Direct { direct, others } => {
+                    if direct.takes(&mut request) {
+                        Inner::Boxed {
+                            future: direct.service().call(request.map(axum::body::Body::new)),
+                        }
+                    } else {
+                        Inner::Routes {
+                            future: others.call(request),
+                        }
+                    }
                 }
-                _ => self.routes.call(request),
-            };
-            Inner::Routes { future }
+                Routing::Routed { served, .. } => Inner::Routes {
+                    future: served.call(request),
+                },
+            }
         };
         ResponseFuture { inner }
     }

@@ -113,6 +113,23 @@ pub(crate) struct ProxyState<U> {
     pub(crate) sse_keep_alive_secs: u64,
 }
 
+/// What [`ProxyServer::routes`] builds.
+struct Built {
+    /// Every route behind its layers, for a router.
+    router: Router,
+    /// The choice among the transcoded bindings, made outside the router's
+    /// layers; `None` without transcoded routes.
+    chooser: Option<transcode::Chooser>,
+    /// The transcoded routes served past any router, and the other routes;
+    /// `None` without transcoded routes, or when an other route's path is
+    /// one they cannot be ranked among.
+    direct: Option<(transcode::Direct, Router)>,
+    /// The CORS policy the routes answer under.
+    cors: CorsLayer,
+    /// The guards, for the traffic outside the routes.
+    guards: Arc<guard::Guards>,
+}
+
 /// Universal proxy server.
 pub struct ProxyServer {
     config: ProxyConfig,
@@ -577,21 +594,19 @@ impl ProxyServer {
         })
     }
 
-    /// Every `(method, path)` route mounted before the verify endpoint, used to
-    /// reject a real collision with a clear error instead of an axum
-    /// duplicate-route panic. `method` is the uppercase HTTP token; same-path
-    /// routes with different methods do NOT collide (the extra-route adapter and
-    /// axum merge them), so the key is the pair, not the path alone.
+    /// Every `(method, path)` route of the proxy's own endpoints and the
+    /// embedder's extra routes, the verify endpoint aside. With the
+    /// transcoded routes, it checks the mounted edge for a real collision,
+    /// reported as a clear error instead of an axum duplicate-route panic,
+    /// and ranks the transcoded paths among the others for the proxy
+    /// service. `method` is the uppercase HTTP token; same-path routes with
+    /// different methods do NOT collide (the extra-route adapter and axum
+    /// merge them), so the key is the pair, not the path alone.
     ///
     /// Must stay exhaustive: health probes, metrics, OpenAPI spec/docs, the OIDC
-    /// surface (injected backend or config-driven static discovery), embedder
-    /// extra routes, and the transcoded REST routes. All built-in surfaces here
-    /// are `GET`.
-    fn reserved_routes(
-        &self,
-        pool: &DescriptorPool,
-        selection: &transcode::RpcSelection,
-    ) -> anyhow::Result<Vec<(String, String)>> {
+    /// surface (injected backend or config-driven static discovery) and
+    /// embedder extra routes. All built-in surfaces here are `GET`.
+    fn endpoint_routes(&self) -> anyhow::Result<Vec<(String, String)>> {
         let mut routes = Vec::new();
         let mut get = |path: String| routes.push(("GET".to_string(), path));
         if self.config.health.enabled {
@@ -626,11 +641,6 @@ impl ProxyServer {
         for route in &self.extra_routes {
             routes.push((route.method.as_str().to_string(), route.path.clone()));
         }
-        routes.extend(transcode::route_paths(
-            pool,
-            &self.config.aliases,
-            selection,
-        ));
         Ok(routes)
     }
 
@@ -664,7 +674,9 @@ impl ProxyServer {
     /// No valid upstream address, or a configuration [`service`](Self::service)
     /// rejects.
     pub fn router(&self) -> anyhow::Result<Router> {
-        let (router, chooser, _, _) = self.routes(self.upstream()?)?;
+        let Built {
+            router, chooser, ..
+        } = self.routes(self.upstream()?)?;
         Ok(match chooser {
             Some(chooser) => chooser.layer(router),
             None => router,
@@ -701,14 +713,23 @@ impl ProxyServer {
     /// # build().unwrap();
     /// ```
     pub fn service<U: Upstream>(&self, upstream: U) -> anyhow::Result<ProxyService<U>> {
-        let (routes, chooser, cors, guards) = self.routes(upstream.clone())?;
+        let Built {
+            router,
+            chooser,
+            direct,
+            cors,
+            guards,
+        } = self.routes(upstream.clone())?;
         // The routes answer a browser's preflight for gRPC-Web too, so its
         // call carries the same policy unless the upstream sets its own.
         let grpc_web_cors = self.config.cors.grpc_web.then_some(cors);
+        let routing = match direct {
+            Some((direct, others)) => service::Routing::Direct { direct, others },
+            None => service::Routing::routed(router, chooser),
+        };
         Ok(ProxyService::new(
             upstream,
-            routes,
-            chooser,
+            routing,
             grpc_web_cors,
             guards,
             self.config.grpc_web.translate,
@@ -718,15 +739,7 @@ impl ProxyServer {
     /// Build the axum router with all endpoints, calling `upstream`; the
     /// choice among its transcoded bindings, made before its layers; the CORS
     /// policy it answers under; and the guards, for the traffic outside it.
-    fn routes<U: Upstream>(
-        &self,
-        upstream: U,
-    ) -> anyhow::Result<(
-        Router,
-        Option<transcode::Chooser>,
-        CorsLayer,
-        Arc<guard::Guards>,
-    )> {
+    fn routes<U: Upstream>(&self, upstream: U) -> anyhow::Result<Built> {
         // Enforce cross-field invariants on the embedded path too, where the
         // config is built directly instead of through `from_yaml_str`.
         self.config.validate()?;
@@ -747,7 +760,13 @@ impl ProxyServer {
         // routes with different methods are legal (they merge), so only a
         // repeated (method, path) — or any overlap with the verify endpoint,
         // which answers ALL methods (`*`) — is a real conflict.
-        let mut mounted = self.reserved_routes(&pool, &selection)?;
+        let endpoints_mounted = self.endpoint_routes()?;
+        let mut mounted = endpoints_mounted.clone();
+        mounted.extend(transcode::route_paths(
+            &pool,
+            &self.config.aliases,
+            &selection,
+        ));
         if let Some(vp) = &verify_path {
             mounted.push(("*".to_string(), vp.clone()));
         }
@@ -1020,14 +1039,51 @@ impl ProxyServer {
         // transcoded ones ranks for it, and on to the fallback (or the plain
         // 404) when none answers it either, past the layers like any path no
         // route answers.
-        let chooser = choices.map(|choices| {
-            let elsewhere =
-                layered(Router::new().merge(endpoints).merge(verify)).with_state(state.clone());
-            choices.with_elsewhere(elsewhere)
+        let elsewhere =
+            layered(Router::new().merge(endpoints).merge(verify)).with_state(state.clone());
+        // Served by the proxy service, the transcoded routes are matched by
+        // the proxy itself, among the paths of every other route, and reached
+        // behind the same layers past any router.
+        let direct = choices.as_ref().and_then(|choices| {
+            let mut others: Vec<(Option<http::Method>, String)> = endpoints_mounted
+                .iter()
+                .map(|(method, path)| {
+                    (
+                        http::Method::from_bytes(method.as_bytes()).ok(),
+                        path.clone(),
+                    )
+                })
+                .collect();
+            if let Some(path) = &verify_path {
+                others.push((None, path.clone()));
+            }
+            let layered = |service: guard::BoxedService| {
+                guard::BoxedService::new(
+                    tower::ServiceBuilder::new()
+                        .map_response(|response: http::Response<_>| {
+                            response.map(axum::body::Body::new)
+                        })
+                        .layer((
+                            TraceLayer::new_for_http(),
+                            cors::layers(cors.clone()),
+                            client_address::ClientAddressLayer::with(guards.client_address.clone()),
+                        ))
+                        .service(guards.service(service, guard::Class::Transcoded)),
+                )
+            };
+            let direct = choices.direct(state.clone(), &others, layered)?;
+            Some((direct, elsewhere.clone()))
         });
+        let chooser = choices.map(|choices| choices.with_elsewhere(elsewhere.clone()));
         let router = router.with_state(state);
 
-        Ok((router, chooser, cors, guards))
+        Ok(Built {
+            router,
+            chooser,
+            direct,
+            cors,
+            guards,
+        })
     }
 
     /// The guards the configuration and the hooks turn on, each with its
