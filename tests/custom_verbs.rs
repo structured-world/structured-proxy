@@ -225,6 +225,9 @@ async fn call(app: &common::App, method: Method, uri: &str) -> (StatusCode, Stri
     (status, allow, body)
 }
 
+// Every `async fn` up to the closing brace of this block is a test: the macro
+// gives each `#[tokio::test]` itself, once in a `remote` and once in an
+// `in_process` module, so none of them carries the attribute here.
 upstream_tests! {
 async fn verb_after_a_variable_routes_with_the_variable_bound() {
     // `{operation}:cancel`: the variable takes the segment without the verb.
@@ -786,6 +789,33 @@ service Verb {
     .router()
     .expect_err("an extra route on a path with verbs must be rejected");
     assert!(err.to_string().contains("more than one endpoint"), "{err}");
+}
+
+#[tokio::test]
+async fn a_guard_may_not_scope_a_method_only_a_skipped_route_binds() {
+    // `/v1/{name=**}` is skipped beside `/v1/{id}`, mounted first: no route
+    // answers its `PROPFIND`, so a scope naming it covers nothing.
+    const SKIPPED_PROTO: &str = r#"
+syntax = "proto3";
+package test.v1;
+import "google/api/annotations.proto";
+message Msg { string name = 1; string id = 2; }
+service Dav {
+  rpc Get(Msg) returns (Msg) { option (google.api.http) = { get: "/v1/{id}" }; }
+  rpc Inspect(Msg) returns (Msg) {
+    option (google.api.http) = { custom: { kind: "PROPFIND" path: "/v1/{name=**}" } };
+  }
+}
+"#;
+    let pool = common::compile("test/v1/skipped_dav.proto", SKIPPED_PROTO);
+    let err = structured_proxy::ProxyServer::from_yaml_str(
+        "upstream:\n  default: \"http://127.0.0.1:1\"\nmaintenance:\n  enabled: true\n  scope:\n    traffic: [transcoded]\n    methods: [\"PROPFIND\"]\n",
+    )
+    .unwrap()
+    .with_descriptors(pool)
+    .router()
+    .expect_err("PROPFIND is answered by no mounted route");
+    assert!(err.to_string().contains("nor one a route answers"), "{err}");
 }
 
 #[tokio::test]

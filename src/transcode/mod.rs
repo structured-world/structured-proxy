@@ -1066,28 +1066,8 @@ pub fn route_paths(
     aliases: &[AliasConfig],
     selection: &RpcSelection,
 ) -> Vec<(String, String)> {
-    // The bindings of each route shape, in first-binding order.
-    let mut shapes: Vec<Vec<RouteBinding>> = Vec::new();
-    let mut by_shape: HashMap<String, usize> = HashMap::new();
-    // The routes themselves report a template left out.
-    for binding in route_bindings(pool, aliases, selection, false) {
-        match by_shape.get(&binding.mount.shape) {
-            Some(&index) => shapes[index].push(binding),
-            None => {
-                by_shape.insert(binding.mount.shape.clone(), shapes.len());
-                shapes.push(vec![binding]);
-            }
-        }
-    }
-    // Only the routes mounted: a shape the router refuses beside the ones
-    // before it is skipped, as the tables are, and reserves nothing.
-    retain_mountable(
-        &mut shapes,
-        |bindings| bindings[0].mount.axum.as_str(),
-        |_, _| {},
-    );
     let mut paths = Vec::new();
-    for bindings in &shapes {
+    for bindings in &shape_bindings(pool, aliases, selection) {
         // The route the shape shares, under the spelling it is mounted with:
         // that of its first binding, whatever names the others capture under.
         let path = bindings[0].mount.axum.as_str();
@@ -1121,6 +1101,34 @@ pub fn route_paths(
     paths
 }
 
+/// The bindings of each route shape the router mounts, in first-binding
+/// order: a shape it refuses beside the ones before it is skipped, as the
+/// tables are, and answers nothing. The routes themselves report a template
+/// left out.
+fn shape_bindings(
+    pool: &DescriptorPool,
+    aliases: &[AliasConfig],
+    selection: &RpcSelection,
+) -> Vec<Vec<RouteBinding>> {
+    let mut shapes: Vec<Vec<RouteBinding>> = Vec::new();
+    let mut by_shape: HashMap<String, usize> = HashMap::new();
+    for binding in route_bindings(pool, aliases, selection, false) {
+        match by_shape.get(&binding.mount.shape) {
+            Some(&index) => shapes[index].push(binding),
+            None => {
+                by_shape.insert(binding.mount.shape.clone(), shapes.len());
+                shapes.push(vec![binding]);
+            }
+        }
+    }
+    retain_mountable(
+        &mut shapes,
+        |bindings| bindings[0].mount.axum.as_str(),
+        |_, _| {},
+    );
+    shapes
+}
+
 /// The methods the transcoded bindings for one pool, aliases and selection
 /// answer: what [`route_paths`] lists under `*` still names methods a route
 /// answers, or every one for a `custom` `*` rule.
@@ -1132,7 +1140,7 @@ pub(crate) struct BoundMethods {
 }
 
 /// The [`BoundMethods`] of the transcoded bindings for this pool, aliases
-/// and selection.
+/// and selection that the router mounts: a skipped route answers none.
 pub(crate) fn bound_methods(
     pool: &DescriptorPool,
     aliases: &[AliasConfig],
@@ -1142,7 +1150,10 @@ pub(crate) fn bound_methods(
         methods: Vec::new(),
         every: false,
     };
-    for binding in route_bindings(pool, aliases, selection, false) {
+    for binding in shape_bindings(pool, aliases, selection)
+        .into_iter()
+        .flatten()
+    {
         match binding.entry.http_method {
             RouteMethod::One(method) if !bound.methods.contains(&method) => {
                 bound.methods.push(method);
