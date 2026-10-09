@@ -31,6 +31,24 @@ cargo nextest run --all-features
 cargo test --doc --all-features
 ```
 
+CI runs these on every pull request, and three more checks that need a
+particular toolchain or host. To run them yourself:
+
+```bash
+# The minimum supported Rust version, `rust-version` in Cargo.toml.
+rustup toolchain install 1.99
+cargo +1.99 check --all-targets --all-features
+cargo +1.99 check --all-targets --no-default-features --features cli
+
+# The static musl build the release ships (Linux, with musl-tools installed).
+rustup target add x86_64-unknown-linux-musl
+cargo nextest run --target x86_64-unknown-linux-musl --features cli
+
+# The advisory check of the dependencies.
+cargo install cargo-deny --locked
+cargo deny check advisories
+```
+
 The rate-limit reconciliation test runs against Redis when
 `SHIELD_REDIS_TEST_URL` names one (`redis://127.0.0.1:6379/`).
 

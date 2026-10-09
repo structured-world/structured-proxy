@@ -664,8 +664,11 @@ impl ProxyServer {
     /// No valid upstream address, or a configuration [`service`](Self::service)
     /// rejects.
     pub fn router(&self) -> anyhow::Result<Router> {
-        let (router, _, _) = self.routes(self.upstream()?)?;
-        Ok(router)
+        let (router, chooser, _, _) = self.routes(self.upstream()?)?;
+        Ok(match chooser {
+            Some(chooser) => chooser.layer(router),
+            None => router,
+        })
     }
 
     /// The whole proxy as one tower service in front of `upstream`: native
@@ -698,25 +701,32 @@ impl ProxyServer {
     /// # build().unwrap();
     /// ```
     pub fn service<U: Upstream>(&self, upstream: U) -> anyhow::Result<ProxyService<U>> {
-        let (routes, cors, guards) = self.routes(upstream.clone())?;
+        let (routes, chooser, cors, guards) = self.routes(upstream.clone())?;
         // The routes answer a browser's preflight for gRPC-Web too, so its
         // call carries the same policy unless the upstream sets its own.
         let grpc_web_cors = self.config.cors.grpc_web.then_some(cors);
         Ok(ProxyService::new(
             upstream,
             routes,
+            chooser,
             grpc_web_cors,
             guards,
             self.config.grpc_web.translate,
         ))
     }
 
-    /// Build the axum router with all endpoints, calling `upstream`, the CORS
-    /// policy it answers under, and the guards, for the traffic outside it.
+    /// Build the axum router with all endpoints, calling `upstream`; the
+    /// choice among its transcoded bindings, made before its layers; the CORS
+    /// policy it answers under; and the guards, for the traffic outside it.
     fn routes<U: Upstream>(
         &self,
         upstream: U,
-    ) -> anyhow::Result<(Router, CorsLayer, Arc<guard::Guards>)> {
+    ) -> anyhow::Result<(
+        Router,
+        Option<transcode::Chooser>,
+        CorsLayer,
+        Arc<guard::Guards>,
+    )> {
         // Enforce cross-field invariants on the embedded path too, where the
         // config is built directly instead of through `from_yaml_str`.
         self.config.validate()?;
@@ -825,7 +835,7 @@ impl ProxyServer {
         let cors = self.build_cors()?;
 
         // Build transcoding routes from descriptor pool.
-        let (transcode_routes, chooser) = transcode::routes_and_chooser(
+        let (transcode_routes, choices) = transcode::routes_and_choices(
             &pool,
             &self.config.aliases,
             &self.transcode.clone().with_selection(selection.clone()),
@@ -1006,23 +1016,15 @@ impl ProxyServer {
         // goes to the proxy's other routes, which a router without the
         // transcoded ones ranks for it, and on to the fallback (or the plain
         // 404) when none answers it either, past the layers like any path no
-        // route answers. That fallback is set after the layers, so it has none.
-        let router = match chooser {
-            Some(chooser) => {
-                let elsewhere = layered(Router::new().merge(endpoints).merge(verify))
-                    .fallback(|request: axum::extract::Request| async {
-                        transcode::unrouted(request)
-                    })
-                    .with_state(state.clone());
-                chooser
-                    .with_elsewhere(guard::BoxedService::new(elsewhere))
-                    .layer(router)
-            }
-            None => router,
-        };
+        // route answers.
+        let chooser = choices.map(|choices| {
+            let elsewhere =
+                layered(Router::new().merge(endpoints).merge(verify)).with_state(state.clone());
+            choices.with_elsewhere(elsewhere)
+        });
         let router = router.with_state(state);
 
-        Ok((router, cors, guards))
+        Ok((router, chooser, cors, guards))
     }
 
     /// The guards the configuration and the hooks turn on, each with its

@@ -258,20 +258,16 @@ pub fn routes_with_options<S: TranscodeState>(
     aliases: &[AliasConfig],
     options: &TranscodeOptions,
 ) -> Router<S> {
-    let (router, chooser) = routes_and_chooser(pool, aliases, options);
-    match chooser {
-        Some(chooser) => chooser.layer(router),
-        None => router,
-    }
+    routes_and_choices(pool, aliases, options).0
 }
 
-/// The routes of [`routes_with_options`] without their [`Chooser`], which
-/// the caller lays over them outside its own layers.
-pub(crate) fn routes_and_chooser<S: TranscodeState>(
+/// The routes of [`routes_with_options`], with the [`Choices`] among their
+/// bindings that the caller makes before its own layers.
+pub(crate) fn routes_and_choices<S: TranscodeState>(
     pool: &DescriptorPool,
     aliases: &[AliasConfig],
     options: &TranscodeOptions,
-) -> (Router<S>, Option<Chooser>) {
+) -> (Router<S>, Option<Choices>) {
     let tables = path_tables(pool, aliases, options);
     if tables.is_empty() {
         tracing::warn!("No HTTP-annotated RPCs found in proto descriptors");
@@ -279,15 +275,8 @@ pub(crate) fn routes_and_chooser<S: TranscodeState>(
     }
 
     let routes = Arc::new(Routes::new(tables));
-    let chooser = Chooser {
-        tables: routes
-            .tables
-            .iter()
-            .enumerate()
-            .map(|(table, mounted)| (mounted.path.clone(), table))
-            .collect(),
+    let choices = Choices {
         routes: routes.clone(),
-        elsewhere: None,
     };
     let mut router: Router<S> = Router::new();
     for (table, mounted) in routes.tables.iter().enumerate() {
@@ -304,90 +293,133 @@ pub(crate) fn routes_and_chooser<S: TranscodeState>(
             }),
         );
     }
-    (router, Some(chooser))
+    (router, Some(choices))
 }
 
-/// Chooses the binding a request a transcoded route matched reaches, before
-/// any layer under it runs. A URL no binding answers (its field template, its
-/// custom verb) is no transcoded request: it goes `elsewhere` (the other
-/// routes, which hand back what they do not answer either), or comes back
-/// [`Unrouted`].
+/// The choice of the binding a request reaches among the transcoded routes,
+/// made before any layer of the routes runs. A URL no binding answers (its
+/// field template, its custom verb) is no transcoded request: it goes to the
+/// proxy's other routes instead.
+#[derive(Clone)]
+pub(crate) struct Choices {
+    // Shared: the middleware clones its state for every request.
+    routes: Arc<Routes>,
+}
+
+impl Choices {
+    /// These choices, handing a URL no binding answers to `elsewhere`: a
+    /// router of the proxy's other routes.
+    pub(crate) fn with_elsewhere(self, elsewhere: Router) -> Chooser {
+        Chooser {
+            choices: self,
+            elsewhere,
+        }
+    }
+
+    /// Choose for `request`, which the router matches (or matched) to the
+    /// table at `table`: `false` when no binding answers it, otherwise the
+    /// choice rides on the request to [`dispatch`].
+    fn choose<B>(&self, table: usize, request: &mut http::Request<B>) -> bool {
+        match self
+            .routes
+            .choose(table, request.method(), request.uri().path())
+        {
+            Choice::NotFound => false,
+            choice => {
+                request.extensions_mut().insert(Chosen(choice));
+                true
+            }
+        }
+    }
+}
+
+/// [`Choices`] with the routes a URL no binding answers goes to.
 #[derive(Clone)]
 pub(crate) struct Chooser {
-    routes: Arc<Routes>,
-    /// Each table's router path, as the router reports the route it matched.
-    tables: HashMap<String, usize>,
-    elsewhere: Option<crate::guard::BoxedService>,
+    choices: Choices,
+    elsewhere: Router,
 }
 
 impl Chooser {
-    /// This chooser handing a URL no binding answers to `elsewhere`.
-    pub(crate) fn with_elsewhere(mut self, elsewhere: crate::guard::BoxedService) -> Self {
-        self.elsewhere = Some(elsewhere);
+    /// Choose for `request` before the router routes it: `false` when its
+    /// path matches a transcoded route but no binding answers it, a request
+    /// for [`elsewhere_mut`](Self::elsewhere_mut) then. Nothing of the routing is on
+    /// it yet, so the other routes, and a fallback after them, route it as if
+    /// the transcoded ones were not there.
+    pub(crate) fn choose_before_routing<B>(&self, request: &mut http::Request<B>) -> bool {
+        match self.choices.routes.table_of(request.uri().path()) {
+            Some(table) => self.choices.choose(table, request),
+            None => true,
+        }
+    }
+
+    /// The proxy's other routes, for the URLs no binding answers.
+    pub(crate) fn elsewhere_mut(&mut self) -> &mut Router {
+        &mut self.elsewhere
+    }
+
+    /// The other routes, with `fallback` answering what they do not.
+    pub(crate) fn with_fallback(mut self, fallback: crate::guard::BoxedService) -> Self {
+        self.elsewhere = self.elsewhere.fallback_service(fallback);
         self
     }
 
-    /// `router`, holding the transcoded routes, with this chooser outside its
-    /// layers.
-    pub(crate) fn layer<S: TranscodeState>(self, router: Router<S>) -> Router<S> {
-        router.layer(axum::middleware::from_fn_with_state(self, choose_first))
+    /// `router`, holding the transcoded routes, choosing outside its layers
+    /// for a router that is served on its own, merged or nested: the request
+    /// is past the routing then, and the router reports the route it matched
+    /// with the paths it is nested at in front.
+    pub(crate) fn layer(self, router: Router) -> Router {
+        router.layer(axum::middleware::from_fn_with_state(self, choose_routed))
     }
 }
 
-/// `request`, which no route answers, on a `404` that a fallback set after
-/// the routes takes instead.
-pub(crate) fn unrouted(request: Request) -> Response {
-    let mut response = StatusCode::NOT_FOUND.into_response();
-    let request = Unrouted(Arc::new(std::sync::Mutex::new(Some(request))));
-    response.extensions_mut().insert(request);
-    response
-}
-
-/// The binding chosen for a request before the layers under the
-/// [`Chooser`], for [`dispatch`].
+/// The binding chosen for a request before the layers of the routes, for
+/// [`dispatch`].
 #[derive(Clone)]
 struct Chosen(Choice);
 
-/// A request no route answers, on the `404` [`unrouted`] makes of it.
-#[derive(Clone)]
-pub(crate) struct Unrouted(Arc<std::sync::Mutex<Option<Request>>>);
-
-impl Unrouted {
-    /// The request, the first time it is taken.
-    pub(crate) fn take(&self) -> Option<Request> {
-        self.0.lock().map_or(None, |mut request| request.take())
-    }
-}
-
-async fn choose_first(
+async fn choose_routed(
     State(chooser): State<Chooser>,
     mut request: Request,
     next: axum::middleware::Next,
 ) -> Response {
-    // The route the router matched, when it is a transcoded one.
-    let matched = request
-        .extensions()
+    let extensions = request.extensions();
+    let matched = extensions
         .get::<axum::extract::MatchedPath>()
-        .and_then(|path| chooser.tables.get(path.as_str()).copied());
+        .and_then(|matched| {
+            let nested = extensions.get::<axum::extract::NestedPath>();
+            local_path(matched.as_str(), nested.map(|nested| nested.as_str()))
+        })
+        .and_then(|path| chooser.choices.routes.table_at(path));
     let Some(matched) = matched else {
         return next.run(request).await;
     };
-    match chooser
-        .routes
-        .choose(matched, request.method(), request.uri().path())
-    {
-        Choice::NotFound => match chooser.elsewhere {
-            Some(elsewhere) => match tower::ServiceExt::oneshot(elsewhere, request).await {
-                Ok(response) => response,
-                Err(never) => match never {},
-            },
-            None => unrouted(request),
-        },
-        choice => {
-            request.extensions_mut().insert(Chosen(choice));
-            next.run(request).await
-        }
+    if chooser.choices.choose(matched, &mut request) {
+        return next.run(request).await;
     }
+    // The other routes route it again: the route the first routing matched
+    // goes, so theirs is reported. Its captures stay, unread: no other route
+    // of the proxy takes path parameters, and an extra route's handler sees
+    // no extensions.
+    request
+        .extensions_mut()
+        .remove::<axum::extract::MatchedPath>();
+    match tower::ServiceExt::oneshot(chooser.elsewhere, request).await {
+        Ok(response) => response,
+        Err(never) => match never {},
+    }
+}
+
+/// The router path `matched` names in the router nested at `nested`, which
+/// writes the paths it is nested at in front of it.
+fn local_path<'p>(matched: &'p str, nested: Option<&str>) -> Option<&'p str> {
+    let Some(nested) = nested else {
+        return Some(matched);
+    };
+    // A prefix ending in `/` is joined to the path without its leading `/`,
+    // and a path of `/` alone is the prefix itself (axum's nesting).
+    let local = matched.strip_prefix(nested.trim_end_matches('/'))?;
+    Some(if local.is_empty() { "/" } else { local })
 }
 
 /// The tables [`routes_with_options`] mounts, one per router path, each
@@ -507,7 +539,8 @@ async fn dispatch<S: TranscodeState>(
         Choice::MethodNotAllowed(allow) => {
             return (StatusCode::METHOD_NOT_ALLOWED, [(ALLOW, allow)]).into_response()
         }
-        Choice::NotFound => return unrouted(Request::from_parts(parts, body)),
+        // Only routes served without a `Chooser` get here.
+        Choice::NotFound => return StatusCode::NOT_FOUND.into_response(),
     };
     let mut path_params = match Path::<PathParams>::from_request_parts(&mut parts, &state).await {
         Ok(Path(params)) => params,

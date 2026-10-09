@@ -421,7 +421,8 @@ enum Segment<'a> {
 /// Convert a single top-level path segment from proto template to axum 0.8 form.
 ///
 /// `is_last` indicates the terminal segment: axum permits a catch-all capture
-/// (`{*name}`) only there, so catch-alls in any other position must degrade.
+/// (`{*name}`) only there. Anywhere else one comes only from a template
+/// [`MountedPath::new`] already marked unsupported, which is mounted nowhere.
 fn convert_segment(segment: &str, idx: usize, is_last: bool) -> Segment<'_> {
     if let Some(inner) = segment.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
         // Brace capture, possibly with a `name=template` field path.
@@ -430,14 +431,12 @@ fn convert_segment(segment: &str, idx: usize, is_last: bool) -> Segment<'_> {
                 // Single-segment field path collapses to a plain capture.
                 "*" => capture(name, false),
                 // Multi-segment catch-all maps to axum's `{*name}` (terminal only).
-                "**" => catch_all(name, is_last),
+                "**" => capture(name, is_last),
                 // Templates with interspersed literals (`{name=shelves/*/books/*}`)
                 // have no axum form: axum cannot bind literal segments into one
                 // capture. The last segment is mounted as a catch-all and the
-                // transcoded routes check the value against the template; in
-                // any other position it degrades to one segment, which the
-                // template cannot match, so that is warned about.
-                _ => catch_all(name, is_last),
+                // transcoded routes check the value against the template.
+                _ => capture(name, is_last),
             };
         }
         // Plain `{name}` is already valid axum 0.8 syntax.
@@ -448,7 +447,7 @@ fn convert_segment(segment: &str, idx: usize, is_last: bool) -> Segment<'_> {
     // other, and starting with a digit, so never with a field path (whose
     // names are identifiers) or a spelled-out template's `{field}.{k}`.
     match segment {
-        "**" => catch_all(&idx.to_string(), is_last),
+        "**" => capture(&idx.to_string(), is_last),
         "*" => capture(&idx.to_string(), false),
         literal => Segment::Literal(literal),
     }
@@ -459,21 +458,4 @@ fn capture(name: &str, catch_all: bool) -> Segment<'static> {
         name: name.to_owned(),
         catch_all,
     }
-}
-
-/// A catch-all capture when `is_last`, else a single-segment one.
-///
-/// axum accepts a catch-all only in the final path segment; a mid-path
-/// `{*name}` is rejected at `Router::route()`. A non-terminal catch-all comes
-/// from a malformed or unsupported google.api.http template, so we degrade
-/// (capturing one segment) and warn rather than panic the whole router.
-fn catch_all(name: &str, is_last: bool) -> Segment<'static> {
-    if !is_last {
-        tracing::warn!(
-            capture = %name,
-            "catch-all in a non-terminal path segment is unrepresentable in axum; \
-             degrading to a single-segment capture"
-        );
-    }
-    capture(name, is_last)
 }

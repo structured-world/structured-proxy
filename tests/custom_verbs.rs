@@ -609,6 +609,70 @@ service Special {
 }
 
 #[tokio::test]
+async fn a_url_no_binding_answers_reaches_a_route_below_it_in_a_nested_router() {
+    // Nested, the router reports the route it matched with the prefix in
+    // front; the URL still goes past the transcoded route that does not take
+    // it, to the extra route below.
+    const SPECIAL_PROTO: &str = r#"
+syntax = "proto3";
+package test.v1;
+import "google/api/annotations.proto";
+message Msg { string name = 1; }
+service Special {
+  rpc Get(Msg) returns (Msg) { option (google.api.http) = { get: "/v1/books/{name=special/*}" }; }
+}
+"#;
+    let pool = common::compile("test/v1/special.proto", SPECIAL_PROTO);
+    let router = structured_proxy::ProxyServer::from_yaml_str(
+        "upstream:\n  default: \"http://127.0.0.1:1\"\n",
+    )
+    .unwrap()
+    .with_descriptors(pool)
+    .with_extra_routes([ExtraRoute::new(Method::GET, "/v1/{*path}", Arc::new(Ping))])
+    .router()
+    .unwrap();
+    let app = axum::Router::new().nest("/api", router);
+    let request = http::Request::get("/api/v1/books/ordinary/x")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"pong");
+}
+
+#[tokio::test]
+async fn the_fallback_routes_a_url_no_binding_answers_as_its_own() {
+    // The transcoded route that matched the path but took no binding leaves
+    // nothing behind: an axum fallback sees only its own route and captures.
+    let pool: DescriptorPool = common::compile("test/v1/ops.proto", OPS_PROTO);
+    let msg = pool.get_message_by_name("test.v1.Msg").unwrap();
+    let fallback = axum::Router::new().route(
+        "/v1/{*rest}",
+        axum::routing::any(
+            |axum::extract::Path(rest): axum::extract::Path<String>,
+             path: axum::extract::MatchedPath| async move {
+                format!("{} {rest}", path.as_str())
+            },
+        ),
+    );
+    let service = structured_proxy::ProxyServer::new()
+        .with_descriptors(pool)
+        .service(tonic::service::Routes::new(Ops { msg }))
+        .unwrap()
+        .with_fallback(fallback);
+    let app = common::App::new(service);
+    let request = http::Request::post("/v1/anything/else:restore")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = common::send(&app, request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, "/v1/{*rest} anything/else:restore");
+}
+
+#[tokio::test]
 async fn a_guard_may_scope_an_extension_method_a_star_rule_answers() {
     // A `custom` `*` rule answers every method, `PROPFIND` included, so a
     // scope may name it even when no rule names it on its own.

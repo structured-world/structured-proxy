@@ -12,6 +12,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::ops::ControlFlow;
 
 use axum::http::{HeaderValue, Method};
 
@@ -30,23 +31,124 @@ pub(super) struct Routes {
     /// carry verbs must not hide one of these from a request that names no
     /// bound verb.
     plain: Index,
-    /// Each table's path alone: whether a request matches a given table, and
-    /// with which captures, whatever ranks above it.
+    /// Every table: the one the router matches a request to.
+    all: Index,
+    /// Each table by its router path, as the router reports the route it
+    /// matched.
+    by_path: HashMap<String, usize>,
+    /// Each table's path alone: with which captures a request matches it.
     single: Vec<matchit::Router<()>>,
 }
 
-/// Some of the tables, ranked as the router ranks their paths.
-#[derive(Default)]
+/// Some of the tables, by the segments of their router paths: whole-segment
+/// literals, variables and a last catch-all, nothing else (`mountable`).
+///
+/// It lists the tables a path matches in the order the router ranks them, a
+/// literal before a variable before a catch-all at the first segment where
+/// two differ, and backtracking past a branch that does not match, as matchit
+/// does. Each segment of a request follows at most three branches, so the
+/// work is bounded by the request's path, not by the number of tables.
 struct Index {
-    router: matchit::Router<usize>,
-    tables: Vec<usize>,
+    /// `nodes[0]` is the root, before the first segment.
+    nodes: Vec<Node>,
+}
+
+#[derive(Default)]
+struct Node {
+    literals: HashMap<String, usize>,
+    variable: Option<usize>,
+    /// The table whose path ends in a catch-all here.
+    rest: Option<usize>,
+    /// The table whose path ends here.
+    table: Option<usize>,
+}
+
+impl Default for Index {
+    fn default() -> Self {
+        Self {
+            nodes: vec![Node::default()],
+        }
+    }
 }
 
 impl Index {
     fn insert(&mut self, path: &str, table: usize) {
-        let inserted = self.router.insert(path, table);
-        debug_assert!(inserted.is_ok(), "{path}: {inserted:?}");
-        self.tables.push(table);
+        let mut node = 0;
+        for segment in path.strip_prefix('/').unwrap_or(path).split('/') {
+            if segment.starts_with("{*") {
+                debug_assert!(self.nodes[node].rest.is_none(), "{path}");
+                self.nodes[node].rest = Some(table);
+                return;
+            }
+            let next = self.nodes.len();
+            let child = if segment.starts_with('{') {
+                *self.nodes[node].variable.get_or_insert(next)
+            } else {
+                *self.nodes[node]
+                    .literals
+                    .entry(segment.to_owned())
+                    .or_insert(next)
+            };
+            if child == next {
+                self.nodes.push(Node::default());
+            }
+            node = child;
+        }
+        debug_assert!(self.nodes[node].table.is_none(), "{path}");
+        self.nodes[node].table = Some(table);
+    }
+
+    /// The best-ranked table `path` matches.
+    fn first(&self, path: &str) -> Option<usize> {
+        match self.each(path, ControlFlow::Break) {
+            ControlFlow::Break(table) => Some(table),
+            ControlFlow::Continue(()) => None,
+        }
+    }
+
+    /// Hand `found` the tables `path` matches, best-ranked first, until it
+    /// breaks with a value.
+    fn each<B>(
+        &self,
+        path: &str,
+        mut found: impl FnMut(usize) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        match path.strip_prefix('/') {
+            Some(rest) => self.visit(0, Some(rest), &mut found),
+            None => ControlFlow::Continue(()),
+        }
+    }
+
+    /// `rest` is what follows the segments `node` stands for, `None` past the
+    /// last one. As in the router, a variable takes an empty segment only
+    /// before another one, and a catch-all a non-empty rest.
+    fn visit<B>(
+        &self,
+        node: usize,
+        rest: Option<&str>,
+        found: &mut impl FnMut(usize) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        let node = &self.nodes[node];
+        let Some(rest) = rest else {
+            return node.table.map_or(ControlFlow::Continue(()), found);
+        };
+        let (segment, tail) = match rest.split_once('/') {
+            Some((segment, tail)) => (segment, Some(tail)),
+            None => (rest, None),
+        };
+        if let Some(&next) = node.literals.get(segment) {
+            self.visit(next, tail, found)?;
+        }
+        if let Some(next) = node
+            .variable
+            .filter(|_| !segment.is_empty() || tail.is_some())
+        {
+            self.visit(next, tail, found)?;
+        }
+        match node.rest.filter(|_| !rest.is_empty()) {
+            Some(table) => found(table),
+            None => ControlFlow::Continue(()),
+        }
     }
 }
 
@@ -293,12 +395,16 @@ impl Routes {
     pub(super) fn new(tables: Vec<PathTable>) -> Self {
         let mut verbs: HashMap<String, Index> = HashMap::new();
         let mut plain = Index::default();
+        let mut all = Index::default();
+        let mut by_path = HashMap::with_capacity(tables.len());
         let mut single = Vec::with_capacity(tables.len());
         for (index, table) in tables.iter().enumerate() {
             let mut alone = matchit::Router::new();
             let inserted = alone.insert(table.path.as_str(), ());
             debug_assert!(inserted.is_ok(), "{}: {inserted:?}", table.path);
             single.push(alone);
+            all.insert(&table.path, index);
+            by_path.insert(table.path.clone(), index);
             if table.bindings.iter().any(|b| b.verb.is_none()) {
                 plain.insert(&table.path, index);
             }
@@ -318,8 +424,21 @@ impl Routes {
             tables,
             verbs,
             plain,
+            all,
+            by_path,
             single,
         }
+    }
+
+    /// The table mounted at `router_path`.
+    pub(super) fn table_at(&self, router_path: &str) -> Option<usize> {
+        self.by_path.get(router_path).copied()
+    }
+
+    /// The table the router matches `path` to, before it routes the request:
+    /// the best-ranked one among the transcoded paths.
+    pub(super) fn table_of(&self, path: &str) -> Option<usize> {
+        self.all.first(path)
     }
 
     /// The router's match of `path` on the table at `table`, which [`choose`]
@@ -356,30 +475,24 @@ impl Routes {
             Some(choice) => return Some(choice),
             None => {}
         }
-        // Rare: only a refused template or method gets here. Rank what is
-        // left with one router of the other tables this path matches, each
-        // taken out once tried: one insertion and one removal per candidate.
-        let mut router = matchit::Router::new();
-        for &table in &index.tables {
-            if table != first && self.single[table].at(path).is_ok() {
-                let inserted = router.insert(self.tables[table].path.as_str(), table);
-                debug_assert!(inserted.is_ok(), "{inserted:?}");
+        // Rare: only a refused template or method gets here. The other tables
+        // this path matches follow `first`, the best-ranked one, in order.
+        let answered = index.each(path, |table| {
+            if table == first {
+                return ControlFlow::Continue(());
             }
-        }
-        loop {
-            let Ok(found) = router.at(path) else {
-                return not_allowed;
-            };
-            let next = *found.value;
-            let removed = router.remove(self.tables[next].path.as_str());
-            debug_assert_eq!(removed, Some(next));
-            match self.tables[next].choose(next, method, &admits) {
+            match self.tables[table].choose(table, method, &admits) {
                 Some(choice @ Choice::MethodNotAllowed(_)) => {
                     not_allowed.get_or_insert(choice);
+                    ControlFlow::Continue(())
                 }
-                Some(choice) => return Some(choice),
-                None => {}
+                Some(choice) => ControlFlow::Break(choice),
+                None => ControlFlow::Continue(()),
             }
+        });
+        match answered {
+            ControlFlow::Break(choice) => Some(choice),
+            ControlFlow::Continue(()) => not_allowed,
         }
     }
 
@@ -404,13 +517,13 @@ impl Routes {
         if let Some((rest, verb)) = split_verb(path) {
             let verb = normalize_escapes(verb);
             if let Some(index) = self.verbs.get(verb.as_ref()) {
-                if let Ok(found) = index.router.at(path) {
+                if let Some(first) = index.first(path) {
                     let bound = |binding: &Binding| {
                         binding.verb.as_ref().is_some_and(|own| {
                             own.raw == verb && (own.empty_ok || !rest.ends_with('/'))
                         }) && binding.fits(path)
                     };
-                    if let Some(choice) = self.answer(index, *found.value, method, path, bound) {
+                    if let Some(choice) = self.answer(index, first, method, path, bound) {
                         return choice;
                     }
                 }
@@ -422,9 +535,9 @@ impl Routes {
         let first = if self.tables[table].bindings.iter().any(|b| b.verb.is_none()) {
             table
         } else {
-            match self.plain.router.at(path) {
-                Ok(found) => *found.value,
-                Err(_) => return Choice::NotFound,
+            match self.plain.first(path) {
+                Some(first) => first,
+                None => return Choice::NotFound,
             }
         };
         self.answer(&self.plain, first, method, path, plain)
@@ -672,3 +785,6 @@ impl Verb {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

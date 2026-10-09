@@ -20,6 +20,7 @@ use tower_http::cors::{Cors, CorsLayer};
 
 use crate::client_address::ClientAddressLayer;
 use crate::guard::{BoxedService, Class, GrpcRejections, Guards};
+use crate::transcode::Chooser;
 
 /// tonic's `TlsConnectInfo<TcpConnectInfo>`, the record its TLS server puts on
 /// a request and `Request::peer_certs` reads. tonic exports the name only with
@@ -74,6 +75,9 @@ use crate::upstream::{
 pub struct ProxyService<U> {
     upstream: U,
     routes: axum::Router,
+    /// The choice among the transcoded bindings, made before the routes route
+    /// a request; `None` without transcoded routes.
+    chooser: Option<Chooser>,
     /// Binary and text gRPC-Web to the upstream under the CORS policy, each
     /// built once; `None` when the upstream owns CORS for gRPC-Web.
     grpc_web: Option<GrpcWebCors<U>>,
@@ -215,27 +219,6 @@ impl<U: Upstream> Service<axum::extract::Request> for Forward<U> {
     }
 }
 
-/// Hands a URL the transcoded routes matched by path, but no binding answers,
-/// to the fallback instead of their `404`.
-async fn redispatch(
-    axum::extract::State(fallback): axum::extract::State<BoxedService>,
-    request: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    let response = next.run(request).await;
-    match response
-        .extensions()
-        .get::<crate::transcode::Unrouted>()
-        .and_then(crate::transcode::Unrouted::take)
-    {
-        Some(request) => match fallback.oneshot(request).await {
-            Ok(response) => response,
-            Err(never) => match never {},
-        },
-        None => response,
-    }
-}
-
 /// The connection requests arrive on, in the form a tonic server records it:
 /// the TCP ends, and behind TLS the client's certificate chain.
 ///
@@ -293,12 +276,14 @@ impl ConnectionInfo {
 }
 
 impl<U: Upstream> ProxyService<U> {
-    /// The service over `upstream` and `routes`; gRPC-Web answers carry
+    /// The service over `upstream` and `routes`, choosing among their
+    /// transcoded bindings with `chooser`; gRPC-Web answers carry
     /// `grpc_web_cors` when set, and gRPC-Web calls are translated to gRPC
     /// when `translate_grpc_web`.
     pub(crate) fn new(
         upstream: U,
         routes: axum::Router,
+        chooser: Option<Chooser>,
         grpc_web_cors: Option<CorsLayer>,
         guards: Arc<Guards>,
         translate_grpc_web: bool,
@@ -347,6 +332,7 @@ impl<U: Upstream> ProxyService<U> {
         Self {
             upstream,
             routes,
+            chooser,
             grpc_web,
             boxed,
             guards,
@@ -380,14 +366,14 @@ impl<U: Upstream> ProxyService<U> {
         };
         // The routes' own layers do not reach a fallback set after them, so
         // it gets the client-address resolution of its own, around its guards.
-        // A URL the routes hand back unanswered passed none of their layers
-        // either, and takes the same way.
+        // A URL no transcoded binding answers goes to the other routes, which
+        // hand what they do not answer to the same fallback.
         let resolve = ClientAddressLayer::with(self.guards.client_address.clone());
         let fallback = BoxedService::new(resolve.layer(guarded));
-        self.routes = self
-            .routes
-            .fallback_service(fallback.clone())
-            .layer(axum::middleware::from_fn_with_state(fallback, redispatch));
+        self.chooser = self
+            .chooser
+            .map(|chooser| chooser.with_fallback(fallback.clone()));
+        self.routes = self.routes.fallback_service(fallback);
         self
     }
 
@@ -427,6 +413,7 @@ impl<U: Upstream> ProxyService<U> {
         Self {
             upstream: self.upstream.clone(),
             routes: self.routes.clone(),
+            chooser: self.chooser.clone(),
             grpc_web: self.grpc_web.clone(),
             boxed: self.boxed.clone(),
             guards: self.guards.clone(),
@@ -534,8 +521,17 @@ where
             } else if let Some(connection) = connection_of(None, &request) {
                 request.extensions_mut().insert(connection);
             }
+            // The binding is chosen before the routes route the request, so a
+            // URL none answers reaches the other routes, and the fallback, as
+            // if the transcoded ones were not there.
+            let routes = match &mut self.chooser {
+                Some(chooser) if !chooser.choose_before_routing(&mut request) => {
+                    chooser.elsewhere_mut()
+                }
+                _ => &mut self.routes,
+            };
             Inner::Routes {
-                future: self.routes.call(request),
+                future: routes.call(request),
             }
         };
         ResponseFuture { inner }
