@@ -779,6 +779,7 @@ async fn dispatch<S: TranscodeState>(
 async fn serve<S: TranscodeState>(routes: Arc<Routes>, state: S, request: Request) -> Response {
     let (mut parts, body) = request.into_parts();
     let head = parts.method == Method::HEAD;
+    let connect = parts.method == Method::CONNECT;
     let choice = match parts.extensions.remove::<Chosen>() {
         Some(Chosen(choice)) => choice,
         None => Choice::NotFound,
@@ -822,11 +823,18 @@ async fn serve<S: TranscodeState>(routes: Arc<Routes>, state: S, request: Reques
         }
         Choice::NotFound => StatusCode::NOT_FOUND.into_response(),
     };
+    let status = response.status();
+    // A 2xx answer to CONNECT has no content and no Content-Length (RFC 9110
+    // §9.3.6, §8.6), as a router's route answers it too.
+    if connect && status.is_success() {
+        response.headers_mut().remove(http::header::CONTENT_LENGTH);
+        *response.body_mut() = axum::body::Body::empty();
+        return response;
+    }
     // As a router's route answers: the length of a body whose size is known,
     // and none sent for a HEAD. Not on a 204, which has no Content-Length, nor
     // on a 304, whose length could only describe the selected representation
     // (RFC 9110 §8.6), never the empty body sent.
-    let status = response.status();
     if status != StatusCode::NO_CONTENT
         && status != StatusCode::NOT_MODIFIED
         && !response
@@ -1074,22 +1082,24 @@ pub fn route_paths(
     );
     let mut paths = Vec::new();
     for bindings in &shapes {
-        let listed = |method: &str, path: &str| (method.to_owned(), path.to_owned());
+        // The route the shape shares, under the spelling it is mounted with:
+        // that of its first binding, whatever names the others capture under.
+        let path = bindings[0].mount.axum.as_str();
+        let listed = |method: &str| (method.to_owned(), path.to_owned());
         // A path with a verb after its variable answers every method: one
         // whose verb is bound only for others is told so with 405.
-        match bindings
+        if bindings
             .iter()
-            .find(|b| b.entry.http_method == RouteMethod::Any || b.mount.verb.is_some())
+            .any(|b| b.entry.http_method == RouteMethod::Any || b.mount.verb.is_some())
         {
-            Some(star) => paths.push(listed("*", &star.mount.axum)),
-            None => {
-                let mut methods: Vec<&str> = Vec::new();
-                for binding in bindings {
-                    let method = binding.entry.http_method.as_str();
-                    if !methods.contains(&method) {
-                        methods.push(method);
-                        paths.push(listed(method, &binding.mount.axum));
-                    }
+            paths.push(listed("*"));
+        } else {
+            let mut methods: Vec<&str> = Vec::new();
+            for binding in bindings {
+                let method = binding.entry.http_method.as_str();
+                if !methods.contains(&method) {
+                    methods.push(method);
+                    paths.push(listed(method));
                 }
             }
         }
@@ -1098,10 +1108,7 @@ pub fn route_paths(
                 .iter()
                 .any(|earlier| table::clash(&earlier.claim(), &binding.claim()));
             if clashes {
-                paths.push(listed(
-                    binding.entry.http_method.as_str(),
-                    &binding.mount.axum,
-                ));
+                paths.push(listed(binding.entry.http_method.as_str()));
             }
         }
     }

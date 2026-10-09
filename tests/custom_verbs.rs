@@ -569,6 +569,42 @@ async fn a_405_allows_the_methods_of_an_extra_route_at_the_same_path() {
     assert_eq!(allow, "GET, HEAD, POST");
 }
 
+async fn a_successful_connect_answer_has_no_length_and_no_content() {
+    // RFC 9110 §9.3.6: a 2xx answer to CONNECT has no content and no
+    // Content-Length, whatever the RPC returned.
+    const TUNNEL_PROTO: &str = r#"
+syntax = "proto3";
+package test.v1;
+import "google/api/annotations.proto";
+message Msg { string name = 1; string operation = 2; string rpc = 3; }
+service Ops {
+  rpc Tunnel(Msg) returns (Msg) {
+    option (google.api.http) = { custom: { kind: "CONNECT", path: "/v1/tunnel" } };
+  }
+}
+"#;
+    let pool: DescriptorPool = common::compile("test/v1/tunnel.proto", TUNNEL_PROTO);
+    let msg = pool.get_message_by_name("test.v1.Msg").unwrap();
+    let app = common::app(UPSTREAM, Ops { msg }, |yaml| {
+        structured_proxy::ProxyServer::from_yaml_str(yaml)
+            .unwrap()
+            .with_descriptors(pool)
+    })
+    .await;
+    let request = http::Request::builder()
+        .method(Method::CONNECT)
+        .uri("/v1/tunnel")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get("content-length").is_none());
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(body.is_empty(), "{body:?}");
+}
+
 async fn a_transcoded_head_binding_keeps_head_beside_an_extra_get() {
     // A route's own HEAD comes before a GET answering HEAD, as a router's
     // method route holds it: the transcoded `custom` HEAD keeps HEAD, the
@@ -830,6 +866,30 @@ async fn a_preflight_for_a_url_no_binding_answers_reaches_the_fallback() {
     let (status, body) = common::send(&app, request).await;
     assert_eq!(status, StatusCode::IM_A_TEAPOT);
     assert_eq!(body, "yours");
+}
+
+#[tokio::test]
+async fn bindings_of_one_shape_under_other_names_start_as_one_route() {
+    // `GET /v1/{id}` and `POST /v1/{name}` share one route, mounted under one
+    // spelling: the startup check must not see two.
+    const NAMES_PROTO: &str = r#"
+syntax = "proto3";
+package test.v1;
+import "google/api/annotations.proto";
+message Msg { string id = 1; string name = 2; }
+service Names {
+  rpc Get(Msg) returns (Msg) { option (google.api.http) = { get: "/v1/{id}" }; }
+  rpc Post(Msg) returns (Msg) { option (google.api.http) = { post: "/v1/{name}" }; }
+}
+"#;
+    let pool = common::compile("test/v1/names.proto", NAMES_PROTO);
+    let built = structured_proxy::ProxyServer::from_yaml_str(
+        "upstream:\n  default: \"http://127.0.0.1:1\"\n",
+    )
+    .unwrap()
+    .with_descriptors(pool)
+    .router();
+    assert!(built.is_ok(), "{:?}", built.err());
 }
 
 #[tokio::test]

@@ -556,10 +556,11 @@ service S {
     );
     let paths = route_paths(&pool, &[], &RpcSelection::default());
     // A path with verbs answers every method (405 for those its verb is not
-    // bound to), so it is listed as `*`.
+    // bound to), so it is listed as `*`; the duplicate under the spelling the
+    // route is mounted with, whatever names it captures under.
     let expected = [
         ("*", "/v1/ops/{name}"),
-        ("POST", "/v1/ops/{id}"),
+        ("POST", "/v1/ops/{name}"),
         ("POST", "/v1/ops:batch"),
     ];
     let expected: Vec<(String, String)> = expected
