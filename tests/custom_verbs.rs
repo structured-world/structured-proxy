@@ -869,6 +869,47 @@ async fn a_preflight_for_a_url_no_binding_answers_reaches_the_fallback() {
 }
 
 #[tokio::test]
+async fn a_prefix_capture_survives_a_binding_of_another_path() {
+    // Nested under `/{operation}`, the router matches `/v1/a/{operation}`, but
+    // the verb is bound on `/v1/{name=**}:cancel`: the captures are read again
+    // for that path, and the prefix's `operation`, named as one the router
+    // matched, still reaches the RPC.
+    const PREFIX_PROTO: &str = r#"
+syntax = "proto3";
+package test.v1;
+import "google/api/annotations.proto";
+message Msg { string name = 1; string operation = 2; string rpc = 3; }
+service Ops {
+  rpc Get(Msg) returns (Msg) { option (google.api.http) = { get: "/v1/a/{operation}" }; }
+  rpc Cancel(Msg) returns (Msg) { option (google.api.http) = { post: "/v1/{name=**}:cancel" }; }
+}
+"#;
+    let pool: DescriptorPool = common::compile("test/v1/prefix.proto", PREFIX_PROTO);
+    let msg = pool.get_message_by_name("test.v1.Msg").unwrap();
+    let url = common::serve(Ops { msg }).await;
+    let router =
+        structured_proxy::ProxyServer::from_yaml_str(&format!("upstream:\n  default: \"{url}\"\n"))
+            .unwrap()
+            .with_descriptors(pool)
+            .router()
+            .unwrap();
+    let app = axum::Router::new().nest("/{operation}", router);
+    let request = http::Request::post("/outer/v1/a/x:cancel")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        (&body["rpc"], &body["name"], &body["operation"]),
+        (&json!("Cancel"), &json!("a/x"), &json!("outer"))
+    );
+}
+
+#[tokio::test]
 async fn bindings_of_one_shape_under_other_names_start_as_one_route() {
     // `GET /v1/{id}` and `POST /v1/{name}` share one route, mounted under one
     // spelling: the startup check must not see two.

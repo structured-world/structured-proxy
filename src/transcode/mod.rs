@@ -744,8 +744,14 @@ async fn dispatch<S: TranscodeState>(
         // segments keeps `%2F` the router decoded: the captures come from the
         // request's path, the router's prefix parameters stay.
         local = parts.uri.clone();
-        let captures = &routes.tables[matched].captures;
-        path_params.retain(|(name, _)| !captures.iter().any(|capture| capture == name));
+        // The matched path's captures are the router's last parameters, after
+        // those of the prefixes it is nested under, which may share their
+        // names: they go by position, the prefixes' stay.
+        let prefixes = path_params
+            .len()
+            .checked_sub(routes.tables[matched].captures.len())
+            .expect("the router captures every variable of the path it matched");
+        path_params.truncate(prefixes);
         if let Err(rejection) = capture(
             &routes,
             table,
