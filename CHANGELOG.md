@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [8.1.1](https://github.com/structured-world/structured-proxy/compare/v8.1.0...v8.1.1) - 2026-10-09
+
+### Fixed
+
+- *(transcode)* route custom verbs after a path variable ([#142](https://github.com/structured-world/structured-proxy/pull/142))
+
+### Other
+
+- *(deps)* bump taiki-e/install-action from 2.87.21 to 2.87.24 ([#137](https://github.com/structured-world/structured-proxy/pull/137))
+
 ## [8.1.0](https://github.com/structured-world/structured-proxy/compare/v8.0.0...v8.1.0) - 2026-10-05
 
 ### Added
