@@ -10,12 +10,11 @@
 //! stand-in method, so it gets the response headers of an ordinary CORS request,
 //! and has its method restored before anything else sees it.
 
-use axum::extract::Request;
+use std::task::{Context, Poll};
+
 use axum::http::header::{ACCESS_CONTROL_REQUEST_METHOD, ORIGIN};
-use axum::http::Method;
-use axum::middleware::{self, Next};
-use axum::response::Response;
-use axum::Router;
+use axum::http::{Method, Request};
+use tower::{Layer, Service};
 use tower_http::cors::CorsLayer;
 
 /// Marks a request whose method the outer layer replaced with [`stand_in`].
@@ -27,42 +26,93 @@ struct OrdinaryOptions;
 /// sending it itself gets no special treatment: without the marker it is left
 /// as it is and matches no route.
 fn stand_in() -> Method {
-    Method::from_bytes(b"X-SP-OPTIONS").expect("a valid method token")
+    Method::from_bytes(STAND_IN.as_bytes()).expect("a valid method token")
 }
 
-/// `router` wrapped in `cors`, with only real preflights answered by it.
-pub(crate) fn layer<S>(router: Router<S>, cors: CorsLayer) -> Router<S>
-where
-    S: Clone + Send + Sync + 'static,
-{
-    router
-        .layer(middleware::from_fn(restore_options))
-        .layer(cors)
-        .layer(middleware::from_fn(disguise_options))
+const STAND_IN: &str = "X-SP-OPTIONS";
+
+/// `cors`, with only real preflights answered by it, outermost first: one
+/// layer stack, so a router applying it boxes each route once.
+pub(crate) fn layers(cors: CorsLayer) -> (Disguise, CorsLayer, Restore) {
+    (Disguise, cors, Restore)
 }
 
-/// Outermost: hide an ordinary `OPTIONS` from the CORS layer.
-async fn disguise_options(mut request: Request, next: Next) -> Response {
-    let headers = request.headers();
-    let preflight =
-        headers.contains_key(ORIGIN) && headers.contains_key(ACCESS_CONTROL_REQUEST_METHOD);
-    if request.method() == Method::OPTIONS && !preflight {
-        *request.method_mut() = stand_in();
-        request.extensions_mut().insert(OrdinaryOptions);
+/// Outermost: hides an ordinary `OPTIONS` from the CORS layer.
+#[derive(Clone, Copy)]
+pub(crate) struct Disguise;
+
+impl<S> Layer<S> for Disguise {
+    type Service = DisguiseOptions<S>;
+
+    fn layer(&self, inner: S) -> DisguiseOptions<S> {
+        DisguiseOptions(inner)
     }
-    next.run(request).await
 }
 
-/// Right inside the CORS layer: give the request its method back.
-async fn restore_options(mut request: Request, next: Next) -> Response {
-    if request
-        .extensions_mut()
-        .remove::<OrdinaryOptions>()
-        .is_some()
-    {
-        *request.method_mut() = Method::OPTIONS;
+/// The service of [`Disguise`].
+#[derive(Clone)]
+pub(crate) struct DisguiseOptions<S>(S);
+
+impl<S: Service<Request<B>>, B> Service<Request<B>> for DisguiseOptions<S> {
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), S::Error>> {
+        self.0.poll_ready(cx)
     }
-    next.run(request).await
+
+    fn call(&mut self, mut request: Request<B>) -> S::Future {
+        if request.method() == Method::OPTIONS {
+            let headers = request.headers();
+            let preflight =
+                headers.contains_key(ORIGIN) && headers.contains_key(ACCESS_CONTROL_REQUEST_METHOD);
+            if !preflight {
+                *request.method_mut() = stand_in();
+                request.extensions_mut().insert(OrdinaryOptions);
+            }
+        }
+        self.0.call(request)
+    }
+}
+
+/// Right inside the CORS layer: gives the request its method back.
+#[derive(Clone, Copy)]
+pub(crate) struct Restore;
+
+impl<S> Layer<S> for Restore {
+    type Service = RestoreOptions<S>;
+
+    fn layer(&self, inner: S) -> RestoreOptions<S> {
+        RestoreOptions(inner)
+    }
+}
+
+/// The service of [`Restore`].
+#[derive(Clone)]
+pub(crate) struct RestoreOptions<S>(S);
+
+impl<S: Service<Request<B>>, B> Service<Request<B>> for RestoreOptions<S> {
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), S::Error>> {
+        self.0.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut request: Request<B>) -> S::Future {
+        // Only the stand-in carries the marker: no map lookup otherwise.
+        if request.method().as_str() == STAND_IN
+            && request
+                .extensions_mut()
+                .remove::<OrdinaryOptions>()
+                .is_some()
+        {
+            *request.method_mut() = Method::OPTIONS;
+        }
+        self.0.call(request)
+    }
 }
 
 #[cfg(test)]

@@ -1,16 +1,19 @@
 use super::*;
 use axum::body::Body;
+use axum::extract::Request;
 use axum::http::StatusCode;
 use axum::routing::any;
+use axum::Router;
 use tower::ServiceExt;
 
 /// A router whose only route answers every method with the method it saw.
 fn app() -> Router {
-    let router = Router::new().route(
-        "/x",
-        any(|method: Method| async move { method.as_str().to_owned() }),
-    );
-    layer(router, CorsLayer::permissive())
+    Router::new()
+        .route(
+            "/x",
+            any(|method: Method| async move { method.as_str().to_owned() }),
+        )
+        .layer(layers(CorsLayer::permissive()))
 }
 
 async fn send(request: Request) -> (StatusCode, axum::http::HeaderMap, String) {

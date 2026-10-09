@@ -994,16 +994,19 @@ impl ProxyServer {
         // reaches the plain 404 (or the fallback's own guards).
         let endpoints = guards.router(endpoints, guard::Class::Endpoints);
         let verify = guards.router(verify, guard::Class::Verify);
+        // One stack, outermost first, applied at once: each layer applied on
+        // its own would box every route again, and the router clones a
+        // route's boxes for every request.
         let layered = |router: Router<ProxyState<U>>| {
-            let router = router
+            router.layer((
+                // Every request, preflights included.
+                TraceLayer::new_for_http(),
+                // Wraps every enforcement layer so short-circuited responses
+                // keep CORS headers, and answers preflight before auth.
+                cors::layers(cors.clone()),
                 // Before every guard: they and the handlers read its result.
-                .layer(client_address::ClientAddressLayer::with(
-                    guards.client_address.clone(),
-                ))
-                .layer(TraceLayer::new_for_http());
-            // Outermost: wraps every enforcement layer so short-circuited
-            // responses keep CORS headers, and answers preflight before auth.
-            cors::layer(router, cors.clone())
+                client_address::ClientAddressLayer::with(guards.client_address.clone()),
+            ))
         };
         let router = layered(
             Router::new()
