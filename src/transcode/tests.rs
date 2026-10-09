@@ -658,6 +658,26 @@ fn answer(routes: &table::Routes, method: Method, path: &str) -> String {
 }
 
 #[test]
+fn a_one_segment_template_shares_its_route_with_a_plain_variable() {
+    // `{name=foo}` matches one segment: mounted as a variable, it shares the
+    // route of `/v1/{id}` instead of a catch-all the router refuses beside
+    // it, and its binding takes `foo` while the open one takes the rest.
+    let routes = routes_of(
+        r#"syntax = "proto3";
+package t;
+import "google/api/annotations.proto";
+message Req { string name = 1; string id = 2; }
+service S {
+  rpc Fixed(Req) returns (Req) { option (google.api.http) = { get: "/v1/{name=foo}" }; }
+  rpc Open(Req) returns (Req) { option (google.api.http) = { get: "/v1/{id}" }; }
+}
+"#,
+    );
+    assert_eq!(answer(&routes, Method::GET, "/v1/foo"), "/t.S/Fixed");
+    assert_eq!(answer(&routes, Method::GET, "/v1/bar"), "/t.S/Open");
+}
+
+#[test]
 fn the_transcoded_paths_rank_among_the_other_routes_as_one_router_does() {
     // The proxy service matches a request's path itself, among the paths of
     // every route, as one router holding them all would: another route's

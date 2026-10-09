@@ -31,8 +31,9 @@ pub(crate) struct CorsLayer(Arc<Policy>);
 
 #[derive(Debug)]
 struct Policy {
-    /// `None` for every origin: `*` for the origin, the methods, the request
-    /// headers and the exposed ones, and no credentials. Otherwise the
+    /// `None` for every origin: `*` for the origin, the methods and the
+    /// exposed headers, the request headers a preflight asks for named back,
+    /// and no credentials. Otherwise the
     /// origins answered, with credentials, whose preflight gets back the
     /// method and headers it asked for (the Fetch standard, §3.2.5, forbids
     /// `*` with credentials).
@@ -49,6 +50,9 @@ const TRUE: HeaderValue = HeaderValue::from_static("true");
 const VARY_REQUEST: HeaderValue = HeaderValue::from_static(
     "origin, access-control-request-method, access-control-request-headers",
 );
+/// What a preflight's answer for every origin depends on.
+const VARY_REQUEST_HEADERS: HeaderValue =
+    HeaderValue::from_static("access-control-request-headers");
 
 impl CorsLayer {
     /// Every origin, every method and header.
@@ -113,7 +117,18 @@ impl Policy {
         match &self.origins {
             None => {
                 answer.insert(ACCESS_CONTROL_ALLOW_METHODS, WILDCARD);
-                answer.insert(ACCESS_CONTROL_ALLOW_HEADERS, WILDCARD);
+                // `*` does not cover `Authorization` (Fetch §3.2.3, the
+                // CORS-preflight fetch): the headers asked for are named back,
+                // which no credentials make unsafe here.
+                match headers.get(ACCESS_CONTROL_REQUEST_HEADERS) {
+                    Some(requested) => {
+                        answer.insert(ACCESS_CONTROL_ALLOW_HEADERS, requested.clone());
+                        answer.insert(VARY, VARY_REQUEST_HEADERS);
+                    }
+                    None => {
+                        answer.insert(ACCESS_CONTROL_ALLOW_HEADERS, WILDCARD);
+                    }
+                }
             }
             Some(_) => {
                 answer.insert(ACCESS_CONTROL_ALLOW_CREDENTIALS, TRUE);

@@ -808,6 +808,18 @@ impl ProxyServer {
             }
             methods.insert(method.as_str());
         }
+        // Paths of different shapes may still be ones the router cannot hold
+        // together, a variable and a catch-all at one position: refused here,
+        // one path per shape, with the router axum routes with.
+        let mut router = matchit::Router::new();
+        let mut shapes = std::collections::HashSet::new();
+        for (_, path) in &mounted {
+            if shapes.insert(normalize_route_shape(path)) {
+                if let Err(error) = router.insert(path.as_str(), ()) {
+                    anyhow::bail!("route path {path:?} conflicts with another route: {error}");
+                }
+            }
+        }
 
         // Keep the actually-configured probe / metrics / verify paths reachable
         // under maintenance mode. The default exempt list names the default
@@ -1060,22 +1072,26 @@ impl ProxyServer {
         // route answers.
         let elsewhere =
             layered(Router::new().merge(endpoints).merge(verify)).with_state(state.clone());
+        // The transcoded paths are ranked among the paths of every other
+        // route: a binding refused at a better-ranked path passes the request
+        // on only to a transcoded path above them all.
+        let mut others: Vec<(Option<http::Method>, String)> = endpoints_mounted
+            .iter()
+            .map(|(method, path)| {
+                (
+                    http::Method::from_bytes(method.as_bytes()).ok(),
+                    path.clone(),
+                )
+            })
+            .collect();
+        if let Some(path) = &verify_path {
+            others.push((None, path.clone()));
+        }
+        let choices = choices.map(|choices| choices.among(&others));
         // Served by the proxy service, the transcoded routes are matched by
-        // the proxy itself, among the paths of every other route, and reached
-        // behind the same layers past any router.
+        // the proxy itself and reached behind the same layers past any
+        // router.
         let direct = choices.as_ref().and_then(|choices| {
-            let mut others: Vec<(Option<http::Method>, String)> = endpoints_mounted
-                .iter()
-                .map(|(method, path)| {
-                    (
-                        http::Method::from_bytes(method.as_bytes()).ok(),
-                        path.clone(),
-                    )
-                })
-                .collect();
-            if let Some(path) = &verify_path {
-                others.push((None, path.clone()));
-            }
             let layered = |service: guard::BoxedService| {
                 guard::BoxedService::new(
                     tower::ServiceBuilder::new()
@@ -1090,7 +1106,7 @@ impl ProxyServer {
                         .service(guards.service(service, guard::Class::Transcoded)),
                 )
             };
-            let direct = choices.direct(state.clone(), &others, layered)?;
+            let direct = choices.direct(state.clone(), layered)?;
             Some((direct, elsewhere.clone()))
         });
         let chooser = choices.map(|choices| choices.with_elsewhere(elsewhere.clone()));

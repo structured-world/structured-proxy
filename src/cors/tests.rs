@@ -121,6 +121,22 @@ async fn every_origin_gets_wildcards_and_no_credentials() {
     assert_eq!(vary, ["accept-encoding"]);
 }
 
+#[tokio::test]
+async fn every_origin_may_send_the_headers_it_asks_for_authorization_included() {
+    // `*` in Access-Control-Allow-Headers does not cover `Authorization`
+    // (Fetch §3.2.3): the headers a preflight asks for are named back, and
+    // the answer varies with them.
+    let (_, headers, _) = send(options(&[
+        ("origin", "https://a.example"),
+        ("access-control-request-method", "GET"),
+        ("access-control-request-headers", "authorization,x-a"),
+    ]))
+    .await;
+    assert_eq!(headers["access-control-allow-headers"], "authorization,x-a");
+    assert_eq!(headers["vary"], "access-control-request-headers");
+    assert_eq!(headers["access-control-allow-origin"], "*");
+}
+
 /// The configured origins with credentials, exposing two headers, a preflight
 /// cached for ten minutes.
 fn listed() -> Router {

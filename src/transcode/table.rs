@@ -523,8 +523,10 @@ impl Routes {
     /// bindings all refuse the request (a field template the value does not
     /// follow), or answer it only for other methods, leaves it to the next
     /// one the path also matches, as a transcoder matching the method first
-    /// does; the best-ranked 405 stands when none answers. `None` when no
-    /// table admits a binding.
+    /// does; the best-ranked 405 stands when none answers. Only the tables
+    /// `ranks` admits are tried: those ranked before every other route the
+    /// request reaches, which take it otherwise. `None` when no table admits
+    /// a binding.
     fn answer(
         &self,
         index: &Index,
@@ -532,6 +534,7 @@ impl Routes {
         method: &Method,
         path: &str,
         admits: impl Fn(&Binding) -> bool,
+        ranks: &impl Fn(usize) -> bool,
     ) -> Option<Choice> {
         let mut not_allowed = None;
         match self.tables[first].choose(first, method, &admits) {
@@ -540,23 +543,27 @@ impl Routes {
             None => {}
         }
         // Rare: only a refused template or method gets here. The other tables
-        // this path matches follow `first`, the best-ranked one, in order.
+        // this path matches follow `first`, the best-ranked one, in order, up
+        // to another route ranked before them.
         let answered = index.each(path, |table| {
             if table == first {
                 return ControlFlow::Continue(());
+            }
+            if !ranks(table) {
+                return ControlFlow::Break(None);
             }
             match self.tables[table].choose(table, method, &admits) {
                 Some(choice @ Choice::MethodNotAllowed(_)) => {
                     not_allowed.get_or_insert(choice);
                     ControlFlow::Continue(())
                 }
-                Some(choice) => ControlFlow::Break(choice),
+                Some(choice) => ControlFlow::Break(Some(choice)),
                 None => ControlFlow::Continue(()),
             }
         });
         match answered {
-            ControlFlow::Break(choice) => Some(choice),
-            ControlFlow::Continue(()) => not_allowed,
+            ControlFlow::Break(Some(choice)) => Some(choice),
+            ControlFlow::Break(None) | ControlFlow::Continue(()) => not_allowed,
         }
     }
 
@@ -572,6 +579,19 @@ impl Routes {
     /// - Otherwise the bindings without a verb answer, of the best path that
     ///   has some, the verb text being part of the last variable.
     pub(super) fn choose(&self, table: usize, method: &Method, path: &str) -> Choice {
+        self.choose_ranked(table, method, path, &|_| true)
+    }
+
+    /// [`choose`](Self::choose) among the routes of the proxy: another table
+    /// than `table` answers only when `ranks` admits it, ranked before every
+    /// other route the request reaches; the URL is that route's otherwise.
+    pub(super) fn choose_ranked(
+        &self,
+        table: usize,
+        method: &Method,
+        path: &str,
+        ranks: &impl Fn(usize) -> bool,
+    ) -> Choice {
         let plain = |binding: &Binding| binding.verb.is_none() && binding.fits(path);
         if self.tables[table].literal_end() {
             if let Some(choice) = self.tables[table].choose(table, method, plain) {
@@ -581,13 +601,16 @@ impl Routes {
         if let Some((rest, verb)) = split_verb(path) {
             let verb = normalize_escapes(verb);
             if let Some(index) = self.verbs.get(verb.as_ref()) {
-                if let Some(first) = index.first(path) {
+                if let Some(first) = index
+                    .first(path)
+                    .filter(|&first| first == table || ranks(first))
+                {
                     let bound = |binding: &Binding| {
                         binding.verb.as_ref().is_some_and(|own| {
                             own.raw == verb && (own.empty_ok || !rest.ends_with('/'))
                         }) && binding.fits(path)
                     };
-                    if let Some(choice) = self.answer(index, first, method, path, bound) {
+                    if let Some(choice) = self.answer(index, first, method, path, bound, ranks) {
                         return choice;
                     }
                 }
@@ -600,11 +623,11 @@ impl Routes {
             table
         } else {
             match self.plain.first(path) {
-                Some(first) => first,
-                None => return Choice::NotFound,
+                Some(first) if ranks(first) => first,
+                _ => return Choice::NotFound,
             }
         };
-        self.answer(&self.plain, first, method, path, plain)
+        self.answer(&self.plain, first, method, path, plain, ranks)
             .unwrap_or(Choice::NotFound)
     }
 }
@@ -620,6 +643,9 @@ pub(super) struct Ranked {
     /// path: such a request is that route's, as a method route is before a
     /// route answering any method there.
     shared: Vec<Vec<Method>>,
+    /// For each table, whether a binding of it answers HEAD itself: then a
+    /// GET of another route at its path does not take HEAD from it.
+    head: Vec<bool>,
 }
 
 impl Ranked {
@@ -647,10 +673,12 @@ impl Ranked {
                 (Some(_), _) => {}
             }
         }
+        let head = routes.tables.iter().map(PathTable::binds_head).collect();
         Some(Self {
             index,
             tables,
             shared,
+            head,
         })
     }
 
@@ -661,11 +689,35 @@ impl Ranked {
         if table >= self.tables {
             return None;
         }
+        if self.theirs(table, method) {
+            return None;
+        }
+        Some(table)
+    }
+
+    /// Whether another route at the path of `table` answers `method`, and
+    /// takes the request from it: one answering `method`, or a HEAD with its
+    /// GET when `table` answers no HEAD itself.
+    fn theirs(&self, table: usize, method: &Method) -> bool {
         let shared = &self.shared[table];
-        // A HEAD goes to the GET route when no route answers HEAD itself.
-        let theirs =
-            shared.contains(method) || (*method == Method::HEAD && shared.contains(&Method::GET));
-        (!theirs).then_some(table)
+        shared.contains(method)
+            || (*method == Method::HEAD && !self.head[table] && shared.contains(&Method::GET))
+    }
+
+    /// Whether `table`, whose path `path` matches, ranks before every other
+    /// route a request for `method` on `path` reaches: whether it may answer
+    /// a request a better-ranked table refused.
+    pub(super) fn ranks_first(&self, table: usize, method: &Method, path: &str) -> bool {
+        let found = self.index.each(path, |id| {
+            if id >= self.tables || self.theirs(id, method) {
+                ControlFlow::Break(false)
+            } else if id == table {
+                ControlFlow::Break(true)
+            } else {
+                ControlFlow::Continue(())
+            }
+        });
+        matches!(found, ControlFlow::Break(true))
     }
 }
 
@@ -760,6 +812,14 @@ impl PathTable {
 
     /// Whether the path ends in a literal (a verb after a literal is part of
     /// it), so the router matched the request's last segment exactly.
+    /// Whether a binding answers HEAD itself (a `custom` HEAD rule), not as
+    /// a GET answers it.
+    pub(super) fn binds_head(&self) -> bool {
+        self.bindings
+            .iter()
+            .any(|binding| binding.entry.http_method == RouteMethod::One(Method::HEAD))
+    }
+
     fn literal_end(&self) -> bool {
         !self.path.ends_with('}')
     }

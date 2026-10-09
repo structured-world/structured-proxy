@@ -90,6 +90,48 @@ service Ops {
 }
 "#;
 
+/// One RPC bound to HEAD alone, for a path an extra route answers GET on.
+const PEEK_PROTO: &str = r#"
+syntax = "proto3";
+package test.v1;
+import "google/api/annotations.proto";
+
+message Msg {
+  string name = 1;
+  string operation = 2;
+  string rpc = 3;
+}
+
+service Ops {
+  rpc Peek(Msg) returns (Msg) {
+    option (google.api.http) = { custom: { kind: "HEAD", path: "/v1/peek" } };
+  }
+}
+"#;
+
+/// A constrained path ranked above an extra route `/v1/a/{kind}/{id}`, and an
+/// open one below it.
+const RANKED_PROTO: &str = r#"
+syntax = "proto3";
+package test.v1;
+import "google/api/annotations.proto";
+
+message Msg {
+  string name = 1;
+  string operation = 2;
+  string rpc = 3;
+}
+
+service Ops {
+  rpc Special(Msg) returns (Msg) {
+    option (google.api.http) = { get: "/v1/a/b/{name=special}" };
+  }
+  rpc Below(Msg) returns (Msg) {
+    option (google.api.http) = { get: "/v1/{name}/b/{operation}" };
+  }
+}
+"#;
+
 /// Answers with the request, `rpc` set to the method it was called as.
 #[derive(Clone)]
 struct Echo {
@@ -432,6 +474,62 @@ async fn an_extra_route_shares_a_transcoded_path_on_another_method() {
     assert_eq!(body["rpc"], "Batch");
 }
 
+async fn a_refused_binding_passes_to_the_next_route_in_rank_not_the_next_transcoded() {
+    // `/v1/a/b/{name=special}` ranks first for `/v1/a/b/ordinary` but does
+    // not take it; the extra route `/v1/a/{kind}/{id}` ranks next, before the
+    // transcoded `/v1/{name}/b/{operation}`, so it answers.
+    let pool: DescriptorPool = common::compile("test/v1/ranked.proto", RANKED_PROTO);
+    let msg = pool.get_message_by_name("test.v1.Msg").unwrap();
+    let app = common::app(UPSTREAM, Ops { msg }, |yaml| {
+        structured_proxy::ProxyServer::from_yaml_str(yaml)
+            .unwrap()
+            .with_descriptors(pool)
+            .with_extra_routes([ExtraRoute::new(
+                Method::GET,
+                "/v1/a/{kind}/{id}",
+                Arc::new(Ping),
+            )])
+    })
+    .await;
+    let request = http::Request::get("/v1/a/b/ordinary")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        common::send(&app, request).await,
+        (StatusCode::OK, "pong".to_owned())
+    );
+    // The constrained binding takes its own value, the open one a path the
+    // extra route does not match.
+    let (status, _, body) = call(&app, Method::GET, "/v1/a/b/special").await;
+    assert_eq!((status, &body["rpc"]), (StatusCode::OK, &json!("Special")));
+    let (status, _, body) = call(&app, Method::GET, "/v1/x/b/y").await;
+    assert_eq!((status, &body["rpc"]), (StatusCode::OK, &json!("Below")));
+}
+
+async fn a_transcoded_head_binding_keeps_head_beside_an_extra_get() {
+    // A route's own HEAD comes before a GET answering HEAD, as a router's
+    // method route holds it: the transcoded `custom` HEAD keeps HEAD, the
+    // extra route next to it GET.
+    let pool: DescriptorPool = common::compile("test/v1/peek.proto", PEEK_PROTO);
+    let msg = pool.get_message_by_name("test.v1.Msg").unwrap();
+    let app = common::app(UPSTREAM, Ops { msg }, |yaml| {
+        structured_proxy::ProxyServer::from_yaml_str(yaml)
+            .unwrap()
+            .with_descriptors(pool)
+            .with_extra_routes([ExtraRoute::new(Method::GET, "/v1/peek", Arc::new(Ping))])
+    })
+    .await;
+    let request = http::Request::head("/v1/peek").body(Body::empty()).unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "application/json");
+    let request = http::Request::get("/v1/peek").body(Body::empty()).unwrap();
+    assert_eq!(
+        common::send(&app, request).await,
+        (StatusCode::OK, "pong".to_owned())
+    );
+}
+
 async fn a_request_goes_where_one_router_of_every_route_sends_it() {
     // The proxy matches a transcoded request itself, yet each one still goes
     // where one router holding every route sends it: the extra route's static
@@ -504,6 +602,65 @@ service Twice {
     .router()
     .expect_err("a repeated method, path and verb must be rejected");
     assert!(err.to_string().contains("more than one endpoint"), "{err}");
+}
+
+#[tokio::test]
+async fn an_extra_route_the_router_cannot_hold_beside_a_transcoded_one_is_refused() {
+    // `/v1/{*path}` beside the transcoded `/v1/{id}` puts a catch-all and a
+    // variable at one position, which the router cannot hold: a startup error
+    // naming the conflict, not a panic when the routers merge.
+    const ID_PROTO: &str = r#"
+syntax = "proto3";
+package test.v1;
+import "google/api/annotations.proto";
+message Msg { string name = 1; string id = 2; }
+service Ids {
+  rpc Get(Msg) returns (Msg) { option (google.api.http) = { get: "/v1/{id}" }; }
+}
+"#;
+    let pool = common::compile("test/v1/ids.proto", ID_PROTO);
+    let err = structured_proxy::ProxyServer::from_yaml_str(
+        "upstream:\n  default: \"http://127.0.0.1:1\"\n",
+    )
+    .unwrap()
+    .with_descriptors(pool)
+    .with_extra_routes([ExtraRoute::new(Method::GET, "/v1/{*path}", Arc::new(Ping))])
+    .router()
+    .expect_err("routes the router cannot hold together must be rejected");
+    assert!(
+        err.to_string().contains("conflicts with another route"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn a_transcoded_route_the_router_skips_reserves_no_path() {
+    // `/v1/{path=**}` is skipped beside `/v1/{id}`, mounted first: an extra
+    // route at its path is refused for the route it conflicts with, not as a
+    // second registration of a path nothing mounts.
+    const SKIPPED_PROTO: &str = r#"
+syntax = "proto3";
+package test.v1;
+import "google/api/annotations.proto";
+message Msg { string path = 1; string id = 2; }
+service Ids {
+  rpc Get(Msg) returns (Msg) { option (google.api.http) = { get: "/v1/{id}" }; }
+  rpc Put(Msg) returns (Msg) { option (google.api.http) = { post: "/v1/{path=**}" }; }
+}
+"#;
+    let pool = common::compile("test/v1/skipped.proto", SKIPPED_PROTO);
+    let err = structured_proxy::ProxyServer::from_yaml_str(
+        "upstream:\n  default: \"http://127.0.0.1:1\"\n",
+    )
+    .unwrap()
+    .with_descriptors(pool)
+    .with_extra_routes([ExtraRoute::new(Method::POST, "/v1/{*path}", Arc::new(Ping))])
+    .router()
+    .expect_err("the extra route conflicts with the mounted `/v1/{id}`");
+    assert!(
+        err.to_string().contains("conflicts with another route"),
+        "{err}"
+    );
 }
 
 #[tokio::test]
@@ -610,6 +767,55 @@ async fn a_preflight_for_a_url_no_binding_answers_reaches_the_fallback() {
     let (status, body) = common::send(&app, request).await;
     assert_eq!(status, StatusCode::IM_A_TEAPOT);
     assert_eq!(body, "yours");
+}
+
+#[tokio::test]
+async fn a_routed_refused_binding_passes_to_the_next_route_in_rank() {
+    // The same through `router()`.
+    let pool = common::compile("test/v1/ranked.proto", RANKED_PROTO);
+    let router = structured_proxy::ProxyServer::from_yaml_str(
+        "upstream:\n  default: \"http://127.0.0.1:1\"\n",
+    )
+    .unwrap()
+    .with_descriptors(pool)
+    .with_extra_routes([ExtraRoute::new(
+        Method::GET,
+        "/v1/a/{kind}/{id}",
+        Arc::new(Ping),
+    )])
+    .router()
+    .unwrap();
+    let request = http::Request::get("/v1/a/b/ordinary")
+        .body(Body::empty())
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"pong");
+}
+
+#[tokio::test]
+async fn a_routed_transcoded_head_binding_keeps_head_beside_an_extra_get() {
+    // The same through `router()`: the transcoded HEAD answers HEAD (here
+    // the upstream is down, so with its error body), the extra route GET.
+    let pool = common::compile("test/v1/peek.proto", PEEK_PROTO);
+    let router = structured_proxy::ProxyServer::from_yaml_str(
+        "upstream:\n  default: \"http://127.0.0.1:1\"\n",
+    )
+    .unwrap()
+    .with_descriptors(pool)
+    .with_extra_routes([ExtraRoute::new(Method::GET, "/v1/peek", Arc::new(Ping))])
+    .router()
+    .unwrap();
+    let request = http::Request::head("/v1/peek").body(Body::empty()).unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+    assert_ne!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "application/json");
+    let request = http::Request::get("/v1/peek").body(Body::empty()).unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]

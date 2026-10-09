@@ -144,7 +144,9 @@ service:
   name: "my-service"
 
 cors:
-  # Empty list = permissive CORS (dev mode, reflects any Origin).
+  # Empty list = permissive CORS (dev mode): every origin (`*`), without
+  # credentials; a preflight gets back the headers it asks for, since `*`
+  # does not cover `Authorization`.
   # A non-empty list allows those exact origins, with credentials; the
   # preflight echoes the methods and headers the browser asks for. There is
   # no "*" wildcard (browsers never send `Origin: *`, so listing "*" would

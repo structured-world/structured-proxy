@@ -432,6 +432,11 @@ fn convert_segment(segment: &str, idx: usize, is_last: bool) -> Segment<'_> {
                 "*" => capture(name, false),
                 // Multi-segment catch-all maps to axum's `{*name}` (terminal only).
                 "**" => capture(name, is_last),
+                // A template of one segment (`{name=foo}`) matches one
+                // segment: a plain capture, whose value the transcoded routes
+                // check against the template, so it shares a route with a
+                // plain variable there rather than a catch-all beside it.
+                template if !template.contains('/') => capture(name, false),
                 // Templates with interspersed literals (`{name=shelves/*/books/*}`)
                 // have no axum form: axum cannot bind literal segments into one
                 // capture. The last segment is mounted as a catch-all and the

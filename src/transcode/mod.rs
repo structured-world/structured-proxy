@@ -289,6 +289,7 @@ pub(crate) fn routes_and_choices<S: TranscodeState>(
     let routes = Arc::new(Routes::new(tables));
     let choices = Choices {
         routes: routes.clone(),
+        ranked: None,
     };
     let mut router: Router<S> = Router::new();
     for (table, mounted) in routes.tables.iter().enumerate() {
@@ -298,12 +299,15 @@ pub(crate) fn routes_and_choices<S: TranscodeState>(
         // HEAD a GET binding serves still goes out without a body: axum's
         // route future empties the body of every HEAD response, `any` routes
         // included.
-        router = router.route(
-            &mounted.path,
-            axum::routing::any(move |State(state): State<S>, request: Request| {
-                dispatch(routes, table, state, request)
-            }),
-        );
+        let handler =
+            move |State(state): State<S>, request: Request| dispatch(routes, table, state, request);
+        let mut route = axum::routing::any(handler.clone());
+        // A binding answering HEAD itself is the path's HEAD route, before
+        // the GET of another route merged at the path answers HEAD.
+        if mounted.binds_head() {
+            route = route.head(handler);
+        }
+        router = router.route(&mounted.path, route);
     }
     (router, Some(choices))
 }
@@ -314,30 +318,40 @@ pub(crate) fn routes_and_choices<S: TranscodeState>(
 /// proxy's other routes instead.
 pub(crate) struct Choices {
     routes: Arc<Routes>,
+    /// The transcoded paths among the proxy's other routes, when known.
+    ranked: Option<Arc<table::Ranked>>,
 }
 
 impl Choices {
+    /// These choices among `others`: the router paths of the proxy's other
+    /// routes, each with the method it answers (`None`: every one). A table
+    /// answers a request a better-ranked one refused only when no other
+    /// route ranks before it. Ranked among none of them when an other path
+    /// is one the proxy cannot rank as the router does.
+    pub(crate) fn among(mut self, others: &[(Option<Method>, String)]) -> Self {
+        self.ranked = table::Ranked::new(&self.routes, others).map(Arc::new);
+        self
+    }
+
     /// These choices, handing a URL no binding answers to `elsewhere`: a
     /// router of the proxy's other routes.
     pub(crate) fn with_elsewhere(self, elsewhere: Router) -> Chooser {
         Chooser(Arc::new(Choosing {
             routes: self.routes,
+            ranked: self.ranked,
             elsewhere,
         }))
     }
 
-    /// The transcoded routes served past any router, calling with `state`,
-    /// among `others`: the router paths of the proxy's other routes, each
-    /// with the method it answers (`None`: every one). `layered` puts the
-    /// layers of the transcoded routes around them. `None` when an other path
-    /// is one the proxy cannot rank as the router does.
+    /// The transcoded routes served past any router, calling with `state`;
+    /// `layered` puts the layers of the transcoded routes around them.
+    /// `None` without a ranking among the other routes.
     pub(crate) fn direct<S: TranscodeState>(
         &self,
         state: S,
-        others: &[(Option<Method>, String)],
         layered: impl FnOnce(BoxedService) -> BoxedService,
     ) -> Option<Direct> {
-        let ranked = table::Ranked::new(&self.routes, others)?;
+        let ranked = self.ranked.clone()?;
         let dispatcher = BoxedService::new(Dispatcher {
             routes: self.routes.clone(),
             state,
@@ -362,7 +376,7 @@ pub(crate) struct Direct {
 }
 
 struct Ranking {
-    ranked: table::Ranked,
+    ranked: Arc<table::Ranked>,
     routes: Arc<Routes>,
 }
 
@@ -376,7 +390,7 @@ impl Direct {
     pub(crate) fn takes<B>(&self, request: &mut http::Request<B>) -> bool {
         let ranking = &*self.ranking;
         match ranking.ranked.table(request.method(), request.uri().path()) {
-            Some(table) => choose(&ranking.routes, table, request),
+            Some(table) => choose(&ranking.routes, Some(&ranking.ranked), table, request),
             None => false,
         }
     }
@@ -418,10 +432,23 @@ impl<S: TranscodeState> tower::Service<Request> for Dispatcher<S> {
 }
 
 /// Choose among `routes` for `request`, which the router matches (or
-/// matched) to the table at `table`: `false` when no binding answers it,
-/// otherwise the choice rides on the request to [`dispatch`].
-fn choose<B>(routes: &Routes, table: usize, request: &mut http::Request<B>) -> bool {
-    match routes.choose(table, request.method(), request.uri().path()) {
+/// matched) to the table at `table`, ranked among the proxy's other routes
+/// by `ranked` when known: `false` when no binding answers it, otherwise the
+/// choice rides on the request to [`dispatch`].
+fn choose<B>(
+    routes: &Routes,
+    ranked: Option<&table::Ranked>,
+    table: usize,
+    request: &mut http::Request<B>,
+) -> bool {
+    let (method, path) = (request.method(), request.uri().path());
+    let choice = match ranked {
+        Some(ranked) => routes.choose_ranked(table, method, path, &|other| {
+            ranked.ranks_first(other, method, path)
+        }),
+        None => routes.choose(table, method, path),
+    };
+    match choice {
         Choice::NotFound => false,
         choice => {
             request.extensions_mut().insert(Chosen(choice));
@@ -437,6 +464,7 @@ pub(crate) struct Chooser(Arc<Choosing>);
 
 struct Choosing {
     routes: Arc<Routes>,
+    ranked: Option<Arc<table::Ranked>>,
     elsewhere: Router,
 }
 
@@ -445,6 +473,7 @@ impl Chooser {
     pub(crate) fn with_fallback(self, fallback: BoxedService) -> Self {
         Self(Arc::new(Choosing {
             routes: self.0.routes.clone(),
+            ranked: self.0.ranked.clone(),
             elsewhere: self.0.elsewhere.clone().fallback_service(fallback),
         }))
     }
@@ -502,7 +531,8 @@ where
                 local_path(matched.as_str(), nested.map(|nested| nested.as_str()))
             })
             .and_then(|path| choosing.routes.table_at(path));
-        if matched.is_none_or(|matched| choose(&choosing.routes, matched, &mut request)) {
+        let ranked = choosing.ranked.as_deref();
+        if matched.is_none_or(|matched| choose(&choosing.routes, ranked, matched, &mut request)) {
             return ChooseFuture::Route {
                 future: self.route.call(request),
             };
@@ -1021,6 +1051,13 @@ pub fn route_paths(
             }
         }
     }
+    // Only the routes mounted: a shape the router refuses beside the ones
+    // before it is skipped, as the tables are, and reserves nothing.
+    retain_mountable(
+        &mut shapes,
+        |bindings| bindings[0].mount.axum.as_str(),
+        |_, _| {},
+    );
     let mut paths = Vec::new();
     for bindings in &shapes {
         let listed = |method: &str, path: &str| (method.to_owned(), path.to_owned());
