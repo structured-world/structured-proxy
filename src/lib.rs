@@ -109,6 +109,8 @@ pub(crate) struct ProxyState<U> {
     pub(crate) upstream: U,
     /// Headers to forward from HTTP to gRPC.
     pub(crate) forwarded_headers: Arc<[String]>,
+    /// The same, as header names.
+    pub(crate) forwarded_names: Arc<[http::HeaderName]>,
     /// SSE keep-alive interval (seconds) for server-streaming responses.
     pub(crate) sse_keep_alive_secs: u64,
 }
@@ -845,9 +847,16 @@ impl ProxyServer {
             .cloned()
             .chain(resolver.forwarded_headers().map(str::to_owned))
             .collect();
+        // Parsed once rather than for every request; every entry is a gRPC
+        // metadata key, so a header name.
+        let forwarded_names = forwarded_headers
+            .iter()
+            .filter_map(|name| http::HeaderName::from_bytes(name.as_bytes()).ok())
+            .collect();
         let state = ProxyState {
             upstream,
             forwarded_headers,
+            forwarded_names,
             sse_keep_alive_secs: self.config.streaming.sse_keep_alive_secs,
         };
 
@@ -1434,6 +1443,7 @@ pub(crate) fn test_state() -> ProxyState<tonic::transport::Channel> {
             .connect_timeout(std::time::Duration::from_millis(100))
             .connect_lazy(),
         forwarded_headers: Arc::from([]),
+        forwarded_names: Arc::from([]),
         sse_keep_alive_secs: 15,
     }
 }

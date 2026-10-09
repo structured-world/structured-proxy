@@ -71,6 +71,12 @@ pub trait TranscodeState: Clone + Send + Sync + 'static {
     fn into_upstream(self) -> Self::Upstream;
     /// Headers to forward from HTTP to gRPC metadata.
     fn forwarded_headers(&self) -> &[String];
+    /// [`forwarded_headers`](Self::forwarded_headers) as header names, when
+    /// the state holds them parsed: a request then skips parsing each name.
+    /// `None` by default.
+    fn forwarded_header_names(&self) -> Option<&[HeaderName]> {
+        None
+    }
     /// SSE keep-alive interval (seconds) for server-streaming responses.
     fn sse_keep_alive_secs(&self) -> u64;
 }
@@ -82,6 +88,9 @@ impl<U: Upstream> TranscodeState for crate::ProxyState<U> {
     }
     fn forwarded_headers(&self) -> &[String] {
         &self.forwarded_headers
+    }
+    fn forwarded_header_names(&self) -> Option<&[HeaderName]> {
+        Some(&self.forwarded_names)
     }
     fn sse_keep_alive_secs(&self) -> u64 {
         self.sse_keep_alive_secs
@@ -1332,15 +1341,12 @@ fn prepare<S: TranscodeState>(
     // A request the proxy resolved carries the client-address headers its
     // forwarding policy wrote; one routed here without that resolution
     // carries only what its client asserted, which is never forwarded.
-    let request_metadata = match address {
-        Some(_) => {
-            metadata::rewritten_headers_to_grpc_metadata(headers, proxy_state.forwarded_headers())
-        }
-        None => {
-            metadata::try_http_headers_to_grpc_metadata(headers, proxy_state.forwarded_headers())
-        }
-    }
-    .map_err(|e| Unmappable(e.to_string()))?;
+    let forwarded = match proxy_state.forwarded_header_names() {
+        Some(names) => metadata::Forwarded::Named(names),
+        None => metadata::Forwarded::Listed(proxy_state.forwarded_headers()),
+    };
+    let request_metadata = metadata::forwarded_metadata(headers, forwarded, address.is_some())
+        .map_err(|e| Unmappable(e.to_string()))?;
     let message =
         decode_request(entry, headers, path_params, raw_query, body).map_err(Unmappable)?;
     let mut request = tonic::Request::new(message);

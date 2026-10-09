@@ -49,17 +49,35 @@ pub fn try_http_headers_to_grpc_metadata(
     headers: &HeaderMap,
     forwarded_headers: &[String],
 ) -> Result<MetadataMap, InvalidForwardedHeader> {
-    checked(headers, forwarded_headers, Source::Client)
+    checked(
+        headers,
+        Forwarded::Listed(forwarded_headers),
+        Source::Client,
+    )
 }
 
-/// [`try_http_headers_to_grpc_metadata`] for a request whose client-address
-/// headers the proxy already rewrote: `forwarded_headers` names them too, and
-/// they are forwarded as the rewrite left them.
-pub(crate) fn rewritten_headers_to_grpc_metadata(
+/// The headers a request forwards: as configured, or already parsed.
+#[derive(Clone, Copy)]
+pub(crate) enum Forwarded<'a> {
+    Listed(&'a [String]),
+    Named(&'a [HeaderName]),
+}
+
+/// [`try_http_headers_to_grpc_metadata`] of the `forwarded` headers, for a
+/// request whose client-address headers the proxy rewrote (`rewritten`):
+/// `forwarded` names them too, and they are forwarded as the rewrite left
+/// them.
+pub(crate) fn forwarded_metadata(
     headers: &HeaderMap,
-    forwarded_headers: &[String],
+    forwarded: Forwarded<'_>,
+    rewritten: bool,
 ) -> Result<MetadataMap, InvalidForwardedHeader> {
-    checked(headers, forwarded_headers, Source::Rewritten)
+    let source = if rewritten {
+        Source::Rewritten
+    } else {
+        Source::Client
+    };
+    checked(headers, forwarded, source)
 }
 
 /// Who last wrote a request's client-address headers.
@@ -73,10 +91,10 @@ enum Source {
 
 fn checked(
     headers: &HeaderMap,
-    forwarded_headers: &[String],
+    forwarded: Forwarded<'_>,
     source: Source,
 ) -> Result<MetadataMap, InvalidForwardedHeader> {
-    forward(headers, forwarded_headers, source, |name, value| {
+    forward(headers, forwarded, source, |name, value| {
         if carries(name, value.as_bytes()) {
             Ok(())
         } else {
@@ -97,7 +115,8 @@ pub fn http_headers_to_grpc_metadata(
     headers: &HeaderMap,
     forwarded_headers: &[String],
 ) -> MetadataMap {
-    match forward::<Infallible>(headers, forwarded_headers, Source::Client, |_, _| Ok(())) {
+    let forwarded = Forwarded::Listed(forwarded_headers);
+    match forward::<Infallible>(headers, forwarded, Source::Client, |_, _| Ok(())) {
         Ok(metadata) => metadata,
         Err(never) => match never {},
     }
@@ -106,70 +125,93 @@ pub fn http_headers_to_grpc_metadata(
 /// The metadata for `headers`, with `check` deciding on each forwarded value.
 fn forward<E>(
     headers: &HeaderMap,
-    forwarded_headers: &[String],
+    forwarded: Forwarded<'_>,
     source: Source,
     mut check: impl FnMut(&HeaderName, &HeaderValue) -> Result<(), E>,
 ) -> Result<MetadataMap, E> {
-    let mut forwarded = HeaderMap::new();
-    for name in forwarded_headers {
-        // Trace-context propagation owns these, listed or not, and
-        // client-address resolution owns the address headers a client sent.
-        if is_trace_context(name) || (source == Source::Client && crate::client_address::owns(name))
-        {
-            continue;
-        }
-        let values = headers.get_all(name.as_str());
-        if values.iter().next().is_none() {
-            continue;
-        }
-        let name = HeaderName::from_bytes(name.as_bytes())
-            .expect("a name the request carries a header under is a valid header name");
-        // A name gRPC metadata cannot carry is refused when the proxy is built;
-        // a direct caller that lists one gets nothing forwarded under it.
-        if !is_grpc_key(name.as_str()) {
-            continue;
-        }
-        // A name listed twice is forwarded once, so its values are not doubled.
-        let Entry::Vacant(vacant) = forwarded.entry(name) else {
-            continue;
-        };
-        let key = vacant.key().clone();
-        let binary = key.as_str().ends_with("-bin");
-        let mut vacant = Some(vacant);
-        let mut entry = None;
-        let mut push = |value: HeaderValue| match entry.as_mut() {
-            Some(entry) => {
-                OccupiedEntry::append(entry, value);
-            }
-            None => {
-                let vacant = vacant
-                    .take()
-                    .expect("only the first value finds the entry vacant");
-                entry = Some(vacant.insert_entry(value));
-            }
-        };
-        for value in values {
-            check(&key, value)?;
-            // gRPC PROTOCOL-HTTP2 lets binary values be joined by commas, and
-            // tonic does not split them before decoding: each part travels as
-            // its own value.
-            if binary && value.as_bytes().contains(&b',') {
-                for part in value.as_bytes().split(|&b| b == b',') {
-                    push(
-                        HeaderValue::from_bytes(part.trim_ascii())
-                            .expect("a trimmed part of a header value is a header value"),
-                    );
+    let mut metadata = HeaderMap::new();
+    match forwarded {
+        Forwarded::Listed(names) => {
+            for name in names {
+                // A name a request cannot carry a header under forwards
+                // nothing.
+                if let Ok(name) = HeaderName::from_bytes(name.as_bytes()) {
+                    forward_one(&mut metadata, headers, &name, source, &mut check)?;
                 }
-            } else {
-                push(value.clone());
+            }
+        }
+        Forwarded::Named(names) => {
+            for name in names {
+                forward_one(&mut metadata, headers, name, source, &mut check)?;
             }
         }
     }
-    let mut metadata = MetadataMap::from_headers(forwarded);
+    let mut metadata = MetadataMap::from_headers(metadata);
 
     inject_trace_context(&mut metadata, headers);
 
     Ok(metadata)
+}
+
+/// Forward every value of the header `name` from `headers` to `forwarded`,
+/// with `check` deciding on each.
+fn forward_one<E>(
+    forwarded: &mut HeaderMap,
+    headers: &HeaderMap,
+    name: &HeaderName,
+    source: Source,
+    check: &mut impl FnMut(&HeaderName, &HeaderValue) -> Result<(), E>,
+) -> Result<(), E> {
+    let text = name.as_str();
+    // Trace-context propagation owns these, listed or not, and client-address
+    // resolution owns the address headers a client sent.
+    if is_trace_context(text) || (source == Source::Client && crate::client_address::owns(text)) {
+        return Ok(());
+    }
+    let values = headers.get_all(name);
+    if values.iter().next().is_none() {
+        return Ok(());
+    }
+    // A name gRPC metadata cannot carry is refused when the proxy is built;
+    // a direct caller that lists one gets nothing forwarded under it.
+    if !is_grpc_key(text) {
+        return Ok(());
+    }
+    // A name listed twice is forwarded once, so its values are not doubled.
+    let Entry::Vacant(vacant) = forwarded.entry(name.clone()) else {
+        return Ok(());
+    };
+    let binary = text.ends_with("-bin");
+    let mut vacant = Some(vacant);
+    let mut entry = None;
+    let mut push = |value: HeaderValue| match entry.as_mut() {
+        Some(entry) => {
+            OccupiedEntry::append(entry, value);
+        }
+        None => {
+            let vacant = vacant
+                .take()
+                .expect("only the first value finds the entry vacant");
+            entry = Some(vacant.insert_entry(value));
+        }
+    };
+    for value in values {
+        check(name, value)?;
+        // gRPC PROTOCOL-HTTP2 lets binary values be joined by commas, and
+        // tonic does not split them before decoding: each part travels as its
+        // own value.
+        if binary && value.as_bytes().contains(&b',') {
+            for part in value.as_bytes().split(|&b| b == b',') {
+                push(
+                    HeaderValue::from_bytes(part.trim_ascii())
+                        .expect("a trimmed part of a header value is a header value"),
+                );
+            }
+        } else {
+            push(value.clone());
+        }
+    }
+    Ok(())
 }
 
 /// Whether gRPC metadata can carry `value` under `name` (gRPC PROTOCOL-HTTP2,
@@ -282,14 +324,16 @@ fn append_ascii(metadata: &mut MetadataMap, key: &'static str, value: &[u8]) {
 /// well-formed per W3C §3.2.2; otherwise (missing or malformed) synthesizes a
 /// fresh one so the upstream always receives a single valid, joinable trace.
 fn inject_trace_context(metadata: &mut MetadataMap, headers: &HeaderMap) {
+    static TRACEPARENT: HeaderName = HeaderName::from_static("traceparent");
+    static TRACESTATE: HeaderName = HeaderName::from_static("tracestate");
     // `metadata` holds no trace-context header of its own: forwarding skips
     // them, so tracestate travels only here, with the trace it annotates.
-    if let Some(tp) = headers.get("traceparent").and_then(|v| v.to_str().ok()) {
+    if let Some(tp) = headers.get(&TRACEPARENT).and_then(|v| v.to_str().ok()) {
         if is_valid_traceparent(tp) {
             insert_ascii(metadata, "traceparent", tp.as_bytes());
             // Every line: W3C Trace Context §3.3 lets tracestate be split
             // over several header lines that together form one list.
-            for ts in headers.get_all("tracestate") {
+            for ts in headers.get_all(&TRACESTATE) {
                 append_ascii(metadata, "tracestate", ts.as_bytes());
             }
             return;
