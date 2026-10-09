@@ -109,6 +109,27 @@ fn synthesized_traceparent_is_unique_per_call() {
 }
 
 #[test]
+fn synthesized_traceparents_are_valid_and_differ_across_threads() {
+    // Each thread draws ids from its own generator, seeded from the system's:
+    // two threads never repeat each other's trace, and every id is a valid
+    // W3C traceparent.
+    let draw = || {
+        (0..64)
+            .map(|_| String::from_utf8(new_traceparent().unwrap().to_vec()).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let here = draw();
+    let there = std::thread::spawn(draw).join().unwrap();
+    let mut all: Vec<&String> = here.iter().chain(&there).collect();
+    for tp in &all {
+        assert!(is_valid_traceparent(tp), "{tp}");
+    }
+    all.sort();
+    all.dedup();
+    assert_eq!(all.len(), 128);
+}
+
+#[test]
 fn grpc_timeout_parses_each_unit() {
     assert_eq!(parse_grpc_timeout("5S"), Some(Duration::from_secs(5)));
     assert_eq!(parse_grpc_timeout("100m"), Some(Duration::from_millis(100)));

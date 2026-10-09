@@ -296,7 +296,12 @@ fn inject_trace_context(metadata: &mut MetadataMap, headers: &HeaderMap) {
         }
     }
     if let Some(tp) = new_traceparent() {
-        insert_ascii(metadata, "traceparent", tp.as_bytes());
+        let value = tonic::metadata::AsciiMetadataValue::try_from(&tp[..])
+            .expect("a traceparent is visible ASCII");
+        metadata.insert(
+            tonic::metadata::MetadataKey::from_static("traceparent"),
+            value,
+        );
     }
 }
 
@@ -327,22 +332,51 @@ fn is_valid_traceparent(tp: &str) -> bool {
 
 /// Build a fresh W3C `traceparent`: `00-<16-byte trace-id>-<8-byte span-id>-01`
 /// (sampled). Returns `None` only if the system RNG is unavailable.
-fn new_traceparent() -> Option<String> {
-    let mut buf = [0u8; 24];
-    getrandom::fill(&mut buf).ok()?;
-    let trace_id = hex(&buf[..16]);
-    let span_id = hex(&buf[16..]);
-    Some(format!("00-{trace_id}-{span_id}-01"))
+fn new_traceparent() -> Option<[u8; 55]> {
+    let (high, low, span) = (random_id()?, random_id()?, random_id()?);
+    // All-zero ids are invalid (W3C Trace Context §3.2.2.3, §3.2.2.4).
+    let low = if high == 0 && low == 0 { 1 } else { low };
+    let span = if span == 0 { 1 } else { span };
+    let mut tp = *b"00-00000000000000000000000000000000-0000000000000000-01";
+    write_hex(&mut tp[3..19], high);
+    write_hex(&mut tp[19..35], low);
+    write_hex(&mut tp[36..52], span);
+    Some(tp)
 }
 
-/// Lowercase-hex encode a byte slice.
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
+/// `value` as 16 lower-case hex digits into `digits`.
+fn write_hex(digits: &mut [u8], value: u64) {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    for (at, digit) in digits.iter_mut().enumerate() {
+        let shift = 60 - 4 * at;
+        *digit = DIGITS[usize::try_from((value >> shift) & 0xf).expect("a nibble")];
     }
-    s
+}
+
+/// 64 random bits for a trace id. W3C Trace Context asks for random ids, not
+/// unpredictable ones (§3.2.2.3; an id is no secret), so they come from a
+/// generator (wyrand) each thread seeds once from the system's, as
+/// OpenTelemetry's SDKs make them, rather than a system call per request.
+/// `None` only when the system cannot seed it.
+fn random_id() -> Option<u64> {
+    thread_local! {
+        static STATE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    }
+    STATE.with(|state| {
+        let seed = match state.get() {
+            Some(seed) => seed,
+            None => {
+                let mut bytes = [0u8; 8];
+                getrandom::fill(&mut bytes).ok()?;
+                u64::from_ne_bytes(bytes)
+            }
+        };
+        let next = seed.wrapping_add(0xa076_1d64_78bd_642f);
+        state.set(Some(next));
+        let wide = u128::from(next) * u128::from(next ^ 0xe703_7ed1_a0b4_28db);
+        // The two halves of the product, folded.
+        Some((wide >> 64) as u64 ^ wide as u64)
+    })
 }
 
 /// Apply a client-supplied deadline to the upstream gRPC call.
