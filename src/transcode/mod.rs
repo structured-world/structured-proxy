@@ -814,10 +814,15 @@ async fn serve<S: TranscodeState>(routes: Arc<Routes>, state: S, request: Reques
         Choice::NotFound => StatusCode::NOT_FOUND.into_response(),
     };
     // As a router's route answers: the length of a body whose size is known,
-    // and none sent for a HEAD.
-    if !response
-        .headers()
-        .contains_key(http::header::CONTENT_LENGTH)
+    // and none sent for a HEAD. Not on a 204, which has no Content-Length, nor
+    // on a 304, whose length could only describe the selected representation
+    // (RFC 9110 §8.6), never the empty body sent.
+    let status = response.status();
+    if status != StatusCode::NO_CONTENT
+        && status != StatusCode::NOT_MODIFIED
+        && !response
+            .headers()
+            .contains_key(http::header::CONTENT_LENGTH)
     {
         if let Some(length) = http_body::Body::size_hint(response.body()).exact() {
             response
