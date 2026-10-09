@@ -73,6 +73,17 @@ use crate::upstream::{
 /// ```
 #[derive(Clone)]
 pub struct ProxyService<U> {
+    /// Shared by every clone: a server clones the service for each request
+    /// and only one path serves it.
+    shared: Arc<Shared<U>>,
+    /// The connection the requests arrive on, set per connection by the
+    /// server.
+    connection: Option<ConnectionInfo>,
+}
+
+/// What every request of a [`ProxyService`] may take a path through.
+#[derive(Clone)]
+struct Shared<U> {
     upstream: U,
     /// Where the requests that are not gRPC go.
     routing: Routing,
@@ -84,16 +95,13 @@ pub struct ProxyService<U> {
     boxed: BoxedGrpc,
     /// The guards, for the fallback an embedder sets later.
     guards: Arc<Guards>,
-    /// The connection the requests arrive on, set per connection by the
-    /// server.
-    connection: Option<ConnectionInfo>,
 }
 
 impl<U> std::fmt::Debug for ProxyService<U> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProxyService")
-            .field("boxed_grpc", &self.boxed.grpc.is_some())
-            .field("boxed_grpc_web", &self.boxed.web.is_some())
+            .field("boxed_grpc", &self.shared.boxed.grpc.is_some())
+            .field("boxed_grpc_web", &self.shared.boxed.web.is_some())
             .field("connection", &self.connection)
             .finish_non_exhaustive()
     }
@@ -376,11 +384,13 @@ impl<U: Upstream> ProxyService<U> {
             web_text: cors.layer(forward(GrpcProtocol::WebText)),
         });
         Self {
-            upstream,
-            routing,
-            grpc_web,
-            boxed,
-            guards,
+            shared: Arc::new(Shared {
+                upstream,
+                routing,
+                grpc_web,
+                boxed,
+                guards,
+            }),
             connection: None,
         }
     }
@@ -403,9 +413,10 @@ impl<U: Upstream> ProxyService<U> {
         F::Response: IntoResponse,
         F::Future: Send + 'static,
     {
+        let shared = Arc::make_mut(&mut self.shared);
         let fallback = BoxedService::new(fallback.map_response(IntoResponse::into_response));
-        let guarded = if self.guards.cover(Class::Fallback) {
-            self.guards.service(fallback, Class::Fallback)
+        let guarded = if shared.guards.cover(Class::Fallback) {
+            shared.guards.service(fallback, Class::Fallback)
         } else {
             fallback
         };
@@ -413,9 +424,9 @@ impl<U: Upstream> ProxyService<U> {
         // it gets the client-address resolution of its own, around its guards.
         // A URL no transcoded binding answers goes to the other routes, which
         // hand what they do not answer to the same fallback.
-        let resolve = ClientAddressLayer::with(self.guards.client_address.clone());
+        let resolve = ClientAddressLayer::with(shared.guards.client_address.clone());
         let fallback = BoxedService::new(resolve.layer(guarded));
-        self.routing = self.routing.with_fallback(fallback);
+        shared.routing = shared.routing.clone().with_fallback(fallback);
         self
     }
 
@@ -453,11 +464,7 @@ impl<U: Upstream> ProxyService<U> {
     #[must_use]
     pub fn for_connection(&self, connection: impl Into<ConnectionInfo>) -> Self {
         Self {
-            upstream: self.upstream.clone(),
-            routing: self.routing.clone(),
-            grpc_web: self.grpc_web.clone(),
-            boxed: self.boxed.clone(),
-            guards: self.guards.clone(),
+            shared: self.shared.clone(),
             connection: Some(connection.into()),
         }
     }
@@ -505,11 +512,13 @@ where
         let protocol = call.or_else(|| {
             is_grpc_web_preflight(request.method(), request.headers()).then_some(GrpcProtocol::Web)
         });
+        // Only the path the request takes is cloned for it.
+        let shared = &*self.shared;
         // A preflight is not a call: it skips the guards and the translation.
         let boxed = match call {
-            Some(GrpcProtocol::Grpc) => self.boxed.grpc.as_mut(),
-            Some(GrpcProtocol::Web) => self.boxed.web.as_mut(),
-            Some(GrpcProtocol::WebText) => self.boxed.web_text.as_mut(),
+            Some(GrpcProtocol::Grpc) => shared.boxed.grpc.as_ref(),
+            Some(GrpcProtocol::Web) => shared.boxed.web.as_ref(),
+            Some(GrpcProtocol::WebText) => shared.boxed.web_text.as_ref(),
             None => None,
         };
         let inner = if let Some(protocol) = protocol {
@@ -519,7 +528,7 @@ where
             // its connection the way tonic's server hands it to a handler.
             let connection = connection_of(self.connection.as_ref(), &request);
             let peer = connection.as_ref().and_then(ConnectionInfo::remote_addr);
-            self.guards.client_address.apply(&mut request, peer);
+            shared.guards.client_address.apply(&mut request, peer);
             if let Some(connection) = connection {
                 connection.into_tonic_extensions(request.extensions_mut());
             }
@@ -528,24 +537,24 @@ where
                 // the translator are middleware, and `Forward` waits for the
                 // upstream per request.
                 Some(service) => Inner::Boxed {
-                    future: service.call(request.map(axum::body::Body::new)),
+                    future: service.clone().call(request.map(axum::body::Body::new)),
                 },
                 None => {
                     let request = request.map(tonic::body::Body::new);
                     // A browser only speaks gRPC-Web, and the routes answered
                     // its preflight: its call gets the same CORS policy.
-                    let cors = match (&mut self.grpc_web, protocol) {
-                        (Some(cors), GrpcProtocol::Web) => Some(&mut cors.web),
-                        (Some(cors), GrpcProtocol::WebText) => Some(&mut cors.web_text),
+                    let cors = match (&shared.grpc_web, protocol) {
+                        (Some(cors), GrpcProtocol::Web) => Some(&cors.web),
+                        (Some(cors), GrpcProtocol::WebText) => Some(&cors.web_text),
                         _ => None,
                     };
                     match cors {
                         // `Forward` is always ready, and so is CORS around it.
                         Some(cors) => Inner::GrpcWeb {
-                            future: cors.call(request),
+                            future: cors.clone().call(request),
                         },
                         None => Inner::Grpc {
-                            call: PassThrough::new(self.upstream.clone(), request, protocol),
+                            call: PassThrough::new(shared.upstream.clone(), request, protocol),
                         },
                     }
                 }
@@ -563,20 +572,24 @@ where
                 request.extensions_mut().insert(connection);
             }
             // A router and the transcoded routes' layers are always ready.
-            match &mut self.routing {
+            // A router is a reference count.
+            match &shared.routing {
                 Routing::Direct { direct, others } => {
                     if direct.takes(&mut request) {
                         Inner::Boxed {
-                            future: direct.service().call(request.map(axum::body::Body::new)),
+                            future: direct
+                                .service()
+                                .clone()
+                                .call(request.map(axum::body::Body::new)),
                         }
                     } else {
                         Inner::Routes {
-                            future: others.call(request),
+                            future: others.clone().call(request),
                         }
                     }
                 }
                 Routing::Routed { served, .. } => Inner::Routes {
-                    future: served.call(request),
+                    future: served.clone().call(request),
                 },
             }
         };

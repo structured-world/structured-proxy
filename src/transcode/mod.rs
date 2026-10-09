@@ -374,8 +374,8 @@ impl Direct {
 
     /// The routes behind their layers, for a request [`takes`](Self::takes)
     /// took.
-    pub(crate) fn service(&mut self) -> &mut BoxedService {
-        &mut self.service
+    pub(crate) fn service(&self) -> &BoxedService {
+        &self.service
     }
 }
 
