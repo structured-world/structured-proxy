@@ -316,9 +316,10 @@ struct Verb {
 pub(super) enum Choice {
     /// The binding at `index` of the table at `table`.
     Route { table: usize, index: usize },
-    /// Bindings answer the URL, none with the request's method: the value of
-    /// `Allow` lists their methods (RFC 9110 §15.5.6).
-    MethodNotAllowed(HeaderValue),
+    /// Bindings of the table at `table` answer the URL, none with the
+    /// request's method: the value of `allow` lists their methods (RFC 9110
+    /// §15.5.6).
+    MethodNotAllowed { table: usize, allow: HeaderValue },
     /// No binding answers the URL.
     NotFound,
 }
@@ -538,7 +539,7 @@ impl Routes {
     ) -> Option<Choice> {
         let mut not_allowed = None;
         match self.tables[first].choose(first, method, &admits) {
-            Some(choice @ Choice::MethodNotAllowed(_)) => not_allowed = Some(choice),
+            Some(choice @ Choice::MethodNotAllowed { .. }) => not_allowed = Some(choice),
             Some(choice) => return Some(choice),
             None => {}
         }
@@ -553,7 +554,7 @@ impl Routes {
                 return ControlFlow::Break(None);
             }
             match self.tables[table].choose(table, method, &admits) {
-                Some(choice @ Choice::MethodNotAllowed(_)) => {
+                Some(choice @ Choice::MethodNotAllowed { .. }) => {
                     not_allowed.get_or_insert(choice);
                     ControlFlow::Continue(())
                 }
@@ -891,13 +892,16 @@ impl PathTable {
         }
         match head {
             Some(index) => Some(Choice::Route { table, index }),
-            None if answered => Some(Choice::MethodNotAllowed(self.allow(|index| {
-                if index < 64 {
-                    admitted & (1 << index) != 0
-                } else {
-                    answers(&self.bindings[index])
-                }
-            }))),
+            None if answered => Some(Choice::MethodNotAllowed {
+                table,
+                allow: self.allow(|index| {
+                    if index < 64 {
+                        admitted & (1 << index) != 0
+                    } else {
+                        answers(&self.bindings[index])
+                    }
+                }),
+            }),
             None => None,
         }
     }
@@ -944,31 +948,35 @@ impl PathTable {
     /// the binding at `index`: its verb taken off the last capture, and the
     /// captures under its own names. A parameter the table's path does not
     /// capture (a prefix the router is nested under) is left as it is.
+    ///
+    /// The path's captures are the last parameters, in its order: a router
+    /// reports those of the prefixes it is nested under first, which may
+    /// share a name with one of them, so they are told apart by position.
     pub(super) fn bind_params<'p>(&'p self, index: usize, params: &mut PathParams<'p>) {
         let binding = &self.bindings[index];
-        let value_of =
-            |params: &PathParams<'p>, name: &str| params.iter().position(|(own, _)| *own == name);
-        if let (Some(verb), Some(last)) = (&binding.verb, self.captures.last()) {
+        let base = params
+            .len()
+            .checked_sub(self.captures.len())
+            .expect("the router captures every variable of the path it matched");
+        if let (Some(verb), Some(last)) = (&binding.verb, self.captures.len().checked_sub(1)) {
             // The verb comes off decoded as the capture was; a kept `%2F` may
             // be spelled in either case.
-            let multi = binding.multi_segment.contains(&(self.captures.len() - 1));
-            if let Some(at) = value_of(params, last) {
-                let value = &mut params[at].1;
-                let len = if multi {
-                    let suffix = verb.multi_segment.len();
-                    value.len().checked_sub(suffix).filter(|&start| {
-                        value
-                            .get(start..)
-                            .is_some_and(|tail| same_octets(tail, &verb.multi_segment))
-                    })
-                } else {
-                    value.strip_suffix(verb.decoded.as_str()).map(str::len)
-                };
-                match (len, value) {
-                    (Some(len), Cow::Borrowed(value)) => *value = &value[..len],
-                    (Some(len), Cow::Owned(value)) => value.truncate(len),
-                    (None, _) => {}
-                }
+            let multi = binding.multi_segment.contains(&last);
+            let value = &mut params[base + last].1;
+            let len = if multi {
+                let suffix = verb.multi_segment.len();
+                value.len().checked_sub(suffix).filter(|&start| {
+                    value
+                        .get(start..)
+                        .is_some_and(|tail| same_octets(tail, &verb.multi_segment))
+                })
+            } else {
+                value.strip_suffix(verb.decoded.as_str()).map(str::len)
+            };
+            match (len, value) {
+                (Some(len), Cow::Borrowed(value)) => *value = &value[..len],
+                (Some(len), Cow::Owned(value)) => value.truncate(len),
+                (None, _) => {}
             }
         }
         let matched = params.len();
@@ -982,9 +990,7 @@ impl PathTable {
                 }
                 value.push_str(match part {
                     Part::Literal(literal) => literal,
-                    Part::Capture(position) => {
-                        value_of(params, &self.captures[*position]).map_or("", |at| &params[at].1)
-                    }
+                    Part::Capture(position) => &params[base + *position].1,
                 });
             }
             params.push((composite.field.as_str(), Cow::Owned(value)));
@@ -996,8 +1002,7 @@ impl PathTable {
         // only and goes. Kept parameters keep their order.
         let mut kept = 0;
         for at in 0..matched {
-            let name = params[at].0;
-            let keep = match self.captures.iter().position(|capture| capture == name) {
+            let keep = match at.checked_sub(base) {
                 // A prefix the router is nested under.
                 None => true,
                 Some(position) if binding.unbound.contains(&position) => false,

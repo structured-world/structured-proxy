@@ -640,7 +640,12 @@ impl ProxyServer {
                 }
             }
         }
-        for route in &self.extra_routes {
+        // Only the extra routes mounted: one the router skips answers nothing.
+        for route in self
+            .extra_routes
+            .iter()
+            .filter(|route| embed::mountable(route))
+        {
             routes.push((route.method.as_str().to_string(), route.path.clone()));
         }
         Ok(routes)

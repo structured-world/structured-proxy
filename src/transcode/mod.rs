@@ -447,7 +447,12 @@ fn choose<B>(
             ranked.ranks_first(other, method, path)
         }) {
             // The other routes at the path answer methods too.
-            Choice::MethodNotAllowed(allow) => Choice::MethodNotAllowed(ranked.allow(table, allow)),
+            // The table that answered, not the one the path matched first:
+            // a refused binding passes the request on.
+            Choice::MethodNotAllowed { table, allow } => Choice::MethodNotAllowed {
+                table,
+                allow: ranked.allow(table, allow),
+            },
             choice => choice,
         },
         None => routes.choose(table, method, path),
@@ -714,7 +719,7 @@ async fn dispatch<S: TranscodeState>(
     };
     let (table, index) = match choice {
         Choice::Route { table, index } => (table, index),
-        Choice::MethodNotAllowed(allow) => {
+        Choice::MethodNotAllowed { allow, .. } => {
             return (StatusCode::METHOD_NOT_ALLOWED, [(ALLOW, allow)]).into_response()
         }
         // Only routes served without a `Chooser` get here.
@@ -812,7 +817,7 @@ async fn serve<S: TranscodeState>(routes: Arc<Routes>, state: S, request: Reques
                 Err(rejection) => rejection.into_response(routes.tables[table].entry(index)),
             }
         }
-        Choice::MethodNotAllowed(allow) => {
+        Choice::MethodNotAllowed { allow, .. } => {
             (StatusCode::METHOD_NOT_ALLOWED, [(ALLOW, allow)]).into_response()
         }
         Choice::NotFound => StatusCode::NOT_FOUND.into_response(),

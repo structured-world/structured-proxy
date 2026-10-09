@@ -506,6 +506,48 @@ async fn a_refused_binding_passes_to_the_next_route_in_rank_not_the_next_transco
     assert_eq!((status, &body["rpc"]), (StatusCode::OK, &json!("Below")));
 }
 
+async fn an_extra_route_of_a_method_the_router_skips_takes_no_request() {
+    // A method axum's method filter has no bit for is never mounted: its path
+    // must not take a request from the transcoded route it would rank above.
+    let pool: DescriptorPool = common::compile("test/v1/ranked.proto", RANKED_PROTO);
+    let msg = pool.get_message_by_name("test.v1.Msg").unwrap();
+    let app = common::app(UPSTREAM, Ops { msg }, |yaml| {
+        structured_proxy::ProxyServer::from_yaml_str(yaml)
+            .unwrap()
+            .with_descriptors(pool)
+            .with_extra_routes([ExtraRoute::new(
+                Method::from_bytes(b"PURGE").unwrap(),
+                "/v1/x/b/y",
+                Arc::new(Ping),
+            )])
+    })
+    .await;
+    let (status, _, body) = call(&app, Method::GET, "/v1/x/b/y").await;
+    assert_eq!((status, &body["rpc"]), (StatusCode::OK, &json!("Below")));
+}
+
+async fn a_405_past_a_refusing_path_allows_the_methods_at_the_answering_one() {
+    // `/v1/a/b/{name=special}` refuses `ordinary`; `/v1/{name}/b/{operation}`
+    // answers it for GET only, beside an extra PUT: the 405 lists the methods
+    // at the path that answered, not at the one that refused.
+    let pool: DescriptorPool = common::compile("test/v1/ranked.proto", RANKED_PROTO);
+    let msg = pool.get_message_by_name("test.v1.Msg").unwrap();
+    let app = common::app(UPSTREAM, Ops { msg }, |yaml| {
+        structured_proxy::ProxyServer::from_yaml_str(yaml)
+            .unwrap()
+            .with_descriptors(pool)
+            .with_extra_routes([ExtraRoute::new(
+                Method::PUT,
+                "/v1/{name}/b/{operation}",
+                Arc::new(Ping),
+            )])
+    })
+    .await;
+    let (status, allow, _) = call(&app, Method::DELETE, "/v1/a/b/ordinary").await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(allow, "GET, HEAD, PUT");
+}
+
 async fn a_405_allows_the_methods_of_an_extra_route_at_the_same_path() {
     // RFC 9110 §15.5.6: `Allow` lists every method the target answers, those
     // of an extra route sharing the transcoded path included.

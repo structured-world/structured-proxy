@@ -628,6 +628,29 @@ service S {
     assert_eq!(params, matched("second"));
 }
 
+#[test]
+fn a_capture_named_as_a_prefix_one_takes_the_verb_off_its_own_value() {
+    // Nested under `/{name}`, the router reports the prefix's `name` before
+    // the path's own: the verb comes off the path's capture, by position, and
+    // the prefix's value is left as it is.
+    let pool = api_pool(
+        r#"syntax = "proto3";
+package t;
+import "google/api/annotations.proto";
+message Req { string name = 1; }
+service S {
+  rpc Cancel(Req) returns (Req) { option (google.api.http) = { post: "/v1/{name}:cancel" }; }
+}
+"#,
+    );
+    let routes = table::Routes::new(path_tables(&pool, &[], &TranscodeOptions::default()));
+    let index = bound(&routes, Method::POST, "/v1/foo:cancel");
+    let mut params: PathParams<'_> = vec![("name", "outer".into()), ("name", "foo:cancel".into())];
+    routes.tables[0].bind_params(index, &mut params);
+    let expected: PathParams<'_> = vec![("name", "outer".into()), ("name", "foo".into())];
+    assert_eq!(params, expected);
+}
+
 /// The index of the binding answering `method path`, in the routes' only table.
 fn bound(routes: &table::Routes, method: Method, path: &str) -> usize {
     match routes.choose(0, &method, path) {
@@ -652,7 +675,9 @@ fn answer(routes: &table::Routes, method: Method, path: &str) -> String {
             .grpc_path
             .path()
             .to_owned(),
-        table::Choice::MethodNotAllowed(allow) => format!("405 {}", allow.to_str().unwrap()),
+        table::Choice::MethodNotAllowed { allow, .. } => {
+            format!("405 {}", allow.to_str().unwrap())
+        }
         table::Choice::NotFound => "404".to_owned(),
     }
 }

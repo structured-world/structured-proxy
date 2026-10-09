@@ -213,6 +213,12 @@ where
     )
 }
 
+/// Whether `route` is mounted: its method is one the router's method filter
+/// holds. Another one is skipped, with a warning, and reserves no path.
+pub(crate) fn mountable(route: &ExtraRoute) -> bool {
+    MethodFilter::try_from(route.method.clone()).is_ok()
+}
+
 /// Build a router for the embedder's extra stateless routes.
 ///
 /// Routes that share a path but differ in method are merged into one
