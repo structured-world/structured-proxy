@@ -1,6 +1,12 @@
 use super::*;
 use crate::upstream::GrpcProtocol;
 
+/// No route answering a method beyond the standard ones.
+const STANDARD: Routed<'static> = Routed {
+    methods: &[],
+    every: 0,
+};
+
 fn maintenance() -> Maintenance {
     Maintenance {
         exempt: vec![
@@ -45,7 +51,13 @@ fn request(method: &str, path: &str) -> http::Request<()> {
 
 #[test]
 fn a_scope_without_traffic_takes_the_default() {
-    let scope = Scope::compile(None, &[Traffic::Transcoded, Traffic::Grpc], "shield", &[]).unwrap();
+    let scope = Scope::compile(
+        None,
+        &[Traffic::Transcoded, Traffic::Grpc],
+        "shield",
+        STANDARD,
+    )
+    .unwrap();
     assert!(scope.covers(Class::Transcoded));
     assert!(scope.covers(Class::Grpc));
     assert!(!scope.covers(Class::Endpoints));
@@ -56,7 +68,7 @@ fn a_scope_without_traffic_takes_the_default() {
 #[test]
 fn all_traffic_covers_every_class() {
     let config = ScopeConfig::traffic([Traffic::All]);
-    let scope = Scope::compile(Some(&config), &[], "shield", &[]).unwrap();
+    let scope = Scope::compile(Some(&config), &[], "shield", STANDARD).unwrap();
     for class in [
         Class::Transcoded,
         Class::Endpoints,
@@ -72,7 +84,7 @@ fn all_traffic_covers_every_class() {
 fn a_scope_that_covers_no_traffic_is_an_error() {
     // An empty list would mount the guard nowhere; a typo, not a choice.
     let config = ScopeConfig::traffic([]);
-    let err = Scope::compile(Some(&config), &[Traffic::Transcoded], "auth", &[]).unwrap_err();
+    let err = Scope::compile(Some(&config), &[Traffic::Transcoded], "auth", STANDARD).unwrap_err();
     assert!(err.contains("auth.scope.traffic"), "{err}");
 }
 
@@ -82,14 +94,16 @@ fn a_relative_or_invalid_path_glob_is_an_error() {
         paths: vec!["v1/**".into()],
         ..ScopeConfig::default()
     };
-    let err = Scope::compile(Some(&relative), &[Traffic::Transcoded], "shield", &[]).unwrap_err();
+    let err =
+        Scope::compile(Some(&relative), &[Traffic::Transcoded], "shield", STANDARD).unwrap_err();
     assert!(err.contains("must start with '/'"), "{err}");
 
     let invalid = ScopeConfig {
         paths: vec!["/v1/[".into()],
         ..ScopeConfig::default()
     };
-    let err = Scope::compile(Some(&invalid), &[Traffic::Transcoded], "shield", &[]).unwrap_err();
+    let err =
+        Scope::compile(Some(&invalid), &[Traffic::Transcoded], "shield", STANDARD).unwrap_err();
     assert!(err.contains("is invalid"), "{err}");
 }
 
@@ -99,7 +113,8 @@ fn an_invalid_method_is_an_error() {
         methods: vec!["GE T".into()],
         ..ScopeConfig::default()
     };
-    let err = Scope::compile(Some(&config), &[Traffic::Transcoded], "shield", &[]).unwrap_err();
+    let err =
+        Scope::compile(Some(&config), &[Traffic::Transcoded], "shield", STANDARD).unwrap_err();
     assert!(err.contains("is not a method"), "{err}");
 }
 
@@ -115,7 +130,7 @@ fn a_catch_all_method_is_an_error() {
     // `*` means every method in route policies; here it would match no
     // request and leave the guard covering nothing.
     let config = methods(&["*"], Traffic::Transcoded);
-    let err = Scope::compile(Some(&config), &[], "auth", &[]).unwrap_err();
+    let err = Scope::compile(Some(&config), &[], "auth", STANDARD).unwrap_err();
     assert!(err.contains("leave methods out"), "{err}");
 }
 
@@ -123,7 +138,7 @@ fn a_catch_all_method_is_an_error() {
 fn a_method_no_route_answers_is_an_error() {
     // A typo matches no request, and the guard would silently cover nothing.
     let config = methods(&["PSOT"], Traffic::Transcoded);
-    let err = Scope::compile(Some(&config), &[], "shield", &[]).unwrap_err();
+    let err = Scope::compile(Some(&config), &[], "shield", STANDARD).unwrap_err();
     assert!(err.contains("\"PSOT\""), "{err}");
 }
 
@@ -131,8 +146,16 @@ fn a_method_no_route_answers_is_an_error() {
 fn an_extension_method_a_route_answers_is_accepted() {
     let config = methods(&["PROPFIND"], Traffic::Transcoded);
     let routed = [Method::from_bytes(b"PROPFIND").unwrap()];
-    let scope = Scope::compile(Some(&config), &[], "shield", &routed).unwrap();
+    let scope = Scope::compile(Some(&config), &[], "shield", Routed::new(&routed)).unwrap();
     assert!(scope.matches(&request("PROPFIND", "/dav")));
+    // A transcoded route answering every method answers it too, but only
+    // for a scope over transcoded traffic.
+    let every = STANDARD.every(Class::Transcoded);
+    let scope = Scope::compile(Some(&config), &[], "shield", every).unwrap();
+    assert!(scope.matches(&request("PROPFIND", "/dav")));
+    let endpoints = methods(&["PROPFIND"], Traffic::Endpoints);
+    let err = Scope::compile(Some(&endpoints), &[], "shield", every).unwrap_err();
+    assert!(err.contains("\"PROPFIND\""), "{err}");
 }
 
 #[test]
@@ -140,7 +163,7 @@ fn any_method_token_is_accepted_for_the_fallback() {
     // The fallback is the embedder's own service: which methods it answers
     // is not the proxy's to know.
     let config = methods(&["PROPFIND"], Traffic::Fallback);
-    assert!(Scope::compile(Some(&config), &[], "shield", &[]).is_ok());
+    assert!(Scope::compile(Some(&config), &[], "shield", STANDARD).is_ok());
 }
 
 #[test]
@@ -150,7 +173,7 @@ fn paths_and_methods_narrow_the_requests_a_scope_matches() {
         methods: vec!["post".into()],
         ..ScopeConfig::default()
     };
-    let scope = Scope::compile(Some(&config), &[Traffic::Transcoded], "shield", &[]).unwrap();
+    let scope = Scope::compile(Some(&config), &[Traffic::Transcoded], "shield", STANDARD).unwrap();
     assert!(scope.narrows());
     assert!(scope.matches(&request("POST", "/v1/orders/42")));
     // Methods compare as tokens, case aside.
@@ -179,7 +202,7 @@ async fn a_narrowed_guard_readies_the_branch_it_calls() {
     };
     let scoped = Scoped {
         layer: tower::layer::layer_fn(|inner| inner),
-        scope: Scope::compile(Some(&config), &[], "maintenance", &[]).unwrap(),
+        scope: Scope::compile(Some(&config), &[], "maintenance", STANDARD).unwrap(),
     }
     .layer(fallback);
     for path in ["/other", "/guarded", "/other"] {

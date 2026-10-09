@@ -48,7 +48,7 @@ use crate::upstream::{
 /// only the guards whose scope names them (`grpc`, `fallback`); a guard's
 /// rejection of a gRPC call is a gRPC status.
 ///
-/// Serve it with [`serve`](crate::serve) or
+/// Serve it with [`serve`](crate::serve()) or
 /// [`serve_with`](crate::serve_with) (TLS, a connection limit), or hand it to
 /// any server that takes a tower service of `http` types: a Unix socket, an
 /// existing hyper or axum server. Native gRPC needs HTTP/2 on that server
@@ -215,6 +215,27 @@ impl<U: Upstream> Service<axum::extract::Request> for Forward<U> {
     }
 }
 
+/// Hands a URL the transcoded routes matched by path, but no binding answers,
+/// to the fallback instead of their `404`.
+async fn redispatch(
+    axum::extract::State(fallback): axum::extract::State<BoxedService>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let response = next.run(request).await;
+    match response
+        .extensions()
+        .get::<crate::transcode::Unrouted>()
+        .and_then(crate::transcode::Unrouted::take)
+    {
+        Some(request) => match fallback.oneshot(request).await {
+            Ok(response) => response,
+            Err(never) => match never {},
+        },
+        None => response,
+    }
+}
+
 /// The connection requests arrive on, in the form a tonic server records it:
 /// the TCP ends, and behind TLS the client's certificate chain.
 ///
@@ -338,9 +359,12 @@ impl<U: Upstream> ProxyService<U> {
     /// tower service. Only the guards whose scope names `fallback` traffic see
     /// them; CORS and tracing are the fallback's own.
     ///
-    /// A request whose path a route answers but not with its method stays with
-    /// the proxy (`405`), as does every gRPC request and every browser
-    /// preflight for a gRPC-Web call, which follows the call it announces.
+    /// A URL whose path a transcoded template's route matches, but which no
+    /// binding answers (its field template or custom verb does not fit), is
+    /// the fallback's too. A request whose path a route answers but not with
+    /// its method stays with the proxy (`405`), as do every gRPC request and
+    /// every browser preflight for a gRPC-Web call, which follows the call it
+    /// announces.
     #[must_use]
     pub fn with_fallback<F>(mut self, fallback: F) -> Self
     where
@@ -348,16 +372,22 @@ impl<U: Upstream> ProxyService<U> {
         F::Response: IntoResponse,
         F::Future: Send + 'static,
     {
+        let fallback = BoxedService::new(fallback.map_response(IntoResponse::into_response));
+        let guarded = if self.guards.cover(Class::Fallback) {
+            self.guards.service(fallback, Class::Fallback)
+        } else {
+            fallback
+        };
         // The routes' own layers do not reach a fallback set after them, so
         // it gets the client-address resolution of its own, around its guards.
+        // A URL the routes hand back unanswered passed none of their layers
+        // either, and takes the same way.
         let resolve = ClientAddressLayer::with(self.guards.client_address.clone());
-        self.routes = if self.guards.cover(Class::Fallback) {
-            let fallback = BoxedService::new(fallback.map_response(IntoResponse::into_response));
-            self.routes
-                .fallback_service(resolve.layer(self.guards.service(fallback, Class::Fallback)))
-        } else {
-            self.routes.fallback_service(resolve.layer(fallback))
-        };
+        let fallback = BoxedService::new(resolve.layer(guarded));
+        self.routes = self
+            .routes
+            .fallback_service(fallback.clone())
+            .layer(axum::middleware::from_fn_with_state(fallback, redispatch));
         self
     }
 

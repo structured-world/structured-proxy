@@ -140,7 +140,7 @@ pub(crate) struct Scope {
 impl Scope {
     /// Compile `config` for the guard named `what`, with `default` traffic
     /// when the config names none; `routed` are the methods the proxy's
-    /// routes answer beyond the standard ones (`custom` rules, extra routes).
+    /// routes answer beyond the standard ones.
     ///
     /// # Errors
     /// A scope that covers no traffic, a path glob that is relative or does
@@ -150,7 +150,7 @@ impl Scope {
         config: Option<&ScopeConfig>,
         default: &[Traffic],
         what: &str,
-        routed: &[Method],
+        routed: Routed<'_>,
     ) -> Result<Arc<Self>, String> {
         let traffic = config.and_then(|c| c.traffic.as_deref()).unwrap_or(default);
         let classes = traffic.iter().fold(0, |acc, t| acc | traffic_bits(*t));
@@ -188,7 +188,7 @@ impl Scope {
             Some(
                 names
                     .iter()
-                    .map(|name| scope_method(name, what, classes & FALLBACK != 0, routed))
+                    .map(|name| scope_method(name, what, classes, routed))
                     .collect::<Result<Vec<_>, _>>()?,
             )
         };
@@ -232,16 +232,35 @@ const STANDARD_METHODS: [Method; 9] = [
     Method::PATCH,
 ];
 
-/// One `scope.methods` entry of the guard `what`: a method some request can
-/// carry, or an error. A method no route answers would match no request and
-/// leave the guard covering nothing, unless the scope covers the fallback,
-/// whose methods are the embedder's.
-fn scope_method(
-    name: &str,
-    what: &str,
-    covers_fallback: bool,
-    routed: &[Method],
-) -> Result<Method, String> {
+/// The methods the proxy's routes answer beyond the standard ones.
+#[derive(Clone, Copy)]
+pub(crate) struct Routed<'a> {
+    /// The methods routes name: `custom` rules, extra routes.
+    methods: &'a [Method],
+    /// The classes with a route answering every method.
+    every: u8,
+}
+
+impl<'a> Routed<'a> {
+    /// Routes that answer `methods`.
+    pub(crate) fn new(methods: &'a [Method]) -> Self {
+        Self { methods, every: 0 }
+    }
+
+    /// With a route of `class` that answers every method: a `custom` `*`
+    /// rule, the verify endpoint. It answers only a scope covering its class.
+    #[must_use]
+    pub(crate) fn every(mut self, class: Class) -> Self {
+        self.every |= class.bit();
+        self
+    }
+}
+
+/// One `scope.methods` entry of the guard `what`, whose scope covers
+/// `classes`: a method some request can carry, or an error. A method no route
+/// answers would match no request and leave the guard covering nothing,
+/// unless the scope covers the fallback, whose methods are the embedder's.
+fn scope_method(name: &str, what: &str, classes: u8, routed: Routed<'_>) -> Result<Method, String> {
     if name == "*" {
         return Err(format!(
             "{what}.scope.methods entry \"*\" is not a method: leave methods out to cover every one"
@@ -249,7 +268,10 @@ fn scope_method(
     }
     let method = Method::from_bytes(name.to_ascii_uppercase().as_bytes())
         .map_err(|_| format!("{what}.scope.methods entry {name:?} is not a method"))?;
-    if covers_fallback || STANDARD_METHODS.contains(&method) || routed.contains(&method) {
+    if classes & (FALLBACK | routed.every) != 0
+        || STANDARD_METHODS.contains(&method)
+        || routed.methods.contains(&method)
+    {
         Ok(method)
     } else {
         Err(format!(

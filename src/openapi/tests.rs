@@ -184,6 +184,18 @@ service Api {
   rpc Raw(google.api.HttpBody) returns (google.api.HttpBody) {
     option (google.api.http) = { post: "/v1/raw" body: "*" };
   }
+  rpc Archive(Item) returns (Item) {
+    option (google.api.http) = { post: "/v1/items/{name}:archive" };
+  }
+  rpc Broken(Item) returns (Item) {
+    option (google.api.http) = { get: "/v1/broken/a{name}b" };
+  }
+  rpc Shelved(Item) returns (Item) {
+    option (google.api.http) = { get: "/v1/shelf/{name=foo%3Abar/*}/books" };
+  }
+  rpc Shadowed(Item) returns (Item) {
+    option (google.api.http) = { get: "/v1/shelf/{name=**}" };
+  }
 }
 "#;
 
@@ -222,6 +234,48 @@ fn custom_head_rule_is_a_head_operation() {
     let item = &spec["paths"]["/v1/items/{name}"];
     assert_eq!(item["head"]["operationId"], "Api.Head");
     assert_eq!(item["head"]["parameters"][0]["in"], "path");
+}
+
+#[test]
+fn custom_verb_after_a_variable_keeps_its_path_and_parameter() {
+    // OpenAPI path templating allows a template expression inside a segment,
+    // so the verb stays in the path and the variable is a path parameter.
+    let spec = spec(&[]);
+    let archive = &spec["paths"]["/v1/items/{name}:archive"]["post"];
+    assert_eq!(archive["operationId"], "Api.Archive");
+    let params = archive["parameters"].as_array().unwrap();
+    let path_params: Vec<&Value> = params.iter().filter(|p| p["in"] == "path").collect();
+    assert_eq!(path_params.len(), 1);
+    assert_eq!(path_params[0]["name"], "name");
+    // No path item without the verb comes from this binding.
+    assert!(spec["paths"]["/v1/items/{name}"].get("post").is_none());
+}
+
+#[test]
+fn a_route_the_router_refuses_beside_another_is_not_documented() {
+    // The escaped literal is a variable to the router, which then refuses the
+    // catch-all after it at that position: only the route it serves is in
+    // the spec.
+    let spec = spec(&[]);
+    let paths = spec["paths"].as_object().unwrap();
+    assert!(
+        paths.contains_key("/v1/shelf/{name=foo%3Abar/*}/books"),
+        "{paths:?}"
+    );
+    assert!(!paths.contains_key("/v1/shelf/{name=**}"), "{paths:?}");
+}
+
+#[test]
+fn a_template_the_router_cannot_serve_is_not_documented() {
+    // The router skips `a{name}b`; the spec must not promise it either.
+    let spec = spec(&[]);
+    let paths = spec["paths"].as_object().unwrap();
+    assert!(!paths.contains_key("/v1/broken/a{name}b"), "{paths:?}");
+    assert!(!paths.values().any(|item| item
+        .as_object()
+        .unwrap()
+        .values()
+        .any(|op| op["operationId"] == "Api.Broken")));
 }
 
 #[test]

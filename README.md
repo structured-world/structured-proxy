@@ -20,7 +20,8 @@ tonic services.
 - REST routes from the `google.api.http` annotations in your protos: path,
   query and JSON or form body mapped onto the request message
   ([Request mapping](#request-mapping)), `response_body`,
-  `additional_bindings`, and `custom` rules for any HTTP method
+  `additional_bindings`, custom verbs (`/v1/{name}:cancel`), and `custom`
+  rules for any HTTP method
 - Server streaming as NDJSON, or Server-Sent Events when the client asks for
   `text/event-stream`
 - Errors as `google.rpc.Status` JSON with the standard HTTP status mapping and
@@ -379,6 +380,48 @@ body, as the route's `google.api.http` rule says:
 
 A value that is not valid for its field, or two members of one `oneof`, is
 answered with `INVALID_ARGUMENT` (400) before the upstream is called.
+
+A variable bound to a multi-segment template (`{name=shelves/*/books/*}`,
+AIP-127) takes only a value of that shape: its literals, one segment per `*`,
+any number for `**`. `**` must be the last part of the path: a template that
+uses it before the last segment, or puts another segment after it, is left
+out with an error in the log. Of the bindings of one router path, those such
+a template or an escaped literal constrains are tried before the open ones. The value of such a variable, and of `{name=**}`, is
+percent-decoded except for `%2F`, which reaches the field as received, so an
+encoded slash stays distinct from a segment boundary; a single-segment
+variable decodes it. A literal of such a template that holds a percent-escape
+matches whatever the case of its hex digits, so to the router it is a
+variable: like any variable, it cannot share its position with a `**` of
+another binding, and the later of the two is left out with an error.
+
+**Custom verbs.** A path template may end in a verb, as AIP-136 custom methods
+do (`post: "/v1/{name=operations/*}:cancel"`):
+
+- A request's verb is its last segment from the first unencoded colon: a
+  client percent-encodes the reserved characters of a variable's value, and a
+  verb writes its own reserved characters encoded too
+  (`:run%3Anow`), so neither holds a raw `:`. A percent-encoded colon (`%3A`)
+  in a request is part of a value, never the verb's delimiter.
+- A verb some binding of the request's path binds owns that URL: only the
+  bindings of that verb answer it, each reaching its own RPC. A verb no
+  binding binds stays part of the last variable (`/v1/items/a:b` is the item
+  `a:b`), as Envoy's transcoder and grpc-gateway treat an unbound verb.
+- A template ending in a literal matches its URL exactly and wins over a
+  variable with the same verb: `get: "/v1/jobs/special:cancel"` answers that
+  URL ahead of `post: "/v1/jobs/{name}:cancel"`, as a static route does.
+- `**` before a verb may match no segment: `/v1/{name=**}:purge` answers
+  `/v1/:purge` with an empty `name`.
+- A path with a verb after its variable answers every method, so an extra
+  route of yours on the same path stops the proxy at startup.
+- A URL that bindings answer, but none with the request's method, is `405`,
+  with their methods in `Allow`. A URL that no binding answers, its field
+  template or verb not fitting, is no transcoded request: another route of
+  the proxy (an extra route of yours) takes it, else it is `404`, or your
+  fallback's, preflight included.
+
+A template the router cannot match, such as text around a variable within one
+segment (`/v1/a{name}b`), is left out with an error in the log; the other
+routes still serve.
 
 ## Client address
 
@@ -1181,7 +1224,8 @@ A plain TCP connection passes `stream.connect_info()` directly
 ### What passes through
 
 A request no route matches gets `404`, or goes to your own service with
-`ProxyService::with_fallback(my_axum_app)`. Native gRPC calls and the fallback
+`ProxyService::with_fallback(my_axum_app)`; so does a URL whose path a
+transcoded route matches but no binding answers. Native gRPC calls and the fallback
 pass only the guards whose scope names `grpc` or `fallback` (see
 [Guards and scopes](#guards-and-scopes)); by default none does. The fallback
 keeps its own CORS and tracing.
@@ -1467,3 +1511,5 @@ USDT (TRC-20): `TFDsezHa1cBkoeZT5q2T49Wp66K8t2DmdA`
 ## License
 
 Apache-2.0
+
+Contributions are accepted under the [Structured World Contributor License Agreement](https://sw.foundation/cla); see [CONTRIBUTING.md](CONTRIBUTING.md).

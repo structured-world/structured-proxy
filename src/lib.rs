@@ -825,7 +825,7 @@ impl ProxyServer {
         let cors = self.build_cors()?;
 
         // Build transcoding routes from descriptor pool.
-        let transcode_routes = transcode::routes_with_options(
+        let (transcode_routes, chooser) = transcode::routes_and_chooser(
             &pool,
             &self.config.aliases,
             &self.transcode.clone().with_selection(selection.clone()),
@@ -841,7 +841,24 @@ impl ProxyServer {
         let forward_auth = auth.as_ref().and_then(|built| {
             auth::forward::ForwardAuth::build(self.config.auth.as_ref()?, built.clone())
         });
-        let guards = Arc::new(self.guards(resolver, auth, maintenance_exempt, &mounted)?);
+        // The methods a route answers: `*` is not a method. It marks the
+        // verify endpoint and a `custom` `*` rule, which answer every method,
+        // and a transcoded path with verbs, whose bindings still name theirs.
+        let mut methods: Vec<http::Method> = mounted
+            .iter()
+            .filter(|(method, _)| method != "*")
+            .filter_map(|(method, _)| http::Method::from_bytes(method.as_bytes()).ok())
+            .collect();
+        let bound = transcode::bound_methods(&pool, &self.config.aliases, &selection);
+        methods.extend(bound.methods);
+        let mut routed = guard::Routed::new(&methods);
+        if bound.every {
+            routed = routed.every(guard::Class::Transcoded);
+        }
+        if verify_path.is_some() {
+            routed = routed.every(guard::Class::Verify);
+        }
+        let guards = Arc::new(self.guards(resolver, auth, maintenance_exempt, routed)?);
 
         // Health routes. Paths are configurable; the whole group is skippable.
         let health_routes = if self.config.health.enabled {
@@ -965,18 +982,45 @@ impl ProxyServer {
         // Each class of traffic behind the guards that cover it, so a request
         // runs only the guards of its own class. A path no route answers
         // reaches the plain 404 (or the fallback's own guards).
-        let router = Router::new()
-            .merge(guards.router(transcode_routes, guard::Class::Transcoded))
-            .merge(guards.router(endpoints, guard::Class::Endpoints))
-            .merge(guards.router(verify, guard::Class::Verify))
-            // Before every guard: they and the handlers read its result.
-            .layer(client_address::ClientAddressLayer::with(
-                guards.client_address.clone(),
-            ))
-            .layer(TraceLayer::new_for_http());
-        // Outermost: wraps every enforcement layer so short-circuited
-        // responses keep CORS headers, and answers preflight before auth.
-        let router = cors::layer(router, cors.clone()).with_state(state);
+        let endpoints = guards.router(endpoints, guard::Class::Endpoints);
+        let verify = guards.router(verify, guard::Class::Verify);
+        let layered = |router: Router<ProxyState<U>>| {
+            let router = router
+                // Before every guard: they and the handlers read its result.
+                .layer(client_address::ClientAddressLayer::with(
+                    guards.client_address.clone(),
+                ))
+                .layer(TraceLayer::new_for_http());
+            // Outermost: wraps every enforcement layer so short-circuited
+            // responses keep CORS headers, and answers preflight before auth.
+            cors::layer(router, cors.clone())
+        };
+        let router = layered(
+            Router::new()
+                .merge(guards.router(transcode_routes, guard::Class::Transcoded))
+                .merge(endpoints.clone())
+                .merge(verify.clone()),
+        );
+        // The binding is chosen before every layer: a URL no binding answers
+        // (its field template, its custom verb) is no transcoded request. It
+        // goes to the proxy's other routes, which a router without the
+        // transcoded ones ranks for it, and on to the fallback (or the plain
+        // 404) when none answers it either, past the layers like any path no
+        // route answers. That fallback is set after the layers, so it has none.
+        let router = match chooser {
+            Some(chooser) => {
+                let elsewhere = layered(Router::new().merge(endpoints).merge(verify))
+                    .fallback(|request: axum::extract::Request| async {
+                        transcode::unrouted(request)
+                    })
+                    .with_state(state.clone());
+                chooser
+                    .with_elsewhere(guard::BoxedService::new(elsewhere))
+                    .layer(router)
+            }
+            None => router,
+        };
+        let router = router.with_state(state);
 
         Ok((router, cors, guards))
     }
@@ -984,7 +1028,7 @@ impl ProxyServer {
     /// The guards the configuration and the hooks turn on, each with its
     /// scope, after the client-address resolution `resolver`;
     /// `maintenance_exempt` lists the paths maintenance mode leaves
-    /// reachable, `mounted` the `(method, path)` of every route.
+    /// reachable, `routed` the methods the routes answer.
     ///
     /// # Errors
     ///
@@ -996,17 +1040,11 @@ impl ProxyServer {
         resolver: Arc<client_address::Resolver>,
         auth: Option<Arc<auth::Auth>>,
         maintenance_exempt: Vec<String>,
-        mounted: &[(String, String)],
+        routed: guard::Routed<'_>,
     ) -> anyhow::Result<guard::Guards> {
         use config::Traffic::{Endpoints, Grpc, Transcoded};
-        // `*` marks a route that answers every method, not a method.
-        let routed: Vec<http::Method> = mounted
-            .iter()
-            .filter(|(method, _)| method != "*")
-            .filter_map(|(method, _)| http::Method::from_bytes(method.as_bytes()).ok())
-            .collect();
         let scope = |config: Option<&ScopeConfig>, default: &[config::Traffic], what: &str| {
-            guard::Scope::compile(config, default, what, &routed).map_err(anyhow::Error::msg)
+            guard::Scope::compile(config, default, what, routed).map_err(anyhow::Error::msg)
         };
         // A guard never sets what the client-address forwarding writes.
         let reserved: Arc<[http::HeaderName]> = resolver.configured_headers().cloned().collect();
