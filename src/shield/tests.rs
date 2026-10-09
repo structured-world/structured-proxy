@@ -183,53 +183,63 @@ async fn rule_without_resolvable_profile_passes() {
 #[test]
 fn jwt_claim_key_uses_claim_then_falls_back_to_ip() {
     let claims = serde_json::json!({ "sub": "alice", "org": { "id": "acme" } });
+    let none = HeaderMap::new();
     let key = KeySource::JwtClaim("sub".to_string());
     // Present claim: identity is the raw claim value (for service resolution);
     // the store key is de-identified (no raw value) and tagged `jwt`.
     let ip = client("1.1.1.1");
-    let k = rule_key("fp", &key, &ip, &HeaderMap::new(), Some(&claims));
-    assert_eq!(k.identity, "alice");
-    assert!(k.store.starts_with("fp:jwt:"));
+    let k = rule_key("fp", &key, &ip, &none, Some(&claims));
+    assert_eq!(k.identity.as_str(), "alice");
+    assert!(k.store.as_str().starts_with("fp:jwt:"));
     assert!(
-        !k.store.contains("alice"),
+        !k.store.as_str().contains("alice"),
         "raw value must not appear in store key"
     );
     // Dotted path into a nested claim.
     let nested = KeySource::JwtClaim("org.id".to_string());
     assert_eq!(
-        rule_key("fp", &nested, &ip, &HeaderMap::new(), Some(&claims)).identity,
+        rule_key("fp", &nested, &ip, &none, Some(&claims))
+            .identity
+            .as_str(),
         "acme"
     );
     // No claims (anonymous) → IP fallback, so the limit can't be dodged.
-    let anon = rule_key("fp", &key, &ip, &HeaderMap::new(), None);
-    assert_eq!(anon.identity, "1.1.1.1");
-    assert!(anon.store.starts_with("fp:ip:"));
+    let anon = rule_key("fp", &key, &ip, &none, None);
+    assert_eq!(anon.identity.as_str(), "1.1.1.1");
+    assert!(anon.store.as_str().starts_with("fp:ip:"));
     // Claim present but missing the requested field → IP fallback.
     let missing = rule_key(
         "fp",
         &KeySource::JwtClaim("missing".to_string()),
         &ip,
-        &HeaderMap::new(),
+        &none,
         Some(&claims),
     );
-    assert_eq!(missing.identity, "1.1.1.1");
-    assert!(missing.store.starts_with("fp:ip:"));
+    assert_eq!(missing.identity.as_str(), "1.1.1.1");
+    assert!(missing.store.as_str().starts_with("fp:ip:"));
 }
 
 #[test]
 fn store_key_namespaced_by_fingerprint_and_value() {
     let key = KeySource::Ip;
+    let none = HeaderMap::new();
     let one = client("1.1.1.1");
     // Same client under two different rules (fingerprints) → independent budgets.
-    let a = rule_key("fpA", &key, &one, &HeaderMap::new(), None);
-    let b = rule_key("fpB", &key, &one, &HeaderMap::new(), None);
-    assert_ne!(a.store, b.store);
+    let a = rule_key("fpA", &key, &one, &none, None);
+    let b = rule_key("fpB", &key, &one, &none, None);
+    assert_ne!(a.store.as_str(), b.store.as_str());
     // Same rule + same value → identical store key (stable across instances).
-    let a2 = rule_key("fpA", &key, &one, &HeaderMap::new(), None);
-    assert_eq!(a.store, a2.store);
+    let a2 = rule_key("fpA", &key, &one, &none, None);
+    assert_eq!(a.store.as_str(), a2.store.as_str());
     // Different value → different store key.
-    let c = rule_key("fpA", &key, &client("2.2.2.2"), &HeaderMap::new(), None);
-    assert_ne!(a.store, c.store);
+    let c = rule_key("fpA", &key, &client("2.2.2.2"), &none, None);
+    assert_ne!(a.store.as_str(), c.store.as_str());
+    // The key is the one the shared store has always been given: the
+    // fingerprint, the tag and the hash of the value, as text.
+    assert_eq!(
+        a.store.as_str(),
+        format!("fpA:ip:{}", matcher::short_hash("1.1.1.1"))
+    );
 }
 
 #[test]
@@ -245,11 +255,12 @@ fn an_unresolved_address_never_keys_by_the_proxys_own_address() {
     let mut headers = HeaderMap::new();
     headers.insert("x-forwarded-for", "garbage".parse().unwrap());
     let invalid = resolver.resolve(Some("10.0.0.1:4000".parse().unwrap()), &headers);
-    let key = rule_key("fp", &KeySource::Ip, &invalid, &HeaderMap::new(), None);
-    assert_eq!(key.identity, "invalid");
+    let none = HeaderMap::new();
+    let key = rule_key("fp", &KeySource::Ip, &invalid, &none, None);
+    assert_eq!(key.identity.as_str(), "invalid");
     let unavailable = ClientAddress::from_peer(None);
-    let key = rule_key("fp", &KeySource::Ip, &unavailable, &HeaderMap::new(), None);
-    assert_eq!(key.identity, "unknown");
+    let key = rule_key("fp", &KeySource::Ip, &unavailable, &none, None);
+    assert_eq!(key.identity.as_str(), "unknown");
 }
 
 #[tokio::test]

@@ -6,6 +6,7 @@
 //! status ([`GrpcRejections`]).
 
 mod concurrency;
+mod gate;
 mod grpc;
 
 use std::borrow::Cow;
@@ -13,8 +14,8 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use axum::extract::{Request, State};
-use axum::middleware::{from_fn_with_state, Next};
+use axum::extract::Request;
+use axum::middleware::from_fn_with_state;
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 use futures::future::Either;
@@ -140,7 +141,7 @@ pub(crate) struct Scope {
 impl Scope {
     /// Compile `config` for the guard named `what`, with `default` traffic
     /// when the config names none; `routed` are the methods the proxy's
-    /// routes answer beyond the standard ones (`custom` rules, extra routes).
+    /// routes answer beyond the standard ones.
     ///
     /// # Errors
     /// A scope that covers no traffic, a path glob that is relative or does
@@ -150,7 +151,7 @@ impl Scope {
         config: Option<&ScopeConfig>,
         default: &[Traffic],
         what: &str,
-        routed: &[Method],
+        routed: Routed<'_>,
     ) -> Result<Arc<Self>, String> {
         let traffic = config.and_then(|c| c.traffic.as_deref()).unwrap_or(default);
         let classes = traffic.iter().fold(0, |acc, t| acc | traffic_bits(*t));
@@ -188,7 +189,7 @@ impl Scope {
             Some(
                 names
                     .iter()
-                    .map(|name| scope_method(name, what, classes & FALLBACK != 0, routed))
+                    .map(|name| scope_method(name, what, classes, routed))
                     .collect::<Result<Vec<_>, _>>()?,
             )
         };
@@ -232,16 +233,35 @@ const STANDARD_METHODS: [Method; 9] = [
     Method::PATCH,
 ];
 
-/// One `scope.methods` entry of the guard `what`: a method some request can
-/// carry, or an error. A method no route answers would match no request and
-/// leave the guard covering nothing, unless the scope covers the fallback,
-/// whose methods are the embedder's.
-fn scope_method(
-    name: &str,
-    what: &str,
-    covers_fallback: bool,
-    routed: &[Method],
-) -> Result<Method, String> {
+/// The methods the proxy's routes answer beyond the standard ones.
+#[derive(Clone, Copy)]
+pub(crate) struct Routed<'a> {
+    /// The methods routes name: `custom` rules, extra routes.
+    methods: &'a [Method],
+    /// The classes with a route answering every method.
+    every: u8,
+}
+
+impl<'a> Routed<'a> {
+    /// Routes that answer `methods`.
+    pub(crate) fn new(methods: &'a [Method]) -> Self {
+        Self { methods, every: 0 }
+    }
+
+    /// With a route of `class` that answers every method: a `custom` `*`
+    /// rule, the verify endpoint. It answers only a scope covering its class.
+    #[must_use]
+    pub(crate) fn every(mut self, class: Class) -> Self {
+        self.every |= class.bit();
+        self
+    }
+}
+
+/// One `scope.methods` entry of the guard `what`, whose scope covers
+/// `classes`: a method some request can carry, or an error. A method no route
+/// answers would match no request and leave the guard covering nothing,
+/// unless the scope covers the fallback, whose methods are the embedder's.
+fn scope_method(name: &str, what: &str, classes: u8, routed: Routed<'_>) -> Result<Method, String> {
     if name == "*" {
         return Err(format!(
             "{what}.scope.methods entry \"*\" is not a method: leave methods out to cover every one"
@@ -249,7 +269,10 @@ fn scope_method(
     }
     let method = Method::from_bytes(name.to_ascii_uppercase().as_bytes())
         .map_err(|_| format!("{what}.scope.methods entry {name:?} is not a method"))?;
-    if covers_fallback || STANDARD_METHODS.contains(&method) || routed.contains(&method) {
+    if classes & (FALLBACK | routed.every) != 0
+        || STANDARD_METHODS.contains(&method)
+        || routed.methods.contains(&method)
+    {
         Ok(method)
     } else {
         Err(format!(
@@ -363,7 +386,11 @@ macro_rules! guard_stack {
         }
         if class.authenticates() {
             // Keyed by claims only the JWT gate verifies.
-            if let Some((shield, scope)) = &guards.shield {
+            if let Some((shield, scope)) = guards
+                .shield
+                .as_ref()
+                .filter(|(shield, _)| shield.enforces(crate::shield::matcher::Phase::PostAuth))
+            {
                 target = $wrap!(
                     target,
                     class,
@@ -380,44 +407,21 @@ macro_rules! guard_stack {
                 );
             }
         }
-        if let Some((shield, scope)) = &guards.shield {
-            target = $wrap!(
-                target,
-                class,
-                scope,
-                from_fn_with_state(shield.clone(), crate::shield::pre_auth_middleware)
-            );
-        }
-        if let Some((concurrency, scope)) = &guards.concurrency {
-            target = $wrap!(
-                target,
-                class,
-                scope,
-                from_fn_with_state(concurrency.clone(), concurrency::middleware)
-            );
-        }
-        if let Some((maintenance, scope)) = &guards.maintenance {
-            target = $wrap!(
-                target,
-                class,
-                scope,
-                from_fn_with_state(maintenance.clone(), maintenance_middleware)
-            );
-        }
-        if let Some(scope) = &guards.require_client {
-            target = $wrap!(
-                target,
-                class,
-                scope,
-                axum::middleware::from_fn(crate::client_address::require)
-            );
+        // A required client address, maintenance, concurrency and the rate
+        // limits before auth decide as the request arrives: one layer.
+        if let Some(gate) = gate::Gate::layer(guards, class) {
+            target = $wrap!(@all target, gate);
         }
         target
     }};
 }
 
-/// One guard layer on a router, when its scope covers the class.
+/// One guard layer on a router, when its scope covers the class; with `@all`,
+/// a layer that applies its scopes itself.
 macro_rules! wrap_router {
+    (@all $target:expr, $layer:expr) => {
+        $target.layer($layer)
+    };
     ($target:expr, $class:expr, $scope:expr, $layer:expr) => {{
         let scope: &Arc<Scope> = $scope;
         if !scope.covers($class) {
@@ -433,8 +437,12 @@ macro_rules! wrap_router {
     }};
 }
 
-/// One guard layer on a boxed service, when its scope covers the class.
+/// One guard layer on a boxed service, when its scope covers the class; with
+/// `@all`, a layer that applies its scopes itself.
 macro_rules! wrap_service {
+    (@all $target:expr, $layer:expr) => {
+        BoxedService::new($layer.layer($target))
+    };
     ($target:expr, $class:expr, $scope:expr, $layer:expr) => {{
         let scope: &Arc<Scope> = $scope;
         let target: BoxedService = $target;
@@ -505,24 +513,6 @@ impl Maintenance {
                 None => path == pattern,
             })
     }
-}
-
-/// Maintenance mode middleware: `UNAVAILABLE` with a five-minute
-/// `Retry-After` for every request outside the exempt paths.
-async fn maintenance_middleware(
-    State(maintenance): State<Arc<Maintenance>>,
-    request: Request,
-    next: Next,
-) -> Response {
-    if maintenance.exempts(request.uri().path()) {
-        return next.run(request).await;
-    }
-    let mut response = reject(tonic::Code::Unavailable, maintenance.message.clone());
-    response.headers_mut().insert(
-        http::header::RETRY_AFTER,
-        http::HeaderValue::from_static("300"),
-    );
-    response
 }
 
 #[cfg(test)]

@@ -249,6 +249,9 @@ fn get(
         "no-content" => {
             md.insert("x-http-code", ascii("204"));
         }
+        "not-modified" => {
+            md.insert("x-http-code", ascii("304"));
+        }
         "bad-code" => {
             md.insert("x-http-code", ascii("abc"));
             md.insert("x-leak", ascii("must not reach the client"));
@@ -643,6 +646,18 @@ async fn http_code_204_answers_without_content() {
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert!(body.is_empty());
     assert!(headers.get("content-type").is_none());
+    // A 204 carries no Content-Length (RFC 9110 §8.6).
+    assert!(headers.get("content-length").is_none());
+}
+
+async fn http_code_304_answers_without_a_length_for_its_empty_body() {
+    // A 304's Content-Length could only describe the selected representation
+    // (RFC 9110 §8.6), never the empty body the proxy sends.
+    let app = proxy(UPSTREAM).await;
+    let (status, headers, body) = call(&app, Method::GET, "/v1/things/not-modified").await;
+    assert_eq!(status, StatusCode::NOT_MODIFIED);
+    assert!(body.is_empty());
+    assert!(headers.get("content-length").is_none());
 }
 
 async fn invalid_http_code_is_a_malformed_upstream_internal() {

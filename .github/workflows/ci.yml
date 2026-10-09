@@ -20,8 +20,10 @@ jobs:
     runs-on: ubuntu-latest
     services:
       # Shared store for the rate-limit cross-instance reconciliation test.
+      # Pulled through Google's Docker Hub mirror: anonymous pulls from
+      # Docker Hub on shared runner addresses hit its rate limit.
       redis:
-        image: redis:7
+        image: mirror.gcr.io/library/redis:7
         ports:
           - 6379:6379
         options: >-
@@ -199,8 +201,11 @@ jobs:
         with:
           persist-credentials: false
       # Scans Cargo.lock for RustSec advisories; honors the ignore list in
-      # deny.toml. Third-party action: pinned to a commit SHA (dependabot
-      # keeps it fresh).
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+      # deny.toml. The released binary rather than the Docker action, whose
+      # image build pulls from Docker Hub and hits its anonymous rate limit
+      # on shared runners.
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
-          command: check advisories
+          tool: cargo-deny
+      - name: Check advisories
+        run: cargo deny check advisories
