@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [8.1.2](https://github.com/structured-world/structured-proxy/compare/v8.1.1...v8.1.2) - 2026-10-12
+
+### Other
+
+- *(deps)* replace serde_yaml with serde-saphyr ([#144](https://github.com/structured-world/structured-proxy/pull/144))
+
 ## [8.1.1](https://github.com/structured-world/structured-proxy/compare/v8.1.0...v8.1.1) - 2026-10-09
 
 ### Fixed
