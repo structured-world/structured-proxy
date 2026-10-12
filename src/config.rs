@@ -329,16 +329,21 @@ pub fn from_yaml<T: serde::de::DeserializeOwned>(yaml: &str) -> anyhow::Result<T
     Ok(parse_yaml(yaml)?)
 }
 
-/// The YAML reader of every config path. Booleans are YAML 1.2's `true` and
-/// `false` only: `yes`, `no`, `on` and `off` are refused rather than read as
-/// booleans. Errors stay on one line, without a snippet of the document, so a
-/// log record holds the whole message.
+/// The YAML reader of every config path, with the YAML 1.2 core schema's
+/// types: a boolean is `true` or `false` in any letter case (`True`, `TRUE`),
+/// while `yes`, `no`, `on` and `off` are refused; an unquoted number or
+/// boolean where text is expected is an error, not the text it spells, so
+/// `name: true` does not start a service called "true". Errors stay on one
+/// line, without a snippet of the document, so a log record holds the whole
+/// message.
 pub(crate) fn parse_yaml<T: serde::de::DeserializeOwned>(yaml: &str) -> Result<T, YamlError> {
     let mut path = None;
     serde_saphyr::with_deserializer_from_str_with_options(
         yaml,
         serde_saphyr::options! {
+            // Matches `true`/`false` ignoring case, the core schema's spellings.
             strict_booleans: true,
+            no_schema: true,
             with_snippet: false,
         },
         |de| {
@@ -581,13 +586,20 @@ impl<'de> Deserialize<'de> for ConfigKeys {
                 mut map: A,
             ) -> Result<ConfigKeys, A::Error> {
                 let mut keys = ConfigKeys::default();
-                while let Some(key) = map.next_key::<String>()? {
-                    if key == "streaming" {
-                        keys.streaming = map.next_value::<MapKeys>()?.0;
-                    } else {
-                        map.next_value::<serde::de::IgnoredAny>()?;
+                while let Some(TextKey(key)) = map.next_key()? {
+                    match key {
+                        Some(key) if key == "streaming" => {
+                            keys.streaming = map.next_value::<MapKeys>()?.0;
+                            keys.top.push(key);
+                        }
+                        Some(key) => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                            keys.top.push(key);
+                        }
+                        None => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
                     }
-                    keys.top.push(key);
                 }
                 Ok(keys)
             }
@@ -618,11 +630,46 @@ impl<'de> Deserialize<'de> for MapKeys {
                 mut map: A,
             ) -> Result<MapKeys, A::Error> {
                 let mut keys = Vec::new();
-                while let Some(key) = map.next_key::<String>()? {
+                while let Some(TextKey(key)) = map.next_key()? {
                     map.next_value::<serde::de::IgnoredAny>()?;
-                    keys.push(key);
+                    keys.extend(key);
                 }
                 Ok(MapKeys(keys))
+            }
+        }
+        de.deserialize_any(Visitor)
+    }
+}
+
+/// A map key as text; `None` for a key that is a number or a boolean, which
+/// no setting is named by and which the reader refuses to take for text.
+struct TextKey(Option<String>);
+
+impl<'de> Deserialize<'de> for TextKey {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = TextKey;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a scalar key")
+            }
+            fn visit_str<E>(self, key: &str) -> Result<TextKey, E> {
+                Ok(TextKey(Some(key.to_owned())))
+            }
+            fn visit_string<E>(self, key: String) -> Result<TextKey, E> {
+                Ok(TextKey(Some(key)))
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<TextKey, E> {
+                Ok(TextKey(None))
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<TextKey, E> {
+                Ok(TextKey(None))
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<TextKey, E> {
+                Ok(TextKey(None))
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<TextKey, E> {
+                Ok(TextKey(None))
             }
         }
         de.deserialize_any(Visitor)

@@ -834,10 +834,48 @@ fn only_yaml_1_2_booleans_are_booleans() {
         let err = ProxyConfig::from_yaml_str(&format!("cors:\n  grpc_web: {value}\n")).unwrap_err();
         assert!(err.to_string().contains("cors.grpc_web"), "{value}: {err}");
     }
-    for (value, expected) in [("true", true), ("false", false)] {
+    // The YAML 1.2 core schema spells them in three cases; files written for
+    // the earlier reader use all of them.
+    for (value, expected) in [
+        ("true", true),
+        ("True", true),
+        ("TRUE", true),
+        ("false", false),
+        ("False", false),
+        ("FALSE", false),
+    ] {
         let config = ProxyConfig::from_yaml_str(&format!("cors:\n  grpc_web: {value}\n")).unwrap();
         assert_eq!(config.cors.grpc_web, expected, "{value}");
     }
+}
+
+#[test]
+fn the_packaged_config_template_loads() {
+    // The RPM/DEB packages install it as the starting config.
+    let yaml = include_str!("../../packaging/config.yaml");
+    let config = ProxyConfig::from_yaml_str(yaml).unwrap();
+    assert_eq!(config.service.name, "structured-proxy");
+    assert!(unknown_config_keys(yaml).is_empty());
+}
+
+#[test]
+fn a_number_or_boolean_is_not_taken_for_text() {
+    // A setting that names something (a service, a header) holds text; an
+    // unquoted `true` or `123` there is a mistake to report, not a name to
+    // start with. Quoted, it is the text it spells.
+    for yaml in [
+        "service:\n  name: true\n",
+        "service:\n  name: 8080\n",
+        "service:\n  name: 1.5\n",
+        "forwarded_headers: [123]\n",
+        "cors:\n  origins: [false]\n",
+    ] {
+        assert!(ProxyConfig::from_yaml_str(yaml).is_err(), "{yaml}");
+    }
+    let config = ProxyConfig::from_yaml_str("service:\n  name: \"8080\"\n").unwrap();
+    assert_eq!(config.service.name, "8080");
+    let config = ProxyConfig::from_yaml_str("forwarded_headers: ['123', x-request-id]\n").unwrap();
+    assert_eq!(config.forwarded_headers, ["123", "x-request-id"]);
 }
 
 #[test]
@@ -923,9 +961,15 @@ fn an_empty_streaming_section_has_no_unknown_keys() {
 }
 
 #[test]
-fn a_non_string_key_is_reported_by_its_text() {
-    // A key no setting reads is reported whatever it looks like.
-    assert_eq!(unknown_config_keys("8080: listen\n"), ["8080"]);
+fn a_number_or_boolean_key_leaves_the_other_keys_reported() {
+    // No setting is named by a number or a boolean, so such a key is skipped,
+    // and the typos beside it are still reported.
+    assert_eq!(
+        unknown_config_keys(
+            "8080: listen\ntrue: 1\nmaintenence: {}\nstreaming:\n  5: x\n  ndjson_envelop: true\n"
+        ),
+        ["maintenence", "streaming.ndjson_envelop"]
+    );
 }
 
 #[test]
