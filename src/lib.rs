@@ -205,7 +205,7 @@ impl ProxyServer {
         for key in config::unknown_config_keys(yaml) {
             tracing::warn!(%key, "unknown config key is ignored");
         }
-        let settings: config::TranscodeFileConfig = serde_yaml::from_str(yaml)?;
+        let settings: config::TranscodeFileConfig = config::parse_yaml(yaml)?;
         let options = settings
             .options()
             .map_err(|e| anyhow::anyhow!("invalid transcoding config: {e}"))?;

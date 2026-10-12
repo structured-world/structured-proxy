@@ -72,8 +72,8 @@ impl FileConfig {
     /// A `runtime:` section that is not a map, holds an unknown key, or sets
     /// `worker_threads` to anything but a positive integer; the message names
     /// the key.
-    pub fn from_yaml_str(yaml: &str) -> Result<Self, serde_yaml::Error> {
-        serde_yaml::from_str(yaml)
+    pub fn from_yaml_str(yaml: &str) -> anyhow::Result<Self> {
+        structured_proxy::config::from_yaml(yaml)
     }
 }
 

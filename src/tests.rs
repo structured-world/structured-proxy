@@ -22,7 +22,7 @@ fn test_minimal_config_server() {
 upstream:
   default: "http://127.0.0.1:50051"
 "#;
-    let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+    let config: ProxyConfig = config::parse_yaml(yaml).unwrap();
     let server = ProxyServer::from_config(config);
     assert!(server.descriptor_pool.is_none());
 }

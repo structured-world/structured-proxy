@@ -6,7 +6,7 @@ fn test_minimal_config_deserialize() {
 upstream:
   default: "grpc://localhost:4180"
 "#;
-    let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+    let config: ProxyConfig = parse_yaml(yaml).unwrap();
     assert_eq!(config.upstream.unwrap().default, "grpc://localhost:4180");
     assert_eq!(config.listen.http, "0.0.0.0:8080");
     assert_eq!(config.service.name, "structured-proxy");
@@ -21,7 +21,7 @@ fn cors_defaults_cover_grpc_web_and_nothing_extra() {
     // Absent `cors:` and an empty one agree: permissive origins, gRPC-Web
     // included, no extra exposed headers, the browser's own preflight cache.
     for yaml in ["service:\n  name: demo\n", "cors: {}\n"] {
-        let cors = serde_yaml::from_str::<ProxyConfig>(yaml).unwrap().cors;
+        let cors = parse_yaml::<ProxyConfig>(yaml).unwrap().cors;
         assert!(cors.origins.is_empty(), "{yaml}");
         assert!(cors.expose_headers.is_empty(), "{yaml}");
         assert_eq!(cors.max_age_secs, None, "{yaml}");
@@ -32,7 +32,7 @@ fn cors_defaults_cover_grpc_web_and_nothing_extra() {
 #[test]
 fn cors_settings_are_read() {
     let yaml = "cors:\n  origins: [\"https://app.example\"]\n  expose_headers: [\"x-request-id\"]\n  max_age_secs: 600\n  grpc_web: false\n";
-    let cors = serde_yaml::from_str::<ProxyConfig>(yaml).unwrap().cors;
+    let cors = parse_yaml::<ProxyConfig>(yaml).unwrap().cors;
     assert_eq!(cors.origins, ["https://app.example"]);
     assert_eq!(cors.expose_headers, ["x-request-id"]);
     assert_eq!(cors.max_age_secs, Some(600));
@@ -42,7 +42,7 @@ fn cors_settings_are_read() {
 #[test]
 fn upstream_is_optional() {
     // An embedder whose upstream is in process names no address.
-    let config: ProxyConfig = serde_yaml::from_str("service:\n  name: demo\n").unwrap();
+    let config: ProxyConfig = parse_yaml("service:\n  name: demo\n").unwrap();
     assert!(config.upstream.is_none());
 }
 
@@ -50,18 +50,18 @@ fn upstream_is_optional() {
 fn upstream_without_its_address_is_rejected() {
     // A present `upstream:` block must say where: an empty one is a mistake,
     // not a request for an in-process upstream.
-    let err = serde_yaml::from_str::<ProxyConfig>("upstream: {}\n").unwrap_err();
+    let err = parse_yaml::<ProxyConfig>("upstream: {}\n").unwrap_err();
     assert!(err.to_string().contains("default"), "{err}");
 }
 
 #[test]
 fn jwks_max_age_defaults_and_overrides() {
     let yaml = "upstream:\n  default: \"grpc://x:1\"\nauth:\n  mode: jwt\n  jwt:\n    jwks_uri: \"https://idp/jwks\"\n";
-    let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+    let cfg: ProxyConfig = parse_yaml(yaml).unwrap();
     assert_eq!(cfg.auth.unwrap().jwt.unwrap().jwks_max_age_secs, 300);
 
     let yaml = "upstream:\n  default: \"grpc://x:1\"\nauth:\n  mode: jwt\n  jwt:\n    jwks_uri: \"https://idp/jwks\"\n    jwks_max_age_secs: 120\n";
-    let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+    let cfg: ProxyConfig = parse_yaml(yaml).unwrap();
     assert_eq!(cfg.auth.unwrap().jwt.unwrap().jwks_max_age_secs, 120);
 }
 
@@ -69,7 +69,7 @@ fn jwks_max_age_defaults_and_overrides() {
 fn jwt_cache_defaults_and_overrides() {
     // Without a `cache:` block the cache is on with its defaults.
     let yaml = "upstream:\n  default: \"grpc://x:1\"\nauth:\n  mode: jwt\n  jwt:\n    jwks_uri: \"https://idp/jwks\"\n";
-    let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+    let cfg: ProxyConfig = parse_yaml(yaml).unwrap();
     let cache = &cfg.auth.unwrap().jwt.unwrap().cache;
     assert!(cache.enabled);
     assert_eq!(cache.max_entries, 10_000);
@@ -78,7 +78,7 @@ fn jwt_cache_defaults_and_overrides() {
 
     // Keys given keep the rest at their defaults.
     let yaml = "upstream:\n  default: \"grpc://x:1\"\nauth:\n  mode: jwt\n  jwt:\n    jwks_uri: \"https://idp/jwks\"\n    cache:\n      max_ttl_secs: 15\n      max_token_bytes: 2048\n";
-    let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+    let cfg: ProxyConfig = parse_yaml(yaml).unwrap();
     let cache = &cfg.auth.unwrap().jwt.unwrap().cache;
     assert!(cache.enabled);
     assert_eq!(cache.max_entries, 10_000);
@@ -90,14 +90,14 @@ fn jwt_cache_defaults_and_overrides() {
 fn jwt_cache_rejects_unknown_keys() {
     // `ttl` for `max_ttl_secs` would otherwise leave the default in force.
     let yaml = "upstream:\n  default: \"grpc://x:1\"\nauth:\n  mode: jwt\n  jwt:\n    cache:\n      ttl: 15\n";
-    let err = serde_yaml::from_str::<ProxyConfig>(yaml).unwrap_err();
+    let err = parse_yaml::<ProxyConfig>(yaml).unwrap_err();
     assert!(err.to_string().contains("ttl"), "{err}");
 }
 
 #[test]
 fn health_and_metrics_defaults_and_overrides() {
     // Defaults: enabled, conventional paths.
-    let min: ProxyConfig = serde_yaml::from_str("upstream:\n  default: \"grpc://x:1\"\n").unwrap();
+    let min: ProxyConfig = parse_yaml("upstream:\n  default: \"grpc://x:1\"\n").unwrap();
     assert!(min.health.enabled);
     assert_eq!(min.health.path, "/health");
     assert_eq!(min.health.ready_path, "/health/ready");
@@ -114,7 +114,7 @@ metrics:
   enabled: false
   path: "/internal/metrics"
 "#;
-    let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+    let cfg: ProxyConfig = parse_yaml(yaml).unwrap();
     assert_eq!(cfg.health.path, "/internal/health");
     // live_path was not overridden, so it stays at the default.
     assert_eq!(cfg.health.live_path, "/health/live");
@@ -270,7 +270,7 @@ forwarded_headers:
   - "dpop"
   - "x-request-id"
 "#;
-    let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+    let config: ProxyConfig = parse_yaml(yaml).unwrap();
     assert_eq!(
         config.upstream.as_ref().unwrap().default,
         "grpc://sid-identity:4180"
@@ -305,7 +305,7 @@ auth:
   authz:
     enabled: false
 "#;
-    let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+    let config: ProxyConfig = parse_yaml(yaml).unwrap();
     let authz = config.auth.unwrap().authz.unwrap();
     assert!(!authz.enabled);
     assert_eq!(authz.endpoint, "");
@@ -319,7 +319,7 @@ upstream:
 descriptors:
   - file: "/etc/proxy/service.descriptor.bin"
 "#;
-    let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+    let config: ProxyConfig = parse_yaml(yaml).unwrap();
     assert_eq!(config.descriptors.len(), 1);
     match &config.descriptors[0] {
         DescriptorSource::File { file } => {
@@ -337,7 +337,7 @@ upstream:
 descriptors:
   - reflection: "grpc://localhost:4180"
 "#;
-    let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+    let config: ProxyConfig = parse_yaml(yaml).unwrap();
     match &config.descriptors[0] {
         DescriptorSource::Reflection { reflection } => {
             assert_eq!(reflection, "grpc://localhost:4180");
@@ -372,7 +372,7 @@ shield:
       key: { type: ip }
       profil: "auth"
 "#;
-    let err = serde_yaml::from_str::<ProxyConfig>(yaml);
+    let err = parse_yaml::<ProxyConfig>(yaml);
     assert!(err.is_err(), "unknown shield field must be rejected");
 }
 
@@ -393,7 +393,7 @@ shield:
       key: { type: ip, name: x-api-key }
       profile: "auth"
 "#;
-    let err = serde_yaml::from_str::<ProxyConfig>(yaml);
+    let err = parse_yaml::<ProxyConfig>(yaml);
     assert!(err.is_err(), "unknown field in a rule key must be rejected");
 }
 
@@ -409,7 +409,7 @@ openapi:
   title: "Test API"
   version: "2.0.0"
 "#;
-    let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+    let config: ProxyConfig = parse_yaml(yaml).unwrap();
     let openapi = config.openapi.unwrap();
     assert!(openapi.enabled);
     assert_eq!(openapi.path, "/api/openapi.json");
@@ -426,7 +426,7 @@ upstream:
 openapi:
   enabled: true
 "#;
-    let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+    let config: ProxyConfig = parse_yaml(yaml).unwrap();
     let openapi = config.openapi.unwrap();
     assert!(openapi.enabled);
     assert_eq!(openapi.path, "/openapi.json");
@@ -481,8 +481,7 @@ streaming:
 fn known_top_level_keys_cover_every_proxy_config_field() {
     // Exhaustive destructuring: adding a ProxyConfig field fails to compile
     // here until the field is also listed as a known top-level key.
-    let config: ProxyConfig =
-        serde_yaml::from_str("upstream:\n  default: \"grpc://x:1\"\n").unwrap();
+    let config: ProxyConfig = parse_yaml("upstream:\n  default: \"grpc://x:1\"\n").unwrap();
     let ProxyConfig {
         upstream: _,
         descriptors: _,
@@ -735,7 +734,7 @@ fn known_streaming_keys_cover_both_streaming_structs() {
 
 /// The transcoding options a YAML document compiles to.
 fn transcode_options(yaml: &str) -> Result<crate::transcode::TranscodeOptions, String> {
-    serde_yaml::from_str::<TranscodeFileConfig>(yaml)
+    parse_yaml::<TranscodeFileConfig>(yaml)
         .map_err(|e| e.to_string())?
         .options()
 }
@@ -775,7 +774,7 @@ error_details:
         .enabled_for("/v1/public/internal/{id}"));
     assert!(!options.error_details.enabled_for("/v1/admin/items"));
     // The ProxyConfig still reads its own streaming key from the same section.
-    let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+    let config: ProxyConfig = parse_yaml(yaml).unwrap();
     assert_eq!(config.streaming.sse_keep_alive_secs, 30);
 }
 
@@ -808,4 +807,139 @@ fn transcode_settings_reject_a_relative_route_pattern() {
     )
     .unwrap_err();
     assert!(err.contains("must start with '/'"), "{err}");
+}
+
+#[test]
+fn json_text_reads_as_a_config() {
+    // Embedders build configurations as JSON and hand the text to
+    // `from_yaml_str`: JSON is YAML, and must stay accepted.
+    let json = r#"{"upstream": {"default": "grpc://x:1"}, "service": {"name": "demo"},
+        "cors": {"origins": ["https://app.example"], "grpc_web": false},
+        "streaming": {"sse_keep_alive_secs": 5, "ndjson_envelope": true}}"#;
+    let config = ProxyConfig::from_yaml_str(json).unwrap();
+    assert_eq!(config.upstream.unwrap().default, "grpc://x:1");
+    assert_eq!(config.service.name, "demo");
+    assert_eq!(config.cors.origins, ["https://app.example"]);
+    assert!(!config.cors.grpc_web);
+    assert_eq!(config.streaming.sse_keep_alive_secs, 5);
+    assert!(transcode_options(json).unwrap().ndjson_envelope);
+    assert!(unknown_config_keys(json).is_empty());
+}
+
+#[test]
+fn only_yaml_1_2_booleans_are_booleans() {
+    // `yes`, `on` and friends are YAML 1.1; a reader that took them for
+    // booleans would turn on settings the format never defined that way.
+    for value in ["yes", "no", "on", "off", "Y", "n"] {
+        let err = ProxyConfig::from_yaml_str(&format!("cors:\n  grpc_web: {value}\n")).unwrap_err();
+        assert!(err.to_string().contains("cors.grpc_web"), "{value}: {err}");
+    }
+    for (value, expected) in [("true", true), ("false", false)] {
+        let config = ProxyConfig::from_yaml_str(&format!("cors:\n  grpc_web: {value}\n")).unwrap();
+        assert_eq!(config.cors.grpc_web, expected, "{value}");
+    }
+}
+
+#[test]
+fn a_parse_error_names_the_key_path_on_one_line() {
+    // The key path tells the operator where the mistake is; the message stays
+    // on one line so a log record holds all of it.
+    let err = ProxyConfig::from_yaml_str("cors:\n  max_age_secs: soon\n").unwrap_err();
+    let message = err.to_string();
+    assert!(message.starts_with("cors.max_age_secs: "), "{message}");
+    assert!(!message.contains('\n'), "{message}");
+
+    // Inside a list, the index is part of the path.
+    let yaml =
+        "shield:\n  rules:\n    - pattern: \"/**\"\n      key: { type: ip }\n      profil: anon\n";
+    let message = ProxyConfig::from_yaml_str(yaml).unwrap_err().to_string();
+    assert!(message.contains("shield.rules[0]"), "{message}");
+    assert!(message.contains("profil"), "{message}");
+}
+
+#[test]
+fn a_document_that_is_not_a_config_map_is_refused_without_a_path() {
+    // Nothing inside the document is at fault, so no path is named.
+    for yaml in ["just text", "[1, 2]", "upstream: [unclosed"] {
+        let message = parse_yaml::<ProxyConfig>(yaml).unwrap_err().to_string();
+        assert!(!message.is_empty(), "{yaml}");
+        assert!(!message.starts_with(':'), "{yaml}: {message}");
+        assert!(!message.contains('\n'), "{yaml}: {message}");
+    }
+}
+
+#[test]
+fn an_empty_document_is_the_default_config() {
+    // A file with only comments, like an empty one, sets nothing.
+    for yaml in ["", "# nothing set yet\n", "---\n"] {
+        let config = ProxyConfig::from_yaml_str(yaml).unwrap();
+        assert!(config.upstream.is_none(), "{yaml:?}");
+        assert_eq!(config.listen.http, "0.0.0.0:8080", "{yaml:?}");
+        assert!(unknown_config_keys(yaml).is_empty(), "{yaml:?}");
+    }
+}
+
+#[test]
+fn a_repeated_key_is_refused() {
+    // Which of two values would win is not something to guess for a config.
+    let err = ProxyConfig::from_yaml_str("service:\n  name: a\nservice:\n  name: b\n").unwrap_err();
+    assert!(err.to_string().contains("service"), "{err}");
+}
+
+#[test]
+fn more_than_one_document_is_refused() {
+    // Only the first would be read; the rest would be silently dropped.
+    assert!(ProxyConfig::from_yaml_str("service:\n  name: a\n---\nservice:\n  name: b\n").is_err());
+}
+
+#[test]
+fn unknown_keys_keep_the_document_order() {
+    // Reported in the order the operator wrote them, streaming ones by path.
+    let yaml =
+        "zeta: 1\nupstream:\n  default: \"grpc://x:1\"\nalpha: 2\nstreaming:\n  zz: 1\n  aa: 2\n";
+    assert_eq!(
+        unknown_config_keys(yaml),
+        ["zeta", "alpha", "streaming.zz", "streaming.aa"]
+    );
+}
+
+#[test]
+fn unknown_keys_of_an_unreadable_document_are_none() {
+    // The parse error is the one to report; there is no key list to warn on.
+    for yaml in [
+        "just text",
+        "[1, 2]",
+        "upstream: [unclosed",
+        "streaming: 5\n",
+    ] {
+        assert!(unknown_config_keys(yaml).is_empty(), "{yaml}");
+    }
+}
+
+#[test]
+fn an_empty_streaming_section_has_no_unknown_keys() {
+    // `streaming:` with no value sets nothing; it is no typo.
+    assert!(unknown_config_keys("streaming:\nstreamin:\n") == ["streamin"]);
+}
+
+#[test]
+fn a_non_string_key_is_reported_by_its_text() {
+    // A key no setting reads is reported whatever it looks like.
+    assert_eq!(unknown_config_keys("8080: listen\n"), ["8080"]);
+}
+
+#[test]
+fn shield_trusted_proxies_names_its_new_place_even_when_empty() {
+    // An empty value still shows where the operator meant to set the list.
+    let err = ProxyConfig::from_yaml_str("shield:\n  trusted_proxies:\n").unwrap_err();
+    assert!(
+        err.to_string().contains("client_address.trusted_proxies"),
+        "{err}"
+    );
+    // A `shield:` that is not a map has its own error, not this one.
+    let err = ProxyConfig::from_yaml_str("shield: 5\n").unwrap_err();
+    assert!(
+        !err.to_string().contains("client_address.trusted_proxies"),
+        "{err}"
+    );
 }

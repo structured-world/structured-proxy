@@ -421,7 +421,7 @@ fn http_body_request_and_response_are_raw_content() {
 
 #[test]
 fn aliases_get_their_own_operation_ids() {
-    let alias: AliasConfig = serde_yaml::from_str("from: /api/{path}\nto: /v1").unwrap();
+    let alias: AliasConfig = crate::config::parse_yaml("from: /api/{path}\nto: /v1").unwrap();
     let spec = spec(&[alias]);
     assert_eq!(
         spec["paths"]["/v1/items"]["post"]["operationId"],
