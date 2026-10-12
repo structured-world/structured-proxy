@@ -581,7 +581,7 @@ mod builtin {
                 issuer: Some("test-iss".into()),
                 audience: Some("test-aud".into()),
                 public_key_pem_file: Some(temp_pub_pem()),
-                cache: serde_yaml::from_str("max_token_bytes: 64").unwrap(),
+                cache: crate::config::parse_yaml("max_token_bytes: 64").unwrap(),
                 ..jwt_claims_only()
             }),
             forward_auth: Some(secure_policy(&[])),
@@ -643,7 +643,7 @@ mod builtin {
                 issuer: Some("test-iss".into()),
                 audience: Some("test-aud".into()),
                 public_key_pem_file: Some(temp_pub_pem()),
-                cache: serde_yaml::from_str("enabled: false").unwrap(),
+                cache: crate::config::parse_yaml("enabled: false").unwrap(),
                 ..jwt_claims_only()
             }),
             forward_auth: Some(secure_policy(&[])),
@@ -693,7 +693,7 @@ mod builtin {
             mode: "jwt".into(),
             jwt: Some(JwtConfig {
                 public_key_pem_file: Some(temp_pub_pem()),
-                cache: serde_yaml::from_str("max_entries: 0").unwrap(),
+                cache: crate::config::parse_yaml("max_entries: 0").unwrap(),
                 ..jwt_claims_only()
             }),
             forward_auth: None,

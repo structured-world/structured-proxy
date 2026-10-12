@@ -78,7 +78,7 @@ service S {
 }
 "#,
     );
-    let alias: AliasConfig = serde_yaml::from_str("from: /api/{path}\nto: /v1").unwrap();
+    let alias: AliasConfig = crate::config::parse_yaml("from: /api/{path}\nto: /v1").unwrap();
     let paths = route_paths(&pool, &[alias], &RpcSelection::default());
     for expected in [
         "/v1/files/{*path}",

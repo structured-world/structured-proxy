@@ -326,8 +326,49 @@ pub struct TranscodeConfig {
 /// assert!(shield.enabled);
 /// ```
 pub fn from_yaml<T: serde::de::DeserializeOwned>(yaml: &str) -> anyhow::Result<T> {
-    Ok(serde_yaml::from_str(yaml)?)
+    Ok(parse_yaml(yaml)?)
 }
+
+/// The YAML reader of every config path, with the YAML 1.2 core schema's
+/// types: a boolean is `true` or `false` in any letter case (`True`, `TRUE`),
+/// while `yes`, `no`, `on` and `off` are refused; an unquoted number or
+/// boolean where text is expected is an error, not the text it spells, so
+/// `name: true` does not start a service called "true". Errors stay on one
+/// line, without a snippet of the document, so a log record holds the whole
+/// message.
+pub(crate) fn parse_yaml<T: serde::de::DeserializeOwned>(yaml: &str) -> Result<T, YamlError> {
+    let mut path = None;
+    serde_saphyr::with_deserializer_from_str_with_options(
+        yaml,
+        serde_saphyr::options! {
+            // Matches `true`/`false` ignoring case, the core schema's spellings.
+            strict_booleans: true,
+            no_schema: true,
+            with_snippet: false,
+        },
+        |de| {
+            serde_path_to_error::deserialize(de).map_err(|e| {
+                if e.path().iter().next().is_some() {
+                    path = Some(e.path().to_string());
+                }
+                e.into_inner()
+            })
+        },
+    )
+    .map_err(|e| {
+        YamlError(match path {
+            Some(path) => format!("{path}: {e}"),
+            // The document as a whole is at fault (not YAML, not a map).
+            None => e.to_string(),
+        })
+    })
+}
+
+/// A YAML document that does not read as the config it should be, naming the
+/// key at fault the way the document spells its path (`runtime.worker_threads`).
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct YamlError(String);
 
 /// How gRPC-Web calls reach the upstream.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -500,40 +541,163 @@ pub(crate) const KNOWN_STREAMING_KEYS: &[&str] = &["sse_keep_alive_secs", "ndjso
 /// force. They are reported, not rejected, so a file that loaded before keeps
 /// loading.
 pub(crate) fn unknown_config_keys(yaml: &str) -> Vec<String> {
-    let Ok(serde_yaml::Value::Mapping(map)) = serde_yaml::from_str(yaml) else {
+    let Ok(ConfigKeys { top, streaming }) = parse_yaml(yaml) else {
         return Vec::new();
     };
-    let mut unknown: Vec<String> = map
-        .keys()
-        .filter_map(|key| key.as_str())
-        .filter(|key| !KNOWN_TOP_LEVEL_KEYS.contains(key))
-        .map(str::to_owned)
+    let mut unknown: Vec<String> = top
+        .into_iter()
+        .filter(|key| !KNOWN_TOP_LEVEL_KEYS.contains(&key.as_str()))
         .collect();
     // `streaming:` is split between StreamingConfig and StreamingFileConfig,
     // so neither can deny unknown fields; its keys are checked here instead.
-    if let Some(serde_yaml::Value::Mapping(streaming)) = map.get("streaming") {
-        unknown.extend(
-            streaming
-                .keys()
-                .filter_map(|key| key.as_str())
-                .filter(|key| !KNOWN_STREAMING_KEYS.contains(key))
-                .map(|key| format!("streaming.{key}")),
-        );
-    }
+    unknown.extend(
+        streaming
+            .iter()
+            .filter(|key| !KNOWN_STREAMING_KEYS.contains(&key.as_str()))
+            .map(|key| format!("streaming.{key}")),
+    );
     unknown
+}
+
+/// The keys of a config document in their order: the top-level ones and those
+/// of `streaming:`. A document that is empty or not a map has none.
+#[derive(Default)]
+struct ConfigKeys {
+    top: Vec<String>,
+    streaming: Vec<String>,
+}
+
+impl<'de> Deserialize<'de> for ConfigKeys {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = ConfigKeys;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a config map")
+            }
+            fn visit_unit<E>(self) -> Result<ConfigKeys, E> {
+                Ok(ConfigKeys::default())
+            }
+            fn visit_none<E>(self) -> Result<ConfigKeys, E> {
+                Ok(ConfigKeys::default())
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<ConfigKeys, A::Error> {
+                let mut keys = ConfigKeys::default();
+                while let Some(TextKey(key)) = map.next_key()? {
+                    match key {
+                        Some(key) if key == "streaming" => {
+                            keys.streaming = map.next_value::<MapKeys>()?.0;
+                            keys.top.push(key);
+                        }
+                        Some(key) => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                            keys.top.push(key);
+                        }
+                        None => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(keys)
+            }
+        }
+        de.deserialize_any(Visitor)
+    }
+}
+
+/// The keys of a map in their order; an empty value has none.
+struct MapKeys(Vec<String>);
+
+impl<'de> Deserialize<'de> for MapKeys {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = MapKeys;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a map")
+            }
+            fn visit_unit<E>(self) -> Result<MapKeys, E> {
+                Ok(MapKeys(Vec::new()))
+            }
+            fn visit_none<E>(self) -> Result<MapKeys, E> {
+                Ok(MapKeys(Vec::new()))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<MapKeys, A::Error> {
+                let mut keys = Vec::new();
+                while let Some(TextKey(key)) = map.next_key()? {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                    keys.extend(key);
+                }
+                Ok(MapKeys(keys))
+            }
+        }
+        de.deserialize_any(Visitor)
+    }
+}
+
+/// A map key as text; `None` for a key that is a number or a boolean, which
+/// no setting is named by and which the reader refuses to take for text.
+struct TextKey(Option<String>);
+
+impl<'de> Deserialize<'de> for TextKey {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = TextKey;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a scalar key")
+            }
+            fn visit_str<E>(self, key: &str) -> Result<TextKey, E> {
+                Ok(TextKey(Some(key.to_owned())))
+            }
+            fn visit_string<E>(self, key: String) -> Result<TextKey, E> {
+                Ok(TextKey(Some(key)))
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<TextKey, E> {
+                Ok(TextKey(None))
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<TextKey, E> {
+                Ok(TextKey(None))
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<TextKey, E> {
+                Ok(TextKey(None))
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<TextKey, E> {
+                Ok(TextKey(None))
+            }
+        }
+        de.deserialize_any(Visitor)
+    }
 }
 
 /// The error for a config that sets `shield.trusted_proxies`, which became
 /// `client_address.trusted_proxies`: the parse error alone would name an
 /// unknown field, not where its value belongs now.
 fn moved_setting(yaml: &str) -> Option<anyhow::Error> {
-    let serde_yaml::Value::Mapping(map) = serde_yaml::from_str(yaml).ok()? else {
-        return None;
-    };
-    let serde_yaml::Value::Mapping(shield) = map.get("shield")? else {
-        return None;
-    };
-    shield.contains_key("trusted_proxies").then(|| {
+    /// The settings that moved, each `true` when the document names it.
+    #[derive(Deserialize)]
+    struct Moved {
+        #[serde(default)]
+        shield: Option<MovedFromShield>,
+    }
+    #[derive(Deserialize)]
+    struct MovedFromShield {
+        #[serde(default, deserialize_with = "named")]
+        trusted_proxies: bool,
+    }
+    /// A key that is present, whatever its value, even `null`.
+    fn named<'de, D: serde::Deserializer<'de>>(de: D) -> Result<bool, D::Error> {
+        serde::de::IgnoredAny::deserialize(de).map(|_| true)
+    }
+
+    let moved: Moved = parse_yaml(yaml).ok()?;
+    moved.shield?.trusted_proxies.then(|| {
         anyhow::anyhow!(
             "shield.trusted_proxies is now client_address.trusted_proxies: the client \
              address is resolved once for the rate limits, the hooks and the upstream"
@@ -1597,7 +1761,7 @@ impl ProxyConfig {
     /// Useful for embedding the proxy: load a baked-in config (e.g. via
     /// `include_str!`) without touching the filesystem.
     pub fn from_yaml_str(yaml: &str) -> anyhow::Result<Self> {
-        let config: Self = match serde_yaml::from_str(yaml) {
+        let config: Self = match parse_yaml(yaml) {
             Ok(config) => config,
             Err(error) => return Err(moved_setting(yaml).map_or_else(|| error.into(), Into::into)),
         };
