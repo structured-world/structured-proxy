@@ -413,7 +413,7 @@ fn query_params(
             continue;
         }
         match field.kind() {
-            Kind::Message(inner) if !is_well_known(&inner) => {
+            Kind::Message(inner) if !has_string_form(&inner) => {
                 if field.is_list() || on_the_way.iter().any(|m| m == inner.full_name()) {
                     continue;
                 }
@@ -429,6 +429,21 @@ fn query_params(
             })),
         }
     }
+}
+
+/// Whether a query value can be a whole `msg`: a well-known type the parser
+/// reads from one string (`Value` as its string value). `Any`, `Struct`,
+/// `ListValue` and `Empty` have no string form, so their fields are bound
+/// one by one, as any other message's.
+fn has_string_form(msg: &MessageDescriptor) -> bool {
+    is_well_known(msg)
+        && !matches!(
+            msg.full_name(),
+            "google.protobuf.Any"
+                | "google.protobuf.Struct"
+                | "google.protobuf.ListValue"
+                | "google.protobuf.Empty"
+        )
 }
 
 /// The field a (possibly dotted) `response_body` path names in `output`,
@@ -547,6 +562,12 @@ fn field_to_schema(field: &FieldDescriptor, encoding: Encoding) -> Value {
         Kind::Enum(e) => {
             let values: Vec<Value> = e.values().map(|v| json!(v.name())).collect();
             json!({ "type": "string", "enum": values })
+        }
+        // A parameter string becomes a `Value`'s string value.
+        Kind::Message(msg)
+            if encoding == Encoding::Param && msg.full_name() == "google.protobuf.Value" =>
+        {
+            json!({ "type": "string" })
         }
         Kind::Message(msg) => {
             if is_well_known(&msg) {

@@ -128,6 +128,7 @@ syntax = "proto3";
 package test.v1;
 import "google/api/annotations.proto";
 import "google/api/httpbody.proto";
+import "google/protobuf/any.proto";
 import "google/protobuf/duration.proto";
 import "google/protobuf/empty.proto";
 import "google/protobuf/field_mask.proto";
@@ -217,6 +218,11 @@ message NullQuery {
   map<string, string> tags = 4;
   repeated Note notes = 5;
   google.protobuf.Timestamp since = 6;
+  google.protobuf.Any payload = 7;
+  google.protobuf.Struct attrs = 8;
+  google.protobuf.ListValue items = 9;
+  google.protobuf.Empty nothing = 10;
+  google.protobuf.Value loose = 11;
 }
 message NullFilter {
   google.protobuf.NullValue none = 1;
@@ -752,14 +758,37 @@ fn null_value_is_json_null_in_bodies_and_a_name_in_parameters() {
 #[test]
 fn query_parameters_are_the_keys_the_parser_reads() {
     // A map or a repeated message cannot be set from a query string, so it
-    // is no parameter; a well-known type is one, read from its string form.
+    // is no parameter. A well-known type with a string form is one, read from
+    // that string; one without (`Any`, `Struct`, `ListValue`, `Empty`) is
+    // bound through its own fields, like any message.
     let spec = spec(&[]);
     let ping = &spec["paths"]["/v1/ping"]["get"];
-    assert_eq!(query_names(ping), ["none", "nones", "filter.none", "since"]);
     assert_eq!(
-        ping["parameters"][3]["schema"],
+        query_names(ping),
+        [
+            "none",
+            "nones",
+            "filter.none",
+            "since",
+            "payload.type_url",
+            "payload.value",
+            "items.values",
+            "loose"
+        ]
+    );
+    let params = ping["parameters"].as_array().unwrap();
+    assert_eq!(
+        params[3]["schema"],
         json!({ "type": "string", "format": "date-time" })
     );
+    // A `Value` read from a query string is its string value, each repeated
+    // key one more element of `ListValue.values`.
+    let string = json!({ "type": "string" });
+    assert_eq!(
+        params[6]["schema"],
+        json!({ "type": "array", "items": string })
+    );
+    assert_eq!(params[7]["schema"], string);
 }
 
 #[test]
