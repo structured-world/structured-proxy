@@ -51,6 +51,11 @@ jobs:
           # These two are what the job uses: `pull-requests` to approve, to read
           # whether auto-merge is armed and to disarm it, and `contents` because
           # merging writes to the branch.
+          #
+          # No `workflows` permission, also for updates that change files under
+          # .github/workflows: that permission governs pushing those files, while
+          # an auto-merge is carried out by GitHub itself, and this App's token
+          # without it already merges Dependabot's GitHub Actions updates.
           permission-contents: write
           permission-pull-requests: write
 
@@ -65,17 +70,15 @@ jobs:
       # approval is left to the repository's stale-review dismissal, which is
       # the setting that exists for it.
       #
-      # A rerun is not a push. Rerunning a Dependabot run leaves `actor` as
-      # dependabot and makes `triggering_actor` whoever asked, the same shape a
-      # foreign push has, except that nothing moved. Only a first attempt is a
-      # real event, and only a real event can have moved anything; without that
-      # check a maintainer rerunning checks would disarm the auto-merge
-      # Dependabot armed, with nothing to arm it again.
+      # `actor` is who caused the event, and a rerun keeps it (only
+      # `triggering_actor` becomes whoever asked): a rerun of a foreign push
+      # disarms again, so a failed attempt can be retried, and a rerun of a
+      # Dependabot push never disarms what Dependabot armed. A reopen moves
+      # nothing, so it never disarms.
       - name: Disarm auto-merge when someone else moved the head
         if: >-
-          github.run_attempt == 1
-          && (github.actor != 'dependabot[bot]'
-              || github.triggering_actor != 'dependabot[bot]')
+          github.event.action == 'synchronize'
+          && github.actor != 'dependabot[bot]'
         # The head is checked because disarming has no precondition of its own:
         # `--match-head-commit` maps to `expectedHeadOid`, which the mutation
         # behind `--disable-auto` does not take. Without the check, a slow run
@@ -110,28 +113,34 @@ jobs:
       # `github.token`, which the permissions block above scopes to reading the
       # pull request.
       #
-      # A rerun of a Dependabot run (`actor` still dependabot, a later attempt)
-      # runs it too, so a transient failure can be retried by hand. A rerun
-      # replays the event Dependabot caused, and if the head moved since, the
-      # merge below refuses it: `--match-head-commit` names the head that
-      # event saw.
+      # It runs for every event Dependabot caused, reruns included (they keep
+      # `actor`), so a transient failure can be retried by hand, and for a
+      # reopen by anyone, after which an unchanged pull request is armed again.
       - name: Dependabot metadata
         id: metadata
         if: >-
           github.actor == 'dependabot[bot]'
-          && (github.triggering_actor == 'dependabot[bot]'
-              || github.run_attempt > 1)
+          || github.event.action == 'reopened'
         uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.1
 
       # The metadata step is skipped for a foreign push, so its outputs are
-      # empty there and this condition is false: approval happens only on a run
-      # of an event Dependabot itself caused.
+      # empty there and this condition is false.
       - name: Approve and enable auto-merge for minor/patch updates
         if: steps.metadata.outputs.update-type == 'version-update:semver-minor' || steps.metadata.outputs.update-type == 'version-update:semver-patch'
+        # fetch-metadata verifies only the first commit of the pull request
+        # (author and signature), and a reopen can come after someone else
+        # pushed: a Dependabot pull request is always one commit, so a second
+        # one is someone else's and leaves the update to manual review.
+        #
         # Both operations name the head this run actually inspected, rather than
         # just the pull request: the approval is recorded against a commit id,
         # and the merge refuses outright if the head has moved.
         run: |
+          commits=$(gh pr view "$PR_NUMBER" --json commits --jq '.commits | length')
+          if [ "$commits" != 1 ]; then
+            echo "$commits commits, not Dependabot's one; leaving it for review"
+            exit 0
+          fi
           gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews" \
             -f event=APPROVE -f commit_id="$HEAD_SHA" --silent
           gh pr merge --auto --squash --match-head-commit "$HEAD_SHA" "$PR_NUMBER"
