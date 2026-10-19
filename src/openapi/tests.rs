@@ -213,6 +213,13 @@ message Wire {
 message NullQuery {
   google.protobuf.NullValue none = 1;
   repeated google.protobuf.NullValue nones = 2;
+  NullFilter filter = 3;
+  map<string, string> tags = 4;
+  repeated Note notes = 5;
+  google.protobuf.Timestamp since = 6;
+}
+message NullFilter {
+  google.protobuf.NullValue none = 1;
 }
 
 service Api {
@@ -424,36 +431,40 @@ fn body_rule_decides_body_and_query_fields() {
     assert_eq!(touch["parameters"].as_array().unwrap().len(), 3);
 }
 
+/// The names of the query parameters of `operation`, in order.
+fn query_names(operation: &Value) -> Vec<&str> {
+    operation["parameters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["in"] == "query")
+        .map(|p| p["name"].as_str().unwrap())
+        .collect()
+}
+
 #[test]
-fn message_typed_query_parameter_schema_is_registered() {
-    // `filter` is bound only through the query; its `$ref` must resolve to a
-    // schema in `components`.
+fn message_typed_query_field_is_one_parameter_per_leaf() {
+    // The query parser reads a field below `filter` from the dotted key
+    // `filter.q`, so that is the parameter, typed as the leaf.
     let spec = spec(&[]);
-    let param = &spec["paths"]["/v1/find"]["get"]["parameters"][0];
-    assert_eq!(param["in"], "query");
-    assert_eq!(param["schema"]["$ref"], "#/components/schemas/Filter");
-    assert!(
-        spec["components"]["schemas"].get("Filter").is_some(),
-        "{}",
-        spec["components"]["schemas"]
-    );
+    let find = &spec["paths"]["/v1/find"]["get"];
+    assert_eq!(query_names(find), ["filter.q"]);
+    assert_eq!(find["parameters"][0]["schema"], json!({ "type": "string" }));
 }
 
 #[test]
 fn self_referencing_message_does_not_recurse_forever() {
-    // `Tree.child` is a `Tree`: in the query (GET) and in the body (POST) its
-    // schema is registered once and referenced, instead of being expanded
-    // until the stack overflows.
+    // `Tree.child` is a `Tree`: in the body (POST) its schema is registered
+    // once and referenced, and in the query (GET) a message already on the
+    // way is not entered again, instead of being expanded until the stack
+    // overflows.
     let spec = spec(&[]);
     let tree = &spec["components"]["schemas"]["Tree"];
     assert_eq!(
         tree["properties"]["child"]["$ref"],
         "#/components/schemas/Tree"
     );
-    assert_eq!(
-        spec["paths"]["/v1/tree"]["get"]["parameters"][1]["schema"]["$ref"],
-        "#/components/schemas/Tree"
-    );
+    assert_eq!(query_names(&spec["paths"]["/v1/tree"]["get"]), ["name"]);
     assert!(spec["paths"]["/v1/tree"]["post"]["requestBody"].is_object());
 }
 
@@ -699,12 +710,18 @@ fn every_response_validates_against_its_schema() {
         let value: Value = serde_json::from_slice(&body).unwrap();
         check_wire(&value, schema, components, &format!("Wire#{variant}"));
     }
+    // Nothing set: every scalar and enum goes out with its default value.
+    let empty = DynamicMessage::new(wire);
+    let body = transcode::json_body(&empty, None).unwrap();
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    check_wire(&value, schema, components, "Wire#default");
 }
 
 #[test]
 fn null_value_is_json_null_in_bodies_and_a_name_in_parameters() {
     // ProtoJSON writes a `NullValue` as `null`, alone, as a oneof member, in
-    // a list and as a map value; the query parser reads it by its enum name.
+    // a list and as a map value; the query parser reads it by its enum name,
+    // below a message field too.
     let spec = spec(&[]);
     let wire = &spec["components"]["schemas"]["Wire"]["properties"];
     let only_null = json!({ "nullable": true, "enum": [null] });
@@ -720,14 +737,28 @@ fn null_value_is_json_null_in_bodies_and_a_name_in_parameters() {
     );
     assert!(spec["components"]["schemas"].get("NullValue").is_none());
 
-    let params = spec["paths"]["/v1/ping"]["get"]["parameters"]
-        .as_array()
-        .unwrap();
+    let ping = &spec["paths"]["/v1/ping"]["get"];
+    let params = ping["parameters"].as_array().unwrap();
     let name = json!({ "type": "string", "enum": ["NULL_VALUE"] });
     assert_eq!(params[0]["schema"], name);
     assert_eq!(
         params[1]["schema"],
         json!({ "type": "array", "items": name })
+    );
+    assert_eq!(params[2]["name"], "filter.none");
+    assert_eq!(params[2]["schema"], name);
+}
+
+#[test]
+fn query_parameters_are_the_keys_the_parser_reads() {
+    // A map or a repeated message cannot be set from a query string, so it
+    // is no parameter; a well-known type is one, read from its string form.
+    let spec = spec(&[]);
+    let ping = &spec["paths"]["/v1/ping"]["get"];
+    assert_eq!(query_names(ping), ["none", "nones", "filter.none", "since"]);
+    assert_eq!(
+        ping["parameters"][3]["schema"],
+        json!({ "type": "string", "format": "date-time" })
     );
 }
 

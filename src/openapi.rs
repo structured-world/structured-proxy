@@ -305,23 +305,9 @@ fn build_operation(
     };
     // With `body: "*"` the whole message is the body: no query parameters.
     if binding.body != BodyMapping::Root {
-        params.extend(
-            input
-                .fields()
-                .filter(|f| {
-                    !path_params.contains(&f.name().to_string()) && body_field != Some(f.name())
-                })
-                .map(|field| {
-                    // A message-typed parameter refers to its schema by `$ref`.
-                    register_nested(&field, schemas);
-                    json!({
-                        "name": field.name(),
-                        "in": "query",
-                        "required": false,
-                        "schema": field_to_schema(&field, Encoding::Param),
-                    })
-                }),
-        );
+        let bound = |key: &str| path_params.iter().any(|p| p == key) || body_field == Some(key);
+        let mut on_the_way = vec![input.full_name().to_owned()];
+        query_params(&input, "", &bound, &mut on_the_way, &mut params);
     }
     if !params.is_empty() {
         op["parameters"] = json!(params);
@@ -406,6 +392,43 @@ fn build_operation(
     }
 
     op
+}
+
+/// Push a query parameter for every field below `msg` that `bound` (the path
+/// and the body) leaves to the query, keyed by its dotted proto path as the
+/// query parser reads it: a field of a message field is `filter.q`, not an
+/// object `filter`. A map or a repeated message cannot be set from a query
+/// string, and a message in `on_the_way` is not entered again, so a message
+/// that contains itself ends.
+fn query_params(
+    msg: &MessageDescriptor,
+    prefix: &str,
+    bound: &dyn Fn(&str) -> bool,
+    on_the_way: &mut Vec<String>,
+    params: &mut Vec<Value>,
+) {
+    for field in msg.fields() {
+        let key = format!("{prefix}{}", field.name());
+        if bound(&key) || field.is_map() {
+            continue;
+        }
+        match field.kind() {
+            Kind::Message(inner) if !is_well_known(&inner) => {
+                if field.is_list() || on_the_way.iter().any(|m| m == inner.full_name()) {
+                    continue;
+                }
+                on_the_way.push(inner.full_name().to_owned());
+                query_params(&inner, &format!("{key}."), bound, on_the_way, params);
+                on_the_way.pop();
+            }
+            _ => params.push(json!({
+                "name": key,
+                "in": "query",
+                "required": false,
+                "schema": field_to_schema(&field, Encoding::Param),
+            })),
+        }
+    }
 }
 
 /// The field a (possibly dotted) `response_body` path names in `output`,
