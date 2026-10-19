@@ -11,10 +11,19 @@ use prost_reflect::{DescriptorPool, FieldDescriptor, Kind, MessageDescriptor, Me
 use serde_json::{json, Map, Value};
 
 use crate::config::{AliasConfig, OpenApiConfig};
-use crate::transcode::request::BodyMapping;
+use crate::transcode::request::{self, BodyMapping};
 use crate::transcode::rule::{self, HttpBinding, RouteMethod};
 use crate::transcode::RpcSelection;
 use crate::transcode::{self, httpbody, path};
+
+/// How a field's value travels, which decides its schema where the two differ.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Encoding {
+    /// ProtoJSON: a request body or a response.
+    Json,
+    /// The string of a path or query parameter.
+    Param,
+}
 
 /// The operations an OpenAPI 3.0 path item can hold, in the order a `*` rule
 /// lists them.
@@ -248,7 +257,7 @@ fn build_operation(
             });
             // Try to get type from input message field.
             if let Some(field) = input.get_field_by_name(name) {
-                param["schema"] = field_to_schema(&field);
+                param["schema"] = field_to_schema(&field, Encoding::Param);
             }
             param
         })
@@ -284,7 +293,7 @@ fn build_operation(
                     raw_content()
                 } else {
                     register_nested(&field, schemas);
-                    json!({ "application/json": { "schema": field_to_schema(&field) } })
+                    json!({ "application/json": { "schema": field_to_schema(&field, Encoding::Json) } })
                 };
                 op["requestBody"] = json!({ "required": true, "content": content });
             }
@@ -296,23 +305,9 @@ fn build_operation(
     };
     // With `body: "*"` the whole message is the body: no query parameters.
     if binding.body != BodyMapping::Root {
-        params.extend(
-            input
-                .fields()
-                .filter(|f| {
-                    !path_params.contains(&f.name().to_string()) && body_field != Some(f.name())
-                })
-                .map(|field| {
-                    // A message-typed parameter refers to its schema by `$ref`.
-                    register_nested(&field, schemas);
-                    json!({
-                        "name": field.name(),
-                        "in": "query",
-                        "required": false,
-                        "schema": field_to_schema(&field),
-                    })
-                }),
-        );
+        let bound = |key: &str| path_params.iter().any(|p| p == key) || body_field == Some(key);
+        let mut on_the_way = vec![input.full_name().to_owned()];
+        query_params(&input, "", &bound, &mut on_the_way, &mut params);
     }
     if !params.is_empty() {
         op["parameters"] = json!(params);
@@ -346,10 +341,10 @@ fn build_operation(
         let schema = match response_field(&output, path) {
             Some(field) => {
                 register_nested(&field, schemas);
-                field_to_schema(&field)
+                field_to_schema(&field, Encoding::Json)
             }
             // The runtime answers JSON `null` for a path that names no field.
-            None => json!({ "nullable": true }),
+            None => null_schema(),
         };
         json!({
             "200": {
@@ -399,6 +394,69 @@ fn build_operation(
     op
 }
 
+/// Push a query parameter for every field below `msg` that `bound` (the path
+/// and the body) leaves to the query, keyed by its dotted proto path as the
+/// query parser reads it: a field of a message field is `filter.q`, not an
+/// object `filter`. A map, or a repeated message without a string form, cannot
+/// be set from a query string, and a message in `on_the_way` is not entered
+/// again, so a message that contains itself ends.
+fn query_params(
+    msg: &MessageDescriptor,
+    prefix: &str,
+    bound: &dyn Fn(&str) -> bool,
+    on_the_way: &mut Vec<String>,
+    params: &mut Vec<Value>,
+) {
+    for field in msg.fields() {
+        let key = format!("{prefix}{}", field.name());
+        if bound(&key) || field.is_map() {
+            continue;
+        }
+        match field.kind() {
+            Kind::Message(inner) if !has_string_form(&inner) => {
+                if field.is_list() || on_the_way.iter().any(|m| m == inner.full_name()) {
+                    continue;
+                }
+                on_the_way.push(inner.full_name().to_owned());
+                query_params(&inner, &format!("{key}."), bound, on_the_way, params);
+                on_the_way.pop();
+            }
+            // Scalars, enums and string-form messages, repeated ones included:
+            // each repeated key is one more element (`seen=…&seen=…`), the
+            // parser reading every value as the element's string form.
+            _ => params.push(json!({
+                "name": key,
+                "in": "query",
+                "required": false,
+                "schema": field_to_schema(&field, Encoding::Param),
+            })),
+        }
+    }
+}
+
+/// Whether a query value can be a whole `msg`: a well-known type the parser
+/// reads from one string (`Value` as its string value). Every other message,
+/// `Any`, `Struct`, `ListValue` and `Empty` included, has its fields bound
+/// one by one.
+fn has_string_form(msg: &MessageDescriptor) -> bool {
+    matches!(
+        msg.full_name(),
+        "google.protobuf.Timestamp"
+            | "google.protobuf.Duration"
+            | "google.protobuf.FieldMask"
+            | "google.protobuf.Value"
+            | "google.protobuf.DoubleValue"
+            | "google.protobuf.FloatValue"
+            | "google.protobuf.Int64Value"
+            | "google.protobuf.UInt64Value"
+            | "google.protobuf.Int32Value"
+            | "google.protobuf.UInt32Value"
+            | "google.protobuf.BoolValue"
+            | "google.protobuf.StringValue"
+            | "google.protobuf.BytesValue"
+    )
+}
+
 /// The field a (possibly dotted) `response_body` path names in `output`,
 /// walking singular message fields.
 fn response_field(output: &MessageDescriptor, path: &str) -> Option<FieldDescriptor> {
@@ -446,8 +504,9 @@ fn message_to_schema(
             continue;
         }
 
-        let schema = field_to_schema(&field);
-        properties.insert(name, schema);
+        // ProtoJSON writes the JSON name; a request may use either name.
+        let schema = field_to_schema(&field, Encoding::Json);
+        properties.insert(field.json_name().to_owned(), schema);
     }
 
     let mut schema = json!({
@@ -479,8 +538,22 @@ fn message_ref_or_inline(msg: &MessageDescriptor, schemas: &mut Map<String, Valu
     json!({ "$ref": format!("#/components/schemas/{}", name) })
 }
 
-fn field_to_schema(field: &FieldDescriptor) -> Value {
+/// Only JSON `null`. OpenAPI 3.0.3 has no `null` type, and `nullable` without
+/// a `type` constrains nothing, so the enum does (OpenAPI 3.0.3, Schema
+/// Object, `nullable`).
+fn null_schema() -> Value {
+    json!({ "nullable": true, "enum": [null] })
+}
+
+fn field_to_schema(field: &FieldDescriptor, encoding: Encoding) -> Value {
     let base = match field.kind() {
+        // ProtoJSON writes a `NullValue` as `null` (protobuf JSON mapping,
+        // "NullValue"); a parameter names it like any enum value.
+        Kind::Enum(e)
+            if e.full_name() == "google.protobuf.NullValue" && encoding == Encoding::Json =>
+        {
+            null_schema()
+        }
         Kind::Double | Kind::Float => json!({ "type": "number", "format": "double" }),
         Kind::Int32 | Kind::Sint32 | Kind::Sfixed32 => {
             json!({ "type": "integer", "format": "int32" })
@@ -501,6 +574,12 @@ fn field_to_schema(field: &FieldDescriptor) -> Value {
             let values: Vec<Value> = e.values().map(|v| json!(v.name())).collect();
             json!({ "type": "string", "enum": values })
         }
+        // A parameter string becomes a `Value`'s string value.
+        Kind::Message(msg)
+            if encoding == Encoding::Param && msg.full_name() == "google.protobuf.Value" =>
+        {
+            json!({ "type": "string" })
+        }
         Kind::Message(msg) => {
             if is_well_known(&msg) {
                 well_known_schema(&msg)
@@ -517,7 +596,7 @@ fn field_to_schema(field: &FieldDescriptor) -> Value {
         if let Kind::Message(entry) = field.kind() {
             let value_field = entry.get_field_by_name("value");
             let value_schema = value_field
-                .map(|f| field_to_schema(&f))
+                .map(|f| field_to_schema(&f, encoding))
                 .unwrap_or_else(|| json!({}));
             json!({ "type": "object", "additionalProperties": value_schema })
         } else {
@@ -528,8 +607,11 @@ fn field_to_schema(field: &FieldDescriptor) -> Value {
     }
 }
 
+/// Whether ProtoJSON writes `msg` in its own form rather than as an object of
+/// its fields: the list the request parser reads by. Any other message of the
+/// `google.protobuf` package (`SourceContext`) is an ordinary message.
 fn is_well_known(msg: &MessageDescriptor) -> bool {
-    msg.full_name().starts_with("google.protobuf.")
+    request::has_special_json(msg)
 }
 
 fn well_known_schema(msg: &MessageDescriptor) -> Value {
@@ -551,9 +633,8 @@ fn well_known_schema(msg: &MessageDescriptor) -> Value {
         "google.protobuf.Int32Value" | "google.protobuf.UInt32Value" => {
             json!({ "type": "integer" })
         }
-        "google.protobuf.Int64Value" | "google.protobuf.UInt64Value" => {
-            json!({ "type": "string", "format": "int64" })
-        }
+        "google.protobuf.Int64Value" => json!({ "type": "string", "format": "int64" }),
+        "google.protobuf.UInt64Value" => json!({ "type": "string", "format": "uint64" }),
         "google.protobuf.FloatValue" | "google.protobuf.DoubleValue" => {
             json!({ "type": "number" })
         }

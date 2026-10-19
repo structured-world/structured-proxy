@@ -154,7 +154,7 @@ impl Presence {
 
 /// Whether prost-reflect reads `message` through its own JSON form rather than
 /// as a map of fields (its list of well-known types).
-pub(super) fn has_special_json(message: &MessageDescriptor) -> bool {
+pub(crate) fn has_special_json(message: &MessageDescriptor) -> bool {
     matches!(
         message.full_name(),
         "google.protobuf.Any"

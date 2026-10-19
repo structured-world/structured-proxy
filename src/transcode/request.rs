@@ -18,7 +18,8 @@ use serde::de::value::StrDeserializer;
 use serde::Deserializer;
 use serde_json::Value as JsonValue;
 
-use presence::{has_special_json, OneEntry, Presence, Recording};
+pub(crate) use presence::has_special_json;
+use presence::{OneEntry, Presence, Recording};
 
 /// The path parameters of a request: each dotted field path the path binds,
 /// with its value.

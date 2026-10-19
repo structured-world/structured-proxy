@@ -1193,7 +1193,7 @@ fn message_to_json_string(msg: &DynamicMessage, opts: &SerializeOptions) -> Resu
 
 /// The unary response body as JSON: the whole message, or the subfield
 /// `response_body` names (JSON `null` when the path does not exist).
-fn json_body(
+pub(crate) fn json_body(
     msg: &DynamicMessage,
     response_body: Option<&str>,
 ) -> Result<Vec<u8>, serde_json::Error> {

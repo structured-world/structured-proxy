@@ -1,3 +1,5 @@
+use prost_reflect::{DynamicMessage, MapKey, Value as ProtoValue};
+
 use super::*;
 
 #[test]
@@ -126,6 +128,14 @@ syntax = "proto3";
 package test.v1;
 import "google/api/annotations.proto";
 import "google/api/httpbody.proto";
+import "google/protobuf/any.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/empty.proto";
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/source_context.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
 
 message Item {
   string name = 1;
@@ -148,6 +158,79 @@ message Upload {
 message Tree {
   string name = 1;
   Tree child = 2;
+}
+enum Shade {
+  SHADE_UNSPECIFIED = 0;
+  SHADE_DARK = 1;
+}
+// Every kind of field a response can carry, for the schema/wire comparison.
+message Wire {
+  double ratio = 1;
+  float scale = 2;
+  int32 small_count = 3;
+  sint32 delta = 4;
+  sfixed32 fixed_delta = 5;
+  int64 big_count = 6;
+  sint64 big_delta = 7;
+  sfixed64 fixed_big = 8;
+  uint32 unsigned_small = 9;
+  fixed32 fixed_small = 10;
+  uint64 unsigned_big = 11;
+  fixed64 fixed_unsigned_big = 12;
+  bool flag = 13;
+  string display_name = 14;
+  bytes raw_data = 15;
+  Shade shade = 16;
+  Note note = 17;
+  google.protobuf.NullValue nothing = 18;
+  oneof choice {
+    google.protobuf.NullValue unset = 19;
+    string label = 20;
+    Note memo = 21;
+  }
+  repeated google.protobuf.NullValue nulls = 22;
+  map<string, google.protobuf.NullValue> null_map = 23;
+  repeated int64 big_list = 24;
+  repeated Shade shades = 25;
+  repeated Note notes = 26;
+  map<int32, string> by_number = 27;
+  map<string, Note> notes_by_key = 28;
+  google.protobuf.Timestamp seen_at = 29;
+  google.protobuf.Duration ttl = 30;
+  google.protobuf.Struct attributes = 31;
+  google.protobuf.Value any_value = 32;
+  google.protobuf.ListValue values = 33;
+  google.protobuf.FieldMask mask = 34;
+  google.protobuf.Empty nothing_else = 35;
+  google.protobuf.StringValue maybe_name = 36;
+  google.protobuf.BytesValue maybe_bytes = 37;
+  google.protobuf.BoolValue maybe_flag = 38;
+  google.protobuf.Int32Value maybe_int = 39;
+  google.protobuf.UInt32Value maybe_uint = 40;
+  google.protobuf.Int64Value maybe_long = 41;
+  google.protobuf.UInt64Value maybe_ulong = 42;
+  google.protobuf.FloatValue maybe_float = 43;
+  google.protobuf.DoubleValue maybe_double = 44;
+  // In the `google.protobuf` package, but an ordinary message on the wire.
+  google.protobuf.SourceContext origin = 45;
+}
+message NullQuery {
+  google.protobuf.NullValue none = 1;
+  repeated google.protobuf.NullValue nones = 2;
+  NullFilter filter = 3;
+  map<string, string> tags = 4;
+  repeated Note notes = 5;
+  google.protobuf.Timestamp since = 6;
+  google.protobuf.Any payload = 7;
+  google.protobuf.Struct attrs = 8;
+  google.protobuf.ListValue items = 9;
+  google.protobuf.Empty nothing = 10;
+  google.protobuf.Value loose = 11;
+  google.protobuf.SourceContext source = 12;
+  repeated google.protobuf.Timestamp seen = 13;
+}
+message NullFilter {
+  google.protobuf.NullValue none = 1;
 }
 
 service Api {
@@ -196,6 +279,12 @@ service Api {
   rpc Shadowed(Item) returns (Item) {
     option (google.api.http) = { get: "/v1/shelf/{name=**}" };
   }
+  rpc Echo(Wire) returns (Wire) {
+    option (google.api.http) = { post: "/v1/wire" body: "*" };
+  }
+  rpc Ping(NullQuery) returns (NullQuery) {
+    option (google.api.http) = { get: "/v1/ping" };
+  }
 }
 "#;
 
@@ -214,16 +303,20 @@ impl protox::file::FileResolver for TestProtos {
     }
 }
 
+fn test_pool() -> DescriptorPool {
+    protox::Compiler::with_file_resolver(TestProtos)
+        .open_file("test/v1/api.proto")
+        .unwrap()
+        .descriptor_pool()
+}
+
 fn spec(aliases: &[AliasConfig]) -> Value {
     spec_of(aliases, &[])
 }
 
 /// [`spec`] documenting only the RPCs `only` selects.
 fn spec_of(aliases: &[AliasConfig], only: &[&str]) -> Value {
-    let pool = protox::Compiler::with_file_resolver(TestProtos)
-        .open_file("test/v1/api.proto")
-        .unwrap()
-        .descriptor_pool();
+    let pool = test_pool();
     let selection = RpcSelection::new(&pool, only).unwrap();
     generate(&pool, &config(), aliases, &selection)
 }
@@ -349,36 +442,40 @@ fn body_rule_decides_body_and_query_fields() {
     assert_eq!(touch["parameters"].as_array().unwrap().len(), 3);
 }
 
+/// The names of the query parameters of `operation`, in order.
+fn query_names(operation: &Value) -> Vec<&str> {
+    operation["parameters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["in"] == "query")
+        .map(|p| p["name"].as_str().unwrap())
+        .collect()
+}
+
 #[test]
-fn message_typed_query_parameter_schema_is_registered() {
-    // `filter` is bound only through the query; its `$ref` must resolve to a
-    // schema in `components`.
+fn message_typed_query_field_is_one_parameter_per_leaf() {
+    // The query parser reads a field below `filter` from the dotted key
+    // `filter.q`, so that is the parameter, typed as the leaf.
     let spec = spec(&[]);
-    let param = &spec["paths"]["/v1/find"]["get"]["parameters"][0];
-    assert_eq!(param["in"], "query");
-    assert_eq!(param["schema"]["$ref"], "#/components/schemas/Filter");
-    assert!(
-        spec["components"]["schemas"].get("Filter").is_some(),
-        "{}",
-        spec["components"]["schemas"]
-    );
+    let find = &spec["paths"]["/v1/find"]["get"];
+    assert_eq!(query_names(find), ["filter.q"]);
+    assert_eq!(find["parameters"][0]["schema"], json!({ "type": "string" }));
 }
 
 #[test]
 fn self_referencing_message_does_not_recurse_forever() {
-    // `Tree.child` is a `Tree`: in the query (GET) and in the body (POST) its
-    // schema is registered once and referenced, instead of being expanded
-    // until the stack overflows.
+    // `Tree.child` is a `Tree`: in the body (POST) its schema is registered
+    // once and referenced, and in the query (GET) a message already on the
+    // way is not entered again, instead of being expanded until the stack
+    // overflows.
     let spec = spec(&[]);
     let tree = &spec["components"]["schemas"]["Tree"];
     assert_eq!(
         tree["properties"]["child"]["$ref"],
         "#/components/schemas/Tree"
     );
-    assert_eq!(
-        spec["paths"]["/v1/tree"]["get"]["parameters"][1]["schema"]["$ref"],
-        "#/components/schemas/Tree"
-    );
+    assert_eq!(query_names(&spec["paths"]["/v1/tree"]["get"]), ["name"]);
     assert!(spec["paths"]["/v1/tree"]["post"]["requestBody"].is_object());
 }
 
@@ -447,12 +544,318 @@ fn a_selection_documents_only_the_rpcs_it_transcodes() {
 
 #[test]
 fn a_selection_naming_nothing_in_the_descriptors_is_an_error() {
-    let pool = protox::Compiler::with_file_resolver(TestProtos)
-        .open_file("test/v1/api.proto")
-        .unwrap()
-        .descriptor_pool();
+    let pool = test_pool();
     for name in ["test.v1.Nope", "test.v1.Api/Nope", "Api"] {
         let err = RpcSelection::new(&pool, [name]).unwrap_err();
         assert!(err.contains(name), "{err}");
     }
+}
+
+// --- schema/wire comparison ----------------------------------------------------
+
+/// The value a field of `kind` holds in a sample: never its default, so the
+/// wire shows its encoding.
+fn sample_value(kind: &Kind, variant: usize, depth: usize) -> ProtoValue {
+    match kind {
+        Kind::Double => ProtoValue::F64(1.5),
+        Kind::Float => ProtoValue::F32(0.5),
+        // Positive and below a second in nanos, so it is also a valid
+        // `Timestamp.nanos` / `Duration.nanos`.
+        Kind::Int32 | Kind::Sint32 | Kind::Sfixed32 => ProtoValue::I32(500_000_000),
+        // Within the `Timestamp` range.
+        Kind::Int64 | Kind::Sint64 | Kind::Sfixed64 => ProtoValue::I64(1_700_000_000),
+        Kind::Uint32 | Kind::Fixed32 => ProtoValue::U32(u32::MAX),
+        Kind::Uint64 | Kind::Fixed64 => ProtoValue::U64(u64::MAX),
+        Kind::Bool => ProtoValue::Bool(true),
+        Kind::String => ProtoValue::String("sample".into()),
+        Kind::Bytes => ProtoValue::Bytes(vec![0, 0xff].into()),
+        Kind::Enum(e) => ProtoValue::EnumNumber(e.values().last().unwrap().number()),
+        Kind::Message(m) => ProtoValue::Message(sample_message(m, variant, depth - 1)),
+    }
+}
+
+fn sample_key(kind: &Kind) -> MapKey {
+    match kind {
+        Kind::String => MapKey::String("k".into()),
+        Kind::Bool => MapKey::Bool(true),
+        Kind::Int32 | Kind::Sint32 | Kind::Sfixed32 => MapKey::I32(-7),
+        Kind::Int64 | Kind::Sint64 | Kind::Sfixed64 => MapKey::I64(-7),
+        Kind::Uint32 | Kind::Fixed32 => MapKey::U32(7),
+        Kind::Uint64 | Kind::Fixed64 => MapKey::U64(7),
+        other => unreachable!("not a map key kind: {other:?}"),
+    }
+}
+
+/// A message with every field set: lists with two elements, maps with one
+/// entry, and member `variant` (modulo their size) of each oneof. Below
+/// `depth` levels a message field is left unset, and a oneof takes its first
+/// member, so a recursive type (`Value` in `ListValue`) ends.
+fn sample_message(desc: &MessageDescriptor, variant: usize, depth: usize) -> DynamicMessage {
+    let mut msg = DynamicMessage::new(desc.clone());
+    for field in desc.fields() {
+        if let Some(oneof) = field.containing_oneof() {
+            let members: Vec<_> = oneof.fields().collect();
+            let pick = if depth == 0 {
+                0
+            } else {
+                variant % members.len()
+            };
+            if members[pick].number() != field.number() {
+                continue;
+            }
+        }
+        let message_typed = matches!(field.kind(), Kind::Message(_));
+        if depth == 0 && message_typed {
+            continue;
+        }
+        let value = if field.is_map() {
+            let Kind::Message(entry) = field.kind() else {
+                unreachable!("a map field is a message of entries");
+            };
+            let key = sample_key(&entry.map_entry_key_field().kind());
+            let value = sample_value(&entry.map_entry_value_field().kind(), variant, depth);
+            ProtoValue::Map([(key, value)].into_iter().collect())
+        } else if field.is_list() {
+            let item = sample_value(&field.kind(), variant, depth);
+            ProtoValue::List(vec![item.clone(), item])
+        } else {
+            sample_value(&field.kind(), variant, depth)
+        };
+        msg.set_field(&field, value);
+    }
+    msg
+}
+
+/// Check that `value` is valid against the OpenAPI 3.0.3 `schema`, resolving
+/// `$ref` in `components`, and that every object key it carries is a declared
+/// property or allowed by `additionalProperties`. `at` names the place for the
+/// failure message.
+fn check_wire(value: &Value, schema: &Value, components: &Value, at: &str) {
+    if let Some(reference) = schema["$ref"].as_str() {
+        let name = reference.strip_prefix("#/components/schemas/").unwrap();
+        let target = &components[name];
+        assert!(target.is_object(), "{at}: unresolved {reference}");
+        return check_wire(value, target, components, at);
+    }
+    if let Some(allowed) = schema["enum"].as_array() {
+        assert!(allowed.contains(value), "{at}: {value} not in {schema}");
+    }
+    let Some(ty) = schema["type"].as_str() else {
+        // No type: any value, `null` included (OpenAPI 3.0.3 `nullable`).
+        return;
+    };
+    if value.is_null() {
+        assert_eq!(schema["nullable"], true, "{at}: null against {schema}");
+        return;
+    }
+    match ty {
+        "string" => {
+            let s = value
+                .as_str()
+                .unwrap_or_else(|| panic!("{at}: {value} is not a string"));
+            match schema["format"].as_str() {
+                Some("int64") => assert!(s.parse::<i64>().is_ok(), "{at}: {s} is not int64"),
+                Some("uint64") => assert!(s.parse::<u64>().is_ok(), "{at}: {s} is not uint64"),
+                _ => {}
+            }
+        }
+        "integer" => {
+            let fits = match schema["format"].as_str() {
+                Some("int32") => value.as_i64().is_some_and(|n| i32::try_from(n).is_ok()),
+                Some("uint32") => value.as_u64().is_some_and(|n| u32::try_from(n).is_ok()),
+                _ => value.is_i64() || value.is_u64(),
+            };
+            assert!(fits, "{at}: {value} does not fit {schema}");
+        }
+        "number" => assert!(value.is_number(), "{at}: {value} is not a number"),
+        "boolean" => assert!(value.is_boolean(), "{at}: {value} is not a boolean"),
+        "array" => {
+            let items = value
+                .as_array()
+                .unwrap_or_else(|| panic!("{at}: {value} is not an array"));
+            for (i, item) in items.iter().enumerate() {
+                check_wire(item, &schema["items"], components, &format!("{at}[{i}]"));
+            }
+        }
+        "object" => {
+            let fields = value
+                .as_object()
+                .unwrap_or_else(|| panic!("{at}: {value} is not an object"));
+            let declared = schema["properties"].as_object();
+            for (key, field) in fields {
+                let at = format!("{at}.{key}");
+                if let Some(property) = declared.and_then(|p| p.get(key)) {
+                    check_wire(field, property, components, &at);
+                    continue;
+                }
+                match &schema["additionalProperties"] {
+                    Value::Bool(true) => {}
+                    extra @ Value::Object(_) => check_wire(field, extra, components, &at),
+                    // A bare object (`Struct`) holds any keys.
+                    Value::Null if declared.is_none() => {}
+                    _ => panic!("{at}: not a declared property of {schema}"),
+                }
+            }
+        }
+        other => panic!("{at}: unknown type {other}"),
+    }
+}
+
+#[test]
+fn every_response_validates_against_its_schema() {
+    // The spec has to describe what the proxy writes: each sample `Wire`
+    // (every scalar, enum, well-known type, a `NullValue` alone, in a oneof,
+    // a list and a map) goes through the unary response serializer and must
+    // validate against the documented response schema.
+    let pool = test_pool();
+    let spec = spec(&[]);
+    let components = &spec["components"]["schemas"];
+    let schema = &spec["paths"]["/v1/wire"]["post"]["responses"]["200"]["content"]
+        ["application/json"]["schema"];
+    let wire = pool.get_message_by_name("test.v1.Wire").unwrap();
+    let choices = wire.oneofs().map(|o| o.fields().len()).max().unwrap();
+    // `Value.kind` has six members: every one of them is sampled too.
+    for variant in 0..choices.max(6) {
+        let msg = sample_message(&wire, variant, 6);
+        let body = transcode::json_body(&msg, None).unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        check_wire(&value, schema, components, &format!("Wire#{variant}"));
+    }
+    // Nothing set: every scalar and enum goes out with its default value.
+    let empty = DynamicMessage::new(wire);
+    let body = transcode::json_body(&empty, None).unwrap();
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    check_wire(&value, schema, components, "Wire#default");
+}
+
+#[test]
+fn null_value_is_json_null_in_bodies_and_a_name_in_parameters() {
+    // ProtoJSON writes a `NullValue` as `null`, alone, as a oneof member, in
+    // a list and as a map value; the query parser reads it by its enum name,
+    // below a message field too.
+    let spec = spec(&[]);
+    let wire = &spec["components"]["schemas"]["Wire"]["properties"];
+    let only_null = json!({ "nullable": true, "enum": [null] });
+    assert_eq!(wire["nothing"], only_null);
+    assert_eq!(wire["unset"], only_null);
+    assert_eq!(
+        wire["nulls"],
+        json!({ "type": "array", "items": only_null })
+    );
+    assert_eq!(
+        wire["nullMap"],
+        json!({ "type": "object", "additionalProperties": only_null })
+    );
+    assert!(spec["components"]["schemas"].get("NullValue").is_none());
+
+    let ping = &spec["paths"]["/v1/ping"]["get"];
+    let params = ping["parameters"].as_array().unwrap();
+    let name = json!({ "type": "string", "enum": ["NULL_VALUE"] });
+    assert_eq!(params[0]["schema"], name);
+    assert_eq!(
+        params[1]["schema"],
+        json!({ "type": "array", "items": name })
+    );
+    assert_eq!(params[2]["name"], "filter.none");
+    assert_eq!(params[2]["schema"], name);
+}
+
+#[test]
+fn query_parameters_are_the_keys_the_parser_reads() {
+    // A map or a repeated message cannot be set from a query string, so it
+    // is no parameter. A well-known type with a string form is one, read from
+    // that string; one without (`Any`, `Struct`, `ListValue`, `Empty`) is
+    // bound through its own fields, like any message.
+    let spec = spec(&[]);
+    let ping = &spec["paths"]["/v1/ping"]["get"];
+    assert_eq!(
+        query_names(ping),
+        [
+            "none",
+            "nones",
+            "filter.none",
+            "since",
+            "payload.type_url",
+            "payload.value",
+            "items.values",
+            "loose",
+            "source.file_name",
+            "seen"
+        ]
+    );
+    let params = ping["parameters"].as_array().unwrap();
+    assert_eq!(
+        params[3]["schema"],
+        json!({ "type": "string", "format": "date-time" })
+    );
+    // A `Value` read from a query string is its string value, each repeated
+    // key one more element of `ListValue.values`.
+    let string = json!({ "type": "string" });
+    assert_eq!(
+        params[6]["schema"],
+        json!({ "type": "array", "items": string })
+    );
+    assert_eq!(params[7]["schema"], string);
+}
+
+#[test]
+fn properties_are_keyed_by_the_json_name() {
+    // Responses carry `displayName`, not `display_name`.
+    let spec = spec(&[]);
+    let wire = spec["components"]["schemas"]["Wire"]["properties"]
+        .as_object()
+        .unwrap();
+    assert!(wire.contains_key("displayName"), "{wire:?}");
+    assert!(!wire.contains_key("display_name"), "{wire:?}");
+}
+
+#[test]
+fn a_repeated_string_form_type_is_one_parameter_per_value() {
+    // Unlike a repeated ordinary message, a repeated well-known type with a
+    // string form is set from the query, one value per repeated key; the
+    // parser and the spec have to agree on that.
+    let pool = test_pool();
+    let spec = spec(&[]);
+    let params = spec["paths"]["/v1/ping"]["get"]["parameters"]
+        .as_array()
+        .unwrap();
+    let seen = params.iter().find(|p| p["name"] == "seen").unwrap();
+    assert_eq!(
+        seen["schema"],
+        json!({ "type": "array", "items": { "type": "string", "format": "date-time" } })
+    );
+
+    let input = pool.get_message_by_name("test.v1.NullQuery").unwrap();
+    let query = "seen=2020-01-01T00:00:00Z&seen=2021-01-01T00:00:00Z&items.values=a&items.values=b";
+    let message = transcode::request::build_request_message(
+        &input,
+        &BodyMapping::None,
+        transcode::request::Body::Absent,
+        &std::collections::HashMap::new(),
+        Some(query),
+    )
+    .unwrap();
+    let value = serde_json::to_value(&message).unwrap();
+    assert_eq!(
+        value["seen"],
+        json!(["2020-01-01T00:00:00Z", "2021-01-01T00:00:00Z"])
+    );
+    assert_eq!(value["items"], json!(["a", "b"]));
+}
+
+#[test]
+fn an_ordinary_google_protobuf_message_has_its_own_schema() {
+    // Only the types with their own JSON form are described inline; any
+    // other message of the package is an object of its fields, as ProtoJSON
+    // writes it.
+    let spec = spec(&[]);
+    let schemas = &spec["components"]["schemas"];
+    assert_eq!(
+        schemas["Wire"]["properties"]["origin"]["$ref"],
+        "#/components/schemas/SourceContext"
+    );
+    assert_eq!(
+        schemas["SourceContext"]["properties"]["fileName"],
+        json!({ "type": "string" })
+    );
 }
