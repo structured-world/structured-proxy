@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [8.1.3](https://github.com/structured-world/structured-proxy/compare/v8.1.2...v8.1.3) - 2026-10-19
+
+### Fixed
+
+- *(openapi)* describe the JSON the proxy writes ([#149](https://github.com/structured-world/structured-proxy/pull/149))
+
+### Other
+
+- *(deps)* bump taiki-e/install-action from 2.87.24 to 2.87.29 ([#146](https://github.com/structured-world/structured-proxy/pull/146))
+- auto-merge minor and patch Dependabot updates ([#151](https://github.com/structured-world/structured-proxy/pull/151))
+
 ## [8.1.2](https://github.com/structured-world/structured-proxy/compare/v8.1.1...v8.1.2) - 2026-10-12
 
 ### Other
