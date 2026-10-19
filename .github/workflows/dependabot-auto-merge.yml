@@ -109,16 +109,23 @@ jobs:
       # No token passed: the action's `github-token` already defaults to
       # `github.token`, which the permissions block above scopes to reading the
       # pull request.
+      #
+      # A rerun of a Dependabot run (`actor` still dependabot, a later attempt)
+      # runs it too, so a transient failure can be retried by hand. A rerun
+      # replays the event Dependabot caused, and if the head moved since, the
+      # merge below refuses it: `--match-head-commit` names the head that
+      # event saw.
       - name: Dependabot metadata
         id: metadata
         if: >-
           github.actor == 'dependabot[bot]'
-          && github.triggering_actor == 'dependabot[bot]'
+          && (github.triggering_actor == 'dependabot[bot]'
+              || github.run_attempt > 1)
         uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.1
 
       # The metadata step is skipped for a foreign push, so its outputs are
       # empty there and this condition is false: approval happens only on a run
-      # Dependabot itself triggered.
+      # of an event Dependabot itself caused.
       - name: Approve and enable auto-merge for minor/patch updates
         if: steps.metadata.outputs.update-type == 'version-update:semver-minor' || steps.metadata.outputs.update-type == 'version-update:semver-patch'
         # Both operations name the head this run actually inspected, rather than
