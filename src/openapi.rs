@@ -16,6 +16,15 @@ use crate::transcode::rule::{self, HttpBinding, RouteMethod};
 use crate::transcode::RpcSelection;
 use crate::transcode::{self, httpbody, path};
 
+/// How a field's value travels, which decides its schema where the two differ.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Encoding {
+    /// ProtoJSON: a request body or a response.
+    Json,
+    /// The string of a path or query parameter.
+    Param,
+}
+
 /// The operations an OpenAPI 3.0 path item can hold, in the order a `*` rule
 /// lists them.
 const OPERATIONS: [&str; 8] = [
@@ -248,7 +257,7 @@ fn build_operation(
             });
             // Try to get type from input message field.
             if let Some(field) = input.get_field_by_name(name) {
-                param["schema"] = field_to_schema(&field);
+                param["schema"] = field_to_schema(&field, Encoding::Param);
             }
             param
         })
@@ -284,7 +293,7 @@ fn build_operation(
                     raw_content()
                 } else {
                     register_nested(&field, schemas);
-                    json!({ "application/json": { "schema": field_to_schema(&field) } })
+                    json!({ "application/json": { "schema": field_to_schema(&field, Encoding::Json) } })
                 };
                 op["requestBody"] = json!({ "required": true, "content": content });
             }
@@ -309,7 +318,7 @@ fn build_operation(
                         "name": field.name(),
                         "in": "query",
                         "required": false,
-                        "schema": field_to_schema(&field),
+                        "schema": field_to_schema(&field, Encoding::Param),
                     })
                 }),
         );
@@ -346,10 +355,10 @@ fn build_operation(
         let schema = match response_field(&output, path) {
             Some(field) => {
                 register_nested(&field, schemas);
-                field_to_schema(&field)
+                field_to_schema(&field, Encoding::Json)
             }
             // The runtime answers JSON `null` for a path that names no field.
-            None => json!({ "nullable": true }),
+            None => null_schema(),
         };
         json!({
             "200": {
@@ -446,8 +455,9 @@ fn message_to_schema(
             continue;
         }
 
-        let schema = field_to_schema(&field);
-        properties.insert(name, schema);
+        // ProtoJSON writes the JSON name; a request may use either name.
+        let schema = field_to_schema(&field, Encoding::Json);
+        properties.insert(field.json_name().to_owned(), schema);
     }
 
     let mut schema = json!({
@@ -479,8 +489,22 @@ fn message_ref_or_inline(msg: &MessageDescriptor, schemas: &mut Map<String, Valu
     json!({ "$ref": format!("#/components/schemas/{}", name) })
 }
 
-fn field_to_schema(field: &FieldDescriptor) -> Value {
+/// Only JSON `null`. OpenAPI 3.0.3 has no `null` type, and `nullable` without
+/// a `type` constrains nothing, so the enum does (OpenAPI 3.0.3, Schema
+/// Object, `nullable`).
+fn null_schema() -> Value {
+    json!({ "nullable": true, "enum": [null] })
+}
+
+fn field_to_schema(field: &FieldDescriptor, encoding: Encoding) -> Value {
     let base = match field.kind() {
+        // ProtoJSON writes a `NullValue` as `null` (protobuf JSON mapping,
+        // "NullValue"); a parameter names it like any enum value.
+        Kind::Enum(e)
+            if e.full_name() == "google.protobuf.NullValue" && encoding == Encoding::Json =>
+        {
+            null_schema()
+        }
         Kind::Double | Kind::Float => json!({ "type": "number", "format": "double" }),
         Kind::Int32 | Kind::Sint32 | Kind::Sfixed32 => {
             json!({ "type": "integer", "format": "int32" })
@@ -517,7 +541,7 @@ fn field_to_schema(field: &FieldDescriptor) -> Value {
         if let Kind::Message(entry) = field.kind() {
             let value_field = entry.get_field_by_name("value");
             let value_schema = value_field
-                .map(|f| field_to_schema(&f))
+                .map(|f| field_to_schema(&f, encoding))
                 .unwrap_or_else(|| json!({}));
             json!({ "type": "object", "additionalProperties": value_schema })
         } else {
@@ -551,9 +575,8 @@ fn well_known_schema(msg: &MessageDescriptor) -> Value {
         "google.protobuf.Int32Value" | "google.protobuf.UInt32Value" => {
             json!({ "type": "integer" })
         }
-        "google.protobuf.Int64Value" | "google.protobuf.UInt64Value" => {
-            json!({ "type": "string", "format": "int64" })
-        }
+        "google.protobuf.Int64Value" => json!({ "type": "string", "format": "int64" }),
+        "google.protobuf.UInt64Value" => json!({ "type": "string", "format": "uint64" }),
         "google.protobuf.FloatValue" | "google.protobuf.DoubleValue" => {
             json!({ "type": "number" })
         }
