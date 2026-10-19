@@ -227,6 +227,7 @@ message NullQuery {
   google.protobuf.Empty nothing = 10;
   google.protobuf.Value loose = 11;
   google.protobuf.SourceContext source = 12;
+  repeated google.protobuf.Timestamp seen = 13;
 }
 message NullFilter {
   google.protobuf.NullValue none = 1;
@@ -778,7 +779,8 @@ fn query_parameters_are_the_keys_the_parser_reads() {
             "payload.value",
             "items.values",
             "loose",
-            "source.file_name"
+            "source.file_name",
+            "seen"
         ]
     );
     let params = ping["parameters"].as_array().unwrap();
@@ -805,6 +807,40 @@ fn properties_are_keyed_by_the_json_name() {
         .unwrap();
     assert!(wire.contains_key("displayName"), "{wire:?}");
     assert!(!wire.contains_key("display_name"), "{wire:?}");
+}
+
+#[test]
+fn a_repeated_string_form_type_is_one_parameter_per_value() {
+    // Unlike a repeated ordinary message, a repeated well-known type with a
+    // string form is set from the query, one value per repeated key; the
+    // parser and the spec have to agree on that.
+    let pool = test_pool();
+    let spec = spec(&[]);
+    let params = spec["paths"]["/v1/ping"]["get"]["parameters"]
+        .as_array()
+        .unwrap();
+    let seen = params.iter().find(|p| p["name"] == "seen").unwrap();
+    assert_eq!(
+        seen["schema"],
+        json!({ "type": "array", "items": { "type": "string", "format": "date-time" } })
+    );
+
+    let input = pool.get_message_by_name("test.v1.NullQuery").unwrap();
+    let query = "seen=2020-01-01T00:00:00Z&seen=2021-01-01T00:00:00Z&items.values=a&items.values=b";
+    let message = transcode::request::build_request_message(
+        &input,
+        &BodyMapping::None,
+        transcode::request::Body::Absent,
+        &std::collections::HashMap::new(),
+        Some(query),
+    )
+    .unwrap();
+    let value = serde_json::to_value(&message).unwrap();
+    assert_eq!(
+        value["seen"],
+        json!(["2020-01-01T00:00:00Z", "2021-01-01T00:00:00Z"])
+    );
+    assert_eq!(value["items"], json!(["a", "b"]));
 }
 
 #[test]

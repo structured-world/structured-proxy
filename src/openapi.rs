@@ -397,9 +397,9 @@ fn build_operation(
 /// Push a query parameter for every field below `msg` that `bound` (the path
 /// and the body) leaves to the query, keyed by its dotted proto path as the
 /// query parser reads it: a field of a message field is `filter.q`, not an
-/// object `filter`. A map or a repeated message cannot be set from a query
-/// string, and a message in `on_the_way` is not entered again, so a message
-/// that contains itself ends.
+/// object `filter`. A map, or a repeated message without a string form, cannot
+/// be set from a query string, and a message in `on_the_way` is not entered
+/// again, so a message that contains itself ends.
 fn query_params(
     msg: &MessageDescriptor,
     prefix: &str,
@@ -421,6 +421,9 @@ fn query_params(
                 query_params(&inner, &format!("{key}."), bound, on_the_way, params);
                 on_the_way.pop();
             }
+            // Scalars, enums and string-form messages, repeated ones included:
+            // each repeated key is one more element (`seen=…&seen=…`), the
+            // parser reading every value as the element's string form.
             _ => params.push(json!({
                 "name": key,
                 "in": "query",
