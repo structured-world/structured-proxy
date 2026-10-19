@@ -11,7 +11,7 @@ use prost_reflect::{DescriptorPool, FieldDescriptor, Kind, MessageDescriptor, Me
 use serde_json::{json, Map, Value};
 
 use crate::config::{AliasConfig, OpenApiConfig};
-use crate::transcode::request::BodyMapping;
+use crate::transcode::request::{self, BodyMapping};
 use crate::transcode::rule::{self, HttpBinding, RouteMethod};
 use crate::transcode::RpcSelection;
 use crate::transcode::{self, httpbody, path};
@@ -432,18 +432,26 @@ fn query_params(
 }
 
 /// Whether a query value can be a whole `msg`: a well-known type the parser
-/// reads from one string (`Value` as its string value). `Any`, `Struct`,
-/// `ListValue` and `Empty` have no string form, so their fields are bound
-/// one by one, as any other message's.
+/// reads from one string (`Value` as its string value). Every other message,
+/// `Any`, `Struct`, `ListValue` and `Empty` included, has its fields bound
+/// one by one.
 fn has_string_form(msg: &MessageDescriptor) -> bool {
-    is_well_known(msg)
-        && !matches!(
-            msg.full_name(),
-            "google.protobuf.Any"
-                | "google.protobuf.Struct"
-                | "google.protobuf.ListValue"
-                | "google.protobuf.Empty"
-        )
+    matches!(
+        msg.full_name(),
+        "google.protobuf.Timestamp"
+            | "google.protobuf.Duration"
+            | "google.protobuf.FieldMask"
+            | "google.protobuf.Value"
+            | "google.protobuf.DoubleValue"
+            | "google.protobuf.FloatValue"
+            | "google.protobuf.Int64Value"
+            | "google.protobuf.UInt64Value"
+            | "google.protobuf.Int32Value"
+            | "google.protobuf.UInt32Value"
+            | "google.protobuf.BoolValue"
+            | "google.protobuf.StringValue"
+            | "google.protobuf.BytesValue"
+    )
 }
 
 /// The field a (possibly dotted) `response_body` path names in `output`,
@@ -596,8 +604,11 @@ fn field_to_schema(field: &FieldDescriptor, encoding: Encoding) -> Value {
     }
 }
 
+/// Whether ProtoJSON writes `msg` in its own form rather than as an object of
+/// its fields: the list the request parser reads by. Any other message of the
+/// `google.protobuf` package (`SourceContext`) is an ordinary message.
 fn is_well_known(msg: &MessageDescriptor) -> bool {
-    msg.full_name().starts_with("google.protobuf.")
+    request::has_special_json(msg)
 }
 
 fn well_known_schema(msg: &MessageDescriptor) -> Value {

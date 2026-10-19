@@ -132,6 +132,7 @@ import "google/protobuf/any.proto";
 import "google/protobuf/duration.proto";
 import "google/protobuf/empty.proto";
 import "google/protobuf/field_mask.proto";
+import "google/protobuf/source_context.proto";
 import "google/protobuf/struct.proto";
 import "google/protobuf/timestamp.proto";
 import "google/protobuf/wrappers.proto";
@@ -210,6 +211,8 @@ message Wire {
   google.protobuf.UInt64Value maybe_ulong = 42;
   google.protobuf.FloatValue maybe_float = 43;
   google.protobuf.DoubleValue maybe_double = 44;
+  // In the `google.protobuf` package, but an ordinary message on the wire.
+  google.protobuf.SourceContext origin = 45;
 }
 message NullQuery {
   google.protobuf.NullValue none = 1;
@@ -223,6 +226,7 @@ message NullQuery {
   google.protobuf.ListValue items = 9;
   google.protobuf.Empty nothing = 10;
   google.protobuf.Value loose = 11;
+  google.protobuf.SourceContext source = 12;
 }
 message NullFilter {
   google.protobuf.NullValue none = 1;
@@ -773,7 +777,8 @@ fn query_parameters_are_the_keys_the_parser_reads() {
             "payload.type_url",
             "payload.value",
             "items.values",
-            "loose"
+            "loose",
+            "source.file_name"
         ]
     );
     let params = ping["parameters"].as_array().unwrap();
@@ -800,4 +805,21 @@ fn properties_are_keyed_by_the_json_name() {
         .unwrap();
     assert!(wire.contains_key("displayName"), "{wire:?}");
     assert!(!wire.contains_key("display_name"), "{wire:?}");
+}
+
+#[test]
+fn an_ordinary_google_protobuf_message_has_its_own_schema() {
+    // Only the types with their own JSON form are described inline; any
+    // other message of the package is an object of its fields, as ProtoJSON
+    // writes it.
+    let spec = spec(&[]);
+    let schemas = &spec["components"]["schemas"];
+    assert_eq!(
+        schemas["Wire"]["properties"]["origin"]["$ref"],
+        "#/components/schemas/SourceContext"
+    );
+    assert_eq!(
+        schemas["SourceContext"]["properties"]["fileName"],
+        json!({ "type": "string" })
+    );
 }
