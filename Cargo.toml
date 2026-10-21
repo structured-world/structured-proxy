@@ -98,7 +98,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # The config file and the sections an embedder hands over as YAML. Safe Rust;
 # deserialization only.
-serde-saphyr = { version = "1.3", default-features = false, features = ["deserialize"] }
+serde-saphyr = { version = "2.0", default-features = false, features = ["deserialize"] }
 # The key path (`runtime.worker_threads`) a config error names; already in the
 # tree through axum.
 serde_path_to_error = "0.1"
