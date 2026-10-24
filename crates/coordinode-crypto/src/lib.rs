@@ -74,6 +74,11 @@ impl KeyProvider for Provider {
     }
 }
 
+/// Records one AES-GCM key may protect before rustls updates or closes: 2^24
+/// full-size records (RFC 8446 section 5.5, draft-irtf-cfrg-aead-limits
+/// section 5.1). ChaCha20-Poly1305 suites keep `u64::MAX`.
+const AES_GCM_CONFIDENTIALITY_LIMIT: u64 = 1 << 24;
+
 #[cfg(feature = "tls12")]
 const TLS12_ECDSA_SCHEMES: [SignatureScheme; 4] = [
     SignatureScheme::ECDSA_NISTP256_SHA256,
@@ -98,7 +103,7 @@ pub const TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256: SupportedCipherSuite =
         common: CipherSuiteCommon {
             suite: CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
             hash_provider: hash::SHA256,
-            confidentiality_limit: u64::MAX,
+            confidentiality_limit: AES_GCM_CONFIDENTIALITY_LIMIT,
         },
         kx: rustls::crypto::KeyExchangeAlgorithm::ECDHE,
         sign: &TLS12_ECDSA_SCHEMES,
@@ -112,7 +117,7 @@ pub const TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384: SupportedCipherSuite =
         common: CipherSuiteCommon {
             suite: CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
             hash_provider: hash::SHA384,
-            confidentiality_limit: u64::MAX,
+            confidentiality_limit: AES_GCM_CONFIDENTIALITY_LIMIT,
         },
         kx: rustls::crypto::KeyExchangeAlgorithm::ECDHE,
         sign: &TLS12_ECDSA_SCHEMES,
@@ -140,7 +145,7 @@ pub const TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256: SupportedCipherSuite =
         common: CipherSuiteCommon {
             suite: CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
             hash_provider: hash::SHA256,
-            confidentiality_limit: u64::MAX,
+            confidentiality_limit: AES_GCM_CONFIDENTIALITY_LIMIT,
         },
         kx: rustls::crypto::KeyExchangeAlgorithm::ECDHE,
         sign: &TLS12_RSA_SCHEMES,
@@ -154,7 +159,7 @@ pub const TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384: SupportedCipherSuite =
         common: CipherSuiteCommon {
             suite: CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
             hash_provider: hash::SHA384,
-            confidentiality_limit: u64::MAX,
+            confidentiality_limit: AES_GCM_CONFIDENTIALITY_LIMIT,
         },
         kx: rustls::crypto::KeyExchangeAlgorithm::ECDHE,
         sign: &TLS12_RSA_SCHEMES,
@@ -181,7 +186,7 @@ pub const TLS13_AES_128_GCM_SHA256: SupportedCipherSuite =
         common: CipherSuiteCommon {
             suite: CipherSuite::TLS13_AES_128_GCM_SHA256,
             hash_provider: hash::SHA256,
-            confidentiality_limit: u64::MAX,
+            confidentiality_limit: AES_GCM_CONFIDENTIALITY_LIMIT,
         },
         hkdf_provider: &rustls::crypto::tls13::HkdfUsingHmac(hmac::SHA256),
         aead_alg: &aead::gcm::Tls13Aes128Gcm,
@@ -193,7 +198,7 @@ pub const TLS13_AES_256_GCM_SHA384: SupportedCipherSuite =
         common: CipherSuiteCommon {
             suite: CipherSuite::TLS13_AES_256_GCM_SHA384,
             hash_provider: hash::SHA384,
-            confidentiality_limit: u64::MAX,
+            confidentiality_limit: AES_GCM_CONFIDENTIALITY_LIMIT,
         },
         hkdf_provider: &rustls::crypto::tls13::HkdfUsingHmac(hmac::SHA384),
         aead_alg: &aead::gcm::Tls13Aes256Gcm,

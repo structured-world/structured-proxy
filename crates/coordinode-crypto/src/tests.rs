@@ -6,6 +6,29 @@ use rustls::crypto::cipher::{AeadKey, Iv, Tls13AeadAlgorithm};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer};
 use rustls::{ConnectionTrafficSecrets, Error, PeerMisbehaved};
 
+// AES-GCM records under one key are bounded (RFC 8446 section 5.5,
+// draft-irtf-cfrg-aead-limits section 5.1): past 2^24 full-size records rustls
+// must update the key or close. ChaCha20-Poly1305 has no practical bound.
+#[test]
+fn aes_gcm_suites_carry_their_confidentiality_limit() {
+    let provider = super::provider();
+    assert_eq!(provider.cipher_suites.len(), 9);
+    for suite in &provider.cipher_suites {
+        let common = match suite {
+            rustls::SupportedCipherSuite::Tls12(suite) => &suite.common,
+            rustls::SupportedCipherSuite::Tls13(suite) => &suite.common,
+        };
+        let name = alloc::format!("{:?}", common.suite);
+        let expected = if name.contains("CHACHA20") {
+            u64::MAX
+        } else {
+            assert!(name.contains("_GCM_"), "{name}");
+            1 << 24
+        };
+        assert_eq!(common.confidentiality_limit, expected, "{name}");
+    }
+}
+
 // TLS 1.3 must reject non-contributory X25519 shares (RFC 8446 section 7.4.2).
 #[test]
 fn x25519_rejects_low_order_shares() {
