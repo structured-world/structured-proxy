@@ -8,7 +8,7 @@
 mod protos;
 
 use std::convert::Infallible;
-use std::future::{ready, Ready};
+use std::future::{Ready, ready};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -119,7 +119,7 @@ impl tower::Service<http::Request<tonic::body::Body>> for Who {
 // --- the embedder's TLS server ------------------------------------------------
 
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {
-    Arc::new(rustls_rustcrypto::provider())
+    Arc::new(coordinode_crypto::provider())
 }
 
 fn chain() -> Vec<CertificateDer<'static>> {
@@ -245,7 +245,7 @@ const TESTDATA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/tls/testdata");
 async fn listen_builtin(listen_yaml: &str) -> SocketAddr {
     // Builds without a crypto backend feature take the process's provider.
     if rustls::crypto::CryptoProvider::get_default().is_none() {
-        rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider())
+        rustls::crypto::CryptoProvider::install_default(coordinode_crypto::provider())
             .expect("each test runs in its own process");
     }
     let pool = pool();

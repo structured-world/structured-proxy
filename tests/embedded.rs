@@ -8,11 +8,11 @@
 //! it fails if any of them can no longer be built from its default or its
 //! constructor.
 
+use structured_proxy::ProxyServer;
 use structured_proxy::config::{
     AliasConfig, ClientAddressConfig, ConcurrencyConfig, DescriptorSource, ListenTlsConfig,
     ProxyConfig, ScopeConfig, Traffic, UpstreamConfig,
 };
-use structured_proxy::ProxyServer;
 
 #[test]
 fn embedded_config_is_constructible() {
@@ -33,10 +33,12 @@ fn embedded_config_is_constructible() {
     client_address.trusted_proxies = vec!["10.0.0.0/8".into()];
     config.client_address = client_address;
     // The default list, unlike a literal, keeps the serde defaults.
-    assert!(config
-        .forwarded_headers
-        .iter()
-        .any(|h| h == "authorization"));
+    assert!(
+        config
+            .forwarded_headers
+            .iter()
+            .any(|h| h == "authorization")
+    );
     // The server accepts a programmatically-built config (the embedded path).
     let _server = ProxyServer::from_config(config);
 }

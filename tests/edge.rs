@@ -16,8 +16,8 @@ use axum::body::Body;
 use http::StatusCode;
 use prost_reflect::{DescriptorPool, DynamicMessage, Value as PbValue};
 use serde_json::Value;
-use structured_proxy::transcode::codec::DynamicCodec;
 use structured_proxy::ProxyServer;
+use structured_proxy::transcode::codec::DynamicCodec;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const EDGE_PROTO: &str = r#"
@@ -802,10 +802,12 @@ async fn a_grpc_web_call_from_an_unlisted_origin_gets_no_allowance() {
     let response = tower::ServiceExt::oneshot(grpc_web_proxy_with(CORS_YAML), request)
         .await
         .unwrap();
-    assert!(response
-        .headers()
-        .get("access-control-allow-origin")
-        .is_none());
+    assert!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none()
+    );
 }
 
 #[tokio::test]

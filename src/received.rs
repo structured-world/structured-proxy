@@ -8,8 +8,8 @@
 //! request extensions. The proxy records them and checks nothing about them.
 //! A remote upstream never sees request extensions.
 
-use axum::http::uri::PathAndQuery;
 use axum::http::Method;
+use axum::http::uri::PathAndQuery;
 
 /// The HTTP request a transcoded gRPC call was made from, as the proxy
 /// received it: its method, its path and query, and the gRPC path of the RPC

@@ -346,7 +346,7 @@ fn object_valued_well_known_details_go_under_value() {
     // under `value`, decided by the type, not by the shape of its JSON: a
     // Struct is a JSON object yet still goes under `value`, and its own
     // `@type` key cannot overwrite the detail's.
-    use prost_reflect::prost_types::{value::Kind, Struct, Value as PbValue};
+    use prost_reflect::prost_types::{Struct, Value as PbValue, value::Kind};
     let mut fields = std::collections::BTreeMap::new();
     fields.insert(
         "@type".to_string(),
@@ -674,7 +674,7 @@ fn struct_keys_that_look_like_debug_info_are_kept() {
     // DebugInfo is withheld where an Any packs it. A Struct is data: a key
     // `@type` naming DebugInfo is just a string there, and the Struct must
     // stay whole and validly wrapped.
-    use prost_reflect::prost_types::{value::Kind, Struct, Value as PbValue};
+    use prost_reflect::prost_types::{Struct, Value as PbValue, value::Kind};
     let mut fields = std::collections::BTreeMap::new();
     fields.insert(
         "@type".to_string(),

@@ -9,14 +9,14 @@
 mod common;
 
 use std::convert::Infallible;
-use std::future::{ready, Ready};
+use std::future::{Ready, ready};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use axum::body::Body;
 use http::StatusCode;
 use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use structured_proxy::transcode::codec::DynamicCodec;
 
 const ITEMS_PROTO: &str = r#"

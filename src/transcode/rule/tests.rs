@@ -7,8 +7,8 @@ use prost_reflect::DescriptorPool;
 fn http_rule_descriptor() -> prost_reflect::MessageDescriptor {
     use prost_reflect::prost::Message;
     use prost_reflect::prost_types::{
-        field_descriptor_proto::{Label, Type},
         DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
+        field_descriptor_proto::{Label, Type},
     };
 
     let str_field = |name: &str, num: i32| FieldDescriptorProto {

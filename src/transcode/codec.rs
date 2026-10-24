@@ -5,8 +5,8 @@
 
 use prost::Message;
 use prost_reflect::{Cardinality, DynamicMessage, Kind, MessageDescriptor, ReflectMessage, Value};
-use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::Status;
+use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 
 /// Encoder for `DynamicMessage` → wire bytes.
 #[derive(Debug, Clone)]

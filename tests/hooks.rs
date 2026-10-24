@@ -11,12 +11,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use http::{HeaderMap, Method, StatusCode};
+use structured_proxy::ProxyServer;
 use structured_proxy::config::ProxyConfig;
 use structured_proxy::hooks::{
     AuthDecider, Decision, ExtraRoute, ExtraRouteHandler, MetadataDocument, OidcBackend,
     RequestParts, RouteRequest, RouteResponse, TokenVerifier,
 };
-use structured_proxy::ProxyServer;
 
 // --- embedder-supplied hook impls (axum-free) ----------------------------
 
@@ -195,9 +195,11 @@ async fn options_verify_request_is_decided_not_answered_by_cors() {
         .await
         .unwrap();
     assert_eq!(preflight.status(), StatusCode::OK);
-    assert!(preflight
-        .headers()
-        .contains_key("access-control-allow-methods"));
+    assert!(
+        preflight
+            .headers()
+            .contains_key("access-control-allow-methods")
+    );
 }
 
 #[tokio::test]
@@ -399,10 +401,12 @@ auth:
     let result = ProxyServer::from_config(config).router();
     let _ = std::fs::remove_file(&pem_path);
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("registered by more than one endpoint"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("registered by more than one endpoint")
+    );
 }
 
 #[tokio::test]
@@ -423,10 +427,12 @@ openapi:
         .with_verify_path("/docs")
         .router();
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("registered by more than one endpoint"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("registered by more than one endpoint")
+    );
 }
 
 #[tokio::test]
@@ -441,10 +447,12 @@ async fn verify_path_colliding_with_oidc_route_is_a_clean_error() {
         .with_verify_path("/.well-known/openid-configuration")
         .router();
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("registered by more than one endpoint"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("registered by more than one endpoint")
+    );
 }
 
 #[tokio::test]
@@ -461,10 +469,12 @@ async fn extra_route_colliding_with_builtin_is_a_clean_error() {
         )])
         .router();
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("registered by more than one endpoint"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("registered by more than one endpoint")
+    );
 }
 
 #[tokio::test]
@@ -514,10 +524,12 @@ async fn structurally_identical_dynamic_routes_are_a_clean_error() {
         ])
         .router();
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("registered by more than one endpoint"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("registered by more than one endpoint")
+    );
 }
 
 #[tokio::test]
@@ -530,10 +542,12 @@ async fn malformed_extra_route_path_is_a_clean_error() {
         .with_extra_routes([ExtraRoute::new(Method::GET, "ping", Arc::new(PingHandler))])
         .router();
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("must start with '/'"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("must start with '/'")
+    );
 }
 
 #[tokio::test]
@@ -545,10 +559,12 @@ async fn malformed_verify_path_is_a_clean_error() {
         .with_verify_path("auth/verify") // missing leading '/'
         .router();
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("must start with '/'"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("must start with '/'")
+    );
 }
 
 #[tokio::test]
@@ -587,10 +603,12 @@ auth:
         .router();
     let _ = std::fs::remove_file(&pem_path);
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("registered by more than one endpoint"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("registered by more than one endpoint")
+    );
 }
 
 #[tokio::test]
@@ -604,10 +622,12 @@ async fn verify_path_colliding_with_probe_is_a_clean_error() {
         .with_verify_path("/health")
         .router();
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("registered by more than one endpoint"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("registered by more than one endpoint")
+    );
 }
 
 #[tokio::test]

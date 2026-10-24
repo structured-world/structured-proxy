@@ -134,19 +134,25 @@ fn non_terminal_field_template_is_spelled_out_in_the_path() {
     );
     let path = proto_path_to_axum("/v1/{name=projects/*}/topics");
     let _router: Router<()> = Router::new().route(&path, get(|| async { "ok" }));
-    assert!(path::MountedPath::new("/v1/{name=projects/*}/topics")
-        .unsupported
-        .is_none());
+    assert!(
+        path::MountedPath::new("/v1/{name=projects/*}/topics")
+            .unsupported
+            .is_none()
+    );
 
     // `**` before the last segment has no faithful form: the binding is
     // left out rather than widened to one segment. A terminal one is still
     // a real catch-all.
-    assert!(path::MountedPath::new("/v1/{rest=**}/tail")
-        .unsupported
-        .is_some());
-    assert!(path::MountedPath::new("/v1/{rest=a/**}/tail")
-        .unsupported
-        .is_some());
+    assert!(
+        path::MountedPath::new("/v1/{rest=**}/tail")
+            .unsupported
+            .is_some()
+    );
+    assert!(
+        path::MountedPath::new("/v1/{rest=a/**}/tail")
+            .unsupported
+            .is_some()
+    );
     assert_eq!(
         proto_path_to_axum("/v1/files/{rest=**}"),
         "/v1/files/{*rest}"
@@ -1059,8 +1065,8 @@ fn item_message() -> DynamicMessage {
 fn item_message_named(name: &str, count: i64) -> DynamicMessage {
     use prost_reflect::prost::Message;
     use prost_reflect::prost_types::{
-        field_descriptor_proto::{Label, Type},
         DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
+        field_descriptor_proto::{Label, Type},
     };
 
     let item = DescriptorProto {
@@ -1191,8 +1197,8 @@ async fn ndjson_terminal_frame_carries_status_details() {
 /// no pool knows, so it cannot be serialized to JSON.
 fn unserializable_message() -> DynamicMessage {
     use prost_reflect::prost_types::{
-        field_descriptor_proto::{Label, Type},
         DescriptorProto, FieldDescriptorProto, FileDescriptorProto,
+        field_descriptor_proto::{Label, Type},
     };
 
     let wrapper = DescriptorProto {

@@ -98,7 +98,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use axum::extract::ConnectInfo;
-use http::header::{HeaderName, FORWARDED};
+use http::header::{FORWARDED, HeaderName};
 use http::{HeaderMap, HeaderValue};
 use ipnet::IpNet;
 use tower::{Layer, Service};
@@ -633,7 +633,7 @@ fn parse_trusted(entry: &str) -> Result<IpNet, String> {
             Err(_) => {
                 return Err(format!(
                     "trusted_proxies entry {entry:?} is neither a CIDR range nor an IP address"
-                ))
+                ));
             }
         },
     };

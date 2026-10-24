@@ -252,7 +252,7 @@ fn a_zero_limit_in_the_config_is_an_error() {
 /// A process crypto provider, for builds without a crypto backend feature.
 fn install_provider() {
     if rustls::crypto::CryptoProvider::get_default().is_none() {
-        rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider())
+        rustls::crypto::CryptoProvider::install_default(coordinode_crypto::provider())
             .expect("each test runs in its own process");
     }
 }
@@ -289,6 +289,41 @@ fn client_auth_without_a_client_ca_is_an_error() {
             .unwrap_err();
         assert!(err.to_string().contains("client_ca_file"), "{err}");
     }
+}
+
+/// The listener YAML for the RSA identity in the TLS fixtures.
+fn rsa_listener_yaml() -> String {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/tls/testdata");
+    format!("listen:\n  tls:\n    cert_file: {dir}/rsa.pem\n    key_file: {dir}/rsa.key.pem\n")
+}
+
+/// The RustCrypto provider presents no RSA identity, and the error names the
+/// key file it refused.
+#[test]
+fn the_rustcrypto_provider_refuses_an_rsa_listener_key() {
+    rustls::crypto::CryptoProvider::install_default(coordinode_crypto::provider())
+        .expect("each test runs in its own process");
+    let err = crate::ProxyServer::from_yaml_str(&rsa_listener_yaml())
+        .unwrap()
+        .serve_options()
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("rsa.key.pem"), "{err}");
+    assert!(err.contains("P-256, P-384 or Ed25519"), "{err}");
+}
+
+/// A provider the host installed keeps its own key contract, whichever
+/// backend features the dependency graph unified: one that signs with RSA
+/// serves an RSA listener.
+#[test]
+fn a_host_provider_with_rsa_serves_an_rsa_listener_key() {
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider())
+        .expect("each test runs in its own process");
+    let options = crate::ProxyServer::from_yaml_str(&rsa_listener_yaml())
+        .unwrap()
+        .serve_options()
+        .unwrap();
+    assert!(options.tls.is_some());
 }
 
 #[test]

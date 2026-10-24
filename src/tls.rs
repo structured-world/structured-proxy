@@ -92,9 +92,15 @@ pub(crate) fn server_config(
             builder.with_client_cert_verifier(verifier)
         }
     };
-    let mut server = builder
-        .with_single_cert(chain, key)
-        .map_err(|e| format!("{}: {e}", config.cert_file.display()))?;
+    // The provider's own key policy decides which identities it presents (the
+    // RustCrypto one refuses RSA), and the error may concern either file.
+    let mut server = builder.with_single_cert(chain, key).map_err(|e| {
+        format!(
+            "{} / {}: {e}",
+            config.cert_file.display(),
+            config.key_file.display()
+        )
+    })?;
     server.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(server)
 }
@@ -126,8 +132,7 @@ fn select_provider(
     })
 }
 
-/// aws-lc wins whenever it is compiled in, as it does for JWT verification:
-/// constant-time, and free of the advisories the RustCrypto provider carries.
+/// The explicitly enabled aws-lc backend retains precedence, as for JWT verification.
 #[cfg(feature = "aws_lc_rs")]
 fn builtin_provider() -> Option<CryptoProvider> {
     Some(rustls::crypto::aws_lc_rs::default_provider())
@@ -136,7 +141,7 @@ fn builtin_provider() -> Option<CryptoProvider> {
 /// The pure-Rust RustCrypto provider, the only backend this build compiled.
 #[cfg(all(feature = "rust_crypto", not(feature = "aws_lc_rs")))]
 fn builtin_provider() -> Option<CryptoProvider> {
-    Some(rustls_rustcrypto::provider())
+    Some(coordinode_crypto::provider())
 }
 
 /// No crypto backend is compiled in.

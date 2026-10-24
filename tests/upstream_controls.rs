@@ -12,7 +12,7 @@
 mod common;
 
 use std::convert::Infallible;
-use std::future::{ready, Ready};
+use std::future::{Ready, ready};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -23,10 +23,10 @@ use http::{HeaderMap, HeaderName, Method, StatusCode};
 use http_body_util::BodyExt;
 use prost::Message as _;
 use prost_reflect::{DescriptorPool, DynamicMessage, Value as PbValue};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
+use structured_proxy::ProxyServer;
 use structured_proxy::transcode::codec::DynamicCodec;
 use structured_proxy::transcode::error::ErrorDetailsPolicy;
-use structured_proxy::ProxyServer;
 use tonic::metadata::{AsciiMetadataValue, BinaryMetadataValue};
 use tower::ServiceExt;
 

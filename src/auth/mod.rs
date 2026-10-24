@@ -10,6 +10,11 @@
 //! [`ProxyServer::with_token_verifier`](crate::ProxyServer::with_token_verifier).
 //! Everything else here — policies, roles, claim headers — is independent of
 //! which one verified the token.
+//!
+//! This module is for an application that leaves authentication and
+//! authorization to the proxy. One with its own authn/authz, such as
+//! structured-id, uses none of it (see
+//! [the crate docs](crate#applications-with-their-own-authentication)).
 
 pub mod authz;
 #[cfg(feature = "builtin_jwt")]
@@ -31,13 +36,13 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::header::{HeaderName, HeaderValue};
 use axum::http::HeaderMap;
+use axum::http::header::{HeaderName, HeaderValue};
 use axum::middleware::Next;
 use axum::response::Response;
 use serde_json::Value;
 
-use crate::config::{default_roles_claim, AuthConfig};
+use crate::config::{AuthConfig, default_roles_claim};
 use crate::hooks::TokenVerifier;
 use policy::Policies;
 

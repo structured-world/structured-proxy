@@ -8,10 +8,10 @@ use std::convert::Infallible;
 use axum::body::Body;
 use http::StatusCode;
 use prost_reflect::DescriptorPool;
-use structured_proxy::transcode::error::ErrorDetailsPolicy;
 use structured_proxy::ProxyServer;
-use tower::util::BoxCloneSyncService;
+use structured_proxy::transcode::error::ErrorDetailsPolicy;
 use tower::ServiceExt;
+use tower::util::BoxCloneSyncService;
 
 mod protos;
 

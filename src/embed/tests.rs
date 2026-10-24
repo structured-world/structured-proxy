@@ -3,10 +3,10 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, Request, StatusCode};
 use axum::routing::get;
-use axum::Router;
 use bytes::Bytes;
 use tower::ServiceExt;
 

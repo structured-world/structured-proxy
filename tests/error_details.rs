@@ -11,7 +11,7 @@
 mod common;
 
 use std::convert::Infallible;
-use std::future::{ready, Ready};
+use std::future::{Ready, ready};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -20,7 +20,7 @@ use futures::stream::BoxStream;
 use http::StatusCode;
 use prost::Message as _;
 use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use structured_proxy::transcode::codec::DynamicCodec;
 use structured_proxy::transcode::error::ErrorDetailsPolicy;
 use tonic_types::{BadRequest, DebugInfo, ErrorDetail, ErrorInfo, FieldViolation, StatusExt};

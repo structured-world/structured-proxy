@@ -29,7 +29,7 @@ pub type TlsConnectInfo =
     <tokio_rustls::server::TlsStream<tokio::net::TcpStream> as Connected>::ConnectInfo;
 
 use crate::upstream::{
-    grpc_protocol, is_grpc_web_preflight, BoxError, GrpcProtocol, PassThrough, Upstream,
+    BoxError, GrpcProtocol, PassThrough, Upstream, grpc_protocol, is_grpc_web_preflight,
 };
 
 /// The proxy as a tower service, built by

@@ -274,16 +274,20 @@ mod tests {
 
     #[test]
     fn zero_rate_or_burst_is_rejected() {
-        assert!(compile_profile(&LimitProfileConfig {
-            rate: "0/min".to_string(),
-            burst: None,
-        })
-        .is_err());
-        assert!(compile_profile(&LimitProfileConfig {
-            rate: "100/min".to_string(),
-            burst: Some(0),
-        })
-        .is_err());
+        assert!(
+            compile_profile(&LimitProfileConfig {
+                rate: "0/min".to_string(),
+                burst: None,
+            })
+            .is_err()
+        );
+        assert!(
+            compile_profile(&LimitProfileConfig {
+                rate: "100/min".to_string(),
+                burst: Some(0),
+            })
+            .is_err()
+        );
     }
 
     #[test]

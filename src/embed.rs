@@ -16,7 +16,7 @@ use axum::http::header::{CONTENT_TYPE, LOCATION, WWW_AUTHENTICATE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, on, MethodFilter, MethodRouter};
+use axum::routing::{MethodFilter, MethodRouter, get, on};
 use axum::{Json, Router};
 
 use crate::client_address::ClientAddress;

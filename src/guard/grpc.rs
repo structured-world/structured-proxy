@@ -3,15 +3,15 @@
 use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
-use std::task::{ready, Context, Poll};
+use std::task::{Context, Poll, ready};
 
 use axum::extract::Request;
 use axum::response::Response;
 use pin_project_lite::pin_project;
 use tower::Service;
 
-use super::{http_to_grpc_code, BoxedService, Rejection};
-use crate::upstream::{grpc_protocol, trailers_only, GrpcProtocol};
+use super::{BoxedService, Rejection, http_to_grpc_code};
+use crate::upstream::{GrpcProtocol, grpc_protocol, trailers_only};
 
 /// The guarded gRPC path of one protocol: a guard's HTTP rejection becomes a
 /// trailers-only status in `protocol` (gRPC PROTOCOL-HTTP2, "Responses"), the

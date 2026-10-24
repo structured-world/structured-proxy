@@ -11,13 +11,13 @@ use std::task::{Context, Poll};
 
 use axum::extract::Request;
 use axum::response::Response;
-use http::header::RETRY_AFTER;
 use http::HeaderValue;
+use http::header::RETRY_AFTER;
 use pin_project_lite::pin_project;
 use tokio::sync::OwnedSemaphorePermit;
 use tower::{Layer, Service};
 
-use super::{reject, Class, Concurrency, Guards, Maintenance, Scope};
+use super::{Class, Concurrency, Guards, Maintenance, Scope, reject};
 use crate::client_address::{ClientAddress, Resolution};
 use crate::shield::matcher::Phase;
 use crate::shield::{Decision, Report, Shield};
