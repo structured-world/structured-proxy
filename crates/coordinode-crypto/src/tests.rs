@@ -11,22 +11,36 @@ use rustls::{ConnectionTrafficSecrets, Error, PeerMisbehaved};
 // must update the key or close. ChaCha20-Poly1305 has no practical bound.
 #[test]
 fn aes_gcm_suites_carry_their_confidentiality_limit() {
-    let provider = super::provider();
-    assert_eq!(provider.cipher_suites.len(), 9);
-    for suite in &provider.cipher_suites {
-        let common = match suite {
-            rustls::SupportedCipherSuite::Tls12(suite) => &suite.common,
-            rustls::SupportedCipherSuite::Tls13(suite) => &suite.common,
-        };
-        let name = alloc::format!("{:?}", common.suite);
-        let expected = if name.contains("CHACHA20") {
-            u64::MAX
-        } else {
-            assert!(name.contains("_GCM_"), "{name}");
-            1 << 24
-        };
-        assert_eq!(common.confidentiality_limit, expected, "{name}");
-    }
+    use rustls::CipherSuite as S;
+    const GCM: u64 = 1 << 24;
+    // The exact suites of the compiled profile, in offer order.
+    let mut expected = Vec::new();
+    #[cfg(feature = "tls12")]
+    expected.extend([
+        (S::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, GCM),
+        (S::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, GCM),
+        (S::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, u64::MAX),
+        (S::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, GCM),
+        (S::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384, GCM),
+        (S::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256, u64::MAX),
+    ]);
+    expected.extend([
+        (S::TLS13_AES_128_GCM_SHA256, GCM),
+        (S::TLS13_AES_256_GCM_SHA384, GCM),
+        (S::TLS13_CHACHA20_POLY1305_SHA256, u64::MAX),
+    ]);
+    let actual: Vec<_> = super::provider()
+        .cipher_suites
+        .iter()
+        .map(|suite| {
+            let common = match suite {
+                rustls::SupportedCipherSuite::Tls12(suite) => &suite.common,
+                rustls::SupportedCipherSuite::Tls13(suite) => &suite.common,
+            };
+            (common.suite, common.confidentiality_limit)
+        })
+        .collect();
+    assert_eq!(actual, expected);
 }
 
 // TLS 1.3 must reject non-contributory X25519 shares (RFC 8446 section 7.4.2).
