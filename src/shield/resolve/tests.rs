@@ -25,7 +25,9 @@ fn with_tls_provider() {
     {
         use rustls::crypto::CryptoProvider;
         // A concurrent test may have installed it first; either way one is set.
-        let installed = coordinode_crypto::provider().install_default().is_ok();
+        let installed = sid_crypto::tls::rustcrypto::provider()
+            .install_default()
+            .is_ok();
         assert!(installed || CryptoProvider::get_default().is_some());
     }
 }

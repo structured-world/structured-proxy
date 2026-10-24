@@ -130,12 +130,10 @@ jobs:
       - name: Doc tests
         run: cargo test --doc ${{ matrix.backend.flags }}
 
-      # Both packages, so structured-proxy is verified against the
-      # coordinode-crypto it would be published with; with `cli`, so the
-      # packaged binary compiles too.
+      # With `cli`, so the packaged binary compiles too.
       - name: Publish dry-run
         if: matrix.backend.name == 'rust_crypto'
-        run: cargo publish --dry-run --workspace --features structured-proxy/cli
+        run: cargo publish --dry-run --features cli
 
   # The release packages ship static musl binaries; build and test that target
   # on every change, so a dependency that breaks it fails here, not at release.
@@ -193,46 +191,6 @@ jobs:
         run: cargo check --all-targets --all-features
       - name: Check (injected verifier)
         run: cargo check --all-targets --no-default-features --features cli
-
-  # The rustls provider package: not a default member, so the jobs above do
-  # not build its own targets. It has its own MSRV and an allocation-only build.
-  coordinode-crypto:
-    name: coordinode-crypto
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-          targets: thumbv7em-none-eabihf
-      - uses: dtolnay/rust-toolchain@1.92
-      # Third-party action: pinned to a commit SHA (dependabot keeps it fresh).
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      # Third-party action: pinned to a commit SHA (dependabot keeps it fresh).
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
-        with:
-          tool: cargo-nextest
-      - name: Clippy
-        run: cargo +stable clippy -p coordinode-crypto --all-targets --all-features
-      - name: Test
-        run: cargo +stable nextest run -p coordinode-crypto --all-features
-      # The TLS 1.3-only profile offers a different suite set.
-      - name: Clippy and test (no tls12)
-        run: |
-          cargo +stable clippy -p coordinode-crypto --all-targets --no-default-features --features std
-          cargo +stable nextest run -p coordinode-crypto --no-default-features --features std
-      - name: Doc tests
-        run: cargo +stable test --doc -p coordinode-crypto --all-features
-      - name: MSRV (1.92)
-        run: cargo +1.92 check -p coordinode-crypto --all-targets
-      # A target with no std: a host target could pull std in through a
-      # transitively unified feature without failing.
-      - name: No-std check
-        env:
-          RUSTFLAGS: '-Dwarnings --cfg getrandom_backend="custom"'
-        run: cargo +stable check -p coordinode-crypto --no-default-features --features alloc --target thumbv7em-none-eabihf
 
   security-audit:
     name: Security Audit

@@ -41,7 +41,7 @@ async fn serve(
         .unwrap();
     let key = PrivateKeyDer::from_pem_slice(key.as_bytes()).unwrap();
     // An independent peer: the client under test is the proxy's, and the
-    // server must present RSA identities, which coordinode-crypto refuses.
+    // server must present RSA identities, which the RustCrypto provider refuses.
     let config = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -83,7 +83,8 @@ async fn serve(
 /// handshakes below cover the one production uses; a build without a backend
 /// falls back to RustCrypto, as an embedder would install one.
 fn client(trusted: &str, host: &str, addr: SocketAddr) -> reqwest::Client {
-    let provider = Arc::new(builtin_provider().unwrap_or_else(coordinode_crypto::provider));
+    let provider =
+        Arc::new(builtin_provider().unwrap_or_else(sid_crypto::tls::rustcrypto::provider));
     reqwest::Client::builder()
         .tls_backend_preconfigured(client_config_with(provider, roots(trusted)).unwrap())
         .resolve(host, addr)
@@ -199,14 +200,20 @@ fn the_aws_lc_backend_brings_the_aws_lc_provider() {
         kind(&builtin),
         kind(&rustls::crypto::aws_lc_rs::default_provider())
     );
-    assert_ne!(kind(&builtin), kind(&coordinode_crypto::provider()));
+    assert_ne!(
+        kind(&builtin),
+        kind(&sid_crypto::tls::rustcrypto::provider())
+    );
 }
 
 #[cfg(all(feature = "rust_crypto", not(feature = "aws_lc_rs")))]
 #[test]
 fn the_rust_crypto_backend_brings_the_rustcrypto_provider() {
     let builtin = builtin_provider().unwrap();
-    assert_eq!(kind(&builtin), kind(&coordinode_crypto::provider()));
+    assert_eq!(
+        kind(&builtin),
+        kind(&sid_crypto::tls::rustcrypto::provider())
+    );
 }
 
 #[cfg(not(any(feature = "rust_crypto", feature = "aws_lc_rs")))]
@@ -218,7 +225,7 @@ fn without_a_crypto_backend_no_provider_is_linked() {
 
 #[test]
 fn the_installed_provider_wins_over_the_builtin_one() {
-    let installed = Arc::new(coordinode_crypto::provider());
+    let installed = Arc::new(sid_crypto::tls::rustcrypto::provider());
     let chosen = select_provider(Some(&installed), || {
         panic!("the builtin provider is not built when one is installed")
     })
@@ -228,7 +235,7 @@ fn the_installed_provider_wins_over_the_builtin_one() {
 
 #[test]
 fn without_an_installed_provider_the_builtin_one_is_used() {
-    let chosen = select_provider(None, || Some(coordinode_crypto::provider())).unwrap();
+    let chosen = select_provider(None, || Some(sid_crypto::tls::rustcrypto::provider())).unwrap();
     assert!(!chosen.cipher_suites.is_empty());
 }
 
@@ -250,7 +257,7 @@ fn a_provider_without_tls12_or_tls13_suites_is_refused() {
     // safe version is an error, not a panic.
     let provider = rustls::crypto::CryptoProvider {
         cipher_suites: Vec::new(),
-        ..coordinode_crypto::provider()
+        ..sid_crypto::tls::rustcrypto::provider()
     };
     let err = client_config_with(Arc::new(provider), roots(CA)).unwrap_err();
     assert!(err.contains("TLS 1.2 or 1.3"), "{err}");

@@ -4,7 +4,7 @@
 # Ignored deliberately; mirror of deny.toml, which carries the full rationale.
 #
 # RUSTSEC-2023-0071: "Marvin Attack" timing sidechannel in `rsa`, via the
-# RustCrypto JWT backend and the coordinode-crypto rustls provider.
+# sid-crypto RustCrypto JWT and rustls providers.
 # No fixed `rsa` release exists; RSA only verifies signatures with public keys
 # (JWTs, TLS peer certificates), RSA private-key operations are refused, and
 # Marvin targets private-key timing.

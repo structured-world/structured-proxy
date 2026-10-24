@@ -1,15 +1,12 @@
 //! Process-wide `jsonwebtoken` crypto provider selection.
 //!
-//! The RustCrypto backend uses jsonwebtoken's extension interface with current
+//! The RustCrypto backend is the `sid-crypto` jsonwebtoken adapter over current
 //! primitives. The optional aws-lc backend retains its existing precedence.
 //! Explicit installation avoids feature inference when dependencies enable
 //! different jsonwebtoken backends in one process.
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(all(feature = "rust_crypto", not(feature = "aws_lc_rs")))]
-mod rust_crypto;
 
 /// The provider this crate installs.
 ///
@@ -23,7 +20,7 @@ pub(crate) fn preferred_provider() -> &'static jsonwebtoken::crypto::CryptoProvi
 /// compiled with.
 #[cfg(all(feature = "rust_crypto", not(feature = "aws_lc_rs")))]
 pub(crate) fn preferred_provider() -> &'static jsonwebtoken::crypto::CryptoProvider {
-    &rust_crypto::DEFAULT_PROVIDER
+    sid_crypto::jwt::rustcrypto::provider()
 }
 
 /// Select the `jsonwebtoken` crypto provider for this process.

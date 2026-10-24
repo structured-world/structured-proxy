@@ -252,7 +252,7 @@ fn a_zero_limit_in_the_config_is_an_error() {
 /// A process crypto provider, for builds without a crypto backend feature.
 fn install_provider() {
     if rustls::crypto::CryptoProvider::get_default().is_none() {
-        rustls::crypto::CryptoProvider::install_default(coordinode_crypto::provider())
+        rustls::crypto::CryptoProvider::install_default(sid_crypto::tls::rustcrypto::provider())
             .expect("each test runs in its own process");
     }
 }
@@ -301,7 +301,7 @@ fn rsa_listener_yaml() -> String {
 /// key file it refused.
 #[test]
 fn the_rustcrypto_provider_refuses_an_rsa_listener_key() {
-    rustls::crypto::CryptoProvider::install_default(coordinode_crypto::provider())
+    rustls::crypto::CryptoProvider::install_default(sid_crypto::tls::rustcrypto::provider())
         .expect("each test runs in its own process");
     let err = crate::ProxyServer::from_yaml_str(&rsa_listener_yaml())
         .unwrap()

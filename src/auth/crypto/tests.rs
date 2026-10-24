@@ -35,7 +35,7 @@ fn aws_lc_rs_only_build_installs_aws_lc_rs() {
 fn rust_crypto_only_build_installs_rust_crypto() {
     assert!(std::ptr::eq(
         super::preferred_provider(),
-        &super::rust_crypto::DEFAULT_PROVIDER
+        sid_crypto::jwt::rustcrypto::provider()
     ));
 }
 

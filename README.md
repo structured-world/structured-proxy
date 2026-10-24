@@ -1477,7 +1477,7 @@ needed. The rustls crypto provider is, in order:
    `rustls::crypto::CryptoProvider::install_default`, if any: an explicit
    choice wins;
 2. aws-lc, with the `aws_lc_rs` feature;
-3. the maintained pure-Rust RustCrypto adapter (`coordinode-crypto`), with `rust_crypto`.
+3. the pure-Rust RustCrypto provider of `sid-crypto`, with `rust_crypto`.
 
 The default build is pure Rust; aws-lc (C) comes with `aws_lc_rs`. A
 `default-features = false` build brings no provider, so a crate that only

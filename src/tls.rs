@@ -141,7 +141,7 @@ fn builtin_provider() -> Option<CryptoProvider> {
 /// The pure-Rust RustCrypto provider, the only backend this build compiled.
 #[cfg(all(feature = "rust_crypto", not(feature = "aws_lc_rs")))]
 fn builtin_provider() -> Option<CryptoProvider> {
-    Some(coordinode_crypto::provider())
+    Some(sid_crypto::tls::rustcrypto::provider())
 }
 
 /// No crypto backend is compiled in.

@@ -6,8 +6,7 @@
 
 [advisories]
 # RUSTSEC-2023-0071: "Marvin Attack" timing sidechannel in `rsa`.
-# Chains: rsa -> structured-proxy (the `rust_crypto` JWT verifier), and
-#         rsa -> coordinode-crypto (the RustCrypto rustls provider) -> structured-proxy.
+# Chain: rsa -> sid-crypto (the RustCrypto JWT and rustls providers) -> structured-proxy.
 #
 # Ignored deliberately. See https://github.com/structured-world/structured-proxy/issues/48
 #   1. No fix exists: the advisory has patched:[] / unaffected:[] in the RustSec
@@ -17,13 +16,13 @@
 #      required by no-C consumers (e.g. CoordiNode ADR-013).
 #   3. RSA here only ever verifies signatures with public keys: JWTs, and the
 #      certificates and handshake signatures of TLS peers. The JWT backend
-#      refuses RSA signer and private-key factories, and coordinode-crypto
+#      refuses RSA signer and private-key factories, and the rustls provider
 #      admits only P-256, P-384 and Ed25519 local identities. Marvin targets
 #      private-key timing (decrypt/sign), which never runs on a verify path.
 #      Revisit when RustCrypto ships a constant-time `rsa` stable release.
 #
-# Both chains come with the `rust_crypto` feature: a `default-features = false`
-# build links neither, and CI checks that `rsa` is not in it.
+# The chain comes with the `rust_crypto` feature: a `default-features = false`
+# build does not link it, and CI checks that `rsa` is not in it.
 ignore = [
   { id = "RUSTSEC-2023-0071", reason = "No fixed `rsa` release exists: the advisory is patched:[] and covers the resolved 0.10.0-rc.19. We deliberately keep pure-Rust crypto (the RustCrypto JWT backend and rustls provider) over C. RSA only verifies signatures with public keys (JWTs, TLS peer certificates and handshake signatures); RSA private-key operations are refused, and Marvin targets private-key timing, so it is not exploitable on a verify path. Revisit when RustCrypto ships a constant-time `rsa` stable. Tracking: structured-world/structured-proxy#48" },
 ]
