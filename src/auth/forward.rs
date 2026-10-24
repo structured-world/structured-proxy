@@ -7,14 +7,14 @@
 
 use std::sync::Arc;
 
+use axum::Router;
 use axum::extract::Request;
 use axum::http::header::{HeaderValue, LOCATION};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
-use axum::Router;
 
-use super::{forbidden, unauthorized, Auth, AuthDecision};
+use super::{Auth, AuthDecision, forbidden, unauthorized};
 use crate::config::AuthConfig;
 
 /// A verification endpoint backed by the shared [`Auth`] machinery.

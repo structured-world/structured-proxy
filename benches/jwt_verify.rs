@@ -7,11 +7,11 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
-use criterion::{criterion_group, criterion_main, Criterion};
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use criterion::{Criterion, criterion_group, criterion_main};
 use ed25519_dalek::{Signer, SigningKey};
-use structured_proxy::auth::{middleware, Auth};
+use structured_proxy::auth::{Auth, middleware};
 use structured_proxy::config::ProxyConfig;
 use tower::ServiceExt;
 

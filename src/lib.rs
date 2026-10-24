@@ -10,10 +10,24 @@
 //! structured-proxy --config sflow-proxy.yaml
 //! ```
 //!
+//! ## Applications with their own authentication
+//!
+//! The proxy's auth (JWT verification, route policies and roles, claim→header
+//! forwarding, forward-auth, ext_authz, and the [`ProxyServer::with_auth`],
+//! [`ProxyServer::with_token_verifier`] and [`ProxyServer::with_auth_decider`]
+//! hooks) is for an application that leaves authentication and authorization
+//! to the proxy and an external identity provider. An application that
+//! verifies tokens and authorizes requests itself, such as structured-id and the
+//! services built on its authn/authz, embeds the proxy with none of it: no
+//! `auth:` section and none of those hooks. Its own checks are the only ones on
+//! the request path.
+//!
 //! ## JWT verification
 //!
-//! The bearer-token check sits behind [`hooks::TokenVerifier`]. A build gets one
-//! of two:
+//! The bearer-token check sits behind [`hooks::TokenVerifier`], for an
+//! application that leaves token verification to the proxy (see
+//! [above](#applications-with-their-own-authentication)). A build gets one of
+//! two:
 //!
 //! - the **built-in** verifier (keys from `auth.jwt`), whose crypto backend is
 //!   picked by a feature: `rust_crypto` (default, pure Rust) or `aws_lc_rs`
@@ -21,10 +35,12 @@
 //!   compiled in at once — Cargo features are additive, so a dependency graph
 //!   with two dependents asking for different backends unifies into exactly that
 //!   build. `aws_lc_rs` then wins: it is constant-time and free of the `rsa`
-//!   advisory `rust_crypto` carries. [`ProxyServer::from_config`] settles that
-//!   choice for the process; a process where another crate may reach
-//!   `jsonwebtoken` before any server exists calls
-//!   [`install_default_crypto_provider`] from `main` instead.
+//!   advisory `rust_crypto` carries. Building the built-in verifier settles
+//!   that choice for the process, unless the host installed a provider first;
+//!   a proxy without `auth.mode: "jwt"`, or with an injected verifier, leaves it
+//!   to the host. A process where another crate may reach `jsonwebtoken` before
+//!   the verifier is built calls [`install_default_crypto_provider`] from `main`
+//!   instead.
 //! - an **injected** one, supplied by the embedder through
 //!   [`ProxyServer::with_token_verifier`]. Since Cargo unifies features across a
 //!   whole dependency graph, a backend feature cannot be chosen per binary —
@@ -82,7 +98,7 @@ pub mod upstream;
 pub use auth::crypto::install_default_crypto_provider;
 pub use client_address::ClientAddress;
 pub use received::ReceivedRequest;
-pub use serve::{serve, serve_with, serve_with_shutdown, ServeOptions};
+pub use serve::{ServeOptions, serve, serve_with, serve_with_shutdown};
 pub use service::{ConnectionInfo, ProxyService};
 
 use axum::extract::State;
@@ -163,13 +179,6 @@ impl Default for ProxyServer {
 impl ProxyServer {
     /// Create from YAML config file.
     pub fn from_config(config: ProxyConfig) -> Self {
-        // Earliest point this crate owns: settle the JWT crypto provider here,
-        // long before the first token arrives. A process whose other crates
-        // reach jsonwebtoken before any server exists calls
-        // `install_default_crypto_provider` from `main` instead.
-        #[cfg(feature = "builtin_jwt")]
-        auth::crypto::install_default_crypto_provider();
-
         Self {
             config,
             descriptor_pool: None,
@@ -396,6 +405,10 @@ impl ProxyServer {
 
     /// JWT auth, route policies, forward-auth and ext_authz (`auth:`); build
     /// the section with [`config::from_yaml`].
+    ///
+    /// Only for an application that leaves authentication to the proxy. One
+    /// with its own authn/authz, such as structured-id, does not call this (see
+    /// [the crate docs](crate#applications-with-their-own-authentication)).
     pub fn with_auth(mut self, auth: config::AuthConfig) -> Self {
         self.config.auth = Some(auth);
         self
@@ -414,6 +427,10 @@ impl ProxyServer {
     /// backs the `/verify` forward-auth endpoint. Its signature is `axum`-free
     /// (see [`hooks::AuthDecider`]), so the embedder never names an HTTP
     /// framework.
+    ///
+    /// Only for an application that leaves authorization to the proxy. One
+    /// with its own authn/authz, such as structured-id, does not call this (see
+    /// [the crate docs](crate#applications-with-their-own-authentication)).
     pub fn with_auth_decider(mut self, decider: Arc<dyn AuthDecider>) -> Self {
         self.auth_decider = Some(decider);
         self
@@ -485,6 +502,11 @@ impl ProxyServer {
     /// `auth.mode` must still be `"jwt"` for the middleware to run; `auth.jwt`
     /// then only configures claim forwarding, and any key source in it is
     /// ignored (with a warning), since the verifier owns its own keys.
+    ///
+    /// Only for an application that leaves token verification to the proxy.
+    /// One that verifies its own tokens, such as structured-id, does not call
+    /// this and has no `auth:` section (see
+    /// [the crate docs](crate#applications-with-their-own-authentication)).
     pub fn with_token_verifier(mut self, verifier: Arc<dyn TokenVerifier>) -> Self {
         self.token_verifier = Some(verifier);
         self

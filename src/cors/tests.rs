@@ -1,9 +1,9 @@
 use super::*;
+use axum::Router;
 use axum::body::Body;
 use axum::extract::Request;
 use axum::http::StatusCode;
 use axum::routing::any;
-use axum::Router;
 use tower::ServiceExt;
 
 /// A router whose only route answers every method with the method it saw, a

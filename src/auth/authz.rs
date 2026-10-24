@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::State;
-use axum::http::header::{HeaderName, HeaderValue, HOST};
+use axum::http::header::{HOST, HeaderName, HeaderValue};
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -18,10 +18,10 @@ use tonic::transport::Channel;
 
 use envoy_types::pb::envoy::config::core::v3::HeaderValueOption;
 use envoy_types::pb::envoy::service::auth::v3::{
+    AttributeContext, CheckRequest, CheckResponse, DeniedHttpResponse,
     attribute_context::{HttpRequest, Request as AttrRequest},
     authorization_client::AuthorizationClient,
     check_response::HttpResponse as EnvoyHttpResponse,
-    AttributeContext, CheckRequest, CheckResponse, DeniedHttpResponse,
 };
 
 use crate::config::AuthzConfig;
@@ -233,8 +233,8 @@ fn denied_to_response(denied: DeniedHttpResponse) -> Response {
 mod tests {
     use super::*;
     use envoy_types::pb::envoy::config::core::v3::HeaderValue as EnvoyHeaderValue;
-    use envoy_types::pb::envoy::r#type::v3::HttpStatus;
     use envoy_types::pb::envoy::service::auth::v3::{CheckResponse, OkHttpResponse};
+    use envoy_types::pb::envoy::r#type::v3::HttpStatus;
     use envoy_types::pb::google::rpc::Status as RpcStatus;
 
     fn hvo(key: &str, value: &str) -> HeaderValueOption {
@@ -395,8 +395,8 @@ mod tests {
 
     #[tokio::test]
     async fn fail_closed_returns_503_when_authz_unreachable() {
-        use axum::routing::get;
         use axum::Router;
+        use axum::routing::get;
         use tower::ServiceExt;
 
         let authz = Authz::build(&AuthzConfig {
@@ -424,8 +424,8 @@ mod tests {
 
     #[tokio::test]
     async fn fail_open_passes_through_when_authz_unreachable() {
-        use axum::routing::get;
         use axum::Router;
+        use axum::routing::get;
         use tower::ServiceExt;
 
         let authz = Authz::build(&AuthzConfig {

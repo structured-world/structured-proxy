@@ -69,7 +69,10 @@ tonic services.
   capabilities you ask for ([Building the proxy in code](#building-the-proxy-in-code))
 - Requests the proxy does not serve go to your own fallback service
 - Hooks for auth decisions, token verification, OIDC and extra routes, with no
-  HTTP framework in your code
+  HTTP framework in your code. The auth hooks are for applications that leave
+  authentication to the proxy and an external identity provider; one with its
+  own authn/authz (such as structured-id) uses none of them
+  ([Applications with their own authentication](#applications-with-their-own-authentication))
 
 ## Non-goals
 
@@ -309,7 +312,8 @@ shield:
   # path never blocks on it; a store outage degrades to per-instance limits.
   # sync: { redis_url: "redis://127.0.0.1/", interval_ms: 500 }
 
-# JWT auth
+# JWT auth. For an application that leaves authentication to the proxy; one
+# with its own authn/authz (such as structured-id) has no `auth:` section.
 auth:
   mode: "jwt"
   # Which traffic needs a token. Default: [transcoded, endpoints]; the
@@ -973,6 +977,17 @@ returns `application/jwk-set+json` (RFC 7517 §8.5).
 command-line dependencies come with the `cli` feature. The library runs on
 your tokio runtime and logs through `tracing` to the subscriber you set up.
 
+### Applications with their own authentication
+
+The proxy's auth (JWT verification, route policies and roles, claim→header
+forwarding, the forward-auth endpoint, ext_authz and the `with_auth`,
+`with_token_verifier` and `with_auth_decider` hooks) is for an application
+that leaves authentication and authorization to the proxy and an external
+identity provider. An application that verifies tokens and authorizes requests
+itself, such as structured-id and the services built on its authn/authz,
+embeds the proxy with none of it: no `auth:` section and none of those hooks.
+Its own checks are the only ones on the request path.
+
 ```rust,no_run
 use std::path::Path;
 use structured_proxy::ProxyServer;
@@ -1284,6 +1299,11 @@ Hooks plug your own stateless logic into the proxy. Their traits use `http`,
 `bytes` and `serde_json` types and `#[async_trait]`, so your crate implements
 them without depending on axum itself.
 
+`with_auth_decider` and `with_token_verifier` are for an application that
+leaves authentication and authorization to the proxy. An application with its
+own authn/authz, such as structured-id, registers neither (see
+[Applications with their own authentication](#applications-with-their-own-authentication)).
+
 ```rust
 use std::sync::Arc;
 use structured_proxy::{config::ProxyConfig, ProxyServer};
@@ -1331,7 +1351,10 @@ The hooks are:
 ## JWT verification
 
 The bearer-token check sits behind the `TokenVerifier` hook. A build gets one of
-two implementations.
+two implementations. Both are for an application that leaves token
+verification to the proxy; one that verifies its own tokens, such as
+structured-id, uses neither (see
+[Applications with their own authentication](#applications-with-their-own-authentication)).
 
 **The built-in verifier** is what a plain config-driven deployment uses: keys
 from `auth.jwt` (an Ed25519 PEM file or a JWKS endpoint), verified with
@@ -1339,16 +1362,17 @@ from `auth.jwt` (an Ed25519 PEM file or a JWKS endpoint), verified with
 
 | Feature | Backend | Notes |
 |---------|---------|-------|
-| `rust_crypto` (default) | RustCrypto | Pure Rust. Uses `rsa`, which carries [RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071); the Marvin attack targets private-key timing, and this path only verifies with public keys (see `deny.toml`). |
-| `aws_lc_rs` | aws-lc | Constant-time / FIPS-capable, advisory-free, links aws-lc through C FFI. |
+| `rust_crypto` (default) | RustCrypto | Current primitives through jsonwebtoken's provider interface. RSA is public-key verification only; RSA signer and private-key extraction factories refuse requests (see `deny.toml`). |
+| `aws_lc_rs` | aws-lc | Explicit optional backend using C FFI. |
 
-Both can be linked at once, as with any pair of Cargo features. `jsonwebtoken`
-cannot infer a provider then, so `ProxyServer::from_config` installs `aws_lc_rs`
-for the process: it is constant-time and carries no advisory. A build that wants
-RustCrypto regardless drops the `aws_lc_rs` feature.
+Both can be linked at once, as with any pair of Cargo features. Building the
+built-in verifier explicitly installs `aws_lc_rs` when both are enabled, unless
+the process installed a provider first. A build that wants RustCrypto omits
+`aws_lc_rs`. A proxy without `auth.mode: "jwt"`, or with an injected verifier,
+installs no `jsonwebtoken` provider: that choice stays with your application.
 
 If another crate in your process uses `jsonwebtoken` too, it may reach it before
-any proxy server is built, and would hit the same ambiguity. It can also turn on
+the built-in verifier is built, and would hit the same ambiguity. It can also turn on
 the other backend for `jsonwebtoken` directly, which leaves this crate looking
 single-backend while `jsonwebtoken` sees two. Settle it once at the top of
 `main`:
@@ -1453,7 +1477,7 @@ needed. The rustls crypto provider is, in order:
    `rustls::crypto::CryptoProvider::install_default`, if any: an explicit
    choice wins;
 2. aws-lc, with the `aws_lc_rs` feature;
-3. the pure-Rust RustCrypto provider (`rustls-rustcrypto`), with `rust_crypto`.
+3. the pure-Rust RustCrypto provider of `sid-crypto`, with `rust_crypto`.
 
 The default build is pure Rust; aws-lc (C) comes with `aws_lc_rs`. A
 `default-features = false` build brings no provider, so a crate that only
@@ -1462,12 +1486,17 @@ or configures a JWKS endpoint or the rate-limit service, installs a provider
 before building the proxy (the outbound client needs one even for an
 `http://` endpoint); otherwise startup fails with an error that says so.
 
-The RustCrypto provider verifies RSA server signatures with `rsa`, under the same
-RUSTSEC-2023-0071 note as the `rust_crypto` JWT backend: only public-key
-verification runs. Its current release still names `rustls-webpki` 0.102, whose
-CRL and name-constraint advisories are listed in `deny.toml` with why they do not
-apply: the provider reads only algorithm identifiers from it, and rustls
-verifies certificates with its own patched `rustls-webpki`.
+The default RustCrypto profile accepts P-256, P-384 and Ed25519 local TLS
+identities. RSA private keys are refused, including RSA inside PKCS#8, before
+listener activation. RSA CA and peer signatures remain verifiable with
+2048..=8192-bit public keys. For example, an ECDSA leaf signed by an RSA CA
+works without giving the listener an RSA signing capability.
+
+Rustls owns certificate-path validation. Algorithm identifiers come from
+`rustls-pki-types`, without an obsolete webpki dependency. The adapter rejects
+all-zero X25519 shared secrets and propagates entropy failures. Its runtime
+dependencies are pure Rust; independent backends are confined to development
+interoperability tests.
 
 ## How it works
 

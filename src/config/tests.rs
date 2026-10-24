@@ -769,9 +769,11 @@ error_details:
     let options = transcode_options(yaml).unwrap();
     assert!(options.ndjson_envelope);
     assert!(options.error_details.enabled_for("/v1/public/items"));
-    assert!(!options
-        .error_details
-        .enabled_for("/v1/public/internal/{id}"));
+    assert!(
+        !options
+            .error_details
+            .enabled_for("/v1/public/internal/{id}")
+    );
     assert!(!options.error_details.enabled_for("/v1/admin/items"));
     // The ProxyConfig still reads its own streaming key from the same section.
     let config: ProxyConfig = parse_yaml(yaml).unwrap();

@@ -334,7 +334,7 @@ fn jwt_mode_without_a_verifier_is_rejected() {
 #[cfg(feature = "builtin_jwt")]
 mod builtin {
     use super::*;
-    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     // Ed25519 test keypair (generated for tests only; not a secret).

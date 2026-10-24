@@ -364,11 +364,12 @@ fn a_template_the_router_cannot_serve_is_not_documented() {
     let spec = spec(&[]);
     let paths = spec["paths"].as_object().unwrap();
     assert!(!paths.contains_key("/v1/broken/a{name}b"), "{paths:?}");
-    assert!(!paths.values().any(|item| item
-        .as_object()
-        .unwrap()
-        .values()
-        .any(|op| op["operationId"] == "Api.Broken")));
+    assert!(!paths.values().any(|item| {
+        item.as_object()
+            .unwrap()
+            .values()
+            .any(|op| op["operationId"] == "Api.Broken")
+    }));
 }
 
 #[test]
@@ -710,8 +711,8 @@ fn every_response_validates_against_its_schema() {
     let pool = test_pool();
     let spec = spec(&[]);
     let components = &spec["components"]["schemas"];
-    let schema = &spec["paths"]["/v1/wire"]["post"]["responses"]["200"]["content"]
-        ["application/json"]["schema"];
+    let schema = &spec["paths"]["/v1/wire"]["post"]["responses"]["200"]["content"]["application/json"]
+        ["schema"];
     let wire = pool.get_message_by_name("test.v1.Wire").unwrap();
     let choices = wire.oneofs().map(|o| o.fields().len()).max().unwrap();
     // `Value.kind` has six members: every one of them is sampled too.

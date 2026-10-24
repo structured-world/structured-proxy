@@ -8,12 +8,12 @@ use std::collections::HashSet;
 
 use axum::http::Method;
 use prost_reflect::{DescriptorPool, FieldDescriptor, Kind, MessageDescriptor, MethodDescriptor};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::config::{AliasConfig, OpenApiConfig};
+use crate::transcode::RpcSelection;
 use crate::transcode::request::{self, BodyMapping};
 use crate::transcode::rule::{self, HttpBinding, RouteMethod};
-use crate::transcode::RpcSelection;
 use crate::transcode::{self, httpbody, path};
 
 /// How a field's value travels, which decides its schema where the two differ.

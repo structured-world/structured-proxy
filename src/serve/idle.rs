@@ -3,9 +3,9 @@
 use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::task::{ready, Context, Poll};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
 use axum::body::Body;

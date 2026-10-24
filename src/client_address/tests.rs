@@ -726,12 +726,14 @@ fn an_unresolved_address_leaves_no_forwarding_header() {
         behind_lb().apply(&mut request, from);
         assert!(request.headers().get("x-forwarded-for").is_none());
         assert!(request.headers().get("x-real-ip").is_none());
-        assert!(request
-            .extensions()
-            .get::<ClientAddress>()
-            .unwrap()
-            .ip()
-            .is_none());
+        assert!(
+            request
+                .extensions()
+                .get::<ClientAddress>()
+                .unwrap()
+                .ip()
+                .is_none()
+        );
     }
 }
 

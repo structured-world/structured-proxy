@@ -3,10 +3,10 @@
 use super::*;
 use crate::config::{KeySourceConfig, LimitProfileConfig, RateRuleConfig, ShieldConfig};
 
+use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::routing::get;
-use axum::Router;
 use std::collections::HashMap;
 use tower::ServiceExt;
 
@@ -415,8 +415,8 @@ mod two_phase {
     }
 
     fn token(sk: &SigningKey, sub: &str) -> String {
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"EdDSA","typ":"JWT"}"#);
         // Far-future exp so default expiry validation passes.
         let claims = serde_json::json!({ "sub": sub, "exp": 9_999_999_999u64 });

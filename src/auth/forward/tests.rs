@@ -21,8 +21,8 @@ fn keypair() -> (SigningKey, String) {
 }
 
 fn sign(sk: &SigningKey, claims: &serde_json::Value) -> String {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"EdDSA","typ":"JWT"}"#);
     let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).unwrap());
     let signing_input = format!("{header}.{payload}");

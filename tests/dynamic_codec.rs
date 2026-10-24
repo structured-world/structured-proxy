@@ -7,14 +7,14 @@
 //! `Missing request message` and leaves the client without its response.
 
 use std::convert::Infallible;
-use std::future::{ready, Ready};
+use std::future::{Ready, ready};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use prost::Message as _;
 use prost_reflect::prost_types::{
-    field_descriptor_proto::{Label, Type},
     DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
+    field_descriptor_proto::{Label, Type},
 };
 use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor, ReflectMessage};
 use structured_proxy::transcode::codec::DynamicCodec;

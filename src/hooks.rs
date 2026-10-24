@@ -8,6 +8,11 @@
 //! `axum` type), so `cargo tree -i axum` in an embedder shows axum only under
 //! `structured-proxy`.
 //!
+//! [`AuthDecider`] and [`TokenVerifier`] are for an application that leaves
+//! authentication and authorization to the proxy. One with its own authn/authz,
+//! such as structured-id, implements neither (see
+//! [the crate docs](crate#applications-with-their-own-authentication)).
+//!
 //! Stateful concerns (BFF sessions, OIDC `authorize`/`token`) are deliberately
 //! absent: the default build is a stateless data plane (see the crate README
 //! Non-goals). They are planned behind an opt-in `bff` feature.
@@ -111,6 +116,10 @@ pub enum Decision {
 /// (e.g. JWT verification + a policy engine + header translation). Called inline
 /// on every proxied request *and* by the `/verify` forward-auth endpoint: same
 /// trait, two call sites.
+///
+/// Only for an application that leaves authorization to the proxy; one with its
+/// own authn/authz, such as structured-id, does not implement it (see
+/// [the crate docs](crate#applications-with-their-own-authentication)).
 #[async_trait]
 pub trait AuthDecider: Send + Sync {
     /// Decide whether to allow, deny, or redirect the request.
@@ -136,6 +145,10 @@ pub trait AuthDecider: Send + Sync {
 /// Everything around verification stays with the proxy: route policies
 /// (`require_auth` / `required_roles`), the roles claim, and the claim→header
 /// forwarding all operate on the returned claims.
+///
+/// Only for an application that leaves token verification to the proxy; one
+/// that verifies its own tokens, such as structured-id, does not implement it
+/// (see [the crate docs](crate#applications-with-their-own-authentication)).
 #[async_trait]
 pub trait TokenVerifier: Send + Sync {
     /// Verify `token` and return its claims, or `None` to reject the request

@@ -11,8 +11,8 @@
 //! insert that finds the cache full sweeps them at most once per second, so it
 //! may leave a new token uncached until the next sweep frees room.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 // no-std: caller-provided monotonic clock
 use std::time::Instant;
 

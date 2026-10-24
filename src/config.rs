@@ -1801,7 +1801,9 @@ impl ProxyConfig {
                 anyhow::bail!("endpoint path {path:?} ({label}) must start with '/'");
             }
             if !seen.insert(path.to_string()) {
-                anyhow::bail!("duplicate endpoint path {path:?} ({label}); each built-in endpoint must have a distinct path");
+                anyhow::bail!(
+                    "duplicate endpoint path {path:?} ({label}); each built-in endpoint must have a distinct path"
+                );
             }
             Ok(())
         };

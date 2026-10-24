@@ -24,13 +24,13 @@ mod table;
 pub use path::proto_path_to_axum;
 pub use select::RpcSelection;
 
+use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{FromRequest, FromRequestParts, OriginalUri, RawPathParams, Request, State};
 use axum::http::header::{ALLOW, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::Router;
 use futures::{StreamExt, TryStreamExt};
 use prost_reflect::{
     DescriptorPool, DynamicMessage, FieldDescriptor, MessageDescriptor, MethodDescriptor,
@@ -720,7 +720,7 @@ async fn dispatch<S: TranscodeState>(
     let (table, index) = match choice {
         Choice::Route { table, index } => (table, index),
         Choice::MethodNotAllowed { allow, .. } => {
-            return (StatusCode::METHOD_NOT_ALLOWED, [(ALLOW, allow)]).into_response()
+            return (StatusCode::METHOD_NOT_ALLOWED, [(ALLOW, allow)]).into_response();
         }
         // Only routes served without a `Chooser` get here.
         Choice::NotFound => return StatusCode::NOT_FOUND.into_response(),

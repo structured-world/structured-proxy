@@ -16,7 +16,7 @@ use std::ops::ControlFlow;
 use axum::http::{HeaderValue, Method};
 use rustc_hash::FxHashMap;
 
-use super::path::{decode_multi_segment, Composite, MountedPath, Part};
+use super::path::{Composite, MountedPath, Part, decode_multi_segment};
 use super::rule::RouteMethod;
 use super::{PathParams, RouteEntry};
 
@@ -881,7 +881,7 @@ impl PathTable {
             match &binding.entry.http_method {
                 RouteMethod::Any => return Some(Choice::Route { table, index }),
                 RouteMethod::One(bound) if bound == method => {
-                    return Some(Choice::Route { table, index })
+                    return Some(Choice::Route { table, index });
                 }
                 // A GET binding answers HEAD too, after one bound to HEAD.
                 RouteMethod::One(bound) if *bound == Method::GET && *method == Method::HEAD => {

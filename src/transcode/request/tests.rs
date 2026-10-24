@@ -1,10 +1,10 @@
 use super::*;
+use prost_reflect::DescriptorPool;
 use prost_reflect::prost::Message;
 use prost_reflect::prost_types::{
-    field_descriptor_proto::{Label, Type},
     DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
+    field_descriptor_proto::{Label, Type},
 };
-use prost_reflect::DescriptorPool;
 use serde_json::Value;
 
 fn field(

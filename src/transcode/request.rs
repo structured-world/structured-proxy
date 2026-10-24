@@ -14,8 +14,8 @@ use std::collections::HashMap;
 use prost_reflect::{
     DynamicMessage, FieldDescriptor, Kind, MessageDescriptor, ReflectMessage, Value,
 };
-use serde::de::value::StrDeserializer;
 use serde::Deserializer;
+use serde::de::value::StrDeserializer;
 use serde_json::Value as JsonValue;
 
 pub(crate) use presence::has_special_json;

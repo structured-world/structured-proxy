@@ -5,9 +5,9 @@
 //! renders the typed `google.rpc.Status` details the upstream attached in the
 //! `grpc-status-details-bin` trailer.
 
+use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use base64::Engine as _;
 use globset::GlobMatcher;
 use prost::Message as _;

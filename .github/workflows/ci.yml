@@ -98,7 +98,7 @@ jobs:
         if: matrix.backend.name == 'injected_verifier'
         run: |
           tree=$(cargo tree -e normal --target all --prefix none --format '{p}' ${{ matrix.backend.flags }})
-          if printf '%s\n' "$tree" | grep -E '^(rsa|rustls-rustcrypto|paste) v|^rustls-webpki v0\.102\.'; then
+          if printf '%s\n' "$tree" | grep -E '^rsa v'; then
             echo "::error::the build without a crypto backend links a crate with an ignored advisory"
             exit 1
           fi
@@ -130,8 +130,7 @@ jobs:
       - name: Doc tests
         run: cargo test --doc ${{ matrix.backend.flags }}
 
-      # With `cli`, so the packaged crate's binary compiles too: without the
-      # feature cargo verifies the library alone.
+      # With `cli`, so the packaged binary compiles too.
       - name: Publish dry-run
         if: matrix.backend.name == 'rust_crypto'
         run: cargo publish --dry-run --features cli

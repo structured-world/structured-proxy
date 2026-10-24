@@ -7,7 +7,7 @@
 //! (grpc-gateway's convention).
 
 use axum::body::Body;
-use axum::http::header::{Entry, OccupiedEntry, CONTENT_TYPE};
+use axum::http::header::{CONTENT_TYPE, Entry, OccupiedEntry};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::Response;
 use tonic::metadata::MetadataMap;

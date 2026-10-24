@@ -10,9 +10,9 @@ use std::path::Path;
 
 use axum::routing::get;
 use axum::{Json, Router};
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
-use serde_json::{json, Map, Value};
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::config::OidcDiscoveryConfig;

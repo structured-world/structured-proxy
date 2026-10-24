@@ -145,16 +145,12 @@ jsonwebtoken = { version = "11", default-features = false, features = [
 # rustls provider the embedder installs is used instead.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
-# The pure-Rust provider of the `rust_crypto` backend. `0.0.2-alpha` still
-# names its `rustls-webpki` 0.102 dependency, which carries four CRL /
-# name-constraint advisories; the provider only reads algorithm identifier
-# constants from it, while certificates are verified by rustls' own (patched)
-# webpki. See deny.toml.
-rustls-rustcrypto = { version = "0.0.2-alpha", optional = true }
+# The pure-Rust rustls and jsonwebtoken providers of the `rust_crypto` backend.
+sid-crypto = { version = "0.1", default-features = false, features = ["std", "tls-rustcrypto", "tls12", "jwt-rustcrypto"], optional = true }
 webpki-roots = "1"
 globset = "0.4"
 base64 = "0.23"
-sha2 = "0.11"
+sha2 = { version = "0.11", features = ["zeroize"] }
 url = "2"
 getrandom = "0.4"
 # Envoy ext_authz `Authorization/Check` messages (External AuthZ).
@@ -185,7 +181,7 @@ builtin_jwt = ["dep:jsonwebtoken"]
 # `rust_crypto` (default): pure-Rust RustCrypto backend. Pulls in `rsa`, which
 # carries RUSTSEC-2023-0071 (Marvin Attack). Not exploitable on our verify-only
 # path (public key, no private-key ops); see deny.toml / issue #48.
-rust_crypto = ["builtin_jwt", "jsonwebtoken/rust_crypto", "dep:rustls-rustcrypto"]
+rust_crypto = ["builtin_jwt", "dep:sid-crypto"]
 # `aws_lc_rs`: constant-time / FIPS-capable backend via aws-lc (C FFI),
 # advisory-free. Opt-in for consumers that allow FFI; enable with
 # `default-features = false, features = ["aws_lc_rs"]`.
@@ -218,7 +214,11 @@ http-body = "1"
 # (src/tls/tests.rs), and the provider it runs on in every build. Default
 # features would pull in aws-lc.
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
-rustls-rustcrypto = "0.0.2-alpha"
+sid-crypto = { version = "0.1", default-features = false, features = ["std", "tls-rustcrypto", "tls12"] }
+# The test HTTPS servers' provider: an independent TLS peer that can present
+# RSA identities, which the RustCrypto provider refuses. Excluded from product
+# dependencies.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 # benches/jwt_verify.rs. Plots and rayon are left out: numbers are enough.
 criterion = { version = "0.8", default-features = false, features = ["async_tokio", "cargo_bench_support"] }
 # The embedding-hooks integration test (tests/hooks.rs) writes hook impls using
