@@ -6,6 +6,90 @@ use rustls::crypto::cipher::{AeadKey, Iv, Tls13AeadAlgorithm};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer};
 use rustls::{ConnectionTrafficSecrets, Error, PeerMisbehaved};
 
+/// The TLS 1.2 AEAD of `suite` in `provider`.
+#[cfg(feature = "tls12")]
+fn tls12_aead(
+    provider: &rustls::crypto::CryptoProvider,
+    suite: rustls::CipherSuite,
+) -> &'static dyn rustls::crypto::cipher::Tls12AeadAlgorithm {
+    match provider.cipher_suites.iter().find(|s| s.suite() == suite) {
+        Some(rustls::SupportedCipherSuite::Tls12(s)) => s.aead_alg,
+        _ => panic!("{suite:?} is not a TLS 1.2 suite of the provider"),
+    }
+}
+
+/// A record of 2^14 plaintext bytes decrypts; one byte more is refused after
+/// authentication, as by an independent provider. The sender is that
+/// independent provider, so the record is genuinely authenticated.
+#[cfg(feature = "tls12")]
+fn tls12_record_limit(suite: rustls::CipherSuite) {
+    use rustls::crypto::cipher::{InboundOpaqueMessage, OutboundPlainMessage};
+    use rustls::{ContentType, ProtocolVersion};
+
+    let oracle = tls12_aead(&rustls::crypto::ring::default_provider(), suite);
+    let ours = tls12_aead(&super::provider(), suite);
+    let shape = oracle.key_block_shape();
+    let key = || AeadKey::from([1; 32]);
+    let iv = alloc::vec![0; shape.fixed_iv_len];
+    let explicit = alloc::vec![0; shape.explicit_nonce_len];
+    for length in [16_384, 16_385] {
+        let data = alloc::vec![7; length];
+        let record = oracle
+            .encrypter(key(), &iv, &explicit)
+            .encrypt(
+                OutboundPlainMessage {
+                    typ: ContentType::ApplicationData,
+                    version: ProtocolVersion::TLSv1_2,
+                    payload: data.as_slice().into(),
+                },
+                0,
+            )
+            .unwrap();
+        let decrypt = |decrypter: &dyn rustls::crypto::cipher::Tls12AeadAlgorithm| {
+            let mut bytes = record.payload.as_ref().to_vec();
+            decrypter
+                .decrypter(key(), &iv)
+                .decrypt(
+                    InboundOpaqueMessage::new(record.typ, record.version, &mut bytes),
+                    0,
+                )
+                .map(|plain| plain.payload.to_vec())
+        };
+        // Lengths, not the buffers, so a failure prints a readable outcome.
+        let expected = if length == 16_384 {
+            Ok(length)
+        } else {
+            Err(Error::PeerSentOversizedRecord)
+        };
+        for (who, aead) in [("oracle", oracle), ("ours", ours)] {
+            let outcome = decrypt(aead);
+            assert_eq!(
+                outcome.as_ref().map(Vec::len),
+                expected.as_ref().map(|len| *len),
+                "{who}, {length} bytes"
+            );
+            if let Ok(plain) = outcome {
+                assert!(plain == data, "{who}: decrypted bytes differ");
+            }
+        }
+    }
+}
+
+// TLS 1.2 plaintext is at most 2^14 bytes (RFC 5246 section 6.2.1), even
+// when the record authenticates. AES-128 shares this decrypter through
+// `impl_gcm_tls12`; rustls' public `AeadKey` builds only 32-byte keys.
+#[cfg(feature = "tls12")]
+#[test]
+fn tls12_aes_gcm_refuses_an_oversized_authenticated_record() {
+    tls12_record_limit(rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384);
+}
+
+#[cfg(feature = "tls12")]
+#[test]
+fn tls12_chacha20_refuses_an_oversized_authenticated_record() {
+    tls12_record_limit(rustls::CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256);
+}
+
 // AES-GCM records under one key are bounded (RFC 8446 section 5.5,
 // draft-irtf-cfrg-aead-limits section 5.1): past 2^24 full-size records rustls
 // must update the key or close. ChaCha20-Poly1305 has no practical bound.

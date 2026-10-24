@@ -243,6 +243,10 @@ macro_rules! impl_gcm_tls12 {
                         .map_err(|_| rustls::Error::DecryptError)?;
                     tag_pos
                 };
+                // `tag_pos` is the authenticated plaintext length.
+                if tag_pos > super::TLS12_MAX_PLAINTEXT_LEN {
+                    return Err(rustls::Error::PeerSentOversizedRecord);
+                }
 
                 // We defer the truncation to here, because we may inadvertently shifted the
                 // original data if the decryption failed. Another way to avoid this is

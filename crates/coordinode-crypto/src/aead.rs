@@ -4,6 +4,11 @@ use rustls::crypto::cipher::{BorrowedPayload, PrefixedPayload};
 pub mod chacha20;
 pub mod gcm;
 
+/// Largest TLS 1.2 record plaintext, 2^14 bytes (RFC 5246 section 6.2.1).
+/// rustls admits longer ciphertext, so the decrypter enforces it.
+#[cfg(feature = "tls12")]
+pub(crate) const TLS12_MAX_PLAINTEXT_LEN: usize = 1 << 14;
+
 pub(crate) struct EncryptBufferAdapter<'a>(&'a mut PrefixedPayload);
 
 impl AsRef<[u8]> for EncryptBufferAdapter<'_> {

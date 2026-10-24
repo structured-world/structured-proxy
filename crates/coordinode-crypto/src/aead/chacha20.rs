@@ -193,6 +193,10 @@ impl MessageDecrypter for Tls12Cipher {
         self.0
             .decrypt_in_place(&nonce, &aad, &mut DecryptBufferAdapter(payload))
             .map_err(|_| rustls::Error::DecryptError)?;
+        // The payload now holds the authenticated plaintext only.
+        if payload.len() > super::TLS12_MAX_PLAINTEXT_LEN {
+            return Err(rustls::Error::PeerSentOversizedRecord);
+        }
 
         Ok(m.into_plain_message())
     }
