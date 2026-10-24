@@ -20,49 +20,47 @@ fn tls12_aead(
 
 /// A record of 2^14 plaintext bytes decrypts; one byte more is refused after
 /// authentication, as by an independent provider. The sender is that
-/// independent provider, so the record is genuinely authenticated.
+/// independent provider, so the record is genuinely authenticated. `keys`
+/// yields a fresh matching (sender, receiver) key pair for the suite.
 #[cfg(feature = "tls12")]
-fn tls12_record_limit(suite: rustls::CipherSuite) {
+fn tls12_record_limit(suite: rustls::CipherSuite, keys: &dyn Fn() -> (AeadKey, AeadKey)) {
     use rustls::crypto::cipher::{InboundOpaqueMessage, OutboundPlainMessage};
     use rustls::{ContentType, ProtocolVersion};
 
     let oracle = tls12_aead(&rustls::crypto::ring::default_provider(), suite);
     let ours = tls12_aead(&super::provider(), suite);
     let shape = oracle.key_block_shape();
-    let key = || AeadKey::from([1; 32]);
     let iv = alloc::vec![0; shape.fixed_iv_len];
     let explicit = alloc::vec![0; shape.explicit_nonce_len];
-    for length in [16_384, 16_385] {
-        let data = alloc::vec![7; length];
-        let record = oracle
-            .encrypter(key(), &iv, &explicit)
-            .encrypt(
-                OutboundPlainMessage {
-                    typ: ContentType::ApplicationData,
-                    version: ProtocolVersion::TLSv1_2,
-                    payload: data.as_slice().into(),
-                },
-                0,
-            )
-            .unwrap();
-        let decrypt = |decrypter: &dyn rustls::crypto::cipher::Tls12AeadAlgorithm| {
+    for (who, receiver) in [("oracle", oracle), ("ours", ours)] {
+        let (tx, rx) = keys();
+        let mut encrypter = oracle.encrypter(tx, &iv, &explicit);
+        let mut decrypter = receiver.decrypter(rx, &iv);
+        for (seq, length) in [(0, 16_384), (1, 16_385)] {
+            let data = alloc::vec![7; length];
+            let record = encrypter
+                .encrypt(
+                    OutboundPlainMessage {
+                        typ: ContentType::ApplicationData,
+                        version: ProtocolVersion::TLSv1_2,
+                        payload: data.as_slice().into(),
+                    },
+                    seq,
+                )
+                .unwrap();
             let mut bytes = record.payload.as_ref().to_vec();
-            decrypter
-                .decrypter(key(), &iv)
+            let outcome = decrypter
                 .decrypt(
                     InboundOpaqueMessage::new(record.typ, record.version, &mut bytes),
-                    0,
+                    seq,
                 )
-                .map(|plain| plain.payload.to_vec())
-        };
-        // Lengths, not the buffers, so a failure prints a readable outcome.
-        let expected = if length == 16_384 {
-            Ok(length)
-        } else {
-            Err(Error::PeerSentOversizedRecord)
-        };
-        for (who, aead) in [("oracle", oracle), ("ours", ours)] {
-            let outcome = decrypt(aead);
+                .map(|plain| plain.payload.to_vec());
+            // Lengths, not the buffers, so a failure prints a readable outcome.
+            let expected = if length == 16_384 {
+                Ok(length)
+            } else {
+                Err(Error::PeerSentOversizedRecord)
+            };
             assert_eq!(
                 outcome.as_ref().map(Vec::len),
                 expected.as_ref().map(|len| *len),
@@ -75,19 +73,97 @@ fn tls12_record_limit(suite: rustls::CipherSuite) {
     }
 }
 
+/// A 32-byte key pair, for the suites whose key length matches
+/// `AeadKey::from`.
+#[cfg(feature = "tls12")]
+fn fixed_256_bit_keys() -> (AeadKey, AeadKey) {
+    (AeadKey::from([1; 32]), AeadKey::from([1; 32]))
+}
+
+/// A matching 16-byte AES-128-GCM key pair from a real local TLS 1.2
+/// handshake: rustls builds shorter `AeadKey`s only internally, and hands them
+/// out through `dangerous_extract_secrets`.
+#[cfg(all(feature = "tls12", feature = "std"))]
+fn handshake_aes128_keys() -> (AeadKey, AeadKey) {
+    use alloc::sync::Arc;
+    const SUITE: rustls::CipherSuite = rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256;
+
+    let certified = rcgen::generate_simple_self_signed(alloc::vec!["localhost".into()]).unwrap();
+    let cert = certified.cert.der().clone();
+    let mut provider = rustls::crypto::ring::default_provider();
+    provider
+        .cipher_suites
+        .retain(|suite| suite.suite() == SUITE);
+    let provider = Arc::new(provider);
+    let mut server = rustls::ServerConfig::builder_with_provider(provider.clone())
+        .with_protocol_versions(&[&rustls::version::TLS12])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(alloc::vec![cert.clone()], certified.signing_key.into())
+        .unwrap();
+    server.enable_secret_extraction = true;
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert).unwrap();
+    let mut client = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS12])
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    client.enable_secret_extraction = true;
+    let mut server = rustls::ServerConnection::new(Arc::new(server)).unwrap();
+    let mut client =
+        rustls::ClientConnection::new(Arc::new(client), "localhost".try_into().unwrap()).unwrap();
+    while client.is_handshaking() || server.is_handshaking() {
+        let mut bytes = Vec::new();
+        client.write_tls(&mut bytes).unwrap();
+        server.read_tls(&mut bytes.as_slice()).unwrap();
+        server.process_new_packets().unwrap();
+        bytes.clear();
+        server.write_tls(&mut bytes).unwrap();
+        client.read_tls(&mut bytes.as_slice()).unwrap();
+        client.process_new_packets().unwrap();
+    }
+    let ConnectionTrafficSecrets::Aes128Gcm { key: tx, .. } =
+        client.dangerous_extract_secrets().unwrap().tx.1
+    else {
+        panic!("the handshake negotiated {SUITE:?}");
+    };
+    let ConnectionTrafficSecrets::Aes128Gcm { key: rx, .. } =
+        server.dangerous_extract_secrets().unwrap().rx.1
+    else {
+        panic!("the handshake negotiated {SUITE:?}");
+    };
+    assert_eq!(tx.as_ref().len(), 16);
+    (tx, rx)
+}
+
 // TLS 1.2 plaintext is at most 2^14 bytes (RFC 5246 section 6.2.1), even
-// when the record authenticates. AES-128 shares this decrypter through
-// `impl_gcm_tls12`; rustls' public `AeadKey` builds only 32-byte keys.
+// when the record authenticates.
 #[cfg(feature = "tls12")]
 #[test]
-fn tls12_aes_gcm_refuses_an_oversized_authenticated_record() {
-    tls12_record_limit(rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384);
+fn tls12_aes256_gcm_refuses_an_oversized_authenticated_record() {
+    tls12_record_limit(
+        rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+        &fixed_256_bit_keys,
+    );
+}
+
+#[cfg(all(feature = "tls12", feature = "std"))]
+#[test]
+fn tls12_aes128_gcm_refuses_an_oversized_authenticated_record() {
+    tls12_record_limit(
+        rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        &handshake_aes128_keys,
+    );
 }
 
 #[cfg(feature = "tls12")]
 #[test]
 fn tls12_chacha20_refuses_an_oversized_authenticated_record() {
-    tls12_record_limit(rustls::CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256);
+    tls12_record_limit(
+        rustls::CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+        &fixed_256_bit_keys,
+    );
 }
 
 // AES-GCM records under one key are bounded (RFC 8446 section 5.5,
