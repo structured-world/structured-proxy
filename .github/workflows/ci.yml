@@ -71,7 +71,7 @@ jobs:
       # Runs each test in its own process, so a hang names the test that hung
       # instead of timing the whole job out. Third-party action: pinned to a
       # commit SHA (dependabot keeps it fresh).
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
         with:
           tool: cargo-nextest
 
@@ -165,7 +165,7 @@ jobs:
         with:
           key: ${{ matrix.target }}
       # Third-party action: pinned to a commit SHA (dependabot keeps it fresh).
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
         with:
           tool: cargo-nextest
 
@@ -204,7 +204,7 @@ jobs:
       # deny.toml. The released binary rather than the Docker action, whose
       # image build pulls from Docker Hub and hits its anonymous rate limit
       # on shared runners.
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
         with:
           tool: cargo-deny
       - name: Check advisories
