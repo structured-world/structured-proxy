@@ -286,6 +286,11 @@ pub enum ForwardingHeader {
     XForwardedFor,
     /// `X-Real-IP`: one address, the trusted proxy's own peer.
     XRealIp,
+    /// A cleaned report from a proxy that already resolved the client:
+    /// `X-Real-IP` with one address and, if present at all, an
+    /// `X-Forwarded-For` of that same one address, with no `Forwarded`. No
+    /// chain is walked; a report that disagrees with itself is invalid.
+    CleanedReport,
 }
 
 /// Which annotated RPCs are transcoded.

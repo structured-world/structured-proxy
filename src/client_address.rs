@@ -170,7 +170,7 @@ pub struct ClientAddress {
 #[non_exhaustive]
 pub enum Resolution {
     /// The connection's peer is the client: it is not a trusted proxy, or it
-    /// is one that forwarded no address.
+    /// is one that forwarded no address where none is required.
     Peer(IpAddr),
     /// A trusted proxy forwarded the address: the first one outside the
     /// trusted proxies, read right to left, or the leftmost when every hop is
@@ -181,7 +181,8 @@ pub enum Resolution {
     /// not the client.
     Invalid(InvalidForwarding),
     /// The server recorded no connection information, so there is no peer to
-    /// start from.
+    /// start from, or a trusted proxy reported nothing where an address is
+    /// required.
     Unavailable,
 }
 
@@ -195,6 +196,8 @@ pub enum InvalidForwarding {
     TooManyHops,
     /// More than one `X-Real-IP` field.
     Repeated,
+    /// A cleaned report whose headers do not name one and the same address.
+    Conflicting,
 }
 
 impl std::fmt::Display for InvalidForwarding {
@@ -203,6 +206,7 @@ impl std::fmt::Display for InvalidForwarding {
             Self::Malformed => "malformed",
             Self::TooManyHops => "beyond too many trusted hops",
             Self::Repeated => "repeated",
+            Self::Conflicting => "in conflict with itself",
         })
     }
 }
@@ -378,9 +382,11 @@ impl Resolver {
                 self.walk(headers.get_all(X_FORWARDED_FOR).iter(), hops)
             }
             ForwardingHeader::XRealIp => real_ip(headers.get_all(X_REAL_IP).iter()),
+            ForwardingHeader::CleanedReport => cleaned_report(headers),
         };
         let resolution = match forwarded {
             Ok(Some(ip)) => Resolution::Forwarded(ip),
+            Ok(None) if self.required => Resolution::Unavailable,
             Ok(None) => Resolution::Peer(peer_ip),
             Err(invalid) => Resolution::Invalid(invalid),
         };
@@ -609,6 +615,26 @@ fn real_ip<'a>(
         .ok_or(InvalidForwarding::Malformed)
 }
 
+/// The client's address in a cleaned report: its `X-Real-IP`, when every other
+/// assertion of an address agrees with it. `None` when nothing is reported.
+fn cleaned_report(headers: &HeaderMap) -> Result<Option<IpAddr>, InvalidForwarding> {
+    let reported = real_ip(headers.get_all(X_REAL_IP).iter())?;
+    let mut chain = headers.get_all(X_FORWARDED_FOR).iter();
+    let (first, second) = (chain.next(), chain.next());
+    let agrees = !headers.contains_key(FORWARDED)
+        && match (reported, first, second) {
+            (_, _, Some(_)) | (None, Some(_), None) => false,
+            (_, None, None) => true,
+            (Some(ip), Some(line), None) => {
+                real_ip(std::iter::once(line)).ok().flatten() == Some(ip)
+            }
+        };
+    if !agrees {
+        return Err(InvalidForwarding::Conflicting);
+    }
+    Ok(reported)
+}
+
 /// An address as forwarding headers carry it: bare, IPv6 in brackets, or
 /// either with a port, which is dropped. Nothing else, so a name, `unknown`
 /// or an obfuscated identifier (RFC 7239 §6.3) never counts as an address.
@@ -666,8 +692,9 @@ fn canonical_net(net: IpNet) -> IpNet {
 /// proxy parts such as the [`shield`](crate::shield) middleware directly, so
 /// they key by the client behind your trusted proxies rather than by the
 /// proxies' own address. The peer comes from the `ConnectInfo<SocketAddr>` an
-/// axum server records (`into_make_service_with_connect_info`); without one
-/// the address is [`Resolution::Unavailable`]. `required` is not enforced
+/// axum server records (`into_make_service_with_connect_info`) or the
+/// `TcpConnectInfo` a tonic server does; without one the address is
+/// [`Resolution::Unavailable`]. `required` is not enforced
 /// here: read [`ClientAddress::resolution`] where it matters.
 ///
 /// # Examples
@@ -741,7 +768,16 @@ where
         let peer = request
             .extensions()
             .get::<ConnectInfo<SocketAddr>>()
-            .map(|ConnectInfo(peer)| *peer);
+            .map(|ConnectInfo(peer)| *peer)
+            .or_else(|| {
+                use crate::service::TlsConnectInfo;
+                use tonic::transport::server::TcpConnectInfo;
+                let extensions = request.extensions();
+                extensions
+                    .get::<TcpConnectInfo>()
+                    .or_else(|| extensions.get::<TlsConnectInfo>().map(|tls| tls.get_ref()))
+                    .and_then(TcpConnectInfo::remote_addr)
+            });
         self.resolver.apply(&mut request, peer);
         self.inner.call(request)
     }

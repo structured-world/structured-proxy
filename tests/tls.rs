@@ -237,6 +237,54 @@ async fn listen() -> SocketAddr {
     addr
 }
 
+/// `ClientAddressLayer` on a tonic server behind TLS: the record a completed
+/// handshake gives names the peer, so a trusted proxy's report is read rather
+/// than the address left unresolved.
+#[tokio::test]
+async fn the_client_address_layer_reads_the_peer_of_a_tls_connection() {
+    use structured_proxy::client_address::{ClientAddressLayer, Resolution};
+    use structured_proxy::config::ClientAddressConfig;
+    use structured_proxy::ClientAddress;
+    use tower::{Layer, ServiceExt};
+
+    let config = rustls::ServerConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(chain(), key())
+        .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client = tokio::spawn(connect(addr, b"h2", Identity::Anonymous));
+    let (tcp, _) = listener.accept().await.unwrap();
+    let tls = acceptor.accept(tcp).await.unwrap();
+    let client = client.await.unwrap();
+    let client_addr = client.get_ref().0.local_addr().unwrap();
+
+    let info: TlsConnectInfo = tls.connect_info();
+    let mut request = http::Request::new(());
+    request.extensions_mut().insert(info);
+    request.headers_mut().insert(
+        "x-forwarded-for",
+        http::HeaderValue::from_static("203.0.113.7"),
+    );
+
+    let mut trust = ClientAddressConfig::default();
+    trust.trusted_proxies = vec!["127.0.0.1".into()];
+    let service = ClientAddressLayer::new(&trust)
+        .unwrap()
+        .layer(tower::service_fn(|request: http::Request<()>| async move {
+            Ok::<_, Infallible>(request.extensions().get::<ClientAddress>().cloned())
+        }));
+    let resolved = service.oneshot(request).await.unwrap().unwrap();
+    assert_eq!(resolved.peer(), Some(client_addr));
+    assert_eq!(
+        resolved.resolution(),
+        Resolution::Forwarded("203.0.113.7".parse().unwrap())
+    );
+}
+
 /// The directory of the test PKI.
 const TESTDATA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/tls/testdata");
 
