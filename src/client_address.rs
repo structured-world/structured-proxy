@@ -769,10 +769,16 @@ where
             .get::<ConnectInfo<SocketAddr>>()
             .map(|ConnectInfo(peer)| *peer)
             .or_else(|| {
-                request
-                    .extensions()
-                    .get::<tonic::transport::server::TcpConnectInfo>()
-                    .and_then(tonic::transport::server::TcpConnectInfo::remote_addr)
+                use tonic::transport::server::{TcpConnectInfo, TlsConnectInfo};
+                let extensions = request.extensions();
+                extensions
+                    .get::<TcpConnectInfo>()
+                    .or_else(|| {
+                        extensions
+                            .get::<TlsConnectInfo<TcpConnectInfo>>()
+                            .map(TlsConnectInfo::get_ref)
+                    })
+                    .and_then(TcpConnectInfo::remote_addr)
             });
         self.resolver.apply(&mut request, peer);
         self.inner.call(request)
