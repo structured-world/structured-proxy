@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [8.1.4](https://github.com/structured-world/structured-proxy/compare/v8.1.3...v8.1.4) - 2026-10-30
+
+### Fixed
+
+- *(client-address)* read the peer a tonic server records ([#158](https://github.com/structured-world/structured-proxy/pull/158))
+- *(crypto)* use the maintained RustCrypto providers ([#159](https://github.com/structured-world/structured-proxy/pull/159))
+
 ## [8.1.3](https://github.com/structured-world/structured-proxy/compare/v8.1.2...v8.1.3) - 2026-10-19
 
 ### Fixed
