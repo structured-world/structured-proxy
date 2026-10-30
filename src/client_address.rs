@@ -621,14 +621,15 @@ fn cleaned_report(headers: &HeaderMap) -> Result<Option<IpAddr>, InvalidForwardi
     let reported = real_ip(headers.get_all(X_REAL_IP).iter())?;
     let mut chain = headers.get_all(X_FORWARDED_FOR).iter();
     let (first, second) = (chain.next(), chain.next());
-    let agrees = match (reported, first, second) {
-        (_, _, Some(_)) => false,
-        (None, None, None) => return Ok(None),
-        (None, Some(_), None) => false,
-        (Some(_), None, None) => true,
-        (Some(ip), Some(line), None) => real_ip(std::iter::once(line)).ok().flatten() == Some(ip),
-    };
-    if !agrees || headers.contains_key(FORWARDED) {
+    let agrees = !headers.contains_key(FORWARDED)
+        && match (reported, first, second) {
+            (_, _, Some(_)) | (None, Some(_), None) => false,
+            (_, None, None) => true,
+            (Some(ip), Some(line), None) => {
+                real_ip(std::iter::once(line)).ok().flatten() == Some(ip)
+            }
+        };
+    if !agrees {
         return Err(InvalidForwarding::Conflicting);
     }
     Ok(reported)
@@ -769,15 +770,12 @@ where
             .get::<ConnectInfo<SocketAddr>>()
             .map(|ConnectInfo(peer)| *peer)
             .or_else(|| {
-                use tonic::transport::server::{TcpConnectInfo, TlsConnectInfo};
+                use crate::service::TlsConnectInfo;
+                use tonic::transport::server::TcpConnectInfo;
                 let extensions = request.extensions();
                 extensions
                     .get::<TcpConnectInfo>()
-                    .or_else(|| {
-                        extensions
-                            .get::<TlsConnectInfo<TcpConnectInfo>>()
-                            .map(TlsConnectInfo::get_ref)
-                    })
+                    .or_else(|| extensions.get::<TlsConnectInfo>().map(|tls| tls.get_ref()))
                     .and_then(TcpConnectInfo::remote_addr)
             });
         self.resolver.apply(&mut request, peer);

@@ -827,6 +827,7 @@ fn a_cleaned_report_must_agree_with_itself() {
         conflict
     );
     assert_eq!(resolve(&[], &["203.0.113.7"], &[]), conflict);
+    assert_eq!(resolve(&[], &[], &["for=198.51.100.9"]), conflict);
     assert_eq!(
         resolve(&["203.0.113.7", "203.0.113.7"], &[], &[]),
         Resolution::Invalid(InvalidForwarding::Repeated)
