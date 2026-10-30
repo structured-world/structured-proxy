@@ -239,7 +239,7 @@ impl Proxy {
 
 fn install_provider() {
     if rustls::crypto::CryptoProvider::get_default().is_none() {
-        rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider())
+        rustls::crypto::CryptoProvider::install_default(sid_crypto::tls::rustcrypto::provider())
             .expect("each test runs in its own process");
     }
 }
@@ -253,12 +253,13 @@ async fn connect(addr: SocketAddr, tls: bool, alpn: &[u8]) -> Box<dyn Io> {
     for cert in CertificateDer::pem_slice_iter(CA.as_bytes()) {
         roots.add(cert.unwrap()).unwrap();
     }
-    let mut config =
-        rustls::ClientConfig::builder_with_provider(Arc::new(rustls_rustcrypto::provider()))
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        sid_crypto::tls::rustcrypto::provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
     config.alpn_protocols = vec![alpn.to_vec()];
     let stream = tokio_rustls::TlsConnector::from(Arc::new(config))
         .connect(ServerName::try_from("localhost").unwrap(), tcp)

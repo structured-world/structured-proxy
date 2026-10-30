@@ -26,7 +26,7 @@ pub(crate) fn preferred_provider() -> &'static jsonwebtoken::crypto::CryptoProvi
 /// compiled with.
 #[cfg(all(feature = "rust_crypto", not(feature = "aws_lc_rs")))]
 pub(crate) fn preferred_provider() -> &'static jsonwebtoken::crypto::CryptoProvider {
-    &jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER
+    sid_crypto::jwt::rustcrypto::provider()
 }
 
 /// Select the `jsonwebtoken` crypto provider for this process.
