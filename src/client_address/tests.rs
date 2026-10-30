@@ -796,3 +796,37 @@ fn a_trusted_proxy_is_a_range_or_one_address() {
         assert!(err.contains("trusted_proxies"), "{bad:?}: {err}");
     }
 }
+
+/// A tonic server records its peer as `TcpConnectInfo`, not as axum's
+/// `ConnectInfo`: the layer resolves from it, so a trusted proxy in front of a
+/// tonic server is not taken for the client, nor the address left unresolved.
+#[tokio::test]
+async fn the_layer_reads_the_peer_a_tonic_server_records() {
+    use tonic::transport::server::TcpConnectInfo;
+    use tower::{service_fn, ServiceExt};
+
+    let layer = ClientAddressLayer::new(&ClientAddressConfig {
+        trusted_proxies: vec!["10.0.0.0/8".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    let service = layer.layer(service_fn(|request: http::Request<()>| async move {
+        Ok::<_, std::convert::Infallible>(request.extensions().get::<ClientAddress>().cloned())
+    }));
+
+    let mut request = http::Request::new(());
+    request
+        .headers_mut()
+        .insert(X_FORWARDED_FOR, HeaderValue::from_static("203.0.113.7"));
+    request.extensions_mut().insert(TcpConnectInfo {
+        local_addr: None,
+        remote_addr: peer("10.1.2.3:443"),
+    });
+
+    let client = service.oneshot(request).await.unwrap().unwrap();
+    assert_eq!(
+        client.resolution(),
+        Resolution::Forwarded(ip("203.0.113.7"))
+    );
+    assert_eq!(client.peer(), peer("10.1.2.3:443"));
+}

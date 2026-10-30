@@ -666,8 +666,9 @@ fn canonical_net(net: IpNet) -> IpNet {
 /// proxy parts such as the [`shield`](crate::shield) middleware directly, so
 /// they key by the client behind your trusted proxies rather than by the
 /// proxies' own address. The peer comes from the `ConnectInfo<SocketAddr>` an
-/// axum server records (`into_make_service_with_connect_info`); without one
-/// the address is [`Resolution::Unavailable`]. `required` is not enforced
+/// axum server records (`into_make_service_with_connect_info`) or the
+/// `TcpConnectInfo` a tonic server does; without one the address is
+/// [`Resolution::Unavailable`]. `required` is not enforced
 /// here: read [`ClientAddress::resolution`] where it matters.
 ///
 /// # Examples
@@ -741,7 +742,13 @@ where
         let peer = request
             .extensions()
             .get::<ConnectInfo<SocketAddr>>()
-            .map(|ConnectInfo(peer)| *peer);
+            .map(|ConnectInfo(peer)| *peer)
+            .or_else(|| {
+                request
+                    .extensions()
+                    .get::<tonic::transport::server::TcpConnectInfo>()
+                    .and_then(tonic::transport::server::TcpConnectInfo::remote_addr)
+            });
         self.resolver.apply(&mut request, peer);
         self.inner.call(request)
     }
