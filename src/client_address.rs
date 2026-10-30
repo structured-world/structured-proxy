@@ -196,6 +196,8 @@ pub enum InvalidForwarding {
     TooManyHops,
     /// More than one `X-Real-IP` field.
     Repeated,
+    /// A cleaned report whose headers do not name one and the same address.
+    Conflicting,
 }
 
 impl std::fmt::Display for InvalidForwarding {
@@ -204,6 +206,7 @@ impl std::fmt::Display for InvalidForwarding {
             Self::Malformed => "malformed",
             Self::TooManyHops => "beyond too many trusted hops",
             Self::Repeated => "repeated",
+            Self::Conflicting => "in conflict with itself",
         })
     }
 }
@@ -379,6 +382,7 @@ impl Resolver {
                 self.walk(headers.get_all(X_FORWARDED_FOR).iter(), hops)
             }
             ForwardingHeader::XRealIp => real_ip(headers.get_all(X_REAL_IP).iter()),
+            ForwardingHeader::CleanedReport => cleaned_report(headers),
         };
         let resolution = match forwarded {
             Ok(Some(ip)) => Resolution::Forwarded(ip),
@@ -609,6 +613,25 @@ fn real_ip<'a>(
     parse_address(trim_whitespace(raw))
         .map(|ip| Some(ip.to_canonical()))
         .ok_or(InvalidForwarding::Malformed)
+}
+
+/// The client's address in a cleaned report: its `X-Real-IP`, when every other
+/// assertion of an address agrees with it. `None` when nothing is reported.
+fn cleaned_report(headers: &HeaderMap) -> Result<Option<IpAddr>, InvalidForwarding> {
+    let reported = real_ip(headers.get_all(X_REAL_IP).iter())?;
+    let mut chain = headers.get_all(X_FORWARDED_FOR).iter();
+    let (first, second) = (chain.next(), chain.next());
+    let agrees = match (reported, first, second) {
+        (_, _, Some(_)) => false,
+        (None, None, None) => return Ok(None),
+        (None, Some(_), None) => false,
+        (Some(_), None, None) => true,
+        (Some(ip), Some(line), None) => real_ip(std::iter::once(line)).ok().flatten() == Some(ip),
+    };
+    if !agrees || headers.contains_key(FORWARDED) {
+        return Err(InvalidForwarding::Conflicting);
+    }
+    Ok(reported)
 }
 
 /// An address as forwarding headers carry it: bare, IPv6 in brackets, or

@@ -797,6 +797,55 @@ fn a_trusted_proxy_is_a_range_or_one_address() {
     }
 }
 
+/// A cleaned report is one address, said once: a reporter whose other headers
+/// disagree with it is refused before they are rewritten away.
+#[test]
+fn a_cleaned_report_must_agree_with_itself() {
+    let cleaned = resolver(&["10.0.0.0/8"], ForwardingHeader::CleanedReport);
+    let resolve = |real: &[&str], chain: &[&str], forwarded: &[&str]| {
+        let mut all = headers("x-real-ip", real);
+        all.extend(xff(chain));
+        all.extend(headers("forwarded", forwarded));
+        cleaned.resolve(peer("10.1.2.3:443"), &all).resolution()
+    };
+    let client = Resolution::Forwarded(ip("203.0.113.7"));
+    let conflict = Resolution::Invalid(InvalidForwarding::Conflicting);
+
+    assert_eq!(resolve(&["203.0.113.7"], &[], &[]), client);
+    assert_eq!(resolve(&["203.0.113.7"], &["203.0.113.7"], &[]), client);
+    assert_eq!(resolve(&["203.0.113.7"], &["198.51.100.9"], &[]), conflict);
+    assert_eq!(
+        resolve(&["203.0.113.7"], &["198.51.100.9, 203.0.113.7"], &[]),
+        conflict
+    );
+    assert_eq!(
+        resolve(&["203.0.113.7"], &["203.0.113.7", "203.0.113.7"], &[]),
+        conflict
+    );
+    assert_eq!(
+        resolve(&["203.0.113.7"], &[], &["for=198.51.100.9"]),
+        conflict
+    );
+    assert_eq!(resolve(&[], &["203.0.113.7"], &[]), conflict);
+    assert_eq!(
+        resolve(&["203.0.113.7", "203.0.113.7"], &[], &[]),
+        Resolution::Invalid(InvalidForwarding::Repeated)
+    );
+}
+
+/// The generic `X-Real-IP` profile keeps a proxy's chain beside it: nginx sends
+/// both, and they name different things.
+#[test]
+fn the_x_real_ip_profile_leaves_the_chain_alone() {
+    let plain = resolver(&["10.0.0.0/8"], ForwardingHeader::XRealIp);
+    let mut all = headers("x-real-ip", &["203.0.113.7"]);
+    all.extend(xff(&["198.51.100.9, 203.0.113.7"]));
+    assert_eq!(
+        plain.resolve(peer("10.1.2.3:443"), &all).resolution(),
+        Resolution::Forwarded(ip("203.0.113.7"))
+    );
+}
+
 /// Where an address is required, a trusted proxy that reports none has not
 /// said who the client is: its own address never stands in, or everything
 /// behind a sidecar would be the pod itself.
