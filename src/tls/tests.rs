@@ -40,13 +40,14 @@ async fn serve(
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     let key = PrivateKeyDer::from_pem_slice(key.as_bytes()).unwrap();
-    let config =
-        rustls::ServerConfig::builder_with_provider(Arc::new(rustls_rustcrypto::provider()))
-            .with_protocol_versions(versions)
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(chain, key)
-            .unwrap();
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(versions)
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(chain, key)
+    .unwrap();
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -80,7 +81,8 @@ async fn serve(
 /// handshakes below cover the one production uses; a build without a backend
 /// falls back to RustCrypto, as an embedder would install one.
 fn client(trusted: &str, host: &str, addr: SocketAddr) -> reqwest::Client {
-    let provider = Arc::new(builtin_provider().unwrap_or_else(rustls_rustcrypto::provider));
+    let provider =
+        Arc::new(builtin_provider().unwrap_or_else(sid_crypto::tls::rustcrypto::provider));
     reqwest::Client::builder()
         .tls_backend_preconfigured(client_config_with(provider, roots(trusted)).unwrap())
         .resolve(host, addr)
@@ -194,14 +196,20 @@ fn the_aws_lc_backend_brings_the_aws_lc_provider() {
         kind(&builtin),
         kind(&rustls::crypto::aws_lc_rs::default_provider())
     );
-    assert_ne!(kind(&builtin), kind(&rustls_rustcrypto::provider()));
+    assert_ne!(
+        kind(&builtin),
+        kind(&sid_crypto::tls::rustcrypto::provider())
+    );
 }
 
 #[cfg(all(feature = "rust_crypto", not(feature = "aws_lc_rs")))]
 #[test]
 fn the_rust_crypto_backend_brings_the_rustcrypto_provider() {
     let builtin = builtin_provider().unwrap();
-    assert_eq!(kind(&builtin), kind(&rustls_rustcrypto::provider()));
+    assert_eq!(
+        kind(&builtin),
+        kind(&sid_crypto::tls::rustcrypto::provider())
+    );
 }
 
 #[cfg(not(any(feature = "rust_crypto", feature = "aws_lc_rs")))]
@@ -213,7 +221,7 @@ fn without_a_crypto_backend_no_provider_is_linked() {
 
 #[test]
 fn the_installed_provider_wins_over_the_builtin_one() {
-    let installed = Arc::new(rustls_rustcrypto::provider());
+    let installed = Arc::new(sid_crypto::tls::rustcrypto::provider());
     let chosen = select_provider(Some(&installed), || {
         panic!("the builtin provider is not built when one is installed")
     })
@@ -223,7 +231,7 @@ fn the_installed_provider_wins_over_the_builtin_one() {
 
 #[test]
 fn without_an_installed_provider_the_builtin_one_is_used() {
-    let chosen = select_provider(None, || Some(rustls_rustcrypto::provider())).unwrap();
+    let chosen = select_provider(None, || Some(sid_crypto::tls::rustcrypto::provider())).unwrap();
     assert!(!chosen.cipher_suites.is_empty());
 }
 
@@ -245,7 +253,7 @@ fn a_provider_without_tls12_or_tls13_suites_is_refused() {
     // safe version is an error, not a panic.
     let provider = rustls::crypto::CryptoProvider {
         cipher_suites: Vec::new(),
-        ..rustls_rustcrypto::provider()
+        ..sid_crypto::tls::rustcrypto::provider()
     };
     let err = client_config_with(Arc::new(provider), roots(CA)).unwrap_err();
     assert!(err.contains("TLS 1.2 or 1.3"), "{err}");

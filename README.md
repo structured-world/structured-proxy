@@ -1339,7 +1339,7 @@ from `auth.jwt` (an Ed25519 PEM file or a JWKS endpoint), verified with
 
 | Feature | Backend | Notes |
 |---------|---------|-------|
-| `rust_crypto` (default) | RustCrypto | Pure Rust. Uses `rsa`, which carries [RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071); the Marvin attack targets private-key timing, and this path only verifies with public keys (see `deny.toml`). |
+| `rust_crypto` (default) | RustCrypto, through `sid-crypto` | Pure Rust. Uses `rsa`, which carries [RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071); the Marvin attack targets private-key timing, and this provider refuses RSA private keys and only verifies with public keys (see `deny.toml`). |
 | `aws_lc_rs` | aws-lc | Constant-time / FIPS-capable, advisory-free, links aws-lc through C FFI. |
 
 Both can be linked at once, as with any pair of Cargo features. `jsonwebtoken`
@@ -1453,7 +1453,7 @@ needed. The rustls crypto provider is, in order:
    `rustls::crypto::CryptoProvider::install_default`, if any: an explicit
    choice wins;
 2. aws-lc, with the `aws_lc_rs` feature;
-3. the pure-Rust RustCrypto provider (`rustls-rustcrypto`), with `rust_crypto`.
+3. the pure-Rust RustCrypto provider of `sid-crypto`, with `rust_crypto`.
 
 The default build is pure Rust; aws-lc (C) comes with `aws_lc_rs`. A
 `default-features = false` build brings no provider, so a crate that only
@@ -1464,10 +1464,9 @@ before building the proxy (the outbound client needs one even for an
 
 The RustCrypto provider verifies RSA server signatures with `rsa`, under the same
 RUSTSEC-2023-0071 note as the `rust_crypto` JWT backend: only public-key
-verification runs. Its current release still names `rustls-webpki` 0.102, whose
-CRL and name-constraint advisories are listed in `deny.toml` with why they do not
-apply: the provider reads only algorithm identifiers from it, and rustls
-verifies certificates with its own patched `rustls-webpki`.
+verification runs. A TLS listener on this provider therefore presents a P-256,
+P-384 or Ed25519 key; an RSA key is refused at startup. Use `aws_lc_rs` or install
+another provider to serve an RSA certificate.
 
 ## How it works
 
