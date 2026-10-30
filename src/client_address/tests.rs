@@ -797,6 +797,32 @@ fn a_trusted_proxy_is_a_range_or_one_address() {
     }
 }
 
+/// Where an address is required, a trusted proxy that reports none has not
+/// said who the client is: its own address never stands in, or everything
+/// behind a sidecar would be the pod itself.
+#[test]
+fn a_trusted_peer_that_must_report_and_reports_nothing_resolves_nothing() {
+    let required = Resolver::build(&ClientAddressConfig {
+        trusted_proxies: vec!["10.0.0.0/8".into()],
+        required: true,
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(
+        required
+            .resolve(peer("10.1.2.3:443"), &HeaderMap::new())
+            .resolution(),
+        Resolution::Unavailable
+    );
+    // An untrusted peer still is the client: it is no proxy.
+    assert_eq!(
+        required
+            .resolve(peer("203.0.113.7:443"), &HeaderMap::new())
+            .resolution(),
+        Resolution::Peer(ip("203.0.113.7"))
+    );
+}
+
 /// A tonic server records its peer as `TcpConnectInfo`, not as axum's
 /// `ConnectInfo`: the layer resolves from it, so a trusted proxy in front of a
 /// tonic server is not taken for the client, nor the address left unresolved.

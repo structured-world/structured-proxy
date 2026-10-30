@@ -170,7 +170,7 @@ pub struct ClientAddress {
 #[non_exhaustive]
 pub enum Resolution {
     /// The connection's peer is the client: it is not a trusted proxy, or it
-    /// is one that forwarded no address.
+    /// is one that forwarded no address where none is required.
     Peer(IpAddr),
     /// A trusted proxy forwarded the address: the first one outside the
     /// trusted proxies, read right to left, or the leftmost when every hop is
@@ -181,7 +181,8 @@ pub enum Resolution {
     /// not the client.
     Invalid(InvalidForwarding),
     /// The server recorded no connection information, so there is no peer to
-    /// start from.
+    /// start from, or a trusted proxy reported nothing where an address is
+    /// required.
     Unavailable,
 }
 
@@ -381,6 +382,7 @@ impl Resolver {
         };
         let resolution = match forwarded {
             Ok(Some(ip)) => Resolution::Forwarded(ip),
+            Ok(None) if self.required => Resolution::Unavailable,
             Ok(None) => Resolution::Peer(peer_ip),
             Err(invalid) => Resolution::Invalid(invalid),
         };
