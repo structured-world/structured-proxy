@@ -99,6 +99,21 @@ async fn fetch(trusted: &str, host: &str, addr: SocketAddr) -> reqwest::Result<S
         .await
 }
 
+/// The pure-Rust provider only verifies with RSA, so a listener on it refuses
+/// an RSA key at startup, naming the file, rather than failing each handshake.
+#[cfg(all(feature = "rust_crypto", not(feature = "aws_lc_rs")))]
+#[test]
+fn a_listener_on_the_pure_rust_provider_refuses_an_rsa_key() {
+    let testdata = concat!(env!("CARGO_MANIFEST_DIR"), "/src/tls/testdata");
+    let config = crate::config::ListenTlsConfig::new(
+        format!("{testdata}/rsa.pem"),
+        format!("{testdata}/rsa.key.pem"),
+    );
+    let refused = server_config(&config).unwrap_err();
+    assert!(refused.contains("rsa.pem"), "{refused}");
+    assert!(refused.contains("private keys"), "{refused}");
+}
+
 #[tokio::test]
 async fn jwks_fetch_over_tls13_with_an_ecdsa_certificate() {
     let (addr, server) = serve(ECDSA_CERT, ECDSA_KEY, &[&rustls::version::TLS13]).await;
