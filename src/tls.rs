@@ -126,8 +126,7 @@ fn select_provider(
     })
 }
 
-/// aws-lc wins whenever it is compiled in, as it does for JWT verification:
-/// constant-time, and free of the advisories the RustCrypto provider carries.
+/// aws-lc wins whenever it is compiled in, as it does for JWT verification.
 #[cfg(feature = "aws_lc_rs")]
 fn builtin_provider() -> Option<CryptoProvider> {
     Some(rustls::crypto::aws_lc_rs::default_provider())
@@ -136,7 +135,7 @@ fn builtin_provider() -> Option<CryptoProvider> {
 /// The pure-Rust RustCrypto provider, the only backend this build compiled.
 #[cfg(all(feature = "rust_crypto", not(feature = "aws_lc_rs")))]
 fn builtin_provider() -> Option<CryptoProvider> {
-    Some(rustls_rustcrypto::provider())
+    Some(sid_crypto::tls::rustcrypto::provider())
 }
 
 /// No crypto backend is compiled in.

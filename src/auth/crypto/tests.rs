@@ -13,10 +13,7 @@ fn tie_break_selects_aws_lc_rs() {
         "the tie-break must select the aws_lc_rs provider"
     );
     assert!(
-        !std::ptr::eq(
-            selected,
-            &jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER
-        ),
+        !std::ptr::eq(selected, sid_crypto::jwt::rustcrypto::provider()),
         "the tie-break must not fall back to RustCrypto"
     );
 }
@@ -40,7 +37,7 @@ fn aws_lc_rs_only_build_installs_aws_lc_rs() {
 fn rust_crypto_only_build_installs_rust_crypto() {
     assert!(std::ptr::eq(
         super::preferred_provider(),
-        &jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER
+        sid_crypto::jwt::rustcrypto::provider()
     ));
 }
 

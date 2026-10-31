@@ -1,7 +1,7 @@
 [package]
 name = "structured-proxy"
 description = "Universal gRPC→REST transcoding proxy — config-driven, works with any gRPC service"
-version = "8.1.3"
+version = "8.1.4"
 edition = "2021"
 # The oldest toolchain the crate builds on: the `msrv` CI job pins it, so
 # raising it is a deliberate change.
@@ -98,7 +98,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # The config file and the sections an embedder hands over as YAML. Safe Rust;
 # deserialization only.
-serde-saphyr = { version = "1.3", default-features = false, features = ["deserialize"] }
+serde-saphyr = { version = "2.0", default-features = false, features = ["deserialize"] }
 # The key path (`runtime.worker_threads`) a config error names; already in the
 # tree through axum.
 serde_path_to_error = "0.1"
@@ -145,12 +145,10 @@ jsonwebtoken = { version = "11", default-features = false, features = [
 # rustls provider the embedder installs is used instead.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
-# The pure-Rust provider of the `rust_crypto` backend. `0.0.2-alpha` still
-# names its `rustls-webpki` 0.102 dependency, which carries four CRL /
-# name-constraint advisories; the provider only reads algorithm identifier
-# constants from it, while certificates are verified by rustls' own (patched)
-# webpki. See deny.toml.
-rustls-rustcrypto = { version = "0.0.2-alpha", optional = true }
+# The pure-Rust TLS and JWT providers of the `rust_crypto` backend, over current
+# RustCrypto primitives; rustls keeps TLS and path validation, jsonwebtoken keeps
+# parsing and claims. RSA is public-key only.
+sid-crypto = { version = "0.1", default-features = false, features = ["std", "tls12"], optional = true }
 webpki-roots = "1"
 globset = "0.4"
 base64 = "0.23"
@@ -183,9 +181,9 @@ builtin_jwt = ["dep:jsonwebtoken"]
 # own rustls provider. With neither, the crate links no crypto backend at all.
 #
 # `rust_crypto` (default): pure-Rust RustCrypto backend. Pulls in `rsa`, which
-# carries RUSTSEC-2023-0071 (Marvin Attack). Not exploitable on our verify-only
-# path (public key, no private-key ops); see deny.toml / issue #48.
-rust_crypto = ["builtin_jwt", "jsonwebtoken/rust_crypto", "dep:rustls-rustcrypto"]
+# carries RUSTSEC-2023-0071 (Marvin Attack). Not exploitable: the JWT provider
+# refuses RSA private keys and TLS only verifies with RSA; see deny.toml / #48.
+rust_crypto = ["builtin_jwt", "sid-crypto/jwt-rustcrypto", "sid-crypto/tls-rustcrypto"]
 # `aws_lc_rs`: constant-time / FIPS-capable backend via aws-lc (C FFI),
 # advisory-free. Opt-in for consumers that allow FFI; enable with
 # `default-features = false, features = ["aws_lc_rs"]`.
@@ -218,7 +216,10 @@ http-body = "1"
 # (src/tls/tests.rs), and the provider it runs on in every build. Default
 # features would pull in aws-lc.
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
-rustls-rustcrypto = "0.0.2-alpha"
+sid-crypto = { version = "0.1", default-features = false, features = ["std", "tls12", "tls-rustcrypto"] }
+# The test server's own side of an RSA handshake: the pure-Rust provider only
+# verifies RSA, which is what the client under test does.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 # benches/jwt_verify.rs. Plots and rayon are left out: numbers are enough.
 criterion = { version = "0.8", default-features = false, features = ["async_tokio", "cargo_bench_support"] }
 # The embedding-hooks integration test (tests/hooks.rs) writes hook impls using

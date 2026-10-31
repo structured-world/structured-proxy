@@ -252,7 +252,7 @@ fn a_zero_limit_in_the_config_is_an_error() {
 /// A process crypto provider, for builds without a crypto backend feature.
 fn install_provider() {
     if rustls::crypto::CryptoProvider::get_default().is_none() {
-        rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider())
+        rustls::crypto::CryptoProvider::install_default(sid_crypto::tls::rustcrypto::provider())
             .expect("each test runs in its own process");
     }
 }
