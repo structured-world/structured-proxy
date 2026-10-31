@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [8.1.5](https://github.com/structured-world/structured-proxy/compare/v8.1.4...v8.1.5) - 2026-10-31
+
+### Fixed
+
+- *(auth)* leave the JWT provider to a host without a verifier ([#163](https://github.com/structured-world/structured-proxy/pull/163))
+
+### Other
+
+- *(deps)* update serde-saphyr requirement from 1.3 to 2.0 ([#153](https://github.com/structured-world/structured-proxy/pull/153))
+
 ## [8.1.4](https://github.com/structured-world/structured-proxy/compare/v8.1.3...v8.1.4) - 2026-10-30
 
 ### Fixed
