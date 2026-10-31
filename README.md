@@ -982,9 +982,14 @@ forwarding, the forward-auth endpoint, ext_authz and the `with_auth`,
 `with_token_verifier` and `with_auth_decider` hooks) is for an application
 that leaves authentication and authorization to the proxy and an external
 identity provider. An application that verifies tokens and authorizes requests
-itself embeds the proxy with none of it: no `auth:` section and none of those
-hooks. Its own checks are the only ones on the request path, and the proxy
-installs no `jsonwebtoken` provider in its process.
+itself needs none of it for the requests that reach its service: no `auth:`
+section, and the proxy installs no `jsonwebtoken` provider in its process.
+
+Those checks cover only what reaches the service. The proxy's own routes
+(health, metrics, OpenAPI, OIDC, extra routes) never do, so each needs a guard
+of its own or must stay off: `with_auth_decider` with a
+`with_auth_decider_scope` that takes in `endpoints` is the proxy-side option
+(see [Guards and scopes](#guards-and-scopes)).
 
 ```rust,no_run
 use std::path::Path;

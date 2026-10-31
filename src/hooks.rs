@@ -8,9 +8,11 @@
 //! `axum` type), so `cargo tree -i axum` in an embedder shows axum only under
 //! `structured-proxy`.
 //!
-//! [`AuthDecider`] and [`TokenVerifier`] are for an application that leaves
-//! authentication and authorization to the proxy; one with its own authn/authz
-//! implements neither.
+//! [`AuthDecider`] and [`TokenVerifier`] are for traffic whose authentication
+//! and authorization are left to the proxy. An application with its own
+//! authn/authz needs neither for requests that reach its service; its checks
+//! never see the proxy's own routes, which take an [`AuthDecider`] scoped to
+//! them or stay off.
 //!
 //! Stateful concerns (BFF sessions, OIDC `authorize`/`token`) are deliberately
 //! absent: the default build is a stateless data plane (see the crate README
