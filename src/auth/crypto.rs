@@ -35,11 +35,11 @@ pub(crate) fn preferred_provider() -> &'static jsonwebtoken::crypto::CryptoProvi
 /// JWT. It is idempotent, and installs the backend this crate was built with,
 /// so `jsonwebtoken` never has to infer one.
 ///
-/// A plain [`ProxyServer`](crate::ProxyServer) deployment needs no call: the
-/// server does this while it is being built. It is public for the case the
-/// server cannot cover, which is also how the ambiguity arises in the first
-/// place: another crate in the graph uses `jsonwebtoken` too and may reach it
-/// first. Call this at the top of `main` and every consumer is covered,
+/// A plain [`ProxyServer`](crate::ProxyServer) deployment needs no call: building
+/// the built-in verifier does this, and a proxy without one installs nothing. It
+/// is public for the case the proxy cannot cover, which is also how the ambiguity
+/// arises in the first place: another crate in the graph uses `jsonwebtoken` too
+/// and may reach it first. Call this at the top of `main` and every consumer is covered,
 /// whichever runs first.
 ///
 /// With both backends linked the choice is `aws_lc_rs`: constant-time, and free
