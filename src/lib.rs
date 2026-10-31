@@ -21,10 +21,11 @@
 //!   compiled in at once — Cargo features are additive, so a dependency graph
 //!   with two dependents asking for different backends unifies into exactly that
 //!   build. `aws_lc_rs` then wins: it is constant-time and free of the `rsa`
-//!   advisory `rust_crypto` carries. [`ProxyServer::from_config`] settles that
-//!   choice for the process; a process where another crate may reach
-//!   `jsonwebtoken` before any server exists calls
-//!   [`install_default_crypto_provider`] from `main` instead.
+//!   advisory `rust_crypto` carries. Building this verifier settles that choice
+//!   for the process; a process where another crate may reach `jsonwebtoken`
+//!   first calls [`install_default_crypto_provider`] from `main` instead. A
+//!   proxy with no built-in verifier installs nothing: that choice stays with
+//!   its host.
 //! - an **injected** one, supplied by the embedder through
 //!   [`ProxyServer::with_token_verifier`]. Since Cargo unifies features across a
 //!   whole dependency graph, a backend feature cannot be chosen per binary —
@@ -163,13 +164,6 @@ impl Default for ProxyServer {
 impl ProxyServer {
     /// Create from YAML config file.
     pub fn from_config(config: ProxyConfig) -> Self {
-        // Earliest point this crate owns: settle the JWT crypto provider here,
-        // long before the first token arrives. A process whose other crates
-        // reach jsonwebtoken before any server exists calls
-        // `install_default_crypto_provider` from `main` instead.
-        #[cfg(feature = "builtin_jwt")]
-        auth::crypto::install_default_crypto_provider();
-
         Self {
             config,
             descriptor_pool: None,

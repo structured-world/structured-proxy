@@ -69,7 +69,9 @@ tonic services.
   capabilities you ask for ([Building the proxy in code](#building-the-proxy-in-code))
 - Requests the proxy does not serve go to your own fallback service
 - Hooks for auth decisions, token verification, OIDC and extra routes, with no
-  HTTP framework in your code
+  HTTP framework in your code. The auth hooks are for applications that leave
+  authentication to the proxy and an external identity provider
+  ([Applications with their own authentication](#applications-with-their-own-authentication))
 
 ## Non-goals
 
@@ -973,6 +975,17 @@ returns `application/jwk-set+json` (RFC 7517 §8.5).
 command-line dependencies come with the `cli` feature. The library runs on
 your tokio runtime and logs through `tracing` to the subscriber you set up.
 
+### Applications with their own authentication
+
+The proxy's auth (JWT verification, route policies and roles, claim→header
+forwarding, the forward-auth endpoint, ext_authz and the `with_auth`,
+`with_token_verifier` and `with_auth_decider` hooks) is for an application
+that leaves authentication and authorization to the proxy and an external
+identity provider. An application that verifies tokens and authorizes requests
+itself embeds the proxy with none of it: no `auth:` section and none of those
+hooks. Its own checks are the only ones on the request path, and the proxy
+installs no `jsonwebtoken` provider in its process.
+
 ```rust,no_run
 use std::path::Path;
 use structured_proxy::ProxyServer;
@@ -1343,12 +1356,15 @@ from `auth.jwt` (an Ed25519 PEM file or a JWKS endpoint), verified with
 | `aws_lc_rs` | aws-lc | Constant-time / FIPS-capable, advisory-free, links aws-lc through C FFI. |
 
 Both can be linked at once, as with any pair of Cargo features. `jsonwebtoken`
-cannot infer a provider then, so `ProxyServer::from_config` installs `aws_lc_rs`
-for the process: it is constant-time and carries no advisory. A build that wants
-RustCrypto regardless drops the `aws_lc_rs` feature.
+cannot infer a provider then, so building the built-in verifier installs
+`aws_lc_rs` for the process, unless the process installed a provider first: it
+is constant-time and carries no advisory. A build that wants RustCrypto
+regardless drops the `aws_lc_rs` feature. A proxy without `auth.mode: "jwt"`, or
+with an injected verifier, installs no `jsonwebtoken` provider: that choice
+stays with your application.
 
 If another crate in your process uses `jsonwebtoken` too, it may reach it before
-any proxy server is built, and would hit the same ambiguity. It can also turn on
+the built-in verifier is built, and would hit the same ambiguity. It can also turn on
 the other backend for `jsonwebtoken` directly, which leaves this crate looking
 single-backend while `jsonwebtoken` sees two. Settle it once at the top of
 `main`:

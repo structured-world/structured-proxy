@@ -43,9 +43,8 @@ impl ConfigVerifier {
     /// max age is below the refresh interval, the PEM file cannot be read, or
     /// it is not a valid Ed25519 public key.
     pub(crate) fn build(jwt: &JwtConfig) -> Result<Self, String> {
-        // Normally settled in `ProxyServer::from_config` already; repeated here
-        // because a verifier can also be built without going through the
-        // server, and the call costs one atomic once the provider is in place.
+        // The only place the proxy settles the jsonwebtoken provider: a proxy
+        // that builds no built-in verifier leaves that choice to its host.
         super::crypto::install_default_crypto_provider();
 
         let keys = if let Some(uri) = &jwt.jwks_uri {
