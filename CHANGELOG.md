@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [8.1.6](https://github.com/structured-world/structured-proxy/compare/v8.1.5...v8.1.6) - 2026-11-04
+
+### Fixed
+
+- *(config)* read an empty document as the defaults ([#166](https://github.com/structured-world/structured-proxy/pull/166))
+
 ## [8.1.5](https://github.com/structured-world/structured-proxy/compare/v8.1.4...v8.1.5) - 2026-10-31
 
 ### Fixed
