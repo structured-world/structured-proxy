@@ -918,6 +918,38 @@ fn an_empty_document_is_the_default_config() {
 }
 
 #[test]
+fn an_explicit_null_document_keeps_its_meaning() {
+    // `null` is a node, unlike an empty document: an optional reads it as
+    // absent and an untyped value as null, never as an empty mapping.
+    for yaml in ["null", "~", "--- null\n"] {
+        assert_eq!(
+            parse_yaml::<Option<String>>(yaml).unwrap(),
+            None,
+            "{yaml:?}"
+        );
+        assert_eq!(
+            parse_yaml::<serde_json::Value>(yaml).unwrap(),
+            serde_json::Value::Null,
+            "{yaml:?}"
+        );
+    }
+    // A config is a mapping; an explicit null is not one.
+    assert!(ProxyConfig::from_yaml_str("null").is_err());
+}
+
+#[test]
+fn an_empty_document_keeps_an_optional_absent() {
+    // The empty-mapping reading applies only when the type refuses no node.
+    for yaml in ["", "# nothing\n", "---\n"] {
+        assert_eq!(
+            parse_yaml::<Option<String>>(yaml).unwrap(),
+            None,
+            "{yaml:?}"
+        );
+    }
+}
+
+#[test]
 fn a_repeated_key_is_refused() {
     // Which of two values would win is not something to guess for a config.
     let err = ProxyConfig::from_yaml_str("service:\n  name: a\nservice:\n  name: b\n").unwrap_err();

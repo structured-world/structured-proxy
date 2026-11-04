@@ -340,14 +340,28 @@ pub fn from_yaml<T: serde::de::DeserializeOwned>(yaml: &str) -> anyhow::Result<T
 /// boolean where text is expected is an error, not the text it spells, so
 /// `name: true` does not start a service called "true". Errors stay on one
 /// line, without a snippet of the document, so a log record holds the whole
-/// message. A document without content (empty, only comments, a bare `---`)
-/// is null, which the reader refuses as a struct; it sets nothing, so it reads
-/// as an empty mapping.
+/// message. A document without any node (empty, only comments, a bare `---`)
+/// sets nothing: a type that refuses it is read from an empty mapping. An
+/// explicit `null` is a node and keeps its meaning.
 pub(crate) fn parse_yaml<T: serde::de::DeserializeOwned>(yaml: &str) -> Result<T, YamlError> {
-    match parse_yaml_document::<Option<T>>(yaml)? {
-        Some(value) => Ok(value),
-        None => parse_yaml_document("{}"),
+    match parse_yaml_document(yaml) {
+        Err(refused) if has_no_node(yaml) => parse_yaml_document("{}").map_err(|_| refused),
+        read => read,
     }
+}
+
+/// Whether `yaml` holds no node: blank and comment lines, document markers
+/// (`---`, `...`) with at most a comment after them, and directives.
+fn has_no_node(yaml: &str) -> bool {
+    yaml.lines().all(|line| {
+        let line = line.trim();
+        let rest = line
+            .strip_prefix("---")
+            .or_else(|| line.strip_prefix("..."))
+            .unwrap_or(line)
+            .trim_start();
+        rest.is_empty() || rest.starts_with('#') || line.starts_with('%')
+    })
 }
 
 fn parse_yaml_document<T: serde::de::DeserializeOwned>(yaml: &str) -> Result<T, YamlError> {
