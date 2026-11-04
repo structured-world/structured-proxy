@@ -340,8 +340,45 @@ pub fn from_yaml<T: serde::de::DeserializeOwned>(yaml: &str) -> anyhow::Result<T
 /// boolean where text is expected is an error, not the text it spells, so
 /// `name: true` does not start a service called "true". Errors stay on one
 /// line, without a snippet of the document, so a log record holds the whole
-/// message.
+/// message. One well-formed document without any node (empty, only comments,
+/// a bare `---`) sets nothing: a type that refuses it is read from an empty
+/// mapping. An explicit `null` is a node and keeps its meaning; two
+/// documents or a broken directive stay errors.
 pub(crate) fn parse_yaml<T: serde::de::DeserializeOwned>(yaml: &str) -> Result<T, YamlError> {
+    match parse_yaml_document(yaml) {
+        Err(refused) if is_one_empty_document(yaml) => {
+            parse_yaml_document("{}").map_err(|_| refused)
+        }
+        read => read,
+    }
+}
+
+/// Whether `yaml` is a single document the reader accepts and that holds no
+/// node: the reader checks the syntax and the document count, the text that
+/// nothing in it is an explicit `null`.
+fn is_one_empty_document(yaml: &str) -> bool {
+    has_no_node(yaml)
+        && matches!(
+            parse_yaml_document::<Option<serde::de::IgnoredAny>>(yaml),
+            Ok(None)
+        )
+}
+
+/// Whether `yaml` holds no node: blank and comment lines, document markers
+/// (`---`, `...`) with at most a comment after them, and directives.
+fn has_no_node(yaml: &str) -> bool {
+    yaml.lines().all(|line| {
+        let line = line.trim();
+        let rest = line
+            .strip_prefix("---")
+            .or_else(|| line.strip_prefix("..."))
+            .unwrap_or(line)
+            .trim_start();
+        rest.is_empty() || rest.starts_with('#') || line.starts_with('%')
+    })
+}
+
+fn parse_yaml_document<T: serde::de::DeserializeOwned>(yaml: &str) -> Result<T, YamlError> {
     let mut path = None;
     serde_saphyr::with_deserializer_from_str_with_options(
         yaml,
