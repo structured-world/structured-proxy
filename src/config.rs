@@ -340,8 +340,17 @@ pub fn from_yaml<T: serde::de::DeserializeOwned>(yaml: &str) -> anyhow::Result<T
 /// boolean where text is expected is an error, not the text it spells, so
 /// `name: true` does not start a service called "true". Errors stay on one
 /// line, without a snippet of the document, so a log record holds the whole
-/// message.
+/// message. A document without content (empty, only comments, a bare `---`)
+/// is null, which the reader refuses as a struct; it sets nothing, so it reads
+/// as an empty mapping.
 pub(crate) fn parse_yaml<T: serde::de::DeserializeOwned>(yaml: &str) -> Result<T, YamlError> {
+    match parse_yaml_document::<Option<T>>(yaml)? {
+        Some(value) => Ok(value),
+        None => parse_yaml_document("{}"),
+    }
+}
+
+fn parse_yaml_document<T: serde::de::DeserializeOwned>(yaml: &str) -> Result<T, YamlError> {
     let mut path = None;
     serde_saphyr::with_deserializer_from_str_with_options(
         yaml,
