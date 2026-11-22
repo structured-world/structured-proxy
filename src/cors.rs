@@ -8,8 +8,10 @@
 //! can serve it.
 //!
 //! The policy is one of two: every origin, as a development default, or the
-//! configured origins with credentials. Every header value it can send is
-//! built once; a request costs a reference count and the headers it gets.
+//! configured origins with credentials, joined by the origins an embedder's
+//! [`CorsOrigins`] admits at the time of the request. Every header value it
+//! can send is built once; a request costs a reference count, the headers it
+//! gets and, with a hook, one call of it.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -25,11 +27,12 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response};
 use pin_project_lite::pin_project;
 use tower::{Layer, Service};
 
+use crate::hooks::CorsOrigins;
+
 /// A CORS policy, as a layer.
 #[derive(Clone, Debug)]
 pub(crate) struct CorsLayer(Arc<Policy>);
 
-#[derive(Debug)]
 struct Policy {
     /// `None` for every origin: `*` for the origin, the methods and the
     /// exposed headers, the request headers a preflight asks for named back,
@@ -38,10 +41,24 @@ struct Policy {
     /// method and headers it asked for (the Fetch standard, §3.2.5, forbids
     /// `*` with credentials).
     origins: Option<Vec<HeaderValue>>,
+    /// The origins the embedder admits beside the listed ones, asked on
+    /// each request; only with listed origins (possibly none listed).
+    admitted: Option<Arc<dyn CorsOrigins>>,
     /// The response headers a browser may read, for the listed origins.
     exposed: Option<HeaderValue>,
     /// How long a browser may cache a preflight's answer.
     max_age: Option<HeaderValue>,
+}
+
+impl std::fmt::Debug for Policy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Policy")
+            .field("origins", &self.origins)
+            .field("admitted", &self.admitted.is_some())
+            .field("exposed", &self.exposed)
+            .field("max_age", &self.max_age)
+            .finish()
+    }
 }
 
 const WILDCARD: HeaderValue = HeaderValue::from_static("*");
@@ -59,16 +76,19 @@ impl CorsLayer {
     pub(crate) fn any(max_age: Option<u64>) -> Self {
         Self(Arc::new(Policy {
             origins: None,
+            admitted: None,
             exposed: None,
             max_age: max_age.map(HeaderValue::from),
         }))
     }
 
-    /// `origins`, with credentials, reading `exposed`.
+    /// `origins` and those `admitted` admits per request, with credentials,
+    /// reading `exposed`.
     pub(crate) fn listed(
         origins: Vec<HeaderValue>,
         exposed: &[HeaderName],
         max_age: Option<u64>,
+        admitted: Option<Arc<dyn CorsOrigins>>,
     ) -> Self {
         let exposed = (!exposed.is_empty()).then(|| {
             let names: Vec<&str> = exposed.iter().map(HeaderName::as_str).collect();
@@ -76,6 +96,7 @@ impl CorsLayer {
         });
         Self(Arc::new(Policy {
             origins: Some(origins),
+            admitted,
             exposed,
             max_age: max_age.map(HeaderValue::from),
         }))
@@ -102,12 +123,19 @@ pub(crate) struct Cors<S> {
 
 impl Policy {
     /// The `Access-Control-Allow-Origin` an `origin` gets: `*`, or the origin
-    /// itself when it is listed.
+    /// itself when it is listed or the embedder admits it now.
     fn allow_origin(&self, origin: Option<&HeaderValue>) -> Option<HeaderValue> {
-        match &self.origins {
-            None => Some(WILDCARD),
-            Some(listed) => origin.filter(|origin| listed.contains(origin)).cloned(),
+        let Some(listed) = &self.origins else {
+            return Some(WILDCARD);
+        };
+        let origin = origin?;
+        if listed.contains(origin) {
+            return Some(origin.clone());
         }
+        // An `Origin` that is not text names no origin a hook could admit.
+        let admitted = self.admitted.as_ref()?;
+        let text = origin.to_str().ok()?;
+        admitted.admits(text).then(|| origin.clone())
     }
 
     /// The answer to a preflight with `headers`.

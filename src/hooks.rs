@@ -156,6 +156,37 @@ pub trait TokenVerifier: Send + Sync {
     async fn verify(&self, token: &str) -> Option<serde_json::Value>;
 }
 
+/// Origins the embedder admits to credentialed CORS beside `cors.origins`,
+/// decided on every request: origins its own run-time settings name, such as
+/// an administration console an operator moved to another host.
+///
+/// Called inline for every request that carries `Origin`, preflights
+/// included, so it answers from what the embedder already holds (a snapshot
+/// it refreshes on its own), never by I/O.
+///
+/// # Examples
+///
+/// ```
+/// use structured_proxy::hooks::CorsOrigins;
+///
+/// struct Console(String);
+///
+/// impl CorsOrigins for Console {
+///     fn admits(&self, origin: &str) -> bool {
+///         origin == self.0
+///     }
+/// }
+///
+/// let console = Console("https://admin.example.com".into());
+/// assert!(console.admits("https://admin.example.com"));
+/// assert!(!console.admits("https://other.example.com"));
+/// ```
+pub trait CorsOrigins: Send + Sync {
+    /// Whether `origin`, the request's `Origin` value as the browser sent it
+    /// (a serialized origin, or `null`), gets credentialed CORS.
+    fn admits(&self, origin: &str) -> bool;
+}
+
 /// A static JSON document served at a fixed path (an OIDC metadata document or a
 /// JWKS document).
 #[derive(Debug, Clone)]
