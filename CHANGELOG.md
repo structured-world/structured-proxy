@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [8.2.0](https://github.com/structured-world/structured-proxy/compare/v8.1.7...v8.2.0) - 2026-11-22
+
+### Added
+
+- *(cors)* admit origins an embedder names at run time ([#173](https://github.com/structured-world/structured-proxy/pull/173))
+
 ## [8.1.7](https://github.com/structured-world/structured-proxy/compare/v8.1.6...v8.1.7) - 2026-11-04
 
 ### Other
