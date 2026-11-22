@@ -99,7 +99,7 @@ use tower_http::trace::TraceLayer;
 use std::sync::Arc;
 
 use config::{DescriptorSource, ProxyConfig, ScopeConfig};
-use hooks::{AuthDecider, ExtraRoute, OidcBackend, TokenVerifier};
+use hooks::{AuthDecider, CorsOrigins, ExtraRoute, OidcBackend, TokenVerifier};
 use upstream::Upstream;
 
 /// What the proxy's handlers share. Every request extracts its own clone, so
@@ -152,6 +152,8 @@ pub struct ProxyServer {
     token_verifier: Option<Arc<dyn TokenVerifier>>,
     /// How the transcoded routes render errors and frame NDJSON streams.
     transcode: transcode::TranscodeOptions,
+    /// Origins the embedder admits to credentialed CORS beside the listed ones.
+    cors_origins: Option<Arc<dyn CorsOrigins>>,
 }
 
 impl Default for ProxyServer {
@@ -174,6 +176,7 @@ impl ProxyServer {
             verify_path: None,
             token_verifier: None,
             transcode: transcode::TranscodeOptions::default(),
+            cors_origins: None,
         }
     }
 
@@ -325,6 +328,14 @@ impl ProxyServer {
     /// The CORS policy (`cors:`).
     pub fn with_cors(mut self, cors: config::CorsConfig) -> Self {
         self.config.cors = cors;
+        self
+    }
+
+    /// Give credentialed CORS also to the origins `origins` admits, asked on
+    /// every request beside `cors.origins`. With it the policy is the
+    /// credentialed one even when no origin is listed.
+    pub fn with_cors_origins(mut self, origins: Arc<dyn CorsOrigins>) -> Self {
+        self.cors_origins = Some(origins);
         self
     }
 
@@ -1305,7 +1316,9 @@ impl ProxyServer {
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        if config.origins.is_empty() {
+        // A hook admitting origins makes the policy the credentialed one, so
+        // its origins never fall back to `*`.
+        if config.origins.is_empty() && self.cors_origins.is_none() {
             tracing::warn!("CORS origins not set — using permissive CORS (dev mode)");
             // Exposes every header already.
             Ok(CorsLayer::any(config.max_age_secs))
@@ -1338,6 +1351,7 @@ impl ProxyServer {
                 origins,
                 &exposed.collect::<Vec<_>>(),
                 config.max_age_secs,
+                self.cors_origins.clone(),
             ))
         }
     }

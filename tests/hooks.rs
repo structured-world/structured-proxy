@@ -13,8 +13,8 @@ use async_trait::async_trait;
 use http::{HeaderMap, Method, StatusCode};
 use structured_proxy::config::ProxyConfig;
 use structured_proxy::hooks::{
-    AuthDecider, Decision, ExtraRoute, ExtraRouteHandler, MetadataDocument, OidcBackend,
-    RequestParts, RouteRequest, RouteResponse, TokenVerifier,
+    AuthDecider, CorsOrigins, Decision, ExtraRoute, ExtraRouteHandler, MetadataDocument,
+    OidcBackend, RequestParts, RouteRequest, RouteResponse, TokenVerifier,
 };
 use structured_proxy::ProxyServer;
 
@@ -91,6 +91,15 @@ impl ExtraRouteHandler for PingHandler {
     }
 }
 
+/// The console origin an embedder's own settings name.
+struct ConsoleOrigin;
+
+impl CorsOrigins for ConsoleOrigin {
+    fn admits(&self, origin: &str) -> bool {
+        origin == "https://console.example.com"
+    }
+}
+
 // --- harness (axum + tower) ----------------------------------------------
 
 use axum::body::Body;
@@ -119,6 +128,44 @@ async fn body_string(resp: axum::response::Response) -> String {
         .await
         .unwrap();
     String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+// With no `cors.origins` the server's CORS is the permissive development
+// default; a CorsOrigins hook makes it the credentialed policy, so the origin
+// it admits gets credentials and any other origin gets nothing, never `*`.
+#[tokio::test]
+async fn a_cors_origins_hook_gives_its_origin_credentials_and_others_nothing() {
+    let app = server()
+        .with_cors_origins(Arc::new(ConsoleOrigin))
+        .router()
+        .unwrap();
+    let preflight = |origin: &str| {
+        axum::http::Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/ping")
+            .header("origin", origin)
+            .header("access-control-request-method", "POST")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let admitted = app
+        .clone()
+        .oneshot(preflight("https://console.example.com"))
+        .await
+        .unwrap();
+    assert_eq!(
+        admitted.headers()["access-control-allow-origin"],
+        "https://console.example.com"
+    );
+    assert_eq!(
+        admitted.headers()["access-control-allow-credentials"],
+        "true"
+    );
+    let other = app
+        .oneshot(preflight("https://other.example.com"))
+        .await
+        .unwrap();
+    assert!(other.headers().get("access-control-allow-origin").is_none());
 }
 
 #[tokio::test]

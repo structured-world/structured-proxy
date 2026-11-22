@@ -1341,6 +1341,10 @@ The hooks are:
   discovery.
 - **`with_extra_routes`**: registers extra stateless routes through a
   framework-agnostic adapter (request parts in, response parts out).
+- **`with_cors_origins`**: gives credentialed CORS to origins your own
+  run-time settings name, beside `cors.origins`, asked on every request
+  (preflights included). With it and no listed origins the policy is the
+  credentialed one, not the permissive development default.
 - **`with_error_details`**: chooses which transcoded routes return the
   upstream's `google.rpc.Status` details (see [Error responses](#error-responses)).
 - **`with_denied_response_headers`**: keeps upstream response metadata keys

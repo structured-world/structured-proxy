@@ -147,7 +147,133 @@ fn listed() -> Router {
             HeaderName::from_static("x-custom"),
         ],
         Some(600),
+        None,
     ))
+}
+
+/// The origins `admitted` holds at the moment of each call, as an embedder's
+/// run-time settings name them.
+struct Admitted(std::sync::Mutex<Vec<String>>);
+
+impl crate::hooks::CorsOrigins for Admitted {
+    fn admits(&self, origin: &str) -> bool {
+        self.0.lock().unwrap().iter().any(|o| o == origin)
+    }
+}
+
+/// Credentialed CORS for `listed` origins and whatever `admitted` admits.
+fn admitting(listed: &[&'static str], admitted: Arc<Admitted>) -> Router {
+    app_with(CorsLayer::listed(
+        listed.iter().map(|o| HeaderValue::from_static(o)).collect(),
+        &[HeaderName::from_static("grpc-status")],
+        None,
+        Some(admitted),
+    ))
+}
+
+// An origin the embedder admits at run time gets the credentialed answer a
+// listed one gets, preflight included: the preflight never reaches the
+// embedder's own routes, so only the CORS layer can answer it.
+#[tokio::test]
+async fn an_admitted_origin_gets_credentialed_cors() {
+    let admitted = Arc::new(Admitted(std::sync::Mutex::new(vec![
+        "https://console.example".into(),
+    ])));
+    let app = admitting(&["https://a.example"], admitted.clone());
+    let (_, headers, body) = send_to(
+        app.clone(),
+        options(&[
+            ("origin", "https://console.example"),
+            ("access-control-request-method", "POST"),
+            ("access-control-request-headers", "x-csrf-token"),
+        ]),
+    )
+    .await;
+    assert!(body.is_empty(), "{body}");
+    assert_eq!(
+        headers["access-control-allow-origin"],
+        "https://console.example"
+    );
+    assert_eq!(headers["access-control-allow-credentials"], "true");
+    assert_eq!(headers["access-control-allow-headers"], "x-csrf-token");
+    let request = Request::post("/x")
+        .header("origin", "https://console.example")
+        .body(Body::empty())
+        .unwrap();
+    let (_, headers, body) = send_to(app.clone(), request).await;
+    assert_eq!(body, "POST");
+    assert_eq!(
+        headers["access-control-allow-origin"],
+        "https://console.example"
+    );
+    assert_eq!(headers["access-control-allow-credentials"], "true");
+    assert_eq!(headers["access-control-expose-headers"], "grpc-status");
+    // The listed origin keeps its answer beside the admitted one.
+    let request = Request::get("/x")
+        .header("origin", "https://a.example")
+        .body(Body::empty())
+        .unwrap();
+    let (_, headers, _) = send_to(app, request).await;
+    assert_eq!(headers["access-control-allow-origin"], "https://a.example");
+}
+
+// What the embedder admits is asked on every request: an origin it stops
+// admitting loses CORS on the next call, one it starts admitting gains it.
+#[tokio::test]
+async fn admission_follows_the_embedder_per_request() {
+    let admitted = Arc::new(Admitted(std::sync::Mutex::new(vec![
+        "https://old.example".into()
+    ])));
+    let app = admitting(&[], admitted.clone());
+    let get = |origin: &'static str| {
+        Request::get("/x")
+            .header("origin", origin)
+            .body(Body::empty())
+            .unwrap()
+    };
+    let (_, headers, _) = send_to(app.clone(), get("https://old.example")).await;
+    assert_eq!(
+        headers["access-control-allow-origin"],
+        "https://old.example"
+    );
+    *admitted.0.lock().unwrap() = vec!["https://new.example".into()];
+    let (_, headers, _) = send_to(app.clone(), get("https://old.example")).await;
+    assert!(!headers.contains_key("access-control-allow-origin"));
+    let (_, headers, _) = send_to(app, get("https://new.example")).await;
+    assert_eq!(
+        headers["access-control-allow-origin"],
+        "https://new.example"
+    );
+}
+
+// An origin neither listed nor admitted gets nothing, preflight included,
+// and the policy with a hook and no listed origins is the credentialed one:
+// never the `*` of the development default.
+#[tokio::test]
+async fn an_origin_neither_listed_nor_admitted_is_not_allowed() {
+    let admitted = Arc::new(Admitted(std::sync::Mutex::new(Vec::new())));
+    let app = admitting(&[], admitted);
+    let (_, headers, _) = send_to(
+        app.clone(),
+        options(&[
+            ("origin", "https://b.example"),
+            ("access-control-request-method", "POST"),
+        ]),
+    )
+    .await;
+    assert!(!headers.contains_key("access-control-allow-origin"));
+    assert_ne!(
+        headers
+            .get("access-control-allow-methods")
+            .map(|v| v.as_bytes()),
+        Some(&b"*"[..])
+    );
+    let request = Request::get("/x")
+        .header("origin", "https://b.example")
+        .body(Body::empty())
+        .unwrap();
+    let (_, headers, _) = send_to(app, request).await;
+    assert!(!headers.contains_key("access-control-allow-origin"));
 }
 
 #[tokio::test]
@@ -197,6 +323,35 @@ async fn a_listed_origin_reads_the_exposed_headers() {
         ]
     );
     assert!(!headers.contains_key("access-control-max-age"));
+}
+
+// The CORS layer owns the allow-origin decision: a route that reflects the
+// request's `Origin` itself cannot admit an origin the policy refuses, since
+// the layer adds credentials to every answer of the credentialed policy.
+// Bug prevented: a credentialed response readable by any reflected origin.
+#[tokio::test]
+async fn a_route_cannot_admit_an_origin_the_policy_refuses() {
+    let app = Router::new()
+        .route(
+            "/x",
+            any(|headers: HeaderMap| async move {
+                let origin = headers.get(ORIGIN).cloned().unwrap();
+                ([(ACCESS_CONTROL_ALLOW_ORIGIN, origin)], "reflected")
+            }),
+        )
+        .layer(CorsLayer::listed(
+            vec![HeaderValue::from_static("https://a.example")],
+            &[],
+            None,
+            None,
+        ));
+    let request = Request::get("/x")
+        .header("origin", "https://b.example")
+        .body(Body::empty())
+        .unwrap();
+    let (_, headers, body) = send_to(app, request).await;
+    assert_eq!(body, "reflected");
+    assert!(!headers.contains_key("access-control-allow-origin"));
 }
 
 #[tokio::test]
