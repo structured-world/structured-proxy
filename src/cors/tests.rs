@@ -325,6 +325,35 @@ async fn a_listed_origin_reads_the_exposed_headers() {
     assert!(!headers.contains_key("access-control-max-age"));
 }
 
+// The CORS layer owns the allow-origin decision: a route that reflects the
+// request's `Origin` itself cannot admit an origin the policy refuses, since
+// the layer adds credentials to every answer of the credentialed policy.
+// Bug prevented: a credentialed response readable by any reflected origin.
+#[tokio::test]
+async fn a_route_cannot_admit_an_origin_the_policy_refuses() {
+    let app = Router::new()
+        .route(
+            "/x",
+            any(|headers: HeaderMap| async move {
+                let origin = headers.get(ORIGIN).cloned().unwrap();
+                ([(ACCESS_CONTROL_ALLOW_ORIGIN, origin)], "reflected")
+            }),
+        )
+        .layer(CorsLayer::listed(
+            vec![HeaderValue::from_static("https://a.example")],
+            &[],
+            None,
+            None,
+        ));
+    let request = Request::get("/x")
+        .header("origin", "https://b.example")
+        .body(Body::empty())
+        .unwrap();
+    let (_, headers, body) = send_to(app, request).await;
+    assert_eq!(body, "reflected");
+    assert!(!headers.contains_key("access-control-allow-origin"));
+}
+
 #[tokio::test]
 async fn an_origin_not_listed_is_not_allowed() {
     let request = Request::get("/x")

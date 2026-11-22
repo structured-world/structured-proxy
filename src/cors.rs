@@ -189,8 +189,16 @@ impl Policy {
             Some(_) => {
                 headers.append(VARY, VARY_REQUEST);
                 headers.insert(ACCESS_CONTROL_ALLOW_CREDENTIALS, TRUE);
-                if let Some(origin) = allow_origin {
-                    headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+                // The policy alone decides the allowed origin: a route's own
+                // reflected value for a refused origin would otherwise ride
+                // along with the credentials added above.
+                match allow_origin {
+                    Some(origin) => {
+                        headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+                    }
+                    None => {
+                        headers.remove(ACCESS_CONTROL_ALLOW_ORIGIN);
+                    }
                 }
                 if let Some(exposed) = &self.exposed {
                     headers.insert(ACCESS_CONTROL_EXPOSE_HEADERS, exposed.clone());
