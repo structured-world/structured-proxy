@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [8.2.1](https://github.com/structured-world/structured-proxy/compare/v8.2.0...v8.2.1) - 2026-11-25
+
+### Other
+
+- *(deps)* bump taiki-e/install-action from 2.90.3 to 2.90.8 ([#175](https://github.com/structured-world/structured-proxy/pull/175))
+
 ## [8.2.0](https://github.com/structured-world/structured-proxy/compare/v8.1.7...v8.2.0) - 2026-11-22
 
 ### Added
